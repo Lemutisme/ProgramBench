@@ -1,5 +1,7 @@
 # ProgramBench 测评 Harness Runbook
 
+English version: [docs/harness_runbook_en.md](harness_runbook_en.md)
+
 ## 适用范围
 
 本文面向需要用 ProgramBench 作为评测 harness 的实验维护者。目标是把一个 SWE-agent 生成的代码库批量打包、运行官方测试、汇总分数，并保留可复现记录。
@@ -15,6 +17,51 @@ uv sync
 ```
 
 - 评测阶段需要访问 Docker Hub 和 HuggingFace，除非镜像和 test blobs 已提前缓存。推理阶段必须隔离互联网，agent 只能访问 cleanroom 二进制和文档。
+
+快速自检：
+
+```bash
+uname -m
+command -v uv
+uv sync
+docker version
+docker ps
+uv run programbench --help
+uv run pytest -q
+```
+
+如果 `uv` 不存在，可按官方安装脚本安装到用户目录，并用绝对路径执行：
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+/home/"$USER"/.local/bin/uv sync
+```
+
+如果 Docker 已安装但 `docker ps` 报 socket 权限错误，生产环境优先把当前用户加入 `docker` 组并重新登录：
+
+```bash
+sudo usermod -aG docker "$USER"
+```
+
+临时自检时也可以使用一个 sudo wrapper，并通过 `PROGRAMBENCH_DOCKER_EXECUTABLE` 交给 ProgramBench。注意 wrapper 需要在 `docker cp` 后把拷出的临时文件 owner 改回当前用户，否则 harness 清理 JUnit XML 临时文件时可能触发 `PermissionError`：
+
+```bash
+cat >/tmp/programbench-docker <<'EOF'
+#!/bin/bash
+sudo docker "$@"
+rc=$?
+if [ "$rc" -eq 0 ] && [ "${1:-}" = "cp" ]; then
+    last="${@: -1}"
+    case "$last" in
+        *:*) ;;
+        *) sudo chown "$(id -u):$(id -g)" "$last" 2>/dev/null || true ;;
+    esac
+fi
+exit "$rc"
+EOF
+chmod +x /tmp/programbench-docker
+export PROGRAMBENCH_DOCKER_EXECUTABLE=/tmp/programbench-docker
+```
 
 ## 1. 输入契约
 
@@ -46,10 +93,13 @@ IID=ffmpeg__ffmpeg.360a402
 AGENT_WORKSPACE=/data/agents/ffmpeg__ffmpeg.360a402/workspace
 
 mkdir -p "$RUN_DIR/$IID"
-tar -czf "$RUN_DIR/$IID/submission.tar.gz" -C "$AGENT_WORKSPACE" .
+tar --owner=0 --group=0 --numeric-owner \
+  -czf "$RUN_DIR/$IID/submission.tar.gz" \
+  -C "$AGENT_WORKSPACE" .
 ```
 
 打包后不要继续修改该目录；如需修复候选代码，重新生成一个新的 run directory，方便结果追踪。
+`--owner=0 --group=0 --numeric-owner` 很重要：ProgramBench 会在 Docker 容器中以 root 解包提交，如果 tar 内的 `./` 记录带有宿主用户 UID，可能把 `/workspace` 改成非 root owner，导致后续 `seed_git` 步骤触发 Git `dubious ownership` 错误。
 
 ## 3. 预热缓存
 
@@ -92,6 +142,73 @@ uv run programbench eval "$RUN_DIR" \
 
 ```bash
 uv run programbench eval "$RUN_DIR" --slice 0:5 -w 1 -b 1
+```
+
+### 本地 fixture 自检
+
+仓库内置了 `testorg__calculator.abc1234` fixture，可用于不依赖 HuggingFace 下载的本地 harness 自检。这个 fixture 是测试用资源，不等同于正式 ProgramBench 镜像；当前本地 Dockerfile 需要补上 `git` 和 `pytest-xdist`，测试 blob 的 `run.sh` 也需要临时调整 JUnit test name，才能完整模拟正式 harness 的成功路径。以下命令只写 `/tmp` 和本地 Docker 镜像，不修改仓库 fixture 文件：
+
+```bash
+IID=testorg__calculator.abc1234
+IMAGE=programbench/testorg_1776_calculator.abc1234:task
+BRANCH=33128f6b8600
+RUN_DIR=/tmp/programbench-smoke-run
+WORK=/tmp/programbench-smoke-work
+BLOB=/tmp/programbench-smoke-blobs
+DOCKER=${PROGRAMBENCH_DOCKER_EXECUTABLE:-docker}
+
+"$DOCKER" build -t "$IMAGE" "src/programbench/data/tasks/$IID"
+cid=$("$DOCKER" run -d "$IMAGE" sleep 2h)
+"$DOCKER" exec "$cid" bash -lc \
+  'apt-get update &&
+   DEBIAN_FRONTEND=noninteractive apt-get install -y git &&
+   pip3 install -q --disable-pip-version-check pytest-xdist &&
+   rm -rf /var/lib/apt/lists/*'
+"$DOCKER" commit "$cid" "$IMAGE"
+"$DOCKER" rm -f "$cid"
+
+rm -rf "$RUN_DIR" "$WORK" "$BLOB" /tmp/programbench-smoke-branch
+mkdir -p "$RUN_DIR/$IID" "$WORK/correct" "$BLOB/$IID/tests" /tmp/programbench-smoke-branch
+
+uv run python -m zipfile -e \
+  "src/programbench/data/test_runs/correct/$IID/submission.zip" \
+  "$WORK/correct"
+tar --owner=0 --group=0 --numeric-owner \
+  -czf "$RUN_DIR/$IID/submission.tar.gz" \
+  -C "$WORK/correct" .
+
+cp -a "src/programbench/data/tasks/$IID/tests/$BRANCH/." /tmp/programbench-smoke-branch/
+uv run python - <<'PY'
+from pathlib import Path
+
+p = Path("/tmp/programbench-smoke-branch/eval/run.sh")
+text = p.read_text()
+text = text.replace(
+    "python3 -m pytest eval/tests/ --junitxml=eval/results.xml -v || true",
+    "rm -rf tests\ncp -a eval/tests tests\npython3 -m pytest tests/ --junitxml=eval/results.xml -v || true",
+)
+p.write_text(text)
+PY
+tar --owner=0 --group=0 --numeric-owner \
+  -czf "$BLOB/$IID/tests/$BRANCH.tar.gz" \
+  -C /tmp/programbench-smoke-branch .
+
+PROGRAMBENCH_BLOB_DIR="$BLOB" \
+uv run programbench eval "$RUN_DIR" \
+  --filter '^testorg__calculator\.abc1234$' \
+  -w 1 \
+  -b 1 \
+  --docker-cpus 2 \
+  --force
+
+uv run programbench info "$RUN_DIR"
+```
+
+期望输出中应看到：
+
+```text
+testorg__calculator.abc1234     ✅  3 tests
+Average                        100  1 instances
 ```
 
 ## 5. 正式评测
@@ -171,6 +288,11 @@ uv run programbench eval "$RUN_DIR" --branch-retries 0
 - `test_branch_errors` 非空：某些测试分支没有干净完成，需要检查该分支日志。
 - `system_error` 或 `not_run`: 不要当成普通测试失败处理；这通常表示 harness、JUnit XML 或测试执行完整性存在问题。
 - `warnings` 非空：查看是否有缺失测试、未知测试或 ignored branch 相关信息，正式报告前应解释清楚。
+- `PermissionError` 且堆栈在 `_copy_file_from_container` / `host_tmp.unlink`: 通常是通过 `sudo docker cp` 拷出的临时 XML 变成 root-owned；使用正常 docker 组权限，或让 sudo wrapper 在 `docker cp` 后 `chown` 目标文件。
+- `seed_git_failed` 且日志包含 `git: command not found`: 评测镜像缺少 Git。正式 ProgramBench 镜像应包含 harness 需要的工具；如果是本地 fixture 镜像，按「本地 fixture 自检」步骤补装 `git`。
+- `seed_git_failed` 且日志包含 `dubious ownership`: 重新检查 `submission.tar.gz` 是否用 `--owner=0 --group=0 --numeric-owner` 打包；可用 `tar -tvf <submission.tar.gz> | head` 确认 owner/group 显示为 `0/0`。
+- `results_read_failed` 且 `run_tests` 输出包含 `unrecognized arguments: --max-worker-restart=4`: 镜像内 pytest 缺少 `pytest-xdist`，导致 harness 注入的 xdist 参数无法识别，测试没有生成 `eval/results.xml`。
+- 日志显示 `expected tests missing from JUnit XML` 或 `test(s) in JUnit XML not in tests.json`: JUnit testcase 名称和 `tests.json` 不一致。正式评测时先确认 test blob 与当前 ProgramBench 数据版本一致；本地 `testorg__calculator.abc1234` fixture 需要按「本地 fixture 自检」步骤临时调整 `run.sh` 的 pytest 收集路径。
 - Docker 拉取失败：确认镜像 tag、网络和 `PROGRAMBENCH_DOCKER_ORG`。
 - HuggingFace blob 下载失败：先执行 `uv run programbench blob sync <instance_id>` 单独定位。
 
@@ -198,3 +320,37 @@ OUT=/data/evals/programbench-$(date +%Y%m%d)
 uv run programbench eval "$RUN_DIR" -o "$OUT" -w 4 -b 1 --docker-cpus 8
 uv run programbench info "$OUT/$(basename "$RUN_DIR")"
 ```
+
+## 11. ProgramBench 作为冻结外部评测环境（auto-research lane 契约）
+
+下游 auto-research harness 通过 **evaluation-environment（评测环境）** 协议消费
+ProgramBench，其中 ProgramBench 是一个 **frozen_external（冻结外部）** 评测器——
+不可变、回路中无 agent 的验证器。本节记录下游强制执行的契约，帮助 harness 维护者
+保持 ProgramBench 证据达到可接受（acceptance-grade）标准。
+
+- **评测器类型 — `frozen_external`。** ProgramBench 用不可变的官方测试、且回路中
+  没有 agent 来给候选打分，因此其分数有资格作为 *acceptance evidence（可接受证据）*。
+  自评或可变的评测器没有这个资格；绝不要让候选自带的检查替代一次正式的 ProgramBench
+  评测。
+- **不可变锚点 — evaluator hash。** 在任何评测 fan-out 之前，消费方 lane 会冻结一个
+  一次性写入的 *preregistration lock（预登记锁）*，以 evaluator hash 为键：ProgramBench
+  git commit（或发布版本）加上每个实例的 test-blob / `tests.json` 身份。这正是 §9 中
+  “ProgramBench git commit 或发布版本”记录被提升为机器校验的锚点——锁定后若 baseline、
+  split、实例集合或 evaluator hash 发生变化，将 fail closed。
+- **主指标 — `official_filtered_pass_rate`。** 分数取自 `programbench info`（§6）：
+  它按当前 `tests.json` 过滤被忽略的 branch/test，且只有 `✅` 才算解决。四舍五入显示为
+  `100` 不等于“已解决”。
+- **Split — calibration 与 confirmation/holdout。** calibration 运行仅用于迭代，
+  **不可晋升（non-promotable）**。可晋升（acceptance-grade）的证据要求一个与每个
+  calibration 实例 **不相交（disjoint）** 的 **confirmation** 或 **holdout** 实例，
+  并且相对预登记的公开 baseline 非回归。
+- **Conformance（一致性）往返。** 用已知分数的 golden 候选对 ProgramBench 做一次真实
+  评测，就是让证据达到 acceptance-grade 的 *非 agent 验证*。本地
+  `testorg__calculator.abc1234` fixture（§4）**仅**是 harness/管路自检——合成 fixture
+  证据永远不是 acceptance-grade。
+- **Cleanroom（净室）。** 推理使用 `task_cleanroom` 镜像 tag（§1）；构造候选期间不要
+  读取 `tests/test*` blob。官方评测只在打包之后运行（§2）。
+
+总之：§9 的可复现记录 *就是* 不可变锚点，`programbench info` 过滤后的 `✅` 分数
+*就是* 主指标，而一次在不相交 confirmation/holdout 实例上的真实（而非 fixture）
+ProgramBench 运行 *就是* acceptance-grade 证据。
