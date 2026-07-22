@@ -11,7 +11,7 @@ Given only a compiled binary and its documentation, AI agents must architect and
 - [Website](https://programbench.com)
 - [Paper](https://arxiv.org/abs/2605.03546)
 - [HuggingFace](https://huggingface.co/datasets/programbench/ProgramBench-Tests)
-- [Leaderboard](https://programbench.com)
+- [Leaderboard](https://programbench.com) ([Submissions](https://github.com/ProgramBench/submissions))
 - [Usage Guide](docs/README.md)
 - [mini-swe-agent baseline](https://mini-swe-agent.com/latest/usage/programbench/)
 

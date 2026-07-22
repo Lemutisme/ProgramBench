@@ -9,6 +9,7 @@ from pathlib import Path
 import typer
 
 from programbench.cli.blob import app as blob_app
+from programbench.cli.submit import app as submit_app
 from programbench.constants import DOCKER_CPUS
 
 app = typer.Typer(
@@ -18,6 +19,7 @@ app = typer.Typer(
     context_settings={"help_option_names": ["-h", "--help"]},
 )
 app.add_typer(blob_app, name="blob")
+app.add_typer(submit_app, name="submit")
 
 
 @app.callback()
@@ -54,7 +56,14 @@ def eval(
     filter_spec: str = typer.Option("", "--filter", help="Filter instance IDs by regex"),
     slice_spec: str = typer.Option("", "--slice", help="Slice specification (e.g. '0:5')"),
     summarize_only: bool = typer.Option(False, "--summarize-only", help="Skip evaluation; just read existing results"),
-    image_tag: str = typer.Option("task", "--image-tag", help="Docker image tag to evaluate"),
+    image_tag: str = typer.Option(
+        "task_cleanroom_v6",
+        "--image-tag",
+        help="Docker image tag to evaluate submissions in. Defaults to the "
+        "artifact-free cleanroom image so submissions can't rely on build "
+        "artifacts leaked into the full :task build environment. Pass "
+        "--image-tag task_v6 to use the full build environment instead.",
+    ),
     output: str = typer.Option(
         "",
         "-o",
