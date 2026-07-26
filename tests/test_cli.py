@@ -18,6 +18,7 @@ def test_top_level_help():
     assert result.exit_code == 0
     assert "eval" in result.output
     assert "blob" in result.output
+    assert "candidate" in result.output
     assert "info" in result.output
 
 
@@ -37,6 +38,12 @@ def test_blob_sync_help():
     result = runner.invoke(app, ["blob", "sync", "--help"])
     assert result.exit_code == 0
     assert "instance" in result.output.lower()
+
+
+def test_candidate_help():
+    result = runner.invoke(app, ["candidate", "--help"])
+    assert result.exit_code == 0
+    assert all(cmd in result.output for cmd in ("clone", "package", "preflight", "probe"))
 
 
 def test_submit_help():

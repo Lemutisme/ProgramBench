@@ -85,6 +85,32 @@ tar -tzf my-agent-run/ffmpeg__ffmpeg.360a402/submission.tar.gz | head
 
 ## 2. 打包候选结果
 
+### Candidate Adapter
+
+使用内置 adapter 让 first-pass 与 remediation 候选保持配对，冻结 reference probes，生成确定性 archive，并在正式评测前发现环境漂移：
+
+```bash
+# 在 remediation 之前 clone 同一个 first-pass candidate。
+uv run programbench candidate clone /data/first-pass/$IID /data/remediation/$IID
+
+# 冻结 reference 行为，并拒绝 candidate regression。
+uv run programbench candidate probe \
+  /data/probes/$IID/cases.json \
+  /data/probes/$IID/ledger.json \
+  /data/first-pass/$IID/reference \
+  /data/remediation/$IID/executable
+
+# 只打包候选源码。
+uv run programbench candidate package /data/remediation/$IID "$RUN_DIR" "$IID"
+
+# 使用 evaluator 相同的 cleanroom 与重定位 /workspace 路径执行断网编译。
+uv run programbench candidate preflight "$RUN_DIR" "$IID" --docker-cpus 4
+```
+
+`cases.json` 是 `{"argv": [...], "stdin": "..."}` 组成的 JSON list。第一次运行 `probe` 会创建不可变 ledger，记录 reference binary hash 以及精确的 exit/stdout/stderr/timeout；后续 cases 发生变化会 fail closed，candidate 出现 regression 时命令返回非零。若 probe 文件位于 workspace 内，应放在 `.programbench/` 下，打包时会自动排除。
+
+Adapter 只负责 candidate layout 和 cleanroom 机制，不定义 agent goal、completion 或 acceptance policy。
+
 对每个实例，把 agent 工作区打成 `submission.tar.gz`：
 
 ```bash

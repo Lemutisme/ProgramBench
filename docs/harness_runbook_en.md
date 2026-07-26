@@ -85,6 +85,42 @@ Image naming rule: `__` in an instance id maps to `_1776_`. For example, `ffmpeg
 
 ## 2. Package Candidate Results
 
+### Candidate Adapter
+
+Use the built-in adapter to keep first-pass and remediation candidates paired,
+freeze reference probes, package deterministic archives, and catch environment
+drift before official evaluation:
+
+```bash
+# Clone one common first-pass candidate before remediation.
+uv run programbench candidate clone /data/first-pass/$IID /data/remediation/$IID
+
+# Freeze reference behavior and reject candidate regressions.
+uv run programbench candidate probe \
+  /data/probes/$IID/cases.json \
+  /data/probes/$IID/ledger.json \
+  /data/first-pass/$IID/reference \
+  /data/remediation/$IID/executable
+
+# Package only candidate source. The adapter excludes .git, .programbench,
+# reference binaries/wrappers, stale executable output, and nested submissions.
+uv run programbench candidate package /data/remediation/$IID "$RUN_DIR" "$IID"
+
+# Compile the frozen archive in the same cleanroom image and relocated
+# /workspace path used by the evaluator. This runs without build-time DNS.
+uv run programbench candidate preflight "$RUN_DIR" "$IID" --docker-cpus 4
+```
+
+`cases.json` is a JSON list of `{"argv": [...], "stdin": "..."}` records.
+The first `probe` call creates an immutable ledger containing the reference
+binary hash plus exact exit/stdout/stderr/timeout results. Later calls fail if
+the cases change and return non-zero if the candidate regresses. Store probe
+files under `.programbench/` when they live inside a workspace; packaging
+excludes that directory.
+
+The adapter owns candidate layout and cleanroom mechanics. It does not define
+agent goals, completion semantics, or acceptance policy.
+
 For each instance, package the agent workspace as `submission.tar.gz`:
 
 ```bash

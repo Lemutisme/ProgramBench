@@ -348,7 +348,7 @@ wheels = [
 
 [[package]]
 name = "programbench"
-version = "1.0.2"
+version = "1.2.4"
 source = { editable = "." }
 dependencies = [
     { name = "huggingface-hub" },
