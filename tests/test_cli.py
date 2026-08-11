@@ -46,6 +46,13 @@ def test_candidate_help():
     assert all(cmd in result.output for cmd in ("clone", "package", "preflight", "probe", "retain"))
 
 
+def test_candidate_retain_help():
+    result = runner.invoke(app, ["candidate", "retain", "--help"])
+    assert result.exit_code == 0
+    assert all(argument in result.output.lower() for argument in ("cases", "ledger", "reference", "candidate"))
+    assert "predecessor" not in result.output.lower()
+
+
 def test_submit_help():
     result = runner.invoke(app, ["submit", "--help"])
     assert result.exit_code == 0

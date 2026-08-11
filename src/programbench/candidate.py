@@ -172,7 +172,6 @@ def retain_regressions(
     cases_path: Path,
     ledger_path: Path,
     reference: Path,
-    predecessor: Path,
     candidate: Path,
     *,
     timeout: float = 5,
@@ -182,57 +181,71 @@ def retain_regressions(
         raise CandidateError("Regression cases must be a JSON list")
     proposed = [_normalize_case(case, index) for index, case in enumerate(cases)]
     ledger = _load_regression_ledger(ledger_path, reference)
-    regressions = ledger["regressions"]
-
-    mismatches = sum(
-        _run_probe(candidate, regression["case"], timeout) != regression["reference"]["result"]
-        for regression in regressions
-    )
-    if mismatches:
-        return RegressionResult(len(regressions), 0, mismatches, ledger["head_sha256"])
-
-    known = [regression["case"] for regression in regressions]
-    added = 0
+    states = _regression_states(ledger["events"])
+    observed = {identifier: state["case"] for identifier, state in states.items()}
     for case in proposed:
-        if case in known:
-            continue
-        reference_results = [_run_probe(reference, case, timeout) for _ in range(2)]
-        predecessor_results = [_run_probe(predecessor, case, timeout) for _ in range(2)]
-        candidate_results = [_run_probe(candidate, case, timeout) for _ in range(2)]
-        if reference_results[0] != reference_results[1]:
-            continue
-        if predecessor_results[0] != predecessor_results[1] or predecessor_results[0] == reference_results[0]:
-            continue
-        if candidate_results[0] != candidate_results[1] or candidate_results[0] != reference_results[0]:
-            continue
-        regression = {
-            "case": case,
-            "reference": {
+        observed.setdefault(_value_sha256(case), case)
+    candidate_sha256 = sha256(candidate)
+    added = 0
+    mismatches = 0
+    for identifier, case in observed.items():
+        state = states.get(identifier)
+        if state:
+            expected = state["reference"]
+        else:
+            reference_results = [_run_probe(reference, case, timeout) for _ in range(2)]
+            if reference_results[0] != reference_results[1]:
+                continue
+            expected = {
                 "result": reference_results[0],
                 "result_sha256": _value_sha256(reference_results[0]),
-            },
-            "failure": {
-                "subject_sha256": sha256(predecessor),
-                "result": predecessor_results[0],
-                "result_sha256": _value_sha256(predecessor_results[0]),
-            },
-            "repair": {
-                "subject_sha256": sha256(candidate),
+            }
+        candidate_results = [_run_probe(candidate, case, timeout) for _ in range(2)]
+        if candidate_results[0] == candidate_results[1] == expected["result"]:
+            if not state or not state["open"]:
+                continue
+            _append_regression_event(
+                ledger,
+                {
+                    "type": "repaired",
+                    "witness_sha256": state["witness_sha256"],
+                    "candidate": {
+                        "subject_sha256": candidate_sha256,
+                        "result": candidate_results[0],
+                        "result_sha256": _value_sha256(candidate_results[0]),
+                    },
+                    "observations": 2,
+                },
+            )
+            state["open"] = False
+            added += 1
+            continue
+        mismatches += 1
+        if candidate_results[0] != candidate_results[1] or (state and state["open"]):
+            continue
+        witness = {
+            "type": "falsified",
+            "case": case,
+            "reference": expected,
+            "candidate": {
+                "subject_sha256": candidate_sha256,
                 "result": candidate_results[0],
                 "result_sha256": _value_sha256(candidate_results[0]),
             },
             "observations": 2,
-            "previous_sha256": ledger["head_sha256"],
         }
-        regression["sha256"] = _value_sha256(regression)
-        regressions.append(regression)
-        ledger["head_sha256"] = regression["sha256"]
-        known.append(case)
+        witness_sha256 = _append_regression_event(ledger, witness)
+        states[identifier] = {
+            "case": case,
+            "reference": expected,
+            "witness_sha256": witness_sha256,
+            "open": True,
+        }
         added += 1
 
     if added or not ledger_path.exists():
         _write_json(ledger_path, ledger)
-    return RegressionResult(len(regressions), added, 0, ledger["head_sha256"])
+    return RegressionResult(len(states), added, mismatches, ledger["head_sha256"])
 
 
 def sha256(path: Path) -> str:
@@ -286,39 +299,75 @@ def _load_or_create_ledger(
 def _load_regression_ledger(path: Path, reference: Path) -> dict[str, object]:
     if not path.exists():
         reference_sha256 = sha256(reference)
-        root_sha256 = _value_sha256({"version": 1, "reference_sha256": reference_sha256})
+        root_sha256 = _value_sha256({"version": 2, "reference_sha256": reference_sha256})
         return {
-            "version": 1,
+            "version": 2,
             "reference_sha256": reference_sha256,
             "root_sha256": root_sha256,
-            "regressions": [],
+            "events": [],
             "head_sha256": root_sha256,
         }
 
     value = json.loads(path.read_text())
-    if not isinstance(value, dict) or value.get("version") != 1:
+    if not isinstance(value, dict) or value.get("version") != 2:
         raise CandidateError("Unsupported regression ledger")
     if value.get("reference_sha256") != sha256(reference):
         raise CandidateError("Regression ledger reference changed")
-    regressions = value.get("regressions")
-    if not isinstance(regressions, list):
+    events = value.get("events")
+    if not isinstance(events, list):
         raise CandidateError("Invalid regression ledger")
-    previous = _value_sha256({"version": 1, "reference_sha256": value["reference_sha256"]})
+    previous = _value_sha256({"version": 2, "reference_sha256": value["reference_sha256"]})
     if value.get("root_sha256") != previous:
         raise CandidateError("Broken regression lineage")
-    for index, regression in enumerate(regressions):
-        if not isinstance(regression, dict):
-            raise CandidateError(f"Regression {index} must be an object")
-        if regression.get("previous_sha256") != previous:
+    for index, event in enumerate(events):
+        if not isinstance(event, dict):
+            raise CandidateError(f"Regression event {index} must be an object")
+        if event.get("previous_sha256") != previous:
             raise CandidateError("Broken regression lineage")
-        recorded = regression.get("sha256")
-        body = {key: item for key, item in regression.items() if key != "sha256"}
+        recorded = event.get("sha256")
+        body = {key: item for key, item in event.items() if key != "sha256"}
         if recorded != _value_sha256(body):
             raise CandidateError("Broken regression lineage")
         previous = recorded
     if value.get("head_sha256") != previous:
         raise CandidateError("Broken regression lineage")
+    _regression_states(events)
     return value
+
+
+def _regression_states(events: list[object]) -> dict[str, dict[str, object]]:
+    states: dict[str, dict[str, object]] = {}
+    for index, event in enumerate(events):
+        if not isinstance(event, dict):
+            raise CandidateError(f"Regression event {index} must be an object")
+        if event.get("type") == "falsified":
+            case = _normalize_case(event.get("case"), index)
+            reference = event.get("reference")
+            if not isinstance(reference, dict) or not isinstance(reference.get("result"), dict):
+                raise CandidateError(f"Regression event {index} has no reference result")
+            states[_value_sha256(case)] = {
+                "case": case,
+                "reference": reference,
+                "witness_sha256": event["sha256"],
+                "open": True,
+            }
+            continue
+        if event.get("type") != "repaired":
+            raise CandidateError(f"Regression event {index} has an unsupported type")
+        witness_sha256 = event.get("witness_sha256")
+        state = next((item for item in states.values() if item["witness_sha256"] == witness_sha256), None)
+        if not state or not state["open"]:
+            raise CandidateError(f"Regression event {index} repairs no open witness")
+        state["open"] = False
+    return states
+
+
+def _append_regression_event(ledger: dict[str, object], event: dict[str, object]) -> str:
+    event["previous_sha256"] = ledger["head_sha256"]
+    event["sha256"] = _value_sha256(event)
+    ledger["events"].append(event)
+    ledger["head_sha256"] = event["sha256"]
+    return event["sha256"]
 
 
 def _write_json(path: Path, value: object) -> None:

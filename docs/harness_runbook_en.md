@@ -102,13 +102,12 @@ uv run programbench candidate probe \
   /data/first-pass/$IID/reference \
   /data/remediation/$IID/executable
 
-# After a repair, retain only reproducible cases that failed on the exact
-# predecessor and now match the reference. Every call replays prior repairs.
+# Observe the current candidate. Reproducible mismatches become durable
+# witnesses immediately; later matching candidates append repair events.
 uv run programbench candidate retain \
   /data/probes/$IID/discoveries.json \
   /data/probes/$IID/regressions.json \
   /data/first-pass/$IID/reference \
-  /data/first-pass/$IID/executable \
   /data/remediation/$IID/executable
 
 # Package only candidate source. The adapter excludes .git, .programbench,
@@ -127,18 +126,20 @@ the cases change and return non-zero if the candidate regresses. Store probe
 files under `.programbench/` when they live inside a workspace; packaging
 excludes that directory.
 
-`retain` adds a proposed case only when two runs agree for each subject, the
-exact predecessor differs from the reference, and the repaired candidate
-matches it. The ledger records the case, exact observations, executable
-hashes, and a chained head hash. Proposed cases may change between calls, but
-retained cases cannot be dropped: each later candidate replays all of them
-even when `discoveries.json` is empty. A regression exits non-zero without
-changing the ledger. The printed `head_sha256` can be bound into an external
+`retain` runs each observation twice. A reproducible mismatch appends a
+`falsified` event immediately; a later candidate that reproducibly matches the
+stored reference result appends a `repaired` event. Regressing a repaired case
+opens it again with another `falsified` event. Proposed cases may change between
+calls, but the command always replays every known case even when
+`discoveries.json` is empty. It exits non-zero while the current candidate has
+mismatches, after durably recording new witnesses and partial repairs. The
+append-only events record exact observations and executable hashes; the printed
+`head_sha256` binds the reference identity and complete lineage for an external
 promotion or handoff record.
 
 These are finite local observations, not access to ProgramBench's hidden
-official evaluation. Their value is that a demonstrated repair becomes durable
-evidence instead of executor memory.
+official evaluation. Their value is that a failure remains durable until repair,
+and a demonstrated repair remains inherited evidence afterward.
 
 The adapter owns candidate layout and cleanroom mechanics. It does not define
 agent goals, completion semantics, or acceptance policy.

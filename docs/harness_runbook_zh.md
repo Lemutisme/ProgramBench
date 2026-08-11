@@ -100,13 +100,12 @@ uv run programbench candidate probe \
   /data/first-pass/$IID/reference \
   /data/remediation/$IID/executable
 
-# 修复后只保留在精确 predecessor 上失败、且已稳定匹配 reference 的反例；
-# 每次调用都会先重放此前保留的全部修复。
+# 观察当前 candidate：可复现 mismatch 立即成为持久 witness；
+# 后续 candidate 匹配 reference 时再追加 repair event。
 uv run programbench candidate retain \
   /data/probes/$IID/discoveries.json \
   /data/probes/$IID/regressions.json \
   /data/first-pass/$IID/reference \
-  /data/first-pass/$IID/executable \
   /data/remediation/$IID/executable
 
 # 只打包候选源码。
@@ -118,9 +117,9 @@ uv run programbench candidate preflight "$RUN_DIR" "$IID" --docker-cpus 4
 
 `cases.json` 是 `{"argv": [...], "stdin": "..."}` 组成的 JSON list。第一次运行 `probe` 会创建不可变 ledger，记录 reference binary hash 以及精确的 exit/stdout/stderr/timeout；后续 cases 发生变化会 fail closed，candidate 出现 regression 时命令返回非零。若 probe 文件位于 workspace 内，应放在 `.programbench/` 下，打包时会自动排除。
 
-`retain` 只在三个 subject 各自连续运行两次结果一致、精确 predecessor 与 reference 不同、修复后的 candidate 与 reference 相同时追加反例。Ledger 保存输入、精确观测、executable hash 与链式 head hash。每次调用可以提出不同的 cases，但已经保留的反例不能被遗漏：即使 `discoveries.json` 为空，后继 candidate 仍须重放全部历史反例。若发生回退，命令以非零状态退出且不修改 ledger。输出的 `head_sha256` 可绑定到外部 promotion 或 handoff 记录。
+`retain` 对每个观测运行两次。可复现 mismatch 会立即追加 `falsified` event；后续 candidate 稳定匹配已保存的 reference result 时追加 `repaired` event。已经修复的 case 再次回退时，会用新的 `falsified` event 重新打开。每次调用可以提出不同的 cases，但即使 `discoveries.json` 为空，命令仍会重放所有已知 case。只要当前 candidate 仍有 mismatch，命令就以非零状态退出；在退出前，新 witness 与局部 repair 已经持久写入。Append-only events 保存精确观测和 executable hash，输出的 `head_sha256` 绑定 reference identity 与完整 lineage，可供外部 promotion 或 handoff 使用。
 
-这些只是有限的本地观测，并不访问 ProgramBench 的官方隐藏评测。其价值在于把已经证明有效的修复变成持久证据，而不是 executor 的记忆。
+这些只是有限的本地观测，并不访问 ProgramBench 的官方隐藏评测。其价值在于让失败持续到被修复，并让已经证明有效的修复在此后成为后代继承的证据。
 
 Adapter 只负责 candidate layout 和 cleanroom 机制，不定义 agent goal、completion 或 acceptance policy。
 

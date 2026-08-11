@@ -80,12 +80,11 @@ def retain(
     cases: Path = typer.Argument(..., exists=True, dir_okay=False),
     ledger: Path = typer.Argument(...),
     reference: Path = typer.Argument(..., exists=True, dir_okay=False),
-    predecessor: Path = typer.Argument(..., exists=True, dir_okay=False),
     candidate: Path = typer.Argument(..., exists=True, dir_okay=False),
     timeout: float = typer.Option(5, "--timeout", min=0.01),
 ) -> None:
-    """Retain repaired counterexamples and replay every retained regression."""
-    result = _run(lambda: retain_regressions(cases, ledger, reference, predecessor, candidate, timeout=timeout))
+    """Retain falsified witnesses, repairs, and every known regression."""
+    result = _run(lambda: retain_regressions(cases, ledger, reference, candidate, timeout=timeout))
     typer.echo(
         f"retained={result.retained} added={result.added} "
         f"mismatches={result.mismatches} head_sha256={result.head_sha256}"
