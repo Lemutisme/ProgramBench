@@ -21,8 +21,8 @@ from programbench.constants import (
     DOCKER_CPUS,
     DOCKER_EXECUTABLE,
     DOCKER_RUN_ARGS,
-    TASKS_DIR,
     TASK_YAML,
+    TASKS_DIR,
     WORKSPACE_DIR,
     image_name_from_instance_id,
 )
@@ -41,6 +41,14 @@ class CandidateError(RuntimeError):
 class PreflightResult:
     executable_hash: str
     output: str
+
+
+@dataclass(frozen=True)
+class RegressionResult:
+    retained: int
+    added: int
+    mismatches: int
+    head_sha256: str
 
 
 def clone_workspace(source: Path, destination: Path) -> None:
@@ -160,6 +168,73 @@ def verify_probes(
     return len(normalized), mismatches
 
 
+def retain_regressions(
+    cases_path: Path,
+    ledger_path: Path,
+    reference: Path,
+    predecessor: Path,
+    candidate: Path,
+    *,
+    timeout: float = 5,
+) -> RegressionResult:
+    cases = json.loads(cases_path.read_text())
+    if not isinstance(cases, list):
+        raise CandidateError("Regression cases must be a JSON list")
+    proposed = [_normalize_case(case, index) for index, case in enumerate(cases)]
+    ledger = _load_regression_ledger(ledger_path, reference)
+    regressions = ledger["regressions"]
+
+    mismatches = sum(
+        _run_probe(candidate, regression["case"], timeout) != regression["reference"]["result"]
+        for regression in regressions
+    )
+    if mismatches:
+        return RegressionResult(len(regressions), 0, mismatches, ledger["head_sha256"])
+
+    known = [regression["case"] for regression in regressions]
+    added = 0
+    for case in proposed:
+        if case in known:
+            continue
+        reference_results = [_run_probe(reference, case, timeout) for _ in range(2)]
+        predecessor_results = [_run_probe(predecessor, case, timeout) for _ in range(2)]
+        candidate_results = [_run_probe(candidate, case, timeout) for _ in range(2)]
+        if reference_results[0] != reference_results[1]:
+            continue
+        if predecessor_results[0] != predecessor_results[1] or predecessor_results[0] == reference_results[0]:
+            continue
+        if candidate_results[0] != candidate_results[1] or candidate_results[0] != reference_results[0]:
+            continue
+        regression = {
+            "case": case,
+            "reference": {
+                "result": reference_results[0],
+                "result_sha256": _value_sha256(reference_results[0]),
+            },
+            "failure": {
+                "subject_sha256": sha256(predecessor),
+                "result": predecessor_results[0],
+                "result_sha256": _value_sha256(predecessor_results[0]),
+            },
+            "repair": {
+                "subject_sha256": sha256(candidate),
+                "result": candidate_results[0],
+                "result_sha256": _value_sha256(candidate_results[0]),
+            },
+            "observations": 2,
+            "previous_sha256": ledger["head_sha256"],
+        }
+        regression["sha256"] = _value_sha256(regression)
+        regressions.append(regression)
+        ledger["head_sha256"] = regression["sha256"]
+        known.append(case)
+        added += 1
+
+    if added or not ledger_path.exists():
+        _write_json(ledger_path, ledger)
+    return RegressionResult(len(regressions), added, 0, ledger["head_sha256"])
+
+
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -206,6 +281,56 @@ def _load_or_create_ledger(
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
     return value
+
+
+def _load_regression_ledger(path: Path, reference: Path) -> dict[str, object]:
+    if not path.exists():
+        reference_sha256 = sha256(reference)
+        root_sha256 = _value_sha256({"version": 1, "reference_sha256": reference_sha256})
+        return {
+            "version": 1,
+            "reference_sha256": reference_sha256,
+            "root_sha256": root_sha256,
+            "regressions": [],
+            "head_sha256": root_sha256,
+        }
+
+    value = json.loads(path.read_text())
+    if not isinstance(value, dict) or value.get("version") != 1:
+        raise CandidateError("Unsupported regression ledger")
+    if value.get("reference_sha256") != sha256(reference):
+        raise CandidateError("Regression ledger reference changed")
+    regressions = value.get("regressions")
+    if not isinstance(regressions, list):
+        raise CandidateError("Invalid regression ledger")
+    previous = _value_sha256({"version": 1, "reference_sha256": value["reference_sha256"]})
+    if value.get("root_sha256") != previous:
+        raise CandidateError("Broken regression lineage")
+    for index, regression in enumerate(regressions):
+        if not isinstance(regression, dict):
+            raise CandidateError(f"Regression {index} must be an object")
+        if regression.get("previous_sha256") != previous:
+            raise CandidateError("Broken regression lineage")
+        recorded = regression.get("sha256")
+        body = {key: item for key, item in regression.items() if key != "sha256"}
+        if recorded != _value_sha256(body):
+            raise CandidateError("Broken regression lineage")
+        previous = recorded
+    if value.get("head_sha256") != previous:
+        raise CandidateError("Broken regression lineage")
+    return value
+
+
+def _write_json(path: Path, value: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+    temporary.replace(path)
+
+
+def _value_sha256(value: object) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _run_probe(executable: Path, case: dict[str, object], timeout: float) -> dict[str, object]:

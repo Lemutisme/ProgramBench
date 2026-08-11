@@ -43,7 +43,7 @@ def test_blob_sync_help():
 def test_candidate_help():
     result = runner.invoke(app, ["candidate", "--help"])
     assert result.exit_code == 0
-    assert all(cmd in result.output for cmd in ("clone", "package", "preflight", "probe"))
+    assert all(cmd in result.output for cmd in ("clone", "package", "preflight", "probe", "retain"))
 
 
 def test_submit_help():

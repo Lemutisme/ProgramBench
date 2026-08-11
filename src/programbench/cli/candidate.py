@@ -4,8 +4,9 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable, TypeVar
+from typing import TypeVar
 
 import typer
 
@@ -15,6 +16,7 @@ from programbench.candidate import (
     clone_workspace,
     package_workspace,
     preflight_candidate,
+    retain_regressions,
     sha256,
     verify_probes,
 )
@@ -70,6 +72,25 @@ def probe(
     total, mismatches = _run(lambda: verify_probes(cases, ledger, reference, candidate, timeout=timeout))
     typer.echo(f"probes={total} mismatches={mismatches}")
     if mismatches:
+        raise typer.Exit(1)
+
+
+@app.command()
+def retain(
+    cases: Path = typer.Argument(..., exists=True, dir_okay=False),
+    ledger: Path = typer.Argument(...),
+    reference: Path = typer.Argument(..., exists=True, dir_okay=False),
+    predecessor: Path = typer.Argument(..., exists=True, dir_okay=False),
+    candidate: Path = typer.Argument(..., exists=True, dir_okay=False),
+    timeout: float = typer.Option(5, "--timeout", min=0.01),
+) -> None:
+    """Retain repaired counterexamples and replay every retained regression."""
+    result = _run(lambda: retain_regressions(cases, ledger, reference, predecessor, candidate, timeout=timeout))
+    typer.echo(
+        f"retained={result.retained} added={result.added} "
+        f"mismatches={result.mismatches} head_sha256={result.head_sha256}"
+    )
+    if result.mismatches:
         raise typer.Exit(1)
 
 

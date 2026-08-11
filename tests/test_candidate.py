@@ -9,9 +9,16 @@ import tarfile
 from pathlib import Path
 
 import pytest
-import programbench.candidate as candidate_module
 
-from programbench.candidate import CandidateError, clone_workspace, package_workspace, sha256, verify_probes
+import programbench.candidate as candidate_module
+from programbench.candidate import (
+    CandidateError,
+    clone_workspace,
+    package_workspace,
+    retain_regressions,
+    sha256,
+    verify_probes,
+)
 
 
 def test_package_is_deterministic_and_excludes_runtime_artifacts(tmp_path: Path):
@@ -82,6 +89,81 @@ def test_probe_ledger_detects_regression_and_freezes_cases(tmp_path: Path):
     cases.write_text(json.dumps([{"argv": [], "stdin": "changed"}]))
     with pytest.raises(CandidateError, match="changed"):
         verify_probes(cases, ledger, reference, candidate)
+
+
+def test_retains_only_repaired_counterexamples_and_replays_them(tmp_path: Path):
+    reference = _script(tmp_path / "reference", "reference")
+    predecessor = _script(tmp_path / "predecessor", "broken")
+    candidate = _script(tmp_path / "candidate", "reference")
+    cases = tmp_path / "cases.json"
+    cases.write_text(json.dumps([{"argv": ["one"], "stdin": "input"}]))
+    ledger = tmp_path / "regressions.json"
+
+    first = retain_regressions(cases, ledger, reference, predecessor, candidate)
+    assert (first.retained, first.added, first.mismatches) == (1, 1, 0)
+    value = json.loads(ledger.read_text())
+    regression = value["regressions"][0]
+    assert value["head_sha256"] == first.head_sha256 == regression["sha256"]
+    assert regression["previous_sha256"] == value["root_sha256"]
+    assert regression["failure"]["subject_sha256"] == sha256(predecessor)
+    assert regression["repair"]["subject_sha256"] == sha256(candidate)
+    assert regression["reference"]["result"] == regression["repair"]["result"]
+
+    cases.write_text("[]")
+    candidate.write_text("#!/bin/sh\nprintf 'regression'")
+    before = ledger.read_bytes()
+    replay = retain_regressions(cases, ledger, reference, predecessor, candidate)
+    assert (replay.retained, replay.added, replay.mismatches) == (1, 0, 1)
+    assert ledger.read_bytes() == before
+
+
+def test_regression_ledger_appends_without_freezing_proposals(tmp_path: Path):
+    reference = _script(tmp_path / "reference", "reference")
+    predecessor = _script(tmp_path / "predecessor", "broken")
+    candidate = _script(tmp_path / "candidate", "reference")
+    cases = tmp_path / "cases.json"
+    ledger = tmp_path / "regressions.json"
+    cases.write_text(json.dumps([{"argv": ["one"], "stdin": ""}]))
+    first = retain_regressions(cases, ledger, reference, predecessor, candidate)
+
+    cases.write_text(json.dumps([{"argv": ["two"], "stdin": ""}]))
+    second = retain_regressions(cases, ledger, reference, predecessor, candidate)
+    value = json.loads(ledger.read_text())
+    assert (second.retained, second.added, second.mismatches) == (2, 1, 0)
+    assert value["regressions"][1]["previous_sha256"] == first.head_sha256
+    assert value["head_sha256"] == second.head_sha256
+
+    changed_reference = _script(tmp_path / "changed-reference", "changed")
+    with pytest.raises(CandidateError, match="reference changed"):
+        retain_regressions(cases, ledger, changed_reference, predecessor, candidate)
+
+
+def test_regression_ledger_rejects_rewritten_history(tmp_path: Path):
+    reference = _script(tmp_path / "reference", "reference")
+    predecessor = _script(tmp_path / "predecessor", "broken")
+    candidate = _script(tmp_path / "candidate", "reference")
+    cases = tmp_path / "cases.json"
+    cases.write_text(json.dumps([{"argv": [], "stdin": "original"}]))
+    ledger = tmp_path / "regressions.json"
+    retain_regressions(cases, ledger, reference, predecessor, candidate)
+
+    value = json.loads(ledger.read_text())
+    value["regressions"][0]["case"]["stdin"] = "rewritten"
+    ledger.write_text(json.dumps(value))
+    with pytest.raises(CandidateError, match="Broken regression lineage"):
+        retain_regressions(cases, ledger, reference, predecessor, candidate)
+
+
+def test_does_not_retain_unproven_regression(tmp_path: Path):
+    reference = _script(tmp_path / "reference", "reference")
+    predecessor = _script(tmp_path / "predecessor", "reference")
+    candidate = _script(tmp_path / "candidate", "reference")
+    cases = tmp_path / "cases.json"
+    cases.write_text(json.dumps([{"argv": [], "stdin": ""}]))
+
+    result = retain_regressions(cases, tmp_path / "regressions.json", reference, predecessor, candidate)
+    assert (result.retained, result.added, result.mismatches) == (0, 0, 0)
+    assert len(result.head_sha256) == 64
 
 
 def _script(path: Path, value: str) -> Path:
