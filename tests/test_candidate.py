@@ -15,6 +15,7 @@ from programbench.candidate import (
     CandidateError,
     clone_workspace,
     package_workspace,
+    replay_regressions,
     retain_regressions,
     sha256,
     verify_probes,
@@ -106,6 +107,11 @@ def test_retains_falsified_witness_until_repaired_and_reopens_regressions(tmp_pa
     assert value["head_sha256"] == first.head_sha256 == witness["sha256"]
     assert witness["previous_sha256"] == value["root_sha256"]
     assert witness["candidate"]["subject_sha256"] == sha256(candidate)
+    replay = replay_regressions(ledger, candidate)
+    assert replay.retained == 1
+    assert replay.mismatches == [
+        {"case": witness["case"], "expected": witness["reference"]["result"], "actual": witness["candidate"]["result"]}
+    ]
 
     cases.write_text("[]")
     candidate = _script(candidate, "reference")
@@ -116,6 +122,7 @@ def test_retains_falsified_witness_until_repaired_and_reopens_regressions(tmp_pa
     assert repair["type"] == "repaired"
     assert repair["witness_sha256"] == witness["sha256"]
     assert repair["candidate"]["subject_sha256"] == sha256(candidate)
+    assert replay_regressions(ledger, candidate).mismatches == []
 
     candidate = _script(candidate, "regressed")
     regressed = retain_regressions(cases, ledger, reference, candidate)
@@ -187,6 +194,9 @@ def test_does_not_retain_unproven_regression(tmp_path: Path):
     result = retain_regressions(cases, tmp_path / "regressions.json", reference, candidate)
     assert (result.retained, result.added, result.mismatches) == (0, 0, 0)
     assert len(result.head_sha256) == 64
+
+    with pytest.raises(CandidateError, match="does not exist"):
+        replay_regressions(tmp_path / "missing.json", candidate)
 
 
 def _script(path: Path, value: str) -> Path:

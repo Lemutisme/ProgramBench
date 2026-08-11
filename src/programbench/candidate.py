@@ -51,6 +51,13 @@ class RegressionResult:
     head_sha256: str
 
 
+@dataclass(frozen=True)
+class RegressionReplayResult:
+    retained: int
+    mismatches: list[dict[str, object]]
+    head_sha256: str
+
+
 def clone_workspace(source: Path, destination: Path) -> None:
     if not source.is_dir():
         raise CandidateError(f"Candidate workspace does not exist: {source}")
@@ -248,6 +255,22 @@ def retain_regressions(
     return RegressionResult(len(states), added, mismatches, ledger["head_sha256"])
 
 
+def replay_regressions(
+    ledger_path: Path,
+    candidate: Path,
+    *,
+    timeout: float = 5,
+) -> RegressionReplayResult:
+    ledger = _read_regression_ledger(ledger_path)
+    states = _regression_states(ledger["events"])
+    mismatches = []
+    for state in states.values():
+        actual = _run_probe(candidate, state["case"], timeout)
+        if actual != state["reference"]["result"]:
+            mismatches.append({"case": state["case"], "expected": state["reference"]["result"], "actual": actual})
+    return RegressionReplayResult(len(states), mismatches, ledger["head_sha256"])
+
+
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -308,11 +331,18 @@ def _load_regression_ledger(path: Path, reference: Path) -> dict[str, object]:
             "head_sha256": root_sha256,
         }
 
+    value = _read_regression_ledger(path)
+    if value.get("reference_sha256") != sha256(reference):
+        raise CandidateError("Regression ledger reference changed")
+    return value
+
+
+def _read_regression_ledger(path: Path) -> dict[str, object]:
+    if not path.exists():
+        raise CandidateError("Regression ledger does not exist")
     value = json.loads(path.read_text())
     if not isinstance(value, dict) or value.get("version") != 2:
         raise CandidateError("Unsupported regression ledger")
-    if value.get("reference_sha256") != sha256(reference):
-        raise CandidateError("Regression ledger reference changed")
     events = value.get("events")
     if not isinstance(events, list):
         raise CandidateError("Invalid regression ledger")

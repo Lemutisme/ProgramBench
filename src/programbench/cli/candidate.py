@@ -4,6 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import json
 from collections.abc import Callable
 from pathlib import Path
 from typing import TypeVar
@@ -16,6 +17,7 @@ from programbench.candidate import (
     clone_workspace,
     package_workspace,
     preflight_candidate,
+    replay_regressions,
     retain_regressions,
     sha256,
     verify_probes,
@@ -88,6 +90,29 @@ def retain(
     typer.echo(
         f"retained={result.retained} added={result.added} "
         f"mismatches={result.mismatches} head_sha256={result.head_sha256}"
+    )
+    if result.mismatches:
+        raise typer.Exit(1)
+
+
+@app.command()
+def replay(
+    ledger: Path = typer.Argument(..., exists=True, dir_okay=False),
+    candidate: Path = typer.Argument(..., exists=True, dir_okay=False),
+    timeout: float = typer.Option(5, "--timeout", min=0.01),
+) -> None:
+    """Replay every retained witness without changing the ledger."""
+    result = _run(lambda: replay_regressions(ledger, candidate, timeout=timeout))
+    typer.echo(
+        json.dumps(
+            {
+                "retained": result.retained,
+                "mismatches": result.mismatches,
+                "head_sha256": result.head_sha256,
+            },
+            indent=2,
+            sort_keys=True,
+        )
     )
     if result.mismatches:
         raise typer.Exit(1)

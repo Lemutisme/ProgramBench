@@ -110,6 +110,11 @@ uv run programbench candidate retain \
   /data/first-pass/$IID/reference \
   /data/remediation/$IID/executable
 
+# Give an improver exact read-only feedback without authority to edit evidence.
+uv run programbench candidate replay \
+  /data/probes/$IID/regressions.json \
+  /data/remediation/$IID/executable
+
 # Package only candidate source. The adapter excludes .git, .programbench,
 # reference binaries/wrappers, stale executable output, and nested submissions.
 uv run programbench candidate package /data/remediation/$IID "$RUN_DIR" "$IID"
@@ -136,6 +141,12 @@ mismatches, after durably recording new witnesses and partial repairs. The
 append-only events record exact observations and executable hashes; the printed
 `head_sha256` binds the reference identity and complete lineage for an external
 promotion or handoff record.
+
+`replay` is the read-only executor interface. It prints each retained case with
+its expected and actual result, exits non-zero on a mismatch, and never changes
+the ledger. It is diagnostic: external `retain` still performs repeated
+observations and is the only command that admits `falsified` or `repaired`
+events.
 
 These are finite local observations, not access to ProgramBench's hidden
 official evaluation. Their value is that a failure remains durable until repair,

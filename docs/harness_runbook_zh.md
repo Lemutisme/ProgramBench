@@ -108,6 +108,11 @@ uv run programbench candidate retain \
   /data/first-pass/$IID/reference \
   /data/remediation/$IID/executable
 
+# 向 improver 提供精确的只读反馈，但不给它修改 evidence 的权限。
+uv run programbench candidate replay \
+  /data/probes/$IID/regressions.json \
+  /data/remediation/$IID/executable
+
 # 只打包候选源码。
 uv run programbench candidate package /data/remediation/$IID "$RUN_DIR" "$IID"
 
@@ -118,6 +123,8 @@ uv run programbench candidate preflight "$RUN_DIR" "$IID" --docker-cpus 4
 `cases.json` 是 `{"argv": [...], "stdin": "..."}` 组成的 JSON list。第一次运行 `probe` 会创建不可变 ledger，记录 reference binary hash 以及精确的 exit/stdout/stderr/timeout；后续 cases 发生变化会 fail closed，candidate 出现 regression 时命令返回非零。若 probe 文件位于 workspace 内，应放在 `.programbench/` 下，打包时会自动排除。
 
 `retain` 对每个观测运行两次。可复现 mismatch 会立即追加 `falsified` event；后续 candidate 稳定匹配已保存的 reference result 时追加 `repaired` event。已经修复的 case 再次回退时，会用新的 `falsified` event 重新打开。每次调用可以提出不同的 cases，但即使 `discoveries.json` 为空，命令仍会重放所有已知 case。只要当前 candidate 仍有 mismatch，命令就以非零状态退出；在退出前，新 witness 与局部 repair 已经持久写入。Append-only events 保存精确观测和 executable hash，输出的 `head_sha256` 绑定 reference identity 与完整 lineage，可供外部 promotion 或 handoff 使用。
+
+`replay` 是 executor 的只读接口。它输出每个 retained case 的 expected 与 actual result，发现 mismatch 时以非零状态退出，并且永远不修改 ledger。它只提供诊断；外部 `retain` 仍会执行重复观测，并且是唯一可以接纳 `falsified` 或 `repaired` event 的命令。
 
 这些只是有限的本地观测，并不访问 ProgramBench 的官方隐藏评测。其价值在于让失败持续到被修复，并让已经证明有效的修复在此后成为后代继承的证据。
 
