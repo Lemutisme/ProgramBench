@@ -14,6 +14,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import MappingProxyType
 from typing import Collection, Iterator, Literal, Mapping, Sequence
 
 import yaml
@@ -25,6 +26,19 @@ class ConfigError(ValueError):
 
 class StateError(ValueError):
     """Raised when a job state cannot be read, validated, or persisted."""
+
+
+class StateConflictError(StateError):
+    """Raised when a state operation uses a stale generation."""
+
+
+class AmbiguousStateCommitError(StateError):
+    """Raised when a failed commit cannot establish which state is durable."""
+
+    def __init__(self, backup_path: Path, reason: BaseException | None = None) -> None:
+        self.backup_path = backup_path
+        detail = f": {reason}" if reason else ""
+        super().__init__(f"state commit is ambiguous; recovery backup retained at {backup_path}{detail}")
 
 
 class JobLockedError(RuntimeError):
@@ -149,15 +163,14 @@ _NORMAL_NEXT: dict[str, Phase] = {
     "packaged": "preflighted",
     "preflighted": "done",
 }
-PHASE_TRANSITIONS: Mapping[str, tuple[Phase, ...]] = {
-    phase: tuple(next_phases)
-    for phase, next_phases in {
+PHASE_TRANSITIONS: Mapping[str, tuple[Phase, ...]] = MappingProxyType(
+    {
         **{phase: (next_phase, "failed", "interrupted") for phase, next_phase in _NORMAL_NEXT.items()},
         "done": (),
         "failed": (),
         "interrupted": (),
-    }.items()
-}
+    }
+)
 
 
 def _finite_float(value: object, label: str) -> float:
@@ -188,6 +201,7 @@ class JobState:
     command_identity: str | None = None
     reset_reason: str | None = None
     reset_at: float | None = None
+    generation: int = 0
 
     def __post_init__(self) -> None:
         if not isinstance(self.phase, str) or self.phase not in _PHASES:
@@ -195,12 +209,14 @@ class JobState:
         if self.phase_timestamps is not None and not isinstance(self.phase_timestamps, Mapping):
             raise StateError("phase timestamps must be a mapping")
         timestamps = {} if self.phase_timestamps is None else dict(self.phase_timestamps)
-        if any(not isinstance(key, str) for key in timestamps):
-            raise StateError("phase timestamps must have string keys")
+        if any(not isinstance(key, str) or key not in _PHASES for key in timestamps):
+            raise StateError("phase timestamps must name known phases")
         object.__setattr__(
             self,
             "phase_timestamps",
-            {key: _finite_float(value, "phase timestamp") for key, value in timestamps.items()},
+            MappingProxyType(
+                {key: _finite_float(value, "phase timestamp") for key, value in sorted(timestamps.items())}
+            ),
         )
         if self.pid is not None and (type(self.pid) is not int or self.pid <= 0):
             raise StateError("pid must be a positive integer")
@@ -223,28 +239,46 @@ class JobState:
         hashes = {} if self.artifact_hashes is None else dict(self.artifact_hashes)
         if any(not isinstance(key, str) or not isinstance(value, str) for key, value in hashes.items()):
             raise StateError("artifact hashes must map strings to strings")
-        object.__setattr__(self, "artifact_hashes", hashes)
+        object.__setattr__(self, "artifact_hashes", MappingProxyType(dict(sorted(hashes.items()))))
         if self.command_identity is not None and not isinstance(self.command_identity, str):
             raise StateError("command identity must be a string")
         if self.reset_reason is not None and not isinstance(self.reset_reason, str):
             raise StateError("reset reason must be a string")
         if self.reset_at is not None:
             object.__setattr__(self, "reset_at", _finite_float(self.reset_at, "reset time"))
+        if type(self.generation) is not int or self.generation < 0:
+            raise StateError("generation must be a nonnegative integer")
 
     def to_dict(self) -> dict[str, object]:
+        validated = JobState(
+            phase=self.phase,
+            phase_timestamps=dict(self.phase_timestamps or {}),
+            pid=self.pid,
+            container_ids=tuple(self.container_ids),
+            exit_class=self.exit_class,
+            provider_turns=self.provider_turns,
+            actions=self.actions,
+            cost=self.cost,
+            artifact_hashes=dict(self.artifact_hashes or {}),
+            command_identity=self.command_identity,
+            reset_reason=self.reset_reason,
+            reset_at=self.reset_at,
+            generation=self.generation,
+        )
         return {
-            "phase": self.phase,
-            "phase_timestamps": dict(self.phase_timestamps or {}),
-            "pid": self.pid,
-            "container_ids": list(self.container_ids),
-            "exit_class": self.exit_class,
-            "provider_turns": self.provider_turns,
-            "actions": self.actions,
-            "cost": self.cost,
-            "artifact_hashes": dict(self.artifact_hashes or {}),
-            "command_identity": self.command_identity,
-            "reset_reason": self.reset_reason,
-            "reset_at": self.reset_at,
+            "phase": validated.phase,
+            "phase_timestamps": dict(validated.phase_timestamps or {}),
+            "pid": validated.pid,
+            "container_ids": list(validated.container_ids),
+            "exit_class": validated.exit_class,
+            "provider_turns": validated.provider_turns,
+            "actions": validated.actions,
+            "cost": validated.cost,
+            "artifact_hashes": dict(validated.artifact_hashes or {}),
+            "command_identity": validated.command_identity,
+            "reset_reason": validated.reset_reason,
+            "reset_at": validated.reset_at,
+            "generation": validated.generation,
         }
 
     @classmethod
@@ -264,6 +298,7 @@ class JobState:
             "command_identity",
             "reset_reason",
             "reset_at",
+            "generation",
         }
         if set(raw) - expected:
             raise StateError("job state contains unknown fields")
@@ -281,6 +316,7 @@ class JobState:
                 command_identity=raw.get("command_identity"),
                 reset_reason=raw.get("reset_reason"),
                 reset_at=raw.get("reset_at"),
+                generation=raw.get("generation", 0),
             )
         except (KeyError, TypeError, ValueError, OverflowError) as error:
             if isinstance(error, StateError):
@@ -288,82 +324,205 @@ class JobState:
             raise StateError(f"invalid job state: {error}") from error
 
 
+def _reject_duplicate_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise StateError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
 class StateStore:
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
+        self.lock_path = self.path.with_name(f"{self.path.name}.lock")
+        self.backup_path = self.path.with_name(f"{self.path.name}.backup")
 
-    def read(self) -> JobState:
+    @contextmanager
+    def _state_lock(self) -> Iterator[None]:
+        with job_lock(self.lock_path, blocking=True):
+            yield
+
+    def _read_unlocked(self) -> JobState:
         try:
-            raw = json.loads(self.path.read_text())
+            raw = json.loads(self.path.read_text(), object_pairs_hook=_reject_duplicate_pairs)
         except FileNotFoundError as error:
             raise StateError(f"state does not exist: {self.path}") from error
+        except StateError:
+            raise
         except (OSError, UnicodeError, ValueError, OverflowError) as error:
             raise StateError(f"could not read state: {self.path}") from error
         try:
             return JobState.from_dict(raw)
         except StateError as error:
             raise StateError(f"invalid state: {self.path}") from error
-        except (TypeError, ValueError) as error:
+        except (TypeError, ValueError, OverflowError) as error:
             raise StateError(f"invalid state: {self.path}") from error
 
-    def read_optional(self) -> JobState | None:
+    def _read_optional_unlocked(self) -> JobState | None:
         try:
-            raw = json.loads(self.path.read_text())
+            raw = json.loads(self.path.read_text(), object_pairs_hook=_reject_duplicate_pairs)
         except FileNotFoundError:
             return None
+        except StateError:
+            raise
         except (OSError, UnicodeError, ValueError, OverflowError) as error:
             raise StateError(f"could not read state: {self.path}") from error
         try:
             return JobState.from_dict(raw)
         except StateError as error:
             raise StateError(f"invalid state: {self.path}") from error
-        except (TypeError, ValueError) as error:
+        except (TypeError, ValueError, OverflowError) as error:
             raise StateError(f"invalid state: {self.path}") from error
 
-    def write(self, state: JobState) -> None:
-        self._write(state, enforce_transition=True)
+    def read(self) -> JobState:
+        with self._state_lock():
+            return self._read_unlocked()
 
-    def reset_for_rerun(self, *, redo: bool, retry_infra: bool, resume: bool = False) -> None:
+    def read_optional(self) -> JobState | None:
+        with self._state_lock():
+            return self._read_optional_unlocked()
+
+    def write(self, state: JobState) -> JobState:
+        with self._state_lock():
+            return self._write_locked(state)
+
+    def reset_for_rerun(
+        self,
+        *,
+        redo: bool,
+        retry_infra: bool,
+        resume: bool = False,
+        expected_generation: int | None = None,
+    ) -> JobState:
         """Reset an explicitly authorized existing job to ``planned``.
 
         ``redo`` restarts any phase, ``retry_infra`` restarts only an eligible
         infrastructure failure, and ``resume`` restarts only an interruption.
+        An optional ``expected_generation`` provides a stale-writer CAS check.
         The reset bypasses the normal monotonic transition check but retains
         all state metadata and on-disk artifacts.
         """
-        current = self.read()
-        if redo:
-            reason = "redo"
-        elif (
-            retry_infra and current.phase == "failed" and current.exit_class == "infrastructure_failed_before_provider"
-        ):
-            reason = "retry_infra"
-        elif resume and current.phase == "interrupted":
-            reason = "resume"
-        else:
-            raise StateError(f"reset is not allowed for phase {current.phase!r}")
-        reset_at = time.time()
-        phase_timestamps = dict(current.phase_timestamps or {})
-        phase_timestamps["planned"] = reset_at
-        self._write(
-            replace(
-                current,
-                phase="planned",
-                phase_timestamps=phase_timestamps,
-                reset_reason=reason,
-                reset_at=reset_at,
-            ),
-            enforce_transition=False,
+        with self._state_lock():
+            current = self._read_unlocked()
+            if expected_generation is not None:
+                self._check_generation(current, expected_generation)
+            if redo:
+                reason = "redo"
+            elif (
+                retry_infra
+                and current.phase == "failed"
+                and current.exit_class == "infrastructure_failed_before_provider"
+            ):
+                reason = "retry_infra"
+            elif resume and current.phase == "interrupted":
+                reason = "resume"
+            else:
+                raise StateError(f"reset is not allowed for phase {current.phase!r}")
+            reset_at = time.time()
+            phase_timestamps = {"planned": reset_at}
+            return self._commit_locked(
+                replace(
+                    current,
+                    phase="planned",
+                    phase_timestamps=phase_timestamps,
+                    reset_reason=reason,
+                    reset_at=reset_at,
+                    generation=current.generation + 1,
+                )
+            )
+
+    def transition(
+        self,
+        next_phase: Phase,
+        *,
+        command_identity: str | None,
+        expected_generation: int,
+        **changes: object,
+    ) -> JobState:
+        with self._state_lock():
+            current = self._read_unlocked()
+            self._check_generation(current, expected_generation)
+            transitions = PHASE_TRANSITIONS.get(current.phase)
+            if not isinstance(next_phase, str) or transitions is None or next_phase not in transitions:
+                raise StateError(f"illegal phase transition: {current.phase} -> {next_phase}")
+            if {"phase", "generation", "command_identity", "phase_timestamps"} & changes.keys():
+                raise StateError("transition metadata cannot override phase or generation")
+            try:
+                candidate = self._advance(current, next_phase, command_identity, changes)
+            except (TypeError, ValueError) as error:
+                raise StateError(f"invalid transition metadata: {error}") from error
+            return self._commit_locked(candidate)
+
+    def update(self, *, expected_generation: int, **changes: object) -> JobState:
+        with self._state_lock():
+            current = self._read_unlocked()
+            self._check_generation(current, expected_generation)
+            if current.phase in ("done", "failed", "interrupted"):
+                raise StateError("terminal state cannot be updated")
+            if "phase" in changes and changes["phase"] != current.phase:
+                raise StateError("same-phase update cannot change phase")
+            if "generation" in changes:
+                raise StateError("update cannot override generation")
+            if "phase_timestamps" in changes:
+                raise StateError("update cannot override phase timestamps")
+            try:
+                candidate = replace(current, **changes, generation=current.generation + 1)
+            except (TypeError, ValueError) as error:
+                raise StateError(f"invalid update metadata: {error}") from error
+            return self._commit_locked(candidate)
+
+    def _check_generation(self, current: JobState, expected_generation: int) -> None:
+        if current.generation != expected_generation:
+            raise StateConflictError(
+                f"stale state generation: expected {expected_generation}, current {current.generation}"
+            )
+
+    def _advance(
+        self, current: JobState, next_phase: Phase, command_identity: str | None, changes: Mapping[str, object]
+    ) -> JobState:
+        timestamps = dict(current.phase_timestamps or {})
+        timestamps[next_phase] = time.time()
+        return replace(
+            current,
+            phase=next_phase,
+            phase_timestamps=timestamps,
+            command_identity=command_identity,
+            generation=current.generation + 1,
+            **changes,
         )
 
-    def _write(self, state: JobState, *, enforce_transition: bool) -> None:
+    def _write_locked(self, state: JobState) -> JobState:
         if not isinstance(state, JobState):
             raise StateError("state must be a JobState")
-        prior = self.read_optional()
-        if enforce_transition and prior is not None and state.phase != prior.phase:
+        prior = self._read_optional_unlocked()
+        if prior is None:
+            if state.phase != "planned":
+                raise StateError("initial state must be planned")
+            timestamps = dict(state.phase_timestamps or {})
+            if set(timestamps) - {"planned"}:
+                raise StateError("initial timestamps cannot contain unreached phases")
+            timestamps.setdefault("planned", time.time())
+            return self._commit_locked(replace(state, phase_timestamps=timestamps, generation=0))
+        self._check_generation(prior, state.generation)
+        if prior.phase in ("done", "failed", "interrupted"):
+            raise StateError("terminal state cannot be rewritten")
+        if state.phase == prior.phase:
+            raise StateError("same-phase update requires the explicit update API")
+        if state.phase != prior.phase:
             transitions = PHASE_TRANSITIONS.get(prior.phase)
             if transitions is None or state.phase not in transitions:
                 raise StateError(f"illegal phase transition: {prior.phase} -> {state.phase}")
+        if set(state.phase_timestamps or {}) - set(prior.phase_timestamps or {}) - {state.phase}:
+            raise StateError("phase timestamps contain unreached phases")
+        timestamps = dict(prior.phase_timestamps or {})
+        timestamps.update(state.phase_timestamps or {})
+        timestamps.setdefault(state.phase, time.time())
+        return self._commit_locked(replace(state, phase_timestamps=timestamps, generation=prior.generation + 1))
+
+    def _commit_locked(self, state: JobState) -> JobState:
+        encoded = json.dumps(state.to_dict(), allow_nan=False, sort_keys=True) + "\n"
         try:
             previous_exists = self.path.exists()
             previous_bytes = self.path.read_bytes() if previous_exists else None
@@ -371,23 +530,46 @@ class StateStore:
             raise StateError(f"could not read previous state: {self.path}") from error
         temporary_name: str | None = None
         replaced = False
+        backup_created = False
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
+            if self.backup_path.exists():
+                raise AmbiguousStateCommitError(self.backup_path)
+            backup_created = True
+            _write_backup(self.backup_path, previous_exists, previous_bytes)
             descriptor, temporary_name = tempfile.mkstemp(prefix=f".{self.path.name}.", dir=self.path.parent)
             with os.fdopen(descriptor, "w") as temporary:
-                temporary.write(json.dumps(state.to_dict(), allow_nan=False, sort_keys=True) + "\n")
+                temporary.write(encoded)
                 temporary.flush()
                 os.fsync(temporary.fileno())
             Path(temporary_name).replace(self.path)
             replaced = True
             temporary_name = None
             _sync_directory(self.path.parent)
+            self.backup_path.unlink(missing_ok=True)
+            _sync_directory(self.path.parent)
+            backup_created = False
+            return state
+        except AmbiguousStateCommitError:
+            raise
         except (OSError, TypeError, ValueError, OverflowError) as error:
             if replaced:
                 try:
                     _restore_previous_state(self.path, previous_exists, previous_bytes)
-                except (OSError, TypeError, ValueError):
-                    pass
+                except BaseException as restore_error:
+                    raise AmbiguousStateCommitError(self.backup_path, restore_error) from restore_error
+                try:
+                    self.backup_path.unlink(missing_ok=True)
+                    _sync_directory(self.path.parent)
+                except BaseException as cleanup_error:
+                    try:
+                        _write_backup(self.backup_path, previous_exists, previous_bytes)
+                    except BaseException:
+                        pass
+                    raise AmbiguousStateCommitError(self.backup_path, cleanup_error) from cleanup_error
+                raise StateError(f"could not write state: {self.path}") from error
+            if backup_created:
+                self.backup_path.unlink(missing_ok=True)
             raise StateError(f"could not write state: {self.path}") from error
         finally:
             if temporary_name is not None:
@@ -431,22 +613,29 @@ class JobPaths:
 
 
 @contextmanager
-def job_lock(path: Path) -> Iterator[Path]:
+def job_lock(path: Path, *, blocking: bool = False) -> Iterator[Path]:
     lock_path = Path(path)
     descriptor = -1
     try:
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(descriptor, fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as error:
+            if blocking:
+                raise
             if error.errno not in (errno.EACCES, errno.EAGAIN):
                 raise
             owner = _read_lock_owner(lock_path)
             raise JobLockedError(lock_path, owner) from error
         metadata = json.dumps({"pid": os.getpid(), "time": time.time()}, sort_keys=True).encode()
         os.ftruncate(descriptor, 0)
-        os.write(descriptor, metadata)
+        remaining = memoryview(metadata)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written <= 0:
+                raise OSError("could not write lock owner metadata")
+            remaining = remaining[written:]
         os.fsync(descriptor)
         yield lock_path
     finally:
@@ -480,6 +669,69 @@ def should_run(job: JobPaths, *, resume: bool, redo: bool, retry_infra: bool = F
     if state.phase == "planned":
         return True
     return resume
+
+
+class JobLease:
+    """Hold a job lock while checking admission and performing explicit reset."""
+
+    def __init__(self, job: JobPaths, *, resume: bool, redo: bool, retry_infra: bool) -> None:
+        self.job = job
+        self.resume = resume
+        self.redo = redo
+        self.retry_infra = retry_infra
+        self.should_run = False
+        self._lock_context = None
+
+    def __enter__(self) -> "JobLease":
+        self._lock_context = job_lock(self.job.lock)
+        self._lock_context.__enter__()
+        try:
+            self.should_run = should_run(
+                self.job,
+                resume=self.resume,
+                redo=self.redo,
+                retry_infra=self.retry_infra,
+            )
+        except BaseException as error:
+            self._lock_context.__exit__(type(error), error, error.__traceback__)
+            self._lock_context = None
+            raise
+        return self
+
+    def reset_for_rerun(self) -> JobState:
+        if self._lock_context is None:
+            raise StateError("job lease is not active")
+        current = StateStore(self.job.state).read()
+        return StateStore(self.job.state).reset_for_rerun(
+            redo=self.redo,
+            retry_infra=self.retry_infra,
+            resume=self.resume,
+            expected_generation=current.generation,
+        )
+
+    def __exit__(self, exception_type, exception, traceback) -> None:
+        if self._lock_context is not None:
+            self._lock_context.__exit__(exception_type, exception, traceback)
+            self._lock_context = None
+
+
+def _write_backup(path: Path, existed: bool, previous_bytes: bytes | None) -> None:
+    temporary_name: str | None = None
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        with os.fdopen(descriptor, "wb") as temporary:
+            temporary.write((b"1\n" + (previous_bytes or b"")) if existed else b"0\n")
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        Path(temporary_name).replace(path)
+        temporary_name = None
+        _sync_directory(path.parent)
+    finally:
+        if temporary_name is not None:
+            try:
+                os.unlink(temporary_name)
+            except OSError:
+                pass
 
 
 def _read_lock_owner(path: Path) -> str | None:

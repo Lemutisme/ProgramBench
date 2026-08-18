@@ -1,4 +1,6 @@
 import json
+import subprocess
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -7,11 +9,14 @@ import pytest
 
 import scripts.run_opencode as runner
 from scripts.run_opencode import (
+    AmbiguousStateCommitError,
     ConfigError,
     Job,
+    JobLease,
     JobLockedError,
     JobPaths,
     JobState,
+    StateConflictError,
     StateError,
     StateStore,
     expand_jobs,
@@ -25,6 +30,29 @@ from scripts.run_opencode import (
 
 def instance(iid: str, difficulty: str, language: str) -> dict[str, str]:
     return {"instance_id": iid, "difficulty": difficulty, "language": language}
+
+
+def store_at(path: Path, phase: str, **changes: object) -> StateStore:
+    store = StateStore(path)
+    current = store.write(JobState(phase="planned"))
+    if phase != "planned":
+        targets = (
+            ("preparing", "executing", "frozen", "packaged", "preflighted")
+            if phase in ("failed", "interrupted")
+            else ("preparing", "executing", "frozen", "packaged", "preflighted", "done")
+        )
+        for next_phase in targets:
+            current = store.transition(next_phase, command_identity=next_phase, expected_generation=current.generation)
+            if next_phase == phase:
+                break
+    if phase in ("failed", "interrupted"):
+        current = store.transition(phase, command_identity=phase, expected_generation=current.generation, **changes)
+        changes = {}
+    elif phase == "done":
+        changes = {}
+    if changes:
+        current = store.update(expected_generation=current.generation, **changes)
+    return store
 
 
 def test_select_instances_is_seeded_stratified_and_excludes_ids():
@@ -438,8 +466,8 @@ def test_load_config_rejects_unusual_yaml_mapping_keys(tmp_path: Path):
 def test_state_store_atomically_round_trips_and_advances_phase(tmp_path: Path):
     path = tmp_path / "state.json"
     state = JobState(
-        phase="executing",
-        phase_timestamps={"planned": 1.0, "executing": 2.0},
+        phase="planned",
+        phase_timestamps={"planned": 1.0},
         pid=123,
         container_ids=("container-1",),
         exit_class=None,
@@ -450,17 +478,106 @@ def test_state_store_atomically_round_trips_and_advances_phase(tmp_path: Path):
     )
 
     store = StateStore(path)
-    store.write(state)
+    current = store.write(state)
+    current = store.transition("preparing", command_identity="prepare", expected_generation=current.generation)
+    current = store.transition("executing", command_identity="execute", expected_generation=current.generation)
+    state = store.update(
+        expected_generation=current.generation,
+        pid=123,
+        provider_turns=4,
+        actions=8,
+        cost=1.25,
+        artifact_hashes={"workspace": "abc"},
+    )
 
     assert store.read() == state
     assert store.next_phase() == "frozen"
     assert list(tmp_path.glob(".state.json.*")) == []
 
 
+def test_job_state_freezes_nested_metadata_and_revalidates_serialization():
+    timestamps = {"planned": 1.0}
+    hashes = {"workspace": "abc"}
+    state = JobState(phase="planned", phase_timestamps=timestamps, artifact_hashes=hashes)
+    timestamps["planned"] = 9.0
+    hashes["workspace"] = "mutated"
+
+    assert state.phase_timestamps["planned"] == 1.0
+    assert state.artifact_hashes["workspace"] == "abc"
+    with pytest.raises(TypeError):
+        state.phase_timestamps["planned"] = 2.0
+    with pytest.raises(TypeError):
+        state.artifact_hashes["workspace"] = "mutated"
+
+    object.__setattr__(state, "phase_timestamps", {"planned": "invalid"})
+    with pytest.raises(StateError):
+        state.to_dict()
+
+
+def test_phase_transition_table_is_immutable():
+    with pytest.raises(TypeError):
+        runner.PHASE_TRANSITIONS["planned"] = ("done",)
+
+
+def test_initial_state_is_planned_and_timestamped(tmp_path: Path):
+    store = StateStore(tmp_path / "state.json")
+    initial = store.write(JobState(phase="planned"))
+
+    assert initial.phase == "planned"
+    assert initial.generation == 0
+    assert set(initial.phase_timestamps) == {"planned"}
+    with pytest.raises(StateError, match="planned"):
+        StateStore(tmp_path / "other.json").write(JobState(phase="executing"))
+    with pytest.raises(StateError, match="unreached"):
+        StateStore(tmp_path / "future.json").write(JobState(phase="planned", phase_timestamps={"executing": 1.0}))
+
+
+def test_transition_and_cas_update_stamp_generation_and_reject_stale_writers(tmp_path: Path):
+    store = StateStore(tmp_path / "state.json")
+    initial = store.write(JobState(phase="planned"))
+    preparing = store.transition("preparing", command_identity="prepare", expected_generation=initial.generation)
+
+    assert preparing.phase == "preparing"
+    assert preparing.command_identity == "prepare"
+    assert preparing.generation == initial.generation + 1
+    assert set(preparing.phase_timestamps) == {"planned", "preparing"}
+    with pytest.raises(StateConflictError):
+        store.transition("executing", command_identity="stale", expected_generation=initial.generation)
+
+    updated = store.update(expected_generation=preparing.generation, provider_turns=2)
+    assert updated.provider_turns == 2
+    assert updated.generation == preparing.generation + 1
+
+
+def test_terminal_same_phase_rewrite_is_rejected(tmp_path: Path):
+    store = StateStore(tmp_path / "state.json")
+    current = store.write(JobState(phase="planned"))
+    for phase in ("preparing", "executing", "frozen", "packaged", "preflighted", "done"):
+        current = store.transition(phase, command_identity=phase, expected_generation=current.generation)
+
+    with pytest.raises(StateError, match="terminal"):
+        store.write(current)
+
+
+def test_nonterminal_same_phase_rewrite_requires_explicit_update_api(tmp_path: Path):
+    store = StateStore(tmp_path / "state.json")
+    current = store.write(JobState(phase="planned"))
+
+    with pytest.raises(StateError, match="update API"):
+        store.write(current)
+
+
+def test_duplicate_json_keys_are_rejected_recursively(tmp_path: Path):
+    path = tmp_path / "state.json"
+    path.write_text('{"phase":"planned","phase_timestamps":{"planned":1,"planned":2}}')
+
+    with pytest.raises(StateError, match="duplicate"):
+        StateStore(path).read()
+
+
 @pytest.mark.parametrize("phase", ["done", "failed", "interrupted"])
 def test_state_store_next_phase_rejects_terminal_phases(tmp_path: Path, phase: str):
-    store = StateStore(tmp_path / "state.json")
-    store.write(JobState(phase=phase))
+    store = store_at(tmp_path / "state.json", phase)
 
     with pytest.raises(StateError, match="no next phase"):
         store.next_phase()
@@ -477,14 +594,13 @@ def test_state_store_next_phase_rejects_unknown_phase(tmp_path: Path):
 def test_state_store_rejects_malformed_json_and_preserves_old_state_on_write_error(tmp_path: Path, monkeypatch):
     path = tmp_path / "state.json"
     store = StateStore(path)
-    original = JobState(phase="planned")
-    store.write(original)
+    original = store.write(JobState(phase="planned"))
     path.write_text('{"phase": 12}')
     with pytest.raises(StateError, match="state"):
         store.read()
 
     path.unlink()
-    store.write(original)
+    original = store.write(JobState(phase="planned"))
     monkeypatch.setattr(runner.Path, "replace", lambda *_args: (_ for _ in ()).throw(OSError("replace failed")))
     with pytest.raises(StateError, match="write"):
         store.write(JobState(phase="preparing"))
@@ -511,11 +627,22 @@ def test_job_state_requires_strict_mapping_fields(field: str, value: object):
 
 
 def test_state_store_allows_only_the_full_monotonic_phase_path(tmp_path: Path):
-    store = StateStore(tmp_path / "state.json")
-    phases = ["planned", "preparing", "executing", "frozen", "packaged", "preflighted", "done"]
-    for phase in phases:
-        store.write(JobState(phase=phase))
+    store = store_at(tmp_path / "state.json", "done")
     assert store.read().phase == "done"
+
+
+def test_state_store_rejects_unreached_timestamps_on_transition(tmp_path: Path):
+    store = StateStore(tmp_path / "state.json")
+    initial = store.write(JobState(phase="planned"))
+
+    with pytest.raises(StateError, match="unreached"):
+        store.write(
+            JobState(
+                phase="preparing",
+                phase_timestamps={"planned": 1.0, "frozen": 2.0},
+                generation=initial.generation,
+            )
+        )
 
 
 @pytest.mark.parametrize(
@@ -524,29 +651,25 @@ def test_state_store_allows_only_the_full_monotonic_phase_path(tmp_path: Path):
 )
 def test_state_store_rejects_illegal_phase_transitions(tmp_path: Path, previous: str, current: str):
     path = tmp_path / "state.json"
-    store = StateStore(path)
-    store.write(JobState(phase=previous))
+    store = store_at(path, previous)
+    current_state = store.read()
 
     with pytest.raises(StateError, match="transition"):
-        store.write(JobState(phase=current))
+        store.transition(current, command_identity="illegal", expected_generation=current_state.generation)
     assert store.read().phase == previous
 
 
 def test_state_store_next_phase_uses_transition_table_and_rejects_ambiguous_state(tmp_path: Path, monkeypatch):
-    store = StateStore(tmp_path / "state.json")
-    store.write(JobState(phase="executing"))
+    store = store_at(tmp_path / "state.json", "executing")
     assert store.next_phase() == "frozen"
-
-    monkeypatch.setitem(runner.PHASE_TRANSITIONS, "executing", ("frozen", "packaged"))
-    with pytest.raises(StateError, match="ambiguous"):
-        store.next_phase()
+    with pytest.raises(StateError, match="unknown"):
+        store.next_phase("unknown")
 
 
 def test_state_store_rolls_back_when_parent_fsync_fails_with_old_state(tmp_path: Path, monkeypatch):
     path = tmp_path / "state.json"
     store = StateStore(path)
-    old = JobState(phase="planned")
-    store.write(old)
+    old = store.write(JobState(phase="planned"))
     old_bytes = path.read_bytes()
     original_sync = runner._sync_directory
     calls = 0
@@ -560,7 +683,7 @@ def test_state_store_rolls_back_when_parent_fsync_fails_with_old_state(tmp_path:
 
     monkeypatch.setattr(runner, "_sync_directory", fail_once)
     with pytest.raises(StateError, match="write"):
-        store.write(JobState(phase="preparing"))
+        store.write(JobState(phase="preparing", generation=old.generation))
     assert path.read_bytes() == old_bytes
     assert store.read() == old
     assert list(tmp_path.glob(".state.json.*")) == []
@@ -590,9 +713,7 @@ def test_state_store_redo_reset_reopens_terminal_job_without_deleting_artifacts(
     path = tmp_path / "state.json"
     artifact = tmp_path / "submission.tar.gz"
     artifact.write_bytes(b"keep me")
-    store = StateStore(path)
-    for phase in ("planned", "preparing", "executing", "frozen", "packaged", "preflighted", "done"):
-        store.write(JobState(phase=phase))
+    store = store_at(path, "done")
 
     store.reset_for_rerun(redo=True, retry_infra=False)
 
@@ -601,26 +722,25 @@ def test_state_store_redo_reset_reopens_terminal_job_without_deleting_artifacts(
     assert reset.reset_reason == "redo"
     assert reset.reset_at is not None
     assert artifact.read_bytes() == b"keep me"
-    store.write(JobState(phase="preparing"))
+    store.transition("preparing", command_identity="preparing", expected_generation=reset.generation)
 
 
 def test_state_store_redo_reset_restarts_unfinished_job_from_planned(tmp_path: Path):
     paths = JobPaths(tmp_path)
-    store = StateStore(paths.state)
-    store.write(JobState(phase="executing"))
+    store = store_at(paths.state, "executing")
 
     assert should_run(paths, resume=False, redo=True) is True
     store.reset_for_rerun(redo=True, retry_infra=False)
 
     assert store.read().phase == "planned"
     assert store.read().reset_reason == "redo"
-    store.write(JobState(phase="preparing"))
+    current = store.read()
+    store.transition("preparing", command_identity="preparing", expected_generation=current.generation)
 
 
 def test_state_store_retry_infra_reset_reopens_only_eligible_failure(tmp_path: Path):
     path = tmp_path / "state.json"
-    store = StateStore(path)
-    store.write(JobState(phase="failed", exit_class="infrastructure_failed_before_provider"))
+    store = store_at(path, "failed", exit_class="infrastructure_failed_before_provider")
 
     store.reset_for_rerun(redo=False, retry_infra=True)
 
@@ -632,31 +752,38 @@ def test_state_store_retry_infra_reset_reopens_only_eligible_failure(tmp_path: P
 
 def test_state_store_resume_reset_reopens_only_interrupted_job(tmp_path: Path):
     paths = JobPaths(tmp_path)
-    store = StateStore(paths.state)
-    store.write(JobState(phase="interrupted"))
+    store = store_at(paths.state, "interrupted")
 
     assert should_run(paths, resume=True, redo=False) is True
     assert should_run(paths, resume=False, redo=False) is False
     store.reset_for_rerun(redo=False, retry_infra=False, resume=True)
     assert store.read().phase == "planned"
     assert store.read().reset_reason == "resume"
-    store.write(JobState(phase="preparing"))
+    current = store.read()
+    store.transition("preparing", command_identity="preparing", expected_generation=current.generation)
 
 
 @pytest.mark.parametrize("phase", ["done", "failed"])
 def test_state_store_resume_reset_rejects_terminal_result(tmp_path: Path, phase: str):
-    store = StateStore(tmp_path / "state.json")
-    store.write(JobState(phase=phase, exit_class="provider_error" if phase == "failed" else None))
+    store = store_at(tmp_path / "state.json", phase, exit_class="provider_error" if phase == "failed" else None)
 
     with pytest.raises(StateError, match="reset"):
         store.reset_for_rerun(redo=False, retry_infra=False, resume=True)
 
 
+def test_state_store_reset_uses_generation_cas(tmp_path: Path):
+    store = store_at(tmp_path / "state.json", "executing")
+    current = store.read()
+    updated = store.update(expected_generation=current.generation, provider_turns=1)
+
+    with pytest.raises(StateConflictError):
+        store.reset_for_rerun(redo=True, retry_infra=False, expected_generation=current.generation)
+    assert store.read().generation == updated.generation
+
+
 def test_state_store_reset_leaves_terminal_state_unchanged_when_write_fails(tmp_path: Path, monkeypatch):
     path = tmp_path / "state.json"
-    store = StateStore(path)
-    for phase in ("planned", "preparing", "executing", "frozen", "packaged", "preflighted", "done"):
-        store.write(JobState(phase=phase))
+    store = store_at(path, "done")
     original = path.read_bytes()
     monkeypatch.setattr(runner, "_sync_directory", lambda _path: (_ for _ in ()).throw(OSError("fsync failed")))
 
@@ -679,8 +806,7 @@ def test_state_store_rejects_ineligible_rerun_resets(
     tmp_path: Path, phase: str, exit_class: str | None, redo: bool, retry_infra: bool
 ):
     path = tmp_path / "state.json"
-    store = StateStore(path)
-    store.write(JobState(phase=phase, exit_class=exit_class))
+    store = store_at(path, phase, exit_class=exit_class)
     original = path.read_bytes()
 
     with pytest.raises(StateError, match="reset"):
@@ -704,16 +830,78 @@ def test_state_store_wraps_huge_json_numbers_as_state_errors(tmp_path: Path):
         StateStore(path).read()
 
 
-def test_concurrent_readers_only_observe_complete_state_documents(tmp_path: Path):
+def test_state_store_retains_backup_when_restore_cannot_be_durable(tmp_path: Path, monkeypatch):
     path = tmp_path / "state.json"
     store = StateStore(path)
-    store.write(JobState(phase="executing", provider_turns=0))
+    store.write(JobState(phase="planned"))
+    original_sync = runner._sync_directory
+    calls = 0
+
+    def fail_after_replace(parent: Path):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("commit fsync failed")
+        original_sync(parent)
+
+    monkeypatch.setattr(runner, "_sync_directory", fail_after_replace)
+    monkeypatch.setattr(
+        runner, "_restore_previous_state", lambda *_args: (_ for _ in ()).throw(OSError("restore failed"))
+    )
+    with pytest.raises(AmbiguousStateCommitError) as error:
+        store.write(JobState(phase="preparing", generation=store.read().generation))
+    assert error.value.backup_path.exists()
+
+
+def test_state_store_retains_absent_target_backup_when_restore_fails(tmp_path: Path, monkeypatch):
+    path = tmp_path / "state.json"
+    store = StateStore(path)
+    original_sync = runner._sync_directory
+    calls = 0
+
+    def fail_after_replace(parent: Path):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("commit fsync failed")
+        original_sync(parent)
+
+    monkeypatch.setattr(runner, "_sync_directory", fail_after_replace)
+    monkeypatch.setattr(
+        runner, "_restore_previous_state", lambda *_args: (_ for _ in ()).throw(OSError("restore failed"))
+    )
+    with pytest.raises(AmbiguousStateCommitError) as error:
+        store.write(JobState(phase="planned"))
+    assert error.value.backup_path.exists()
+
+
+def test_job_lease_holds_admission_lock_and_rechecks_under_lock(tmp_path: Path):
+    paths = JobPaths(tmp_path)
+    StateStore(paths.state).write(JobState(phase="planned"))
+    with JobLease(paths, resume=False, redo=False, retry_infra=False) as lease:
+        assert lease.should_run is True
+        with pytest.raises(JobLockedError):
+            with job_lock(paths.lock):
+                pass
+
+    paths = JobPaths(tmp_path / "redo")
+    store_at(paths.state, "executing")
+    with JobLease(paths, resume=False, redo=True, retry_infra=False) as lease:
+        assert lease.should_run is True
+        assert lease.reset_for_rerun().phase == "planned"
+
+
+def test_concurrent_readers_only_observe_complete_state_documents(tmp_path: Path):
+    path = tmp_path / "state.json"
+    store = store_at(path, "executing")
     stop = threading.Event()
     errors: list[Exception] = []
+    reads = [0]
 
     def writer():
         for turn in range(200):
-            store.write(JobState(phase="executing", provider_turns=turn))
+            current = store.read()
+            store.update(expected_generation=current.generation, provider_turns=turn)
         stop.set()
 
     def reader():
@@ -721,6 +909,7 @@ def test_concurrent_readers_only_observe_complete_state_documents(tmp_path: Path
             try:
                 state = store.read()
                 assert state.phase == "executing"
+                reads[0] += 1
             except Exception as error:  # pragma: no cover - failure is asserted below
                 errors.append(error)
                 stop.set()
@@ -731,6 +920,7 @@ def test_concurrent_readers_only_observe_complete_state_documents(tmp_path: Path
         for future in futures:
             future.result()
     assert errors == []
+    assert reads[0] > 0
 
 
 def test_job_lock_rejects_second_owner_with_diagnostic(tmp_path: Path):
@@ -756,20 +946,45 @@ def test_job_lock_releases_after_normal_exit_and_exception(tmp_path: Path):
         assert "pid" in path.read_text()
 
 
+def test_job_lock_contention_and_owner_death_are_process_safe(tmp_path: Path):
+    path = tmp_path / "job.lock"
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import time, sys\nfrom pathlib import Path\nfrom scripts.run_opencode import job_lock\n"
+            "with job_lock(Path(sys.argv[1])):\n print('held', flush=True)\n time.sleep(30)",
+            str(path),
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert child.stdout is not None
+    assert child.stdout.readline().strip() == "held"
+    with pytest.raises(JobLockedError):
+        with job_lock(path):
+            pass
+    child.kill()
+    child.wait(timeout=5)
+    with job_lock(path):
+        pass
+
+
 def test_resume_runs_next_unfinished_phase_and_redo_reruns_done_job(tmp_path: Path):
     paths = JobPaths(tmp_path)
-    StateStore(paths.state).write(JobState(phase="planned"))
+    store = store_at(paths.state, "planned")
     assert should_run(paths, resume=False, redo=False) is True
 
+    current = store.read()
     for phase in ("preparing", "executing", "frozen", "packaged"):
-        StateStore(paths.state).write(JobState(phase=phase))
+        current = store.transition(phase, command_identity=phase, expected_generation=current.generation)
 
     assert should_run(paths, resume=True, redo=False) is True
     assert StateStore(paths.state).next_phase() == "preflighted"
 
     paths.submission.write_bytes(b"submission")
-    StateStore(paths.state).write(JobState(phase="preflighted"))
-    StateStore(paths.state).write(JobState(phase="done"))
+    current = store.transition("preflighted", command_identity="preflight", expected_generation=current.generation)
+    store.transition("done", command_identity="done", expected_generation=current.generation)
     assert should_run(paths, resume=True, redo=False) is False
     assert should_run(paths, resume=True, redo=True) is True
 
@@ -777,7 +992,7 @@ def test_resume_runs_next_unfinished_phase_and_redo_reruns_done_job(tmp_path: Pa
 @pytest.mark.parametrize("exit_class", ["provider_error", "evaluation_failed", "timeout"])
 def test_failed_terminal_results_are_not_rerun(tmp_path: Path, exit_class: str):
     paths = JobPaths(tmp_path)
-    StateStore(paths.state).write(JobState(phase="failed", exit_class=exit_class))
+    store_at(paths.state, "failed", exit_class=exit_class)
 
     assert should_run(paths, resume=True, redo=False) is False
     assert should_run(paths, resume=True, redo=False, retry_infra=True) is False
@@ -785,7 +1000,7 @@ def test_failed_terminal_results_are_not_rerun(tmp_path: Path, exit_class: str):
 
 def test_only_pre_provider_infrastructure_failure_can_be_explicitly_retried(tmp_path: Path):
     paths = JobPaths(tmp_path)
-    StateStore(paths.state).write(JobState(phase="failed", exit_class="infrastructure_failed_before_provider"))
+    store_at(paths.state, "failed", exit_class="infrastructure_failed_before_provider")
 
     assert should_run(paths, resume=True, redo=False) is False
     assert should_run(paths, resume=True, redo=False, retry_infra=True) is True
@@ -793,12 +1008,12 @@ def test_only_pre_provider_infrastructure_failure_can_be_explicitly_retried(tmp_
 
 def test_failed_terminal_redo_can_reset_and_continue(tmp_path: Path):
     paths = JobPaths(tmp_path)
-    store = StateStore(paths.state)
-    store.write(JobState(phase="failed", exit_class="provider_error"))
+    store = store_at(paths.state, "failed", exit_class="provider_error")
 
     assert should_run(paths, resume=False, redo=True) is True
     store.reset_for_rerun(redo=True, retry_infra=False)
-    store.write(JobState(phase="preparing"))
+    current = store.read()
+    store.transition("preparing", command_identity="preparing", expected_generation=current.generation)
     assert store.read().phase == "preparing"
 
 
@@ -835,7 +1050,7 @@ def test_should_run_resume_rules_are_explicit(
         paths.submission.write_bytes(b"valid")
     if phase is not None:
         exit_class = "infrastructure_failed_before_provider" if phase == "failed" and retry_infra else "provider_error"
-        StateStore(paths.state).write(JobState(phase=phase, exit_class=exit_class if phase == "failed" else None))
+        store_at(paths.state, phase, exit_class=exit_class if phase == "failed" else None)
 
     assert should_run(paths, resume=resume, redo=redo, retry_infra=retry_infra) is expected
 
