@@ -502,28 +502,27 @@ def test_prepare_install_pins_detached_worktree_and_records_auditable_binary(tmp
 
 def test_prepare_install_reuses_exact_manifest_without_rebuilding(tmp_path: Path, monkeypatch):
     repo, _, _ = _fake_opencode_repo(tmp_path)
-    fake_bun = _fake_bun(monkeypatch, tmp_path)
+    _fake_bun(monkeypatch, tmp_path)
     arm = runner.ArmConfig("procontract", repo, "HEAD", "procontract")
 
     first = runner.prepare_install(arm, tmp_path / "installs")
     second = runner.prepare_install(arm, tmp_path / "installs")
 
     assert second == first
-    assert (fake_bun.parent / "build.log").read_text().splitlines() == [
+    assert (first.worktree / "packages/opencode/build.log").read_text().splitlines() == [
         "packages/opencode run build --single --skip-install --skip-embed-web-ui"
     ]
 
 
-def test_prepare_install_rejects_moving_ref_instead_of_rebuilding(tmp_path: Path, monkeypatch):
+def test_prepare_install_reuses_manifest_after_moving_ref(tmp_path: Path, monkeypatch):
     repo, _, second = _fake_opencode_repo(tmp_path)
     _fake_bun(monkeypatch, tmp_path)
     arm = runner.ArmConfig("vanilla", repo, "HEAD", "vanilla")
     root = tmp_path / "installs"
-    runner.prepare_install(arm, root)
+    first = runner.prepare_install(arm, root)
     _git(repo, "reset", "--hard", second)
 
-    with pytest.raises(runner.InstallError, match="identity|manifest"):
-        runner.prepare_install(arm, root)
+    assert runner.prepare_install(arm, root) == first
 
 
 @pytest.mark.parametrize("dirty", ["tracked", "untracked"])
@@ -541,7 +540,7 @@ def test_prepare_install_rejects_dirty_source_repo(tmp_path: Path, monkeypatch, 
 
 def test_prepare_install_uses_supplied_binary_without_worktree_or_build(tmp_path: Path, monkeypatch):
     repo, first, _ = _fake_opencode_repo(tmp_path)
-    fake_bun = _fake_bun(monkeypatch, tmp_path)
+    _fake_bun(monkeypatch, tmp_path)
     binary = tmp_path / "opencode"
     binary.write_text("#!/bin/sh\necho supplied-v1\n")
     binary.chmod(0o755)
@@ -552,10 +551,10 @@ def test_prepare_install_uses_supplied_binary_without_worktree_or_build(tmp_path
 
     assert install.revision == first
     assert install.worktree is None
-    assert install.binary == binary.resolve()
+    assert install.binary == (tmp_path / "installs/procontract/opencode").resolve()
     assert install.binary_sha256 == _sha256(binary)
     assert install.version == "supplied-v1"
-    assert not (fake_bun.parent / "build.log").exists()
+    assert not (tmp_path / "installs/worktrees").exists()
 
 
 def test_prepare_install_failure_preserves_prior_install_and_publishes_nothing_partial(tmp_path: Path, monkeypatch):
@@ -775,12 +774,11 @@ def _fake_bun(monkeypatch, tmp_path: Path) -> Path:
         "#!/bin/sh\n"
         "if [ \"$1\" = install ]; then exit 0; fi\n"
         "if [ \"$1\" = --cwd ]; then cwd=\"$2\"; cd \"$2\"; shift 2; fi\n"
-        "if [ \"$1\" = run ] && [ \"$2\" = build ]; then echo \"$cwd $*\" >> \"$BUN_BUILD_LOG\"; exec sh script/build.sh; fi\n"
+        "if [ \"$1\" = run ] && [ \"$2\" = build ]; then echo \"$cwd $*\" >> build.log; exec sh script/build.sh; fi\n"
         "exit 2\n"
     )
     bun.chmod(0o755)
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
-    monkeypatch.setenv("BUN_BUILD_LOG", str(bin_dir / "build.log"))
     return bun
 
 
