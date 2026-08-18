@@ -745,7 +745,7 @@ def test_failed_terminal_results_are_not_rerun(tmp_path: Path, exit_class: str):
     paths = JobPaths(tmp_path)
     StateStore(paths.state).write(JobState(phase="failed", exit_class=exit_class))
 
-    assert should_run(paths, resume=True, redo=True) is False
+    assert should_run(paths, resume=True, redo=False) is False
     assert should_run(paths, resume=True, redo=False, retry_infra=True) is False
 
 
@@ -755,6 +755,17 @@ def test_only_pre_provider_infrastructure_failure_can_be_explicitly_retried(tmp_
 
     assert should_run(paths, resume=True, redo=False) is False
     assert should_run(paths, resume=True, redo=False, retry_infra=True) is True
+
+
+def test_failed_terminal_redo_can_reset_and_continue(tmp_path: Path):
+    paths = JobPaths(tmp_path)
+    store = StateStore(paths.state)
+    store.write(JobState(phase="failed", exit_class="provider_error"))
+
+    assert should_run(paths, resume=False, redo=True) is True
+    store.reset_for_rerun(redo=True, retry_infra=False)
+    store.write(JobState(phase="preparing"))
+    assert store.read().phase == "preparing"
 
 
 @pytest.mark.parametrize(
@@ -770,7 +781,7 @@ def test_only_pre_provider_infrastructure_failure_can_be_explicitly_retried(tmp_
         ("done", True, False, False, False, False),
         ("done", True, False, True, False, True),
         ("failed", False, False, False, False, False),
-        ("failed", True, False, True, False, False),
+        ("failed", True, False, True, False, True),
         ("failed", False, False, False, True, True),
         ("interrupted", False, True, False, False, True),
         ("interrupted", False, False, True, False, True),

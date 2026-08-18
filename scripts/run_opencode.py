@@ -451,15 +451,15 @@ def job_lock(path: Path) -> Iterator[Path]:
 
 def should_run(job: JobPaths, *, resume: bool, redo: bool, retry_infra: bool = False) -> bool:
     state = StateStore(job.state).read_optional()
+    if redo:
+        return True
     if state is not None and state.phase == "failed":
         return retry_infra and state.exit_class == "infrastructure_failed_before_provider"
     if state is not None and state.phase == "done":
-        return redo
-    if not redo and _valid_submission(job.submission):
+        return False
+    if _valid_submission(job.submission):
         return False
     if state is None:
-        return True
-    if redo:
         return True
     if state.phase == "planned":
         return True
