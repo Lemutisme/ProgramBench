@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 import scripts.run_opencode as runner
+import scripts.campaign_state as state_module
 from scripts.run_opencode import (
     AmbiguousStateCommitError,
     ConfigError,
@@ -549,13 +550,33 @@ def test_transition_and_cas_update_stamp_generation_and_reject_stale_writers(tmp
     assert updated.generation == preparing.generation + 1
 
 
+def test_transition_requires_command_and_preserves_prior_timestamp_history(tmp_path: Path):
+    store = StateStore(tmp_path / "state.json")
+    initial = store.write(JobState(phase="planned", phase_timestamps={"planned": 1.0}))
+    with pytest.raises(StateError, match="nonempty"):
+        store.transition("preparing", command_identity="", expected_generation=initial.generation)
+
+    preparing = store.transition("preparing", command_identity="prepare", expected_generation=initial.generation)
+    assert preparing.phase_timestamps["planned"] == 1.0
+    assert set(preparing.phase_timestamps) == {"planned", "preparing"}
+    with pytest.raises(StateError, match="immutable"):
+        store.update(expected_generation=preparing.generation, command_identity="overwrite")
+    with pytest.raises(StateError, match="metadata"):
+        store.transition(
+            "executing",
+            command_identity="execute",
+            expected_generation=preparing.generation,
+            command_identity_override="x",
+        )
+
+
 def test_terminal_same_phase_rewrite_is_rejected(tmp_path: Path):
     store = StateStore(tmp_path / "state.json")
     current = store.write(JobState(phase="planned"))
     for phase in ("preparing", "executing", "frozen", "packaged", "preflighted", "done"):
         current = store.transition(phase, command_identity=phase, expected_generation=current.generation)
 
-    with pytest.raises(StateError, match="terminal"):
+    with pytest.raises(StateError, match="existing|terminal"):
         store.write(current)
 
 
@@ -563,7 +584,7 @@ def test_nonterminal_same_phase_rewrite_requires_explicit_update_api(tmp_path: P
     store = StateStore(tmp_path / "state.json")
     current = store.write(JobState(phase="planned"))
 
-    with pytest.raises(StateError, match="update API"):
+    with pytest.raises(StateError, match="existing|update API"):
         store.write(current)
 
 
@@ -573,6 +594,61 @@ def test_duplicate_json_keys_are_rejected_recursively(tmp_path: Path):
 
     with pytest.raises(StateError, match="duplicate"):
         StateStore(path).read()
+
+
+def test_retained_backup_fails_closed_until_explicit_recovery_choice(tmp_path: Path):
+    path = tmp_path / "state.json"
+    store = StateStore(path)
+    original = store.write(JobState(phase="planned"))
+    store.backup_path.write_bytes(b"1\n" + path.read_bytes())
+
+    with pytest.raises(AmbiguousStateCommitError) as error:
+        store.read()
+    assert error.value.backup_path == store.backup_path
+    assert store.backup_path.exists()
+    with pytest.raises(AmbiguousStateCommitError):
+        store.read_optional()
+    with pytest.raises(AmbiguousStateCommitError):
+        should_run(JobPaths(tmp_path), resume=False, redo=False)
+
+    recovered = store.recover_state(choice="backup")
+    assert recovered == original
+    assert not store.backup_path.exists()
+
+
+def test_recover_target_validates_target_and_removes_marker(tmp_path: Path):
+    path = tmp_path / "state.json"
+    store = StateStore(path)
+    original = store.write(JobState(phase="planned"))
+    store.backup_path.write_bytes(b"1\n" + path.read_bytes())
+    recovered = store.recover_state(choice="target")
+    assert recovered == original
+    assert not store.backup_path.exists()
+
+
+def test_cleanup_failure_reports_committed_target_and_retained_marker(tmp_path: Path, monkeypatch):
+    path = tmp_path / "state.json"
+    store = StateStore(path)
+    original = store.write(JobState(phase="planned"))
+    calls = 0
+    original_sync = state_module._sync_directory
+
+    def fail_cleanup(parent: Path):
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise OSError("cleanup fsync failed")
+        original_sync(parent)
+
+    monkeypatch.setattr(state_module, "_sync_directory", fail_cleanup)
+    with pytest.raises(state_module.StateCleanupError) as error:
+        store.transition("preparing", command_identity="prepare", expected_generation=original.generation)
+    assert "target committed" in str(error.value)
+    assert path.exists()
+    assert error.value.marker_path is not None
+    assert error.value.marker_path.exists()
+    with pytest.raises(AmbiguousStateCommitError):
+        store.read()
 
 
 @pytest.mark.parametrize("phase", ["done", "failed", "interrupted"])
@@ -603,7 +679,7 @@ def test_state_store_rejects_malformed_json_and_preserves_old_state_on_write_err
     original = store.write(JobState(phase="planned"))
     monkeypatch.setattr(runner.Path, "replace", lambda *_args: (_ for _ in ()).throw(OSError("replace failed")))
     with pytest.raises(StateError, match="write"):
-        store.write(JobState(phase="preparing"))
+        store.transition("preparing", command_identity="prepare", expected_generation=original.generation)
     assert store.read() == original
     assert list(tmp_path.glob(".state.json.*")) == []
 
@@ -635,13 +711,12 @@ def test_state_store_rejects_unreached_timestamps_on_transition(tmp_path: Path):
     store = StateStore(tmp_path / "state.json")
     initial = store.write(JobState(phase="planned"))
 
-    with pytest.raises(StateError, match="unreached"):
-        store.write(
-            JobState(
-                phase="preparing",
-                phase_timestamps={"planned": 1.0, "frozen": 2.0},
-                generation=initial.generation,
-            )
+    with pytest.raises(StateError):
+        store.transition(
+            "preparing",
+            command_identity="prepare",
+            expected_generation=initial.generation,
+            phase_timestamps={"frozen": 2.0},
         )
 
 
@@ -671,7 +746,7 @@ def test_state_store_rolls_back_when_parent_fsync_fails_with_old_state(tmp_path:
     store = StateStore(path)
     old = store.write(JobState(phase="planned"))
     old_bytes = path.read_bytes()
-    original_sync = runner._sync_directory
+    original_sync = state_module._sync_directory
     calls = 0
 
     def fail_once(parent: Path):
@@ -681,9 +756,9 @@ def test_state_store_rolls_back_when_parent_fsync_fails_with_old_state(tmp_path:
             raise OSError("directory fsync failed")
         original_sync(parent)
 
-    monkeypatch.setattr(runner, "_sync_directory", fail_once)
+    monkeypatch.setattr(state_module, "_sync_directory", fail_once)
     with pytest.raises(StateError, match="write"):
-        store.write(JobState(phase="preparing", generation=old.generation))
+        store.transition("preparing", command_identity="prepare", expected_generation=old.generation)
     assert path.read_bytes() == old_bytes
     assert store.read() == old
     assert list(tmp_path.glob(".state.json.*")) == []
@@ -692,7 +767,7 @@ def test_state_store_rolls_back_when_parent_fsync_fails_with_old_state(tmp_path:
 def test_state_store_rolls_back_when_parent_fsync_fails_without_old_state(tmp_path: Path, monkeypatch):
     path = tmp_path / "state.json"
     store = StateStore(path)
-    original_sync = runner._sync_directory
+    original_sync = state_module._sync_directory
     calls = 0
 
     def fail_once(parent: Path):
@@ -702,7 +777,7 @@ def test_state_store_rolls_back_when_parent_fsync_fails_without_old_state(tmp_pa
             raise OSError("directory fsync failed")
         original_sync(parent)
 
-    monkeypatch.setattr(runner, "_sync_directory", fail_once)
+    monkeypatch.setattr(state_module, "_sync_directory", fail_once)
     with pytest.raises(StateError, match="write"):
         store.write(JobState(phase="planned"))
     assert not path.exists()
@@ -785,7 +860,7 @@ def test_state_store_reset_leaves_terminal_state_unchanged_when_write_fails(tmp_
     path = tmp_path / "state.json"
     store = store_at(path, "done")
     original = path.read_bytes()
-    monkeypatch.setattr(runner, "_sync_directory", lambda _path: (_ for _ in ()).throw(OSError("fsync failed")))
+    monkeypatch.setattr(state_module, "_sync_directory", lambda _path: (_ for _ in ()).throw(OSError("fsync failed")))
 
     with pytest.raises(StateError, match="write"):
         store.reset_for_rerun(redo=True, retry_infra=False)
@@ -834,7 +909,7 @@ def test_state_store_retains_backup_when_restore_cannot_be_durable(tmp_path: Pat
     path = tmp_path / "state.json"
     store = StateStore(path)
     store.write(JobState(phase="planned"))
-    original_sync = runner._sync_directory
+    original_sync = state_module._sync_directory
     calls = 0
 
     def fail_after_replace(parent: Path):
@@ -844,19 +919,19 @@ def test_state_store_retains_backup_when_restore_cannot_be_durable(tmp_path: Pat
             raise OSError("commit fsync failed")
         original_sync(parent)
 
-    monkeypatch.setattr(runner, "_sync_directory", fail_after_replace)
+    monkeypatch.setattr(state_module, "_sync_directory", fail_after_replace)
     monkeypatch.setattr(
-        runner, "_restore_previous_state", lambda *_args: (_ for _ in ()).throw(OSError("restore failed"))
+        state_module, "_restore_previous_state", lambda *_args: (_ for _ in ()).throw(OSError("restore failed"))
     )
     with pytest.raises(AmbiguousStateCommitError) as error:
-        store.write(JobState(phase="preparing", generation=store.read().generation))
+        store.transition("preparing", command_identity="prepare", expected_generation=store.read().generation)
     assert error.value.backup_path.exists()
 
 
 def test_state_store_retains_absent_target_backup_when_restore_fails(tmp_path: Path, monkeypatch):
     path = tmp_path / "state.json"
     store = StateStore(path)
-    original_sync = runner._sync_directory
+    original_sync = state_module._sync_directory
     calls = 0
 
     def fail_after_replace(parent: Path):
@@ -866,9 +941,9 @@ def test_state_store_retains_absent_target_backup_when_restore_fails(tmp_path: P
             raise OSError("commit fsync failed")
         original_sync(parent)
 
-    monkeypatch.setattr(runner, "_sync_directory", fail_after_replace)
+    monkeypatch.setattr(state_module, "_sync_directory", fail_after_replace)
     monkeypatch.setattr(
-        runner, "_restore_previous_state", lambda *_args: (_ for _ in ()).throw(OSError("restore failed"))
+        state_module, "_restore_previous_state", lambda *_args: (_ for _ in ()).throw(OSError("restore failed"))
     )
     with pytest.raises(AmbiguousStateCommitError) as error:
         store.write(JobState(phase="planned"))
@@ -889,6 +964,16 @@ def test_job_lease_holds_admission_lock_and_rechecks_under_lock(tmp_path: Path):
     with JobLease(paths, resume=False, redo=True, retry_infra=False) as lease:
         assert lease.should_run is True
         assert lease.reset_for_rerun().phase == "planned"
+
+
+def test_job_lease_reentry_rejects_without_losing_original_context(tmp_path: Path):
+    paths = JobPaths(tmp_path)
+    StateStore(paths.state).write(JobState(phase="planned"))
+    lease = JobLease(paths, resume=False, redo=False, retry_infra=False)
+    with lease:
+        with pytest.raises(StateError, match="already active"):
+            lease.__enter__()
+        assert lease.should_run is True
 
 
 def test_concurrent_readers_only_observe_complete_state_documents(tmp_path: Path):
@@ -968,6 +1053,68 @@ def test_job_lock_contention_and_owner_death_are_process_safe(tmp_path: Path):
     child.wait(timeout=5)
     with job_lock(path):
         pass
+
+
+def test_competing_subprocess_cas_transitions_have_one_winner(tmp_path: Path):
+    path = tmp_path / "state.json"
+    store = StateStore(path)
+    store.write(JobState(phase="planned"))
+    code = (
+        "import sys\n"
+        "from pathlib import Path\n"
+        "from scripts.campaign_state import StateStore\n"
+        "try:\n"
+        " store = StateStore(Path(sys.argv[1]))\n"
+        " store.transition('preparing', command_identity='prepare', expected_generation=0)\n"
+        " print('ok', flush=True)\n"
+        "except Exception as error:\n"
+        " print(type(error).__name__, flush=True)\n"
+    )
+    processes = [
+        subprocess.Popen([sys.executable, "-c", code, str(path)], stdout=subprocess.PIPE, text=True) for _ in range(2)
+    ]
+    try:
+        outputs = [process.communicate(timeout=10)[0].strip() for process in processes]
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+    assert outputs.count("ok") == 1
+    assert store.read().phase == "preparing"
+    assert store.read().generation == 1
+
+
+def test_subprocess_crash_after_target_replace_fails_closed(tmp_path: Path):
+    path = tmp_path / "state.json"
+    store = StateStore(path)
+    store.write(JobState(phase="planned"))
+    code = (
+        "import os, sys\n"
+        "from pathlib import Path\n"
+        "import scripts.campaign_state as state\n"
+        "original = Path.replace\n"
+        "calls = 0\n"
+        "def replace(source, target):\n"
+        " global calls\n"
+        " calls += 1\n"
+        " result = original(source, target)\n"
+        " if calls == 2: os._exit(91)\n"
+        " return result\n"
+        "Path.replace = replace\n"
+        "state.StateStore(Path(sys.argv[1])).transition('preparing', command_identity='prepare', expected_generation=0)\n"
+    )
+    process = subprocess.Popen([sys.executable, "-c", code, str(path)])
+    try:
+        assert process.wait(timeout=10) == 91
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+    with pytest.raises(AmbiguousStateCommitError):
+        store.read()
+    assert store.backup_path.exists()
+    assert store.recover_state(choice="backup").phase == "planned"
 
 
 def test_resume_runs_next_unfinished_phase_and_redo_reruns_done_job(tmp_path: Path):
