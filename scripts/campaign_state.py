@@ -37,13 +37,15 @@ class AmbiguousStateCommitError(StateError):
 
 
 class StateCleanupError(StateError):
-    """Raised when target committed but recovery-marker cleanup was not durable."""
+    """Raised when recovery-marker cleanup was not durable."""
 
-    def __init__(self, target_path: Path, marker_path: Path | None, reason: BaseException) -> None:
+    def __init__(self, target_path: Path, marker_path: Path | None, reason: BaseException, *, committed: bool) -> None:
         self.target_path = target_path
         self.marker_path = marker_path
+        self.committed = committed
+        status = "target committed" if committed else "target NOT committed"
         detail = f"; recovery marker retained at {marker_path}" if marker_path else "; no recovery marker remains"
-        super().__init__(f"state target committed; cleanup failed for {target_path}{detail}: {reason}")
+        super().__init__(f"state {status}; cleanup failed for {target_path}{detail}: {reason}")
 
 
 class JobLockedError(RuntimeError):
@@ -229,6 +231,13 @@ class JobState:
             raise StateError(f"invalid job state: {error}") from error
 
 
+@dataclass(frozen=True)
+class RecoveryState:
+    existed: bool
+    state: JobState | None
+    raw_bytes: bytes
+
+
 def _reject_duplicate_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
     result: dict[str, object] = {}
     for key, value in pairs:
@@ -288,9 +297,9 @@ class JobPaths:
         )
 
 
-def _write_backup(path: Path, existed: bool, previous_bytes: bytes | None) -> None:
+def _backup_envelope(existed: bool, previous_bytes: bytes | None) -> bytes:
     payload = previous_bytes or b""
-    encoded = json.dumps(
+    return json.dumps(
         {
             "version": 1,
             "existed": existed,
@@ -299,6 +308,10 @@ def _write_backup(path: Path, existed: bool, previous_bytes: bytes | None) -> No
         },
         sort_keys=True,
     ).encode("utf-8")
+
+
+def _write_backup(path: Path, existed: bool, previous_bytes: bytes | None) -> None:
+    encoded = _backup_envelope(existed, previous_bytes)
     _write_raw_marker(path, encoded)
 
 
@@ -420,20 +433,19 @@ class StateStore:
             if not self.backup_path.exists():
                 raise StateError("no recovery backup exists")
             if choice == "backup":
-                existed, data = _read_backup(self.backup_path)
-                _restore_previous_state(self.path, existed, data)
-                self._cleanup_recovery_marker(self.backup_path.read_bytes())
+                recovery = _read_backup(self.backup_path)
+                marker_bytes = self.backup_path.read_bytes()
+                _restore_previous_state(self.path, recovery.existed, recovery.raw_bytes)
+                self._cleanup_recovery_marker(marker_bytes, committed=True)
+                return recovery.state
             elif choice == "target":
                 state = self._read_target_unlocked()
-                self._cleanup_recovery_marker(self.backup_path.read_bytes())
+                self._cleanup_recovery_marker(self.backup_path.read_bytes(), committed=True)
                 return state
             else:
                 raise StateError(f"unknown recovery choice: {choice!r}")
-            if not existed:
-                return None
-            return self._read_target_unlocked()
 
-    def _cleanup_recovery_marker(self, marker_bytes: bytes) -> None:
+    def _cleanup_recovery_marker(self, marker_bytes: bytes, *, committed: bool) -> None:
         try:
             self.backup_path.unlink(missing_ok=True)
             _sync_directory(self.path.parent)
@@ -443,7 +455,7 @@ class StateStore:
             except BaseException:
                 pass
             marker = self.backup_path if self.backup_path.exists() else None
-            raise StateCleanupError(self.path, marker, error) from error
+            raise StateCleanupError(self.path, marker, error, committed=committed) from error
 
     def _read_target_unlocked(self) -> JobState:
         try:
@@ -581,7 +593,7 @@ class StateStore:
                 except BaseException as restore_error:
                     raise AmbiguousStateCommitError(self.backup_path, restore_error) from restore_error
                 try:
-                    self._cleanup_recovery_marker(self.backup_path.read_bytes())
+                    self._cleanup_recovery_marker(self.backup_path.read_bytes(), committed=False)
                 except StateCleanupError:
                     raise
                 raise StateError(f"could not write state: {self.path}") from error
@@ -596,7 +608,7 @@ class StateStore:
                         except BaseException:
                             pass
                     marker = self.backup_path if self.backup_path.exists() else None
-                    raise StateCleanupError(self.path, marker, cleanup_error) from cleanup_error
+                    raise StateCleanupError(self.path, marker, cleanup_error, committed=False) from cleanup_error
             raise StateError(f"could not write state: {self.path}") from error
         finally:
             if temporary_name is not None:
@@ -613,27 +625,40 @@ class StateStore:
             except BaseException:
                 pass
             marker = self.backup_path if self.backup_path.exists() else None
-            raise StateCleanupError(self.path, marker, cleanup_error) from cleanup_error
+            raise StateCleanupError(self.path, marker, cleanup_error, committed=True) from cleanup_error
         return state
 
 
-def _read_backup(path: Path) -> tuple[bool, bytes | None]:
+def _read_backup(path: Path) -> RecoveryState:
     try:
-        payload = path.read_bytes()
+        marker_bytes = path.read_bytes()
     except OSError as error:
         raise StateError(f"could not read recovery backup: {path}") from error
     try:
-        raw = json.loads(payload.decode("utf-8"), object_pairs_hook=_reject_duplicate_pairs)
-        if not isinstance(raw, dict) or raw.get("version") != 1 or not isinstance(raw.get("existed"), bool):
+        raw = json.loads(marker_bytes.decode("utf-8"), object_pairs_hook=_reject_duplicate_pairs)
+        if not isinstance(raw, dict) or set(raw) != {"version", "existed", "data", "sha256"}:
             raise StateError(f"invalid recovery backup: {path}")
-        encoded = raw.get("data")
-        checksum = raw.get("sha256")
-        if not isinstance(encoded, str) or not isinstance(checksum, str):
+        version = raw["version"]
+        existed = raw["existed"]
+        encoded = raw["data"]
+        checksum = raw["sha256"]
+        if type(version) is not int or version != 1 or type(existed) is not bool:
+            raise StateError(f"invalid recovery backup: {path}")
+        if type(encoded) is not str or type(checksum) is not str:
             raise StateError(f"invalid recovery backup: {path}")
         data = base64.b64decode(encoded.encode("ascii"), validate=True)
         if hashlib.sha256(data).hexdigest() != checksum:
             raise StateError(f"recovery backup checksum mismatch: {path}")
-        return raw["existed"], data if raw["existed"] else None
+        if not existed:
+            if data:
+                raise StateError(f"invalid recovery backup: {path}")
+            return RecoveryState(False, None, data)
+        try:
+            decoded = json.loads(data.decode("utf-8"), object_pairs_hook=_reject_duplicate_pairs)
+            state = JobState.from_dict(decoded)
+        except (StateError, UnicodeError, ValueError, TypeError, OverflowError) as error:
+            raise StateError(f"invalid recovery backup: {path}") from error
+        return RecoveryState(True, state, data)
     except (StateError, UnicodeError, ValueError, TypeError, binascii.Error) as error:
         if isinstance(error, StateError):
             raise

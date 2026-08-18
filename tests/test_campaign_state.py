@@ -2,6 +2,7 @@ import subprocess
 import sys
 import threading
 import select
+import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -229,6 +230,45 @@ def test_corrupt_backup_does_not_mutate_target_or_marker(tmp_path: Path):
     assert store.backup_path.read_bytes() == marker_before
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [b"not-json", b'{"phase":"unknown","phase_timestamps":{}}'],
+)
+def test_backup_payload_must_decode_to_valid_job_state_without_mutation(tmp_path: Path, payload: bytes):
+    path = tmp_path / "state.json"
+    store = StateStore(path)
+    store.write(JobState(phase="planned"))
+    marker = state_module._backup_envelope(True, payload)
+    store.backup_path.write_bytes(marker)
+    target_before = path.read_bytes()
+    marker_before = store.backup_path.read_bytes()
+
+    with pytest.raises(StateError, match="backup"):
+        store.recover_state(choice="backup")
+    assert path.read_bytes() == target_before
+    assert store.backup_path.read_bytes() == marker_before
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda envelope: envelope.update(version=True),
+        lambda envelope: envelope.update(extra="field"),
+        lambda envelope: envelope.pop("sha256"),
+    ],
+)
+def test_backup_envelope_has_strict_schema_and_types(tmp_path: Path, mutate):
+    path = tmp_path / "state.json"
+    store = StateStore(path)
+    store.write(JobState(phase="planned"))
+    envelope = json.loads(state_module._backup_envelope(True, path.read_bytes()))
+    mutate(envelope)
+    store.backup_path.write_text(json.dumps(envelope))
+
+    with pytest.raises(StateError, match="backup"):
+        store.recover_state(choice="backup")
+
+
 def test_recover_absent_prior_target_returns_none(tmp_path: Path):
     path = tmp_path / "state.json"
     store = StateStore(path)
@@ -275,11 +315,60 @@ def test_cleanup_failure_reports_committed_target_and_retained_marker(tmp_path: 
     with pytest.raises(state_module.StateCleanupError) as error:
         store.transition("preparing", command_identity="prepare", expected_generation=original.generation)
     assert "target committed" in str(error.value)
+    assert error.value.committed is True
     assert path.exists()
     assert error.value.marker_path is not None
     assert error.value.marker_path.exists()
     with pytest.raises(AmbiguousStateCommitError):
         store.read()
+
+
+def test_pre_replace_cleanup_failure_reports_uncommitted_target(tmp_path: Path, monkeypatch):
+    path = tmp_path / "state.json"
+    store = StateStore(path)
+    original_sync = state_module._sync_directory
+    calls = 0
+
+    def fail_backup_then_cleanup(parent: Path):
+        nonlocal calls
+        calls += 1
+        if calls in (1, 2):
+            raise OSError("backup or cleanup fsync failed")
+        original_sync(parent)
+
+    monkeypatch.setattr(state_module, "_sync_directory", fail_backup_then_cleanup)
+    with pytest.raises(state_module.StateCleanupError) as error:
+        store.write(JobState(phase="planned"))
+    assert error.value.committed is False
+    assert "target NOT committed" in str(error.value)
+    assert not path.exists()
+    assert error.value.marker_path is not None
+    assert error.value.marker_path.exists()
+
+
+def test_existing_target_pre_replace_cleanup_failure_keeps_old_target(tmp_path: Path, monkeypatch):
+    path = tmp_path / "state.json"
+    store = StateStore(path)
+    original = store.write(JobState(phase="planned"))
+    original_bytes = path.read_bytes()
+    original_sync = state_module._sync_directory
+    calls = 0
+
+    def fail_backup_then_cleanup(parent: Path):
+        nonlocal calls
+        calls += 1
+        if calls in (1, 2):
+            raise OSError("backup or cleanup fsync failed")
+        original_sync(parent)
+
+    monkeypatch.setattr(state_module, "_sync_directory", fail_backup_then_cleanup)
+    with pytest.raises(state_module.StateCleanupError) as error:
+        store.transition("preparing", command_identity="prepare", expected_generation=original.generation)
+    assert error.value.committed is False
+    assert "target NOT committed" in str(error.value)
+    assert path.read_bytes() == original_bytes
+    assert error.value.marker_path is not None
+    assert error.value.marker_path.exists()
 
 
 @pytest.mark.parametrize("phase", ["done", "failed", "interrupted"])
