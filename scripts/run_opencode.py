@@ -71,8 +71,8 @@ _LIMIT_KEYS = frozenset(
 _CACHE_KEYS = frozenset({"warmup_turns", "minimum_read_ratio", "stop_after_consecutive_failures"})
 _ARM_KEYS = frozenset({"repo", "revision", "mode", "binary"})
 _INSTALL_COMMAND = ("bun", "install", "--frozen-lockfile")
-_BUILD_COMMAND = ("bun", "--cwd", "packages/cli", "run", "build", "--single", "--baseline")
-_BUILT_BINARY = Path("packages/cli/dist/cli-linux-x64-baseline/bin/lildax")
+_BUILD_COMMAND = ("bun", "--cwd", "packages/opencode", "run", "build", "--single", "--skip-install", "--skip-embed-web-ui")
+_BUILT_BINARY = Path("packages/opencode/dist/opencode-linux-x64/bin/opencode")
 
 
 @dataclass(frozen=True)
@@ -278,13 +278,7 @@ def freeze_campaign_config(config: CampaignConfig, manifest_path: Path) -> None:
 
 def run_checked(command: Sequence[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
     """Run an approved command without exposing its output in installation errors."""
-    try:
-        result = subprocess.run(command, cwd=cwd, capture_output=True, check=False, text=True)
-    except OSError as error:
-        raise InstallError(f"could not run command: {command[0]}") from error
-    if result.returncode != 0:
-        raise InstallError(f"command failed: {command[0]}")
-    return result
+    return subprocess.run(command, cwd=cwd, capture_output=True, check=False, text=True)
 
 
 def prepare_install(
@@ -304,7 +298,7 @@ def prepare_install(
             run_command,
             ("git", "-C", str(repo), "rev-parse", f"{arm.revision}^{{commit}}"),
             None,
-            "resolve revision",
+            "rev-parse",
         )
         if not re.fullmatch(r"[0-9a-f]{40}", revision):
             raise InstallError("git did not resolve a commit SHA")
@@ -313,7 +307,7 @@ def prepare_install(
         manifest = root / arm.name / "install.json"
         if manifest.exists():
             existing = load_install_record(manifest)
-            _require_matching_install(existing, arm, repo, revision, supplied, supplied_hash)
+            _require_matching_install(existing, arm, repo, revision, supplied, supplied_hash, run_command)
             return existing
         if (root / arm.name).exists():
             raise InstallError(f"install path exists without a manifest: {root / arm.name}")
@@ -403,12 +397,12 @@ def _build_and_publish_install(
             run_command,
             ("git", "-C", str(repo), "worktree", "add", "--detach", str(temporary_worktree), revision),
             None,
-            "create detached worktree",
+            "worktree-add",
         )
         install_command = _INSTALL_COMMAND
         build_command = _BUILD_COMMAND
-        _run_command(run_command, install_command, temporary_worktree, "install dependencies")
-        _run_command(run_command, build_command, temporary_worktree, "build OpenCode")
+        _run_command(run_command, install_command, temporary_worktree, "install")
+        _run_command(run_command, build_command, temporary_worktree, "build")
         binary = temporary_worktree / _BUILT_BINARY
         binary_sha256 = _binary_sha256(binary)
         version = _binary_version(binary, run_command, temporary_worktree)
@@ -416,7 +410,7 @@ def _build_and_publish_install(
             run_command,
             ("git", "-C", str(repo), "worktree", "move", str(temporary_worktree), str(final_worktree)),
             None,
-            "move detached worktree",
+            "worktree-move",
         )
         moved = True
         record = InstallRecord(
@@ -464,6 +458,7 @@ def _require_matching_install(
     revision: str,
     supplied: Path | None,
     supplied_hash: str | None,
+    run_command: Callable[[Sequence[str], Path | None], subprocess.CompletedProcess[str]],
 ) -> None:
     if record.arm != arm.name or record.repo != repo or record.revision != revision:
         raise InstallError("install manifest identity conflicts with requested arm")
@@ -485,6 +480,52 @@ def _require_matching_install(
         raise InstallError("install manifest binary hash does not match installed binary")
     if record.worktree is not None and not record.worktree.is_dir():
         raise InstallError("install manifest worktree does not exist")
+    if record.worktree is not None:
+        _require_live_worktree(record, repo, run_command)
+    if _binary_version(record.binary, run_command, record.worktree) != record.version:
+        raise InstallError("install manifest version does not match installed binary")
+
+
+def _require_live_worktree(
+    record: InstallRecord,
+    repo: Path,
+    run_command: Callable[[Sequence[str], Path | None], subprocess.CompletedProcess[str]],
+) -> None:
+    if record.worktree is None:
+        return
+    worktree_revision = _command_text(
+        run_command,
+        ("git", "-C", str(record.worktree), "rev-parse", "HEAD"),
+        None,
+        "worktree-rev-parse",
+    )
+    if worktree_revision != record.revision:
+        raise InstallError("install manifest worktree revision does not match installed revision")
+    detached = _run_optional(
+        run_command,
+        ("git", "-C", str(record.worktree), "symbolic-ref", "-q", "HEAD"),
+        None,
+        "worktree-symbolic-ref",
+    )
+    if detached.returncode == 0:
+        raise InstallError("install manifest worktree must be detached")
+    if detached.returncode != 1:
+        raise InstallError(_command_failure("worktree-symbolic-ref", detached.args, None, detached.returncode))
+    source_common = _git_common_directory(repo, repo, run_command, "source-common-dir")
+    worktree_common = _git_common_directory(record.worktree, record.worktree, run_command, "worktree-common-dir")
+    if source_common != worktree_common:
+        raise InstallError("install manifest worktree does not belong to source repository")
+
+
+def _git_common_directory(
+    location: Path,
+    base: Path,
+    run_command: Callable[[Sequence[str], Path | None], subprocess.CompletedProcess[str]],
+    action: str,
+) -> Path:
+    common = _command_text(run_command, ("git", "-C", str(location), "rev-parse", "--git-common-dir"), None, action)
+    path = Path(common)
+    return path.resolve() if path.is_absolute() else (base / path).resolve()
 
 
 def _binary_sha256(binary: Path) -> str:
@@ -501,7 +542,7 @@ def _binary_version(
     run_command: Callable[[Sequence[str], Path | None], subprocess.CompletedProcess[str]],
     cwd: Path | None,
 ) -> str:
-    version = _command_text(run_command, (str(binary), "--version"), cwd, "smoke binary")
+    version = _command_text(run_command, (str(binary), "--version"), cwd, "smoke")
     if not version:
         raise InstallError("binary did not report a version")
     return version.splitlines()[0]
@@ -550,13 +591,30 @@ def _run_command(
 ) -> subprocess.CompletedProcess[str]:
     try:
         result = run_command(command, cwd)
-    except InstallError:
-        raise
+    except InstallError as error:
+        raise InstallError(_command_failure(action, command, cwd, "unavailable")) from error
     except (OSError, subprocess.SubprocessError) as error:
-        raise InstallError(f"{action} command failed") from error
+        raise InstallError(_command_failure(action, command, cwd, "unavailable")) from error
     if result.returncode != 0:
-        raise InstallError(f"{action} command failed")
+        raise InstallError(_command_failure(action, command, cwd, result.returncode))
     return result
+
+
+def _run_optional(
+    run_command: Callable[[Sequence[str], Path | None], subprocess.CompletedProcess[str]],
+    command: Sequence[str],
+    cwd: Path | None,
+    action: str,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return run_command(command, cwd)
+    except (InstallError, OSError, subprocess.SubprocessError) as error:
+        raise InstallError(_command_failure(action, command, cwd, "unavailable")) from error
+
+
+def _command_failure(action: str, command: Sequence[str], cwd: Path | None, exit_code: int | str) -> str:
+    location = str(cwd.resolve()) if cwd else "none"
+    return f"{action} command={command[0]} cwd={location} exit={exit_code}"
 
 
 def _command_text(

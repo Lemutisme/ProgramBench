@@ -482,7 +482,20 @@ def test_prepare_install_pins_detached_worktree_and_records_auditable_binary(tmp
     assert install.binary_sha256 == _sha256(install.binary)
     assert install.version == "fake-v1"
     assert install.install_command == ("bun", "install", "--frozen-lockfile")
-    assert install.build_command == ("bun", "--cwd", "packages/cli", "run", "build", "--single", "--baseline")
+    assert install.build_command == (
+        "bun",
+        "--cwd",
+        "packages/opencode",
+        "run",
+        "build",
+        "--single",
+        "--skip-install",
+        "--skip-embed-web-ui",
+    )
+    assert _git(install.worktree, "rev-parse", "HEAD") == first
+    assert subprocess.run(
+        ["git", "-C", str(install.worktree), "symbolic-ref", "-q", "HEAD"], capture_output=True, check=False
+    ).returncode == 1
     assert _git(repo, "status", "--porcelain") == ""
 
 
@@ -495,7 +508,9 @@ def test_prepare_install_reuses_exact_manifest_without_rebuilding(tmp_path: Path
     second = runner.prepare_install(arm, tmp_path / "installs")
 
     assert second == first
-    assert (fake_bun.parent / "build.log").read_text().splitlines() == ["build"]
+    assert (fake_bun.parent / "build.log").read_text().splitlines() == [
+        "packages/opencode run build --single --skip-install --skip-embed-web-ui"
+    ]
 
 
 def test_prepare_install_rejects_moving_ref_instead_of_rebuilding(tmp_path: Path, monkeypatch):
@@ -583,6 +598,86 @@ def test_prepare_install_serializes_same_arm_and_rejects_conflicting_identity(tm
     assert sum(isinstance(result, runner.InstallError) for result in results) == 1
 
 
+def test_prepare_install_rejects_forged_version_and_attached_worktree(tmp_path: Path, monkeypatch):
+    repo, _, _ = _fake_opencode_repo(tmp_path)
+    _fake_bun(monkeypatch, tmp_path)
+    arm = runner.ArmConfig("procontract", repo, "HEAD", "procontract")
+    root = tmp_path / "installs"
+    install = runner.prepare_install(arm, root)
+    manifest = root / arm.name / "install.json"
+    raw = json.loads(manifest.read_text())
+    raw["version"] = "forged"
+    manifest.write_text(json.dumps(raw))
+
+    with pytest.raises(runner.InstallError, match="version"):
+        runner.prepare_install(arm, root)
+
+    raw["version"] = install.version
+    manifest.write_text(json.dumps(raw))
+    _git(install.worktree, "checkout", "-b", "attached")
+
+    with pytest.raises(runner.InstallError, match="detached"):
+        runner.prepare_install(arm, root)
+
+
+def test_prepare_install_rejects_worktree_from_another_repository(tmp_path: Path, monkeypatch):
+    repo, revision, _ = _fake_opencode_repo(tmp_path)
+    _fake_bun(monkeypatch, tmp_path)
+    arm = runner.ArmConfig("procontract", repo, "HEAD", "procontract")
+    root = tmp_path / "installs"
+    install = runner.prepare_install(arm, root)
+    foreign = tmp_path / "foreign"
+    subprocess.run(["git", "clone", str(repo), str(foreign)], check=True, capture_output=True, text=True)
+    _git(foreign, "checkout", "--detach", revision)
+    foreign_binary = foreign / "packages/opencode/dist/opencode-linux-x64/bin/opencode"
+    foreign_binary.parent.mkdir(parents=True)
+    foreign_binary.write_bytes(install.binary.read_bytes())
+    foreign_binary.chmod(0o755)
+    manifest = root / arm.name / "install.json"
+    raw = json.loads(manifest.read_text())
+    raw["worktree"] = str(foreign)
+    raw["binary"] = str(foreign_binary)
+    raw["smoke_command"] = [str(foreign_binary), "--version"]
+    manifest.write_text(json.dumps(raw))
+
+    with pytest.raises(runner.InstallError, match="source repository"):
+        runner.prepare_install(arm, root)
+
+
+@pytest.mark.parametrize(
+    ("target", "expected"),
+    [
+        ("rev-parse", "rev-parse command=git"),
+        ("worktree-add", "worktree-add command=git"),
+        ("install", "install command=bun"),
+        ("build", "build command=bun"),
+        ("smoke", "smoke command=.*opencode"),
+    ],
+)
+def test_prepare_install_normalizes_each_command_failure(tmp_path: Path, monkeypatch, target: str, expected: str):
+    repo, _, _ = _fake_opencode_repo(tmp_path)
+    _fake_bun(monkeypatch, tmp_path)
+
+    def fail_selected(command, cwd):
+        if target == "rev-parse" and command[:4] == ("git", "-C", str(repo), "rev-parse"):
+            return subprocess.CompletedProcess(command, 17, "credential=secret", "credential=secret")
+        if target == "worktree-add" and command[3:6] == ("worktree", "add", "--detach"):
+            return subprocess.CompletedProcess(command, 17, "credential=secret", "credential=secret")
+        if target == "install" and command == ("bun", "install", "--frozen-lockfile"):
+            return subprocess.CompletedProcess(command, 17, "credential=secret", "credential=secret")
+        if target == "build" and command[0] == "bun" and "build" in command:
+            return subprocess.CompletedProcess(command, 17, "credential=secret", "credential=secret")
+        if target == "smoke" and command[-1:] == ("--version",):
+            return subprocess.CompletedProcess(command, 17, "credential=secret", "credential=secret")
+        return runner.run_checked(command, cwd)
+
+    with pytest.raises(runner.InstallError, match=expected) as error:
+        runner.prepare_install(runner.ArmConfig("procontract", repo, "HEAD", "procontract"), tmp_path / "installs", fail_selected)
+
+    assert "exit=17" in str(error.value)
+    assert "credential=secret" not in str(error.value)
+
+
 def test_load_install_record_rejects_duplicate_keys_and_corrupt_hash(tmp_path: Path):
     manifest = tmp_path / "install.json"
     manifest.write_text('{"arm":"one","arm":"two"}')
@@ -614,14 +709,14 @@ def _fake_opencode_repo(tmp_path: Path) -> tuple[Path, str, str]:
     _git(repo, "init")
     _git(repo, "config", "user.email", "test@example.invalid")
     _git(repo, "config", "user.name", "Test User")
-    (repo / "packages/cli/script").mkdir(parents=True)
+    (repo / "packages/opencode/script").mkdir(parents=True)
     (repo / "VERSION").write_text("v1\n")
-    (repo / "packages/cli/script/build.sh").write_text(
-        "#!/bin/sh\nmkdir -p dist/cli-linux-x64-baseline/bin\n"
-        "printf '#!/bin/sh\\necho fake-%s\\n' \"$(cat ../../VERSION)\" > dist/cli-linux-x64-baseline/bin/lildax\n"
-        "chmod +x dist/cli-linux-x64-baseline/bin/lildax\n"
+    (repo / "packages/opencode/script/build.sh").write_text(
+        "#!/bin/sh\nmkdir -p dist/opencode-linux-x64/bin\n"
+        "printf '#!/bin/sh\\necho fake-%s\\n' \"$(cat ../../VERSION)\" > dist/opencode-linux-x64/bin/opencode\n"
+        "chmod +x dist/opencode-linux-x64/bin/opencode\n"
     )
-    (repo / "packages/cli/script/build.sh").chmod(0o755)
+    (repo / "packages/opencode/script/build.sh").chmod(0o755)
     _git(repo, "add", ".")
     _git(repo, "commit", "-m", "v1")
     first = _git(repo, "rev-parse", "HEAD")
@@ -640,8 +735,8 @@ def _fake_bun(monkeypatch, tmp_path: Path) -> Path:
     bun.write_text(
         "#!/bin/sh\n"
         "if [ \"$1\" = install ]; then exit 0; fi\n"
-        "if [ \"$1\" = --cwd ]; then cd \"$2\"; shift 2; fi\n"
-        "if [ \"$1\" = run ] && [ \"$2\" = build ]; then echo build >> \"$BUN_BUILD_LOG\"; exec sh script/build.sh; fi\n"
+        "if [ \"$1\" = --cwd ]; then cwd=\"$2\"; cd \"$2\"; shift 2; fi\n"
+        "if [ \"$1\" = run ] && [ \"$2\" = build ]; then echo \"$cwd $*\" >> \"$BUN_BUILD_LOG\"; exec sh script/build.sh; fi\n"
         "exit 2\n"
     )
     bun.chmod(0o755)
