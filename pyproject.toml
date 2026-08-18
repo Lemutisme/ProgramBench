@@ -36,3 +36,4 @@ line-length = 120
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["slow: tests that require Docker or other heavyweight external services"]

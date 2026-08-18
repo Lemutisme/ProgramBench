@@ -41,28 +41,33 @@ def package_workspace(workspace: Path, run_dir: Path, instance_id: str) -> Path:
         raise CandidateError("Candidate workspace must contain compile.sh")
 
     output = run_dir / instance_id / "submission.tar.gz"
+    temporary = output.with_name(f".{output.name}.tmp")
     clean_hashes = _clean_hashes(instance_id)
     output.parent.mkdir(parents=True, exist_ok=True)
-    with output.open("wb") as raw:
-        with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as compressed:
-            with tarfile.open(fileobj=compressed, mode="w") as archive:
-                for path in sorted(workspace.rglob("*")):
-                    relative = path.relative_to(workspace)
-                    if any(part in _EXCLUDED_NAMES for part in relative.parts):
-                        continue
-                    if path.is_file() and not path.is_symlink() and sha256(path) in clean_hashes:
-                        raise CandidateError(f"Candidate contains a cleanroom reference artifact: {relative}")
-                    info = archive.gettarinfo(path, arcname=relative.as_posix())
-                    info.uid = 0
-                    info.gid = 0
-                    info.uname = ""
-                    info.gname = ""
-                    info.mtime = 0
-                    if path.is_file() and not path.is_symlink():
-                        with path.open("rb") as source:
-                            archive.addfile(info, source)
-                    else:
-                        archive.addfile(info)
+    try:
+        with temporary.open("wb") as raw:
+            with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as compressed:
+                with tarfile.open(fileobj=compressed, mode="w") as archive:
+                    for path in sorted(workspace.rglob("*")):
+                        relative = path.relative_to(workspace)
+                        if any(part in _EXCLUDED_NAMES for part in relative.parts):
+                            continue
+                        if path.is_file() and not path.is_symlink() and sha256(path) in clean_hashes:
+                            raise CandidateError(f"Candidate contains a cleanroom reference artifact: {relative}")
+                        info = archive.gettarinfo(path, arcname=relative.as_posix())
+                        info.uid = 0
+                        info.gid = 0
+                        info.uname = ""
+                        info.gname = ""
+                        info.mtime = 0
+                        if path.is_file() and not path.is_symlink():
+                            with path.open("rb") as source:
+                                archive.addfile(info, source)
+                        else:
+                            archive.addfile(info)
+        temporary.replace(output)
+    finally:
+        temporary.unlink(missing_ok=True)
     return output
 
 
@@ -86,7 +91,7 @@ def preflight_candidate(
     )
     output: list[str] = []
     try:
-        _step(env, f"rm -rf {WORKSPACE_DIR}/* {WORKSPACE_DIR}/.[!.]*", output)
+        _step(env, f"find {WORKSPACE_DIR} -mindepth 1 -maxdepth 1 -exec rm -rf -- {{}} +", output)
         env.copy_in_tar(archive, f"{WORKSPACE_DIR}/")
         hashes = _clean_hashes(instance_id)
         if hashes:
@@ -120,7 +125,11 @@ def preflight_candidate(
 
 
 def sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _step(env: ContainerEnvironment, command: str, output: list[str]) -> str:
@@ -136,5 +145,18 @@ def _clean_hashes(instance_id: str) -> set[str]:
     task = TASKS_DIR / instance_id / TASK_YAML
     if not task.is_file():
         return set()
-    value = yaml.safe_load(task.read_text()) or {}
-    return set(value.get("eval_clean_hashes", []))
+    try:
+        value = yaml.safe_load(task.read_text())
+    except yaml.YAMLError as error:
+        raise CandidateError(f"Task metadata is invalid YAML: {task}") from error
+    if not isinstance(value, dict):
+        raise CandidateError("Task metadata must be a mapping")
+    clean_hashes = value.get("eval_clean_hashes", [])
+    if not isinstance(clean_hashes, list):
+        raise CandidateError("eval_clean_hashes must be a list")
+    if not all(
+        isinstance(item, str) and len(item) == 64 and all(character in "0123456789abcdef" for character in item)
+        for item in clean_hashes
+    ):
+        raise CandidateError("eval_clean_hashes entries must be 64-char lowercase hex strings")
+    return set(clean_hashes)
