@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import errno
+import base64
+import binascii
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -286,11 +289,25 @@ class JobPaths:
 
 
 def _write_backup(path: Path, existed: bool, previous_bytes: bytes | None) -> None:
+    payload = previous_bytes or b""
+    encoded = json.dumps(
+        {
+            "version": 1,
+            "existed": existed,
+            "data": base64.b64encode(payload).decode("ascii"),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+    _write_raw_marker(path, encoded)
+
+
+def _write_raw_marker(path: Path, payload: bytes) -> None:
     temporary_name: str | None = None
     try:
         descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
         with os.fdopen(descriptor, "wb") as temporary:
-            temporary.write((b"1\n" + (previous_bytes or b"")) if existed else b"0\n")
+            temporary.write(payload)
             temporary.flush()
             os.fsync(temporary.fileno())
         Path(temporary_name).replace(path)
@@ -398,30 +415,31 @@ class StateStore:
         with self._state_lock():
             return self._read_optional_unlocked()
 
-    def recover_state(self, *, choice: Literal["backup", "target"]) -> JobState:
+    def recover_state(self, *, choice: Literal["backup", "target"]) -> JobState | None:
         with self._state_lock():
             if not self.backup_path.exists():
                 raise StateError("no recovery backup exists")
             if choice == "backup":
                 existed, data = _read_backup(self.backup_path)
                 _restore_previous_state(self.path, existed, data)
-                self._cleanup_recovery_marker(existed, data)
+                self._cleanup_recovery_marker(self.backup_path.read_bytes())
             elif choice == "target":
-                existed, data = _read_backup(self.backup_path)
                 state = self._read_target_unlocked()
-                self._cleanup_recovery_marker(existed, data)
+                self._cleanup_recovery_marker(self.backup_path.read_bytes())
                 return state
             else:
                 raise StateError(f"unknown recovery choice: {choice!r}")
+            if not existed:
+                return None
             return self._read_target_unlocked()
 
-    def _cleanup_recovery_marker(self, existed: bool, data: bytes | None) -> None:
+    def _cleanup_recovery_marker(self, marker_bytes: bytes) -> None:
         try:
             self.backup_path.unlink(missing_ok=True)
             _sync_directory(self.path.parent)
         except BaseException as error:
             try:
-                _write_backup(self.backup_path, existed, data)
+                _write_raw_marker(self.backup_path, marker_bytes)
             except BaseException:
                 pass
             marker = self.backup_path if self.backup_path.exists() else None
@@ -562,12 +580,23 @@ class StateStore:
                     _restore_previous_state(self.path, previous_exists, previous_bytes)
                 except BaseException as restore_error:
                     raise AmbiguousStateCommitError(self.backup_path, restore_error) from restore_error
+                try:
+                    self._cleanup_recovery_marker(self.backup_path.read_bytes())
+                except StateCleanupError:
+                    raise
                 raise StateError(f"could not write state: {self.path}") from error
             if backup_created:
                 try:
                     self.backup_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
+                    _sync_directory(self.path.parent)
+                except BaseException as cleanup_error:
+                    if not self.backup_path.exists():
+                        try:
+                            _write_backup(self.backup_path, previous_exists, previous_bytes)
+                        except BaseException:
+                            pass
+                    marker = self.backup_path if self.backup_path.exists() else None
+                    raise StateCleanupError(self.path, marker, cleanup_error) from cleanup_error
             raise StateError(f"could not write state: {self.path}") from error
         finally:
             if temporary_name is not None:
@@ -593,11 +622,22 @@ def _read_backup(path: Path) -> tuple[bool, bytes | None]:
         payload = path.read_bytes()
     except OSError as error:
         raise StateError(f"could not read recovery backup: {path}") from error
-    if payload == b"0\n":
-        return False, None
-    if payload.startswith(b"1\n"):
-        return True, payload[2:]
-    raise StateError(f"invalid recovery backup: {path}")
+    try:
+        raw = json.loads(payload.decode("utf-8"), object_pairs_hook=_reject_duplicate_pairs)
+        if not isinstance(raw, dict) or raw.get("version") != 1 or not isinstance(raw.get("existed"), bool):
+            raise StateError(f"invalid recovery backup: {path}")
+        encoded = raw.get("data")
+        checksum = raw.get("sha256")
+        if not isinstance(encoded, str) or not isinstance(checksum, str):
+            raise StateError(f"invalid recovery backup: {path}")
+        data = base64.b64decode(encoded.encode("ascii"), validate=True)
+        if hashlib.sha256(data).hexdigest() != checksum:
+            raise StateError(f"recovery backup checksum mismatch: {path}")
+        return raw["existed"], data if raw["existed"] else None
+    except (StateError, UnicodeError, ValueError, TypeError, binascii.Error) as error:
+        if isinstance(error, StateError):
+            raise
+        raise StateError(f"invalid recovery backup: {path}") from error
 
 
 def should_run(job: JobPaths, *, resume: bool, redo: bool, retry_infra: bool = False) -> bool:
