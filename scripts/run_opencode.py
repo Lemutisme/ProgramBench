@@ -12,7 +12,7 @@ import os
 import tempfile
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Collection, Iterator, Literal, Mapping, Sequence
 
@@ -141,6 +141,7 @@ Phase = Literal[
 _PHASES = frozenset(
     {"planned", "preparing", "executing", "frozen", "packaged", "preflighted", "done", "failed", "interrupted"}
 )
+_TERMINAL_PHASES = frozenset({"done", "failed", "interrupted"})
 _NORMAL_NEXT: dict[str, Phase] = {
     "planned": "preparing",
     "preparing": "executing",
@@ -160,6 +161,18 @@ PHASE_TRANSITIONS: Mapping[str, tuple[Phase, ...]] = {
 }
 
 
+def _finite_float(value: object, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise StateError(f"{label} must be a finite number")
+    try:
+        converted = float(value)
+    except (OverflowError, TypeError, ValueError) as error:
+        raise StateError(f"{label} must be a finite number") from error
+    if not math.isfinite(converted):
+        raise StateError(f"{label} must be a finite number")
+    return converted
+
+
 @dataclass(frozen=True)
 class JobState:
     """Validated, JSON-serializable state for one campaign job."""
@@ -174,6 +187,8 @@ class JobState:
     cost: float = 0.0
     artifact_hashes: Mapping[str, str] | None = None
     command_identity: str | None = None
+    reset_reason: str | None = None
+    reset_at: float | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.phase, str) or self.phase not in _PHASES:
@@ -183,12 +198,11 @@ class JobState:
         timestamps = {} if self.phase_timestamps is None else dict(self.phase_timestamps)
         if any(not isinstance(key, str) for key in timestamps):
             raise StateError("phase timestamps must have string keys")
-        if any(
-            isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
-            for value in timestamps.values()
-        ):
-            raise StateError("phase timestamps must be finite numbers")
-        object.__setattr__(self, "phase_timestamps", {key: float(value) for key, value in timestamps.items()})
+        object.__setattr__(
+            self,
+            "phase_timestamps",
+            {key: _finite_float(value, "phase timestamp") for key, value in timestamps.items()},
+        )
         if self.pid is not None and (type(self.pid) is not int or self.pid <= 0):
             raise StateError("pid must be a positive integer")
         if not isinstance(self.container_ids, (tuple, list)) or not all(
@@ -201,13 +215,10 @@ class JobState:
         for name, value in (("provider turns", self.provider_turns), ("actions", self.actions)):
             if type(value) is not int or value < 0:
                 raise StateError(f"{name} must be a nonnegative integer")
-        if (
-            isinstance(self.cost, bool)
-            or not isinstance(self.cost, (int, float))
-            or not math.isfinite(self.cost)
-            or self.cost < 0
-        ):
+        cost = _finite_float(self.cost, "cost")
+        if cost < 0:
             raise StateError("cost must be a nonnegative finite number")
+        object.__setattr__(self, "cost", cost)
         if self.artifact_hashes is not None and not isinstance(self.artifact_hashes, Mapping):
             raise StateError("artifact hashes must be a mapping")
         hashes = {} if self.artifact_hashes is None else dict(self.artifact_hashes)
@@ -216,6 +227,10 @@ class JobState:
         object.__setattr__(self, "artifact_hashes", hashes)
         if self.command_identity is not None and not isinstance(self.command_identity, str):
             raise StateError("command identity must be a string")
+        if self.reset_reason is not None and not isinstance(self.reset_reason, str):
+            raise StateError("reset reason must be a string")
+        if self.reset_at is not None:
+            object.__setattr__(self, "reset_at", _finite_float(self.reset_at, "reset time"))
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -229,6 +244,8 @@ class JobState:
             "cost": self.cost,
             "artifact_hashes": dict(self.artifact_hashes or {}),
             "command_identity": self.command_identity,
+            "reset_reason": self.reset_reason,
+            "reset_at": self.reset_at,
         }
 
     @classmethod
@@ -246,6 +263,8 @@ class JobState:
             "cost",
             "artifact_hashes",
             "command_identity",
+            "reset_reason",
+            "reset_at",
         }
         if set(raw) - expected:
             raise StateError("job state contains unknown fields")
@@ -261,8 +280,10 @@ class JobState:
                 cost=raw.get("cost", 0.0),
                 artifact_hashes=raw.get("artifact_hashes"),
                 command_identity=raw.get("command_identity"),
+                reset_reason=raw.get("reset_reason"),
+                reset_at=raw.get("reset_at"),
             )
-        except (KeyError, TypeError, ValueError) as error:
+        except (KeyError, TypeError, ValueError, OverflowError) as error:
             if isinstance(error, StateError):
                 raise
             raise StateError(f"invalid job state: {error}") from error
@@ -277,7 +298,7 @@ class StateStore:
             raw = json.loads(self.path.read_text())
         except FileNotFoundError as error:
             raise StateError(f"state does not exist: {self.path}") from error
-        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        except (OSError, UnicodeError, ValueError, OverflowError) as error:
             raise StateError(f"could not read state: {self.path}") from error
         try:
             return JobState.from_dict(raw)
@@ -291,7 +312,7 @@ class StateStore:
             raw = json.loads(self.path.read_text())
         except FileNotFoundError:
             return None
-        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        except (OSError, UnicodeError, ValueError, OverflowError) as error:
             raise StateError(f"could not read state: {self.path}") from error
         try:
             return JobState.from_dict(raw)
@@ -301,10 +322,37 @@ class StateStore:
             raise StateError(f"invalid state: {self.path}") from error
 
     def write(self, state: JobState) -> None:
+        self._write(state, enforce_transition=True)
+
+    def reset_for_rerun(self, *, redo: bool, retry_infra: bool) -> None:
+        current = self.read()
+        if redo and current.phase in _TERMINAL_PHASES:
+            reason = "redo"
+        elif (
+            retry_infra and current.phase == "failed" and current.exit_class == "infrastructure_failed_before_provider"
+        ):
+            reason = "retry_infra"
+        else:
+            raise StateError(f"reset is not allowed for phase {current.phase!r}")
+        reset_at = time.time()
+        phase_timestamps = dict(current.phase_timestamps or {})
+        phase_timestamps["planned"] = reset_at
+        self._write(
+            replace(
+                current,
+                phase="planned",
+                phase_timestamps=phase_timestamps,
+                reset_reason=reason,
+                reset_at=reset_at,
+            ),
+            enforce_transition=False,
+        )
+
+    def _write(self, state: JobState, *, enforce_transition: bool) -> None:
         if not isinstance(state, JobState):
             raise StateError("state must be a JobState")
         prior = self.read_optional()
-        if prior is not None and state.phase != prior.phase:
+        if enforce_transition and prior is not None and state.phase != prior.phase:
             transitions = PHASE_TRANSITIONS.get(prior.phase)
             if transitions is None or state.phase not in transitions:
                 raise StateError(f"illegal phase transition: {prior.phase} -> {state.phase}")
@@ -326,7 +374,7 @@ class StateStore:
             replaced = True
             temporary_name = None
             _sync_directory(self.path.parent)
-        except (OSError, TypeError, ValueError) as error:
+        except (OSError, TypeError, ValueError, OverflowError) as error:
             if replaced:
                 try:
                     _restore_previous_state(self.path, previous_exists, previous_bytes)

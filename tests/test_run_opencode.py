@@ -586,6 +586,90 @@ def test_state_store_rolls_back_when_parent_fsync_fails_without_old_state(tmp_pa
     assert list(tmp_path.glob(".state.json.*")) == []
 
 
+def test_state_store_redo_reset_reopens_terminal_job_without_deleting_artifacts(tmp_path: Path):
+    path = tmp_path / "state.json"
+    artifact = tmp_path / "submission.tar.gz"
+    artifact.write_bytes(b"keep me")
+    store = StateStore(path)
+    for phase in ("planned", "preparing", "executing", "frozen", "packaged", "preflighted", "done"):
+        store.write(JobState(phase=phase))
+
+    store.reset_for_rerun(redo=True, retry_infra=False)
+
+    reset = store.read()
+    assert reset.phase == "planned"
+    assert reset.reset_reason == "redo"
+    assert reset.reset_at is not None
+    assert artifact.read_bytes() == b"keep me"
+    store.write(JobState(phase="preparing"))
+
+
+def test_state_store_retry_infra_reset_reopens_only_eligible_failure(tmp_path: Path):
+    path = tmp_path / "state.json"
+    store = StateStore(path)
+    store.write(JobState(phase="failed", exit_class="infrastructure_failed_before_provider"))
+
+    store.reset_for_rerun(redo=False, retry_infra=True)
+
+    reset = store.read()
+    assert reset.phase == "planned"
+    assert reset.reset_reason == "retry_infra"
+    assert reset.reset_at is not None
+
+
+def test_state_store_reset_leaves_terminal_state_unchanged_when_write_fails(tmp_path: Path, monkeypatch):
+    path = tmp_path / "state.json"
+    store = StateStore(path)
+    for phase in ("planned", "preparing", "executing", "frozen", "packaged", "preflighted", "done"):
+        store.write(JobState(phase=phase))
+    original = path.read_bytes()
+    monkeypatch.setattr(runner, "_sync_directory", lambda _path: (_ for _ in ()).throw(OSError("fsync failed")))
+
+    with pytest.raises(StateError, match="write"):
+        store.reset_for_rerun(redo=True, retry_infra=False)
+    assert path.read_bytes() == original
+    assert store.read().phase == "done"
+
+
+@pytest.mark.parametrize(
+    ("phase", "exit_class", "redo", "retry_infra"),
+    [
+        ("done", None, False, False),
+        ("done", None, False, True),
+        ("failed", "provider_error", False, True),
+        ("executing", None, True, False),
+        ("failed", "infrastructure_failed_before_provider", False, False),
+    ],
+)
+def test_state_store_rejects_ineligible_rerun_resets(
+    tmp_path: Path, phase: str, exit_class: str | None, redo: bool, retry_infra: bool
+):
+    path = tmp_path / "state.json"
+    store = StateStore(path)
+    store.write(JobState(phase=phase, exit_class=exit_class))
+    original = path.read_bytes()
+
+    with pytest.raises(StateError, match="reset"):
+        store.reset_for_rerun(redo=redo, retry_infra=retry_infra)
+    assert path.read_bytes() == original
+
+
+def test_state_store_wraps_huge_json_numbers_as_state_errors(tmp_path: Path):
+    path = tmp_path / "state.json"
+    path.write_text('{"phase": "planned", "phase_timestamps": {"planned": ' + "9" * 10000 + "}}")
+
+    with pytest.raises(StateError):
+        StateStore(path).read()
+
+    path.write_text('{"phase": "planned", "cost": ' + "8" * 10000 + "}")
+    with pytest.raises(StateError):
+        StateStore(path).read_optional()
+
+    path.write_text('{"phase": "planned", "reset_at": ' + "7" * 10000 + "}")
+    with pytest.raises(StateError):
+        StateStore(path).read()
+
+
 def test_concurrent_readers_only_observe_complete_state_documents(tmp_path: Path):
     path = tmp_path / "state.json"
     store = StateStore(path)
