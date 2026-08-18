@@ -3,20 +3,38 @@
 from __future__ import annotations
 
 import argparse
+import errno
+import fcntl
 import hashlib
 import json
 import math
 import os
 import tempfile
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Collection, Literal, Mapping, Sequence
+from typing import Collection, Iterator, Literal, Mapping, Sequence
 
 import yaml
 
 
 class ConfigError(ValueError):
     """Raised when campaign configuration or its frozen manifest is invalid."""
+
+
+class StateError(ValueError):
+    """Raised when a job state cannot be read, validated, or persisted."""
+
+
+class JobLockedError(RuntimeError):
+    """Raised when another process owns a job lock."""
+
+    def __init__(self, path: Path, owner: str | None = None) -> None:
+        self.path = path
+        self.owner = owner
+        detail = f"; owner={owner}" if owner else ""
+        super().__init__(f"job lock is already held: {path}{detail}")
 
 
 class _UniqueKeyLoader(yaml.SafeLoader):
@@ -115,6 +133,283 @@ class CampaignConfig:
 class Job:
     instance_id: str
     arm: str
+
+
+Phase = Literal[
+    "planned", "preparing", "executing", "frozen", "packaged", "preflighted", "done", "failed", "interrupted"
+]
+_PHASES = frozenset(
+    {"planned", "preparing", "executing", "frozen", "packaged", "preflighted", "done", "failed", "interrupted"}
+)
+_NORMAL_NEXT: dict[str, Phase] = {
+    "planned": "preparing",
+    "preparing": "executing",
+    "executing": "frozen",
+    "frozen": "packaged",
+    "packaged": "preflighted",
+    "preflighted": "done",
+}
+PHASE_TRANSITIONS: Mapping[str, tuple[Phase, ...]] = {
+    phase: tuple(next_phases)
+    for phase, next_phases in {
+        **{phase: (next_phase, "failed", "interrupted") for phase, next_phase in _NORMAL_NEXT.items()},
+        "done": (),
+        "failed": (),
+        "interrupted": (),
+    }.items()
+}
+
+
+@dataclass(frozen=True)
+class JobState:
+    """Validated, JSON-serializable state for one campaign job."""
+
+    phase: Phase
+    phase_timestamps: Mapping[str, float] | None = None
+    pid: int | None = None
+    container_ids: tuple[str, ...] = ()
+    exit_class: str | None = None
+    provider_turns: int = 0
+    actions: int = 0
+    cost: float = 0.0
+    artifact_hashes: Mapping[str, str] | None = None
+    command_identity: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.phase, str) or self.phase not in _PHASES:
+            raise StateError(f"unknown job phase: {self.phase!r}")
+        timestamps = {} if self.phase_timestamps is None else dict(self.phase_timestamps)
+        if any(not isinstance(key, str) for key in timestamps):
+            raise StateError("phase timestamps must have string keys")
+        if any(
+            isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+            for value in timestamps.values()
+        ):
+            raise StateError("phase timestamps must be finite numbers")
+        object.__setattr__(self, "phase_timestamps", {key: float(value) for key, value in timestamps.items()})
+        if self.pid is not None and (type(self.pid) is not int or self.pid <= 0):
+            raise StateError("pid must be a positive integer")
+        if not isinstance(self.container_ids, (tuple, list)) or not all(
+            isinstance(value, str) for value in self.container_ids
+        ):
+            raise StateError("container IDs must be strings")
+        object.__setattr__(self, "container_ids", tuple(self.container_ids))
+        if self.exit_class is not None and not isinstance(self.exit_class, str):
+            raise StateError("exit class must be a string")
+        for name, value in (("provider turns", self.provider_turns), ("actions", self.actions)):
+            if type(value) is not int or value < 0:
+                raise StateError(f"{name} must be a nonnegative integer")
+        if (
+            isinstance(self.cost, bool)
+            or not isinstance(self.cost, (int, float))
+            or not math.isfinite(self.cost)
+            or self.cost < 0
+        ):
+            raise StateError("cost must be a nonnegative finite number")
+        hashes = {} if self.artifact_hashes is None else dict(self.artifact_hashes)
+        if any(not isinstance(key, str) or not isinstance(value, str) for key, value in hashes.items()):
+            raise StateError("artifact hashes must map strings to strings")
+        object.__setattr__(self, "artifact_hashes", hashes)
+        if self.command_identity is not None and not isinstance(self.command_identity, str):
+            raise StateError("command identity must be a string")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "phase": self.phase,
+            "phase_timestamps": dict(self.phase_timestamps or {}),
+            "pid": self.pid,
+            "container_ids": list(self.container_ids),
+            "exit_class": self.exit_class,
+            "provider_turns": self.provider_turns,
+            "actions": self.actions,
+            "cost": self.cost,
+            "artifact_hashes": dict(self.artifact_hashes or {}),
+            "command_identity": self.command_identity,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: object) -> "JobState":
+        if not isinstance(raw, dict):
+            raise StateError("job state must be a JSON object")
+        expected = {
+            "phase",
+            "phase_timestamps",
+            "pid",
+            "container_ids",
+            "exit_class",
+            "provider_turns",
+            "actions",
+            "cost",
+            "artifact_hashes",
+            "command_identity",
+        }
+        if set(raw) - expected:
+            raise StateError("job state contains unknown fields")
+        try:
+            return cls(
+                phase=raw["phase"],
+                phase_timestamps=raw.get("phase_timestamps"),
+                pid=raw.get("pid"),
+                container_ids=raw.get("container_ids", ()),
+                exit_class=raw.get("exit_class"),
+                provider_turns=raw.get("provider_turns", 0),
+                actions=raw.get("actions", 0),
+                cost=raw.get("cost", 0.0),
+                artifact_hashes=raw.get("artifact_hashes"),
+                command_identity=raw.get("command_identity"),
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            if isinstance(error, StateError):
+                raise
+            raise StateError(f"invalid job state: {error}") from error
+
+
+class StateStore:
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+
+    def read(self) -> JobState:
+        try:
+            raw = json.loads(self.path.read_text())
+        except FileNotFoundError as error:
+            raise StateError(f"state does not exist: {self.path}") from error
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise StateError(f"could not read state: {self.path}") from error
+        try:
+            return JobState.from_dict(raw)
+        except StateError as error:
+            raise StateError(f"invalid state: {self.path}") from error
+        except (TypeError, ValueError) as error:
+            raise StateError(f"invalid state: {self.path}") from error
+
+    def read_optional(self) -> JobState | None:
+        try:
+            raw = json.loads(self.path.read_text())
+        except FileNotFoundError:
+            return None
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise StateError(f"could not read state: {self.path}") from error
+        try:
+            return JobState.from_dict(raw)
+        except StateError as error:
+            raise StateError(f"invalid state: {self.path}") from error
+        except (TypeError, ValueError) as error:
+            raise StateError(f"invalid state: {self.path}") from error
+
+    def write(self, state: JobState) -> None:
+        if not isinstance(state, JobState):
+            raise StateError("state must be a JobState")
+        temporary_name: str | None = None
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            descriptor, temporary_name = tempfile.mkstemp(prefix=f".{self.path.name}.", dir=self.path.parent)
+            with os.fdopen(descriptor, "w") as temporary:
+                temporary.write(json.dumps(state.to_dict(), allow_nan=False, sort_keys=True) + "\n")
+                temporary.flush()
+                os.fsync(temporary.fileno())
+            Path(temporary_name).replace(self.path)
+            temporary_name = None
+            _sync_directory(self.path.parent)
+        except (OSError, TypeError, ValueError) as error:
+            raise StateError(f"could not write state: {self.path}") from error
+        finally:
+            if temporary_name is not None:
+                try:
+                    os.unlink(temporary_name)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    pass
+
+    def next_phase(self, state: JobState | Phase | None = None) -> Phase:
+        current_phase = self.read().phase if state is None else state.phase if isinstance(state, JobState) else state
+        if not isinstance(current_phase, str) or current_phase not in _PHASES:
+            raise StateError(f"unknown job phase: {current_phase!r}")
+        try:
+            return _NORMAL_NEXT[current_phase]
+        except KeyError as error:
+            raise StateError(f"phase {current_phase!r} has no next phase") from error
+
+
+@dataclass(frozen=True)
+class JobPaths:
+    root: Path = Path(".")
+    state: Path | None = None
+    lock: Path | None = None
+    submission: Path | None = None
+
+    def __post_init__(self) -> None:
+        root = Path(self.root)
+        object.__setattr__(self, "root", root)
+        object.__setattr__(self, "state", root / "state.json" if self.state is None else Path(self.state))
+        object.__setattr__(self, "lock", root / "job.lock" if self.lock is None else Path(self.lock))
+        object.__setattr__(
+            self, "submission", root / "submission.tar.gz" if self.submission is None else Path(self.submission)
+        )
+
+
+@contextmanager
+def job_lock(path: Path) -> Iterator[Path]:
+    lock_path = Path(path)
+    descriptor = -1
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            if error.errno not in (errno.EACCES, errno.EAGAIN):
+                raise
+            owner = _read_lock_owner(lock_path)
+            raise JobLockedError(lock_path, owner) from error
+        metadata = json.dumps({"pid": os.getpid(), "time": time.time()}, sort_keys=True).encode()
+        os.ftruncate(descriptor, 0)
+        os.write(descriptor, metadata)
+        os.fsync(descriptor)
+        yield lock_path
+    finally:
+        if descriptor >= 0:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+
+
+def should_run(job: JobPaths, *, resume: bool, redo: bool, retry_infra: bool = False) -> bool:
+    state = StateStore(job.state).read_optional()
+    if state is None:
+        return True
+    if state.phase == "planned":
+        return True
+    if state.phase == "done":
+        return redo or not _valid_submission(job.submission)
+    if state.phase == "failed":
+        return retry_infra and state.exit_class == "infrastructure_failed_before_provider"
+    if state.phase == "interrupted":
+        return resume or redo
+    return resume or redo
+
+
+def _read_lock_owner(path: Path) -> str | None:
+    try:
+        return path.read_text()
+    except (OSError, UnicodeError):
+        return None
+
+
+def _sync_directory(path: Path) -> None:
+    descriptor = os.open(str(path), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _valid_submission(path: Path) -> bool:
+    try:
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
 
 
 def select_instances(

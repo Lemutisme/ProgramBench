@@ -6,7 +6,21 @@ from pathlib import Path
 import pytest
 
 import scripts.run_opencode as runner
-from scripts.run_opencode import ConfigError, Job, expand_jobs, freeze_campaign_config, load_config, select_instances
+from scripts.run_opencode import (
+    ConfigError,
+    Job,
+    JobLockedError,
+    JobPaths,
+    JobState,
+    StateError,
+    StateStore,
+    expand_jobs,
+    freeze_campaign_config,
+    job_lock,
+    load_config,
+    select_instances,
+    should_run,
+)
 
 
 def instance(iid: str, difficulty: str, language: str) -> dict[str, str]:
@@ -419,6 +433,104 @@ def test_load_config_rejects_unusual_yaml_mapping_keys(tmp_path: Path):
 
     with pytest.raises(ConfigError, match="invalid YAML|mapping key"):
         load_config(config)
+
+
+def test_state_store_atomically_round_trips_and_advances_phase(tmp_path: Path):
+    path = tmp_path / "state.json"
+    state = JobState(
+        phase="executing",
+        phase_timestamps={"planned": 1.0, "executing": 2.0},
+        pid=123,
+        container_ids=("container-1",),
+        exit_class=None,
+        provider_turns=4,
+        actions=8,
+        cost=1.25,
+        artifact_hashes={"workspace": "abc"},
+    )
+
+    store = StateStore(path)
+    store.write(state)
+
+    assert store.read() == state
+    assert store.next_phase() == "frozen"
+    assert list(tmp_path.glob(".state.json.*")) == []
+
+
+@pytest.mark.parametrize("phase", ["done", "failed", "interrupted"])
+def test_state_store_next_phase_rejects_terminal_phases(tmp_path: Path, phase: str):
+    store = StateStore(tmp_path / "state.json")
+    store.write(JobState(phase=phase))
+
+    with pytest.raises(StateError, match="no next phase"):
+        store.next_phase()
+
+
+def test_state_store_next_phase_rejects_unknown_phase(tmp_path: Path):
+    path = tmp_path / "state.json"
+    path.write_text('{"phase": "unknown"}')
+
+    with pytest.raises(StateError, match="state"):
+        StateStore(path).next_phase()
+
+
+def test_state_store_rejects_malformed_json_and_preserves_old_state_on_write_error(tmp_path: Path, monkeypatch):
+    path = tmp_path / "state.json"
+    store = StateStore(path)
+    original = JobState(phase="planned")
+    store.write(original)
+    path.write_text('{"phase": 12}')
+    with pytest.raises(StateError, match="state"):
+        store.read()
+
+    store.write(original)
+    monkeypatch.setattr(runner.Path, "replace", lambda *_args: (_ for _ in ()).throw(OSError("replace failed")))
+    with pytest.raises(StateError, match="write"):
+        store.write(JobState(phase="preparing"))
+    assert store.read() == original
+    assert list(tmp_path.glob(".state.json.*")) == []
+
+
+def test_job_lock_rejects_second_owner_with_diagnostic(tmp_path: Path):
+    path = tmp_path / "job.lock"
+    with job_lock(path):
+        with pytest.raises(JobLockedError, match="job.lock") as error:
+            with job_lock(path):
+                pass
+        assert str(path) in str(error.value)
+
+
+def test_resume_runs_next_unfinished_phase_and_redo_reruns_done_job(tmp_path: Path):
+    paths = JobPaths(tmp_path)
+    StateStore(paths.state).write(JobState(phase="planned"))
+    assert should_run(paths, resume=False, redo=False) is True
+
+    StateStore(paths.state).write(JobState(phase="packaged"))
+
+    assert should_run(paths, resume=True, redo=False) is True
+    assert StateStore(paths.state).next_phase() == "preflighted"
+
+    paths.submission.write_bytes(b"submission")
+    StateStore(paths.state).write(JobState(phase="done"))
+    assert should_run(paths, resume=True, redo=False) is False
+    assert should_run(paths, resume=True, redo=True) is True
+
+
+@pytest.mark.parametrize("exit_class", ["provider_error", "evaluation_failed", "timeout"])
+def test_failed_terminal_results_are_not_rerun(tmp_path: Path, exit_class: str):
+    paths = JobPaths(tmp_path)
+    StateStore(paths.state).write(JobState(phase="failed", exit_class=exit_class))
+
+    assert should_run(paths, resume=True, redo=True) is False
+    assert should_run(paths, resume=True, redo=False, retry_infra=True) is False
+
+
+def test_only_pre_provider_infrastructure_failure_can_be_explicitly_retried(tmp_path: Path):
+    paths = JobPaths(tmp_path)
+    StateStore(paths.state).write(JobState(phase="failed", exit_class="infrastructure_failed_before_provider"))
+
+    assert should_run(paths, resume=True, redo=False) is False
+    assert should_run(paths, resume=True, redo=False, retry_infra=True) is True
 
 
 def campaign_yaml(repo: Path, *, model: str = "test/model") -> str:
