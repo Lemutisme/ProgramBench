@@ -307,7 +307,7 @@ def prepare_install(
         manifest = root / arm.name / "install.json"
         if manifest.exists():
             existing = load_install_record(manifest)
-            _require_matching_install(existing, arm, repo, revision, supplied, supplied_hash, run_command)
+            _require_matching_install(existing, arm, root, repo, revision, supplied, supplied_hash, run_command)
             return existing
         if (root / arm.name).exists():
             raise InstallError(f"install path exists without a manifest: {root / arm.name}")
@@ -454,6 +454,7 @@ def _require_clean_source(
 def _require_matching_install(
     record: InstallRecord,
     arm: ArmConfig,
+    root: Path,
     repo: Path,
     revision: str,
     supplied: Path | None,
@@ -476,6 +477,8 @@ def _require_matching_install(
         raise InstallError("install manifest identity conflicts with requested arm")
     if record.smoke_command != (str(record.binary), "--version"):
         raise InstallError("install manifest identity conflicts with requested arm")
+    if record.worktree is not None and record.worktree != (root / "worktrees" / f"{arm.name}-{revision}").resolve():
+        raise InstallError("install manifest worktree is not the owned worktree path")
     if not record.binary.is_file() or _binary_sha256(record.binary) != record.binary_sha256:
         raise InstallError("install manifest binary hash does not match installed binary")
     if record.worktree is not None and not record.worktree.is_dir():
@@ -591,10 +594,8 @@ def _run_command(
 ) -> subprocess.CompletedProcess[str]:
     try:
         result = run_command(command, cwd)
-    except InstallError as error:
-        raise InstallError(_command_failure(action, command, cwd, "unavailable")) from error
-    except (OSError, subprocess.SubprocessError) as error:
-        raise InstallError(_command_failure(action, command, cwd, "unavailable")) from error
+    except Exception:
+        raise InstallError(_command_failure(action, command, cwd, "unavailable")) from None
     if result.returncode != 0:
         raise InstallError(_command_failure(action, command, cwd, result.returncode))
     return result
@@ -608,8 +609,8 @@ def _run_optional(
 ) -> subprocess.CompletedProcess[str]:
     try:
         return run_command(command, cwd)
-    except (InstallError, OSError, subprocess.SubprocessError) as error:
-        raise InstallError(_command_failure(action, command, cwd, "unavailable")) from error
+    except Exception:
+        raise InstallError(_command_failure(action, command, cwd, "unavailable")) from None
 
 
 def _command_failure(action: str, command: Sequence[str], cwd: Path | None, exit_code: int | str) -> str:

@@ -2,6 +2,7 @@ import json
 import os
 import subprocess
 import threading
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -626,22 +627,60 @@ def test_prepare_install_rejects_worktree_from_another_repository(tmp_path: Path
     arm = runner.ArmConfig("procontract", repo, "HEAD", "procontract")
     root = tmp_path / "installs"
     install = runner.prepare_install(arm, root)
-    foreign = tmp_path / "foreign"
-    subprocess.run(["git", "clone", str(repo), str(foreign)], check=True, capture_output=True, text=True)
-    _git(foreign, "checkout", "--detach", revision)
-    foreign_binary = foreign / "packages/opencode/dist/opencode-linux-x64/bin/opencode"
+    binary = install.binary.read_bytes()
+    _git(repo, "worktree", "remove", "--force", str(install.worktree))
+    subprocess.run(["git", "clone", str(repo), str(install.worktree)], check=True, capture_output=True, text=True)
+    _git(install.worktree, "checkout", "--detach", revision)
+    foreign_binary = install.worktree / "packages/opencode/dist/opencode-linux-x64/bin/opencode"
     foreign_binary.parent.mkdir(parents=True)
-    foreign_binary.write_bytes(install.binary.read_bytes())
+    foreign_binary.write_bytes(binary)
     foreign_binary.chmod(0o755)
-    manifest = root / arm.name / "install.json"
-    raw = json.loads(manifest.read_text())
-    raw["worktree"] = str(foreign)
-    raw["binary"] = str(foreign_binary)
-    raw["smoke_command"] = [str(foreign_binary), "--version"]
-    manifest.write_text(json.dumps(raw))
 
     with pytest.raises(runner.InstallError, match="source repository"):
         runner.prepare_install(arm, root)
+
+
+def test_prepare_install_rejects_other_detached_worktree_at_same_revision(tmp_path: Path, monkeypatch):
+    repo, revision, _ = _fake_opencode_repo(tmp_path)
+    _fake_bun(monkeypatch, tmp_path)
+    arm = runner.ArmConfig("procontract", repo, "HEAD", "procontract")
+    root = tmp_path / "installs"
+    install = runner.prepare_install(arm, root)
+    other_worktree = tmp_path / "other-worktree"
+    _git(repo, "worktree", "add", "--detach", str(other_worktree), revision)
+    other_binary = other_worktree / "packages/opencode/dist/opencode-linux-x64/bin/opencode"
+    other_binary.parent.mkdir(parents=True)
+    other_binary.write_bytes(install.binary.read_bytes())
+    other_binary.chmod(0o755)
+    manifest = root / arm.name / "install.json"
+    raw = json.loads(manifest.read_text())
+    raw["worktree"] = str(other_worktree)
+    raw["binary"] = str(other_binary)
+    raw["smoke_command"] = [str(other_binary), "--version"]
+    manifest.write_text(json.dumps(raw))
+
+    with pytest.raises(runner.InstallError, match="owned worktree"):
+        runner.prepare_install(arm, root)
+
+
+def test_prepare_install_hides_secret_bearing_command_exception(tmp_path: Path, monkeypatch):
+    repo, _, _ = _fake_opencode_repo(tmp_path)
+    _fake_bun(monkeypatch, tmp_path)
+
+    def fail_rev_parse(command, cwd):
+        if command[:4] == ("git", "-C", str(repo), "rev-parse"):
+            raise RuntimeError("fake-secret-value")
+        return runner.run_checked(command, cwd)
+
+    with pytest.raises(runner.InstallError) as error:
+        runner.prepare_install(
+            runner.ArmConfig("procontract", repo, "HEAD", "procontract"), tmp_path / "installs", fail_rev_parse
+        )
+
+    assert "fake-secret-value" not in str(error.value)
+    assert "fake-secret-value" not in "".join(traceback.format_exception(error.value))
+    assert error.value.__cause__ is None
+    assert error.value.__suppress_context__
 
 
 @pytest.mark.parametrize(
