@@ -6,14 +6,18 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import math
+import os
+import re
+import shutil
+import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Collection, Literal, Mapping, Sequence
-import os
-import tempfile
+from typing import Callable, Collection, Literal, Mapping, Sequence
 
 from scripts.campaign_state import (
     AmbiguousStateCommitError,
@@ -36,6 +40,10 @@ import yaml
 
 class ConfigError(ValueError):
     """Raised when campaign configuration or its frozen manifest is invalid."""
+
+
+class InstallError(RuntimeError):
+    """Raised when a pinned OpenCode installation cannot be prepared safely."""
 
 
 class _UniqueKeyLoader(yaml.SafeLoader):
@@ -62,6 +70,9 @@ _LIMIT_KEYS = frozenset(
 )
 _CACHE_KEYS = frozenset({"warmup_turns", "minimum_read_ratio", "stop_after_consecutive_failures"})
 _ARM_KEYS = frozenset({"repo", "revision", "mode", "binary"})
+_INSTALL_COMMAND = ("bun", "install", "--frozen-lockfile")
+_BUILD_COMMAND = ("bun", "--cwd", "packages/cli", "run", "build", "--single", "--baseline")
+_BUILT_BINARY = Path("packages/cli/dist/cli-linux-x64-baseline/bin/lildax")
 
 
 @dataclass(frozen=True)
@@ -118,6 +129,20 @@ class ArmConfig:
     revision: str
     mode: Literal["procontract", "vanilla"]
     binary: Path | None = None
+
+
+@dataclass(frozen=True)
+class InstallRecord:
+    arm: str
+    repo: Path
+    revision: str
+    worktree: Path | None
+    binary: Path
+    binary_sha256: str
+    version: str
+    install_command: tuple[str, ...]
+    build_command: tuple[str, ...]
+    smoke_command: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -249,6 +274,371 @@ def freeze_campaign_config(config: CampaignConfig, manifest_path: Path) -> None:
     finally:
         if os.path.exists(temporary_name):
             os.unlink(temporary_name)
+
+
+def run_checked(command: Sequence[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+    """Run an approved command without exposing its output in installation errors."""
+    try:
+        result = subprocess.run(command, cwd=cwd, capture_output=True, check=False, text=True)
+    except OSError as error:
+        raise InstallError(f"could not run command: {command[0]}") from error
+    if result.returncode != 0:
+        raise InstallError(f"command failed: {command[0]}")
+    return result
+
+
+def prepare_install(
+    arm: ArmConfig,
+    root: Path,
+    run_command: Callable[[Sequence[str], Path | None], subprocess.CompletedProcess[str]] = run_checked,
+) -> InstallRecord:
+    """Pin one arm to a detached worktree and publish an auditable installation record."""
+    repo = arm.repo.resolve()
+    if not repo.is_dir():
+        raise InstallError(f"source repository does not exist: {repo}")
+    root = root.resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    with _arm_lock(root, arm.name):
+        _require_clean_source(repo, run_command)
+        revision = _command_text(
+            run_command,
+            ("git", "-C", str(repo), "rev-parse", f"{arm.revision}^{{commit}}"),
+            None,
+            "resolve revision",
+        )
+        if not re.fullmatch(r"[0-9a-f]{40}", revision):
+            raise InstallError("git did not resolve a commit SHA")
+        supplied = arm.binary.resolve() if arm.binary else None
+        supplied_hash = _binary_sha256(supplied) if supplied else None
+        manifest = root / arm.name / "install.json"
+        if manifest.exists():
+            existing = load_install_record(manifest)
+            _require_matching_install(existing, arm, repo, revision, supplied, supplied_hash)
+            return existing
+        if (root / arm.name).exists():
+            raise InstallError(f"install path exists without a manifest: {root / arm.name}")
+        if supplied:
+            record = InstallRecord(
+                arm=arm.name,
+                repo=repo,
+                revision=revision,
+                worktree=None,
+                binary=supplied,
+                binary_sha256=supplied_hash,
+                version=_binary_version(supplied, run_command, None),
+                install_command=(),
+                build_command=(),
+                smoke_command=(str(supplied), "--version"),
+            )
+            _publish_install(root, record)
+            return record
+        return _build_and_publish_install(arm, root, repo, revision, run_command)
+
+
+def load_install_record(path: Path) -> InstallRecord:
+    """Read a strict, duplicate-key-free installation manifest."""
+    try:
+        raw = json.loads(path.read_text(), object_pairs_hook=_unique_json_object)
+    except (OSError, json.JSONDecodeError, ValueError) as error:
+        raise InstallError(f"invalid install manifest: {path}") from error
+    keys = {
+        "arm",
+        "repo",
+        "revision",
+        "worktree",
+        "binary",
+        "binary_sha256",
+        "version",
+        "install_command",
+        "build_command",
+        "smoke_command",
+    }
+    if not isinstance(raw, dict) or set(raw) != keys:
+        raise InstallError(f"invalid install manifest: {path}")
+    try:
+        arm = _manifest_string(raw, "arm")
+        repo = _manifest_path(raw, "repo")
+        revision = _manifest_string(raw, "revision")
+        worktree = raw["worktree"]
+        if worktree is not None:
+            worktree = _manifest_path(raw, "worktree")
+        binary = _manifest_path(raw, "binary")
+        binary_sha256 = _manifest_string(raw, "binary_sha256")
+        version = _manifest_string(raw, "version")
+        commands = tuple(_manifest_command(raw, name) for name in ("install_command", "build_command", "smoke_command"))
+    except (KeyError, ValueError) as error:
+        raise InstallError(f"invalid install manifest: {path}") from error
+    if not re.fullmatch(r"[0-9a-f]{40}", revision) or not re.fullmatch(r"[0-9a-f]{64}", binary_sha256):
+        raise InstallError(f"invalid install manifest: {path}")
+    return InstallRecord(
+        arm=arm,
+        repo=repo,
+        revision=revision,
+        worktree=worktree,
+        binary=binary,
+        binary_sha256=binary_sha256,
+        version=version,
+        install_command=commands[0],
+        build_command=commands[1],
+        smoke_command=commands[2],
+    )
+
+
+def _build_and_publish_install(
+    arm: ArmConfig,
+    root: Path,
+    repo: Path,
+    revision: str,
+    run_command: Callable[[Sequence[str], Path | None], subprocess.CompletedProcess[str]],
+) -> InstallRecord:
+    temporary = Path(tempfile.mkdtemp(prefix=f".{arm.name}-", dir=root))
+    temporary_worktree = temporary / "worktree"
+    final_worktree = root / "worktrees" / f"{arm.name}-{revision}"
+    moved = False
+    try:
+        if final_worktree.exists():
+            raise InstallError(f"worktree path already exists: {final_worktree}")
+        final_worktree.parent.mkdir(parents=True, exist_ok=True)
+        _run_command(
+            run_command,
+            ("git", "-C", str(repo), "worktree", "add", "--detach", str(temporary_worktree), revision),
+            None,
+            "create detached worktree",
+        )
+        install_command = _INSTALL_COMMAND
+        build_command = _BUILD_COMMAND
+        _run_command(run_command, install_command, temporary_worktree, "install dependencies")
+        _run_command(run_command, build_command, temporary_worktree, "build OpenCode")
+        binary = temporary_worktree / _BUILT_BINARY
+        binary_sha256 = _binary_sha256(binary)
+        version = _binary_version(binary, run_command, temporary_worktree)
+        _run_command(
+            run_command,
+            ("git", "-C", str(repo), "worktree", "move", str(temporary_worktree), str(final_worktree)),
+            None,
+            "move detached worktree",
+        )
+        moved = True
+        record = InstallRecord(
+            arm=arm.name,
+            repo=repo,
+            revision=revision,
+            worktree=final_worktree,
+            binary=final_worktree / _BUILT_BINARY,
+            binary_sha256=binary_sha256,
+            version=version,
+            install_command=install_command,
+            build_command=build_command,
+            smoke_command=(str(final_worktree / _BUILT_BINARY), "--version"),
+        )
+        _publish_install(root, record, temporary)
+        return record
+    except InstallError:
+        if moved:
+            _remove_owned_worktree(repo, final_worktree, run_command)
+        elif temporary_worktree.exists():
+            _remove_owned_worktree(repo, temporary_worktree, run_command)
+        raise
+    finally:
+        if temporary.exists():
+            shutil.rmtree(temporary, ignore_errors=True)
+
+
+def _require_clean_source(
+    repo: Path, run_command: Callable[[Sequence[str], Path | None], subprocess.CompletedProcess[str]]
+) -> None:
+    status = _command_text(
+        run_command,
+        ("git", "-C", str(repo), "status", "--porcelain", "--untracked-files=all"),
+        None,
+        "inspect source repository",
+    )
+    if status:
+        raise InstallError("source repository must be clean")
+
+
+def _require_matching_install(
+    record: InstallRecord,
+    arm: ArmConfig,
+    repo: Path,
+    revision: str,
+    supplied: Path | None,
+    supplied_hash: str | None,
+) -> None:
+    if record.arm != arm.name or record.repo != repo or record.revision != revision:
+        raise InstallError("install manifest identity conflicts with requested arm")
+    if supplied is None and record.worktree is None:
+        raise InstallError("install manifest identity conflicts with requested arm")
+    if supplied is not None and (record.worktree is not None or record.binary != supplied or record.binary_sha256 != supplied_hash):
+        raise InstallError("install manifest identity conflicts with requested arm")
+    if supplied is None and (
+        record.install_command != _INSTALL_COMMAND
+        or record.build_command != _BUILD_COMMAND
+        or record.binary != record.worktree / _BUILT_BINARY
+    ):
+        raise InstallError("install manifest identity conflicts with requested arm")
+    if supplied is not None and (record.install_command or record.build_command):
+        raise InstallError("install manifest identity conflicts with requested arm")
+    if record.smoke_command != (str(record.binary), "--version"):
+        raise InstallError("install manifest identity conflicts with requested arm")
+    if not record.binary.is_file() or _binary_sha256(record.binary) != record.binary_sha256:
+        raise InstallError("install manifest binary hash does not match installed binary")
+    if record.worktree is not None and not record.worktree.is_dir():
+        raise InstallError("install manifest worktree does not exist")
+
+
+def _binary_sha256(binary: Path) -> str:
+    if not binary.is_file() or not os.access(binary, os.X_OK):
+        raise InstallError(f"binary is not an executable file: {binary}")
+    try:
+        return hashlib.sha256(binary.read_bytes()).hexdigest()
+    except OSError as error:
+        raise InstallError(f"could not hash binary: {binary}") from error
+
+
+def _binary_version(
+    binary: Path,
+    run_command: Callable[[Sequence[str], Path | None], subprocess.CompletedProcess[str]],
+    cwd: Path | None,
+) -> str:
+    version = _command_text(run_command, (str(binary), "--version"), cwd, "smoke binary")
+    if not version:
+        raise InstallError("binary did not report a version")
+    return version.splitlines()[0]
+
+
+def _publish_install(root: Path, record: InstallRecord, temporary: Path | None = None) -> None:
+    manifest_parent = root / record.arm
+    publication = temporary or Path(tempfile.mkdtemp(prefix=f".{record.arm}-", dir=root))
+    manifest = publication / "install.json"
+    try:
+        manifest.write_text(json.dumps(_install_manifest(record), indent=2, sort_keys=True) + "\n")
+        with manifest.open("r+") as handle:
+            handle.flush()
+            os.fsync(handle.fileno())
+        if manifest_parent.exists():
+            raise InstallError(f"install path already exists: {manifest_parent}")
+        os.rename(publication, manifest_parent)
+        _fsync_directory(root)
+    except OSError as error:
+        raise InstallError(f"could not publish install manifest: {manifest_parent}") from error
+    finally:
+        if temporary is None and publication.exists():
+            shutil.rmtree(publication, ignore_errors=True)
+
+
+def _install_manifest(record: InstallRecord) -> dict[str, object]:
+    return {
+        "arm": record.arm,
+        "repo": str(record.repo),
+        "revision": record.revision,
+        "worktree": str(record.worktree) if record.worktree else None,
+        "binary": str(record.binary),
+        "binary_sha256": record.binary_sha256,
+        "version": record.version,
+        "install_command": list(record.install_command),
+        "build_command": list(record.build_command),
+        "smoke_command": list(record.smoke_command),
+    }
+
+
+def _run_command(
+    run_command: Callable[[Sequence[str], Path | None], subprocess.CompletedProcess[str]],
+    command: Sequence[str],
+    cwd: Path | None,
+    action: str,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        result = run_command(command, cwd)
+    except InstallError:
+        raise
+    except (OSError, subprocess.SubprocessError) as error:
+        raise InstallError(f"{action} command failed") from error
+    if result.returncode != 0:
+        raise InstallError(f"{action} command failed")
+    return result
+
+
+def _command_text(
+    run_command: Callable[[Sequence[str], Path | None], subprocess.CompletedProcess[str]],
+    command: Sequence[str],
+    cwd: Path | None,
+    action: str,
+) -> str:
+    result = _run_command(run_command, command, cwd, action)
+    return result.stdout.strip()
+
+
+def _remove_owned_worktree(
+    repo: Path,
+    worktree: Path,
+    run_command: Callable[[Sequence[str], Path | None], subprocess.CompletedProcess[str]],
+) -> None:
+    try:
+        _run_command(
+            run_command,
+            ("git", "-C", str(repo), "worktree", "remove", "--force", str(worktree)),
+            None,
+            "remove temporary worktree",
+        )
+    except InstallError:
+        pass
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    values: dict[str, object] = {}
+    for key, value in pairs:
+        if key in values:
+            raise ValueError(f"duplicate JSON key: {key}")
+        values[key] = value
+    return values
+
+
+def _manifest_string(raw: Mapping[str, object], name: str) -> str:
+    value = raw[name]
+    if not isinstance(value, str) or not value:
+        raise ValueError(name)
+    return value
+
+
+def _manifest_path(raw: Mapping[str, object], name: str) -> Path:
+    value = _manifest_string(raw, name)
+    path = Path(value)
+    if not path.is_absolute() or str(path.resolve()) != value:
+        raise ValueError(name)
+    return path
+
+
+def _manifest_command(raw: Mapping[str, object], name: str) -> tuple[str, ...]:
+    value = raw[name]
+    if not isinstance(value, list) or not all(isinstance(item, str) and item for item in value):
+        raise ValueError(name)
+    return tuple(value)
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(str(path), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+class _arm_lock:
+    def __init__(self, root: Path, arm: str) -> None:
+        self.path = root / ".locks" / f"{arm}.lock"
+        self.handle = None
+
+    def __enter__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.handle = self.path.open("a+")
+        fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        if self.handle:
+            fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
+            self.handle.close()
 
 
 def main() -> None:

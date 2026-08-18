@@ -1,4 +1,6 @@
 import json
+import os
+import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -463,3 +465,201 @@ def _freeze_result(config, manifest_path: Path):
     except ConfigError as error:
         return error
     return None
+
+
+def test_prepare_install_pins_detached_worktree_and_records_auditable_binary(tmp_path: Path, monkeypatch):
+    repo, first, _ = _fake_opencode_repo(tmp_path)
+    _fake_bun(monkeypatch, tmp_path)
+    arm = runner.ArmConfig("procontract", repo, "HEAD", "procontract")
+
+    install = runner.prepare_install(arm, tmp_path / "installs")
+
+    assert install.revision == first
+    assert len(install.revision) == 40
+    assert install.worktree is not None
+    assert install.worktree != repo
+    assert install.binary.is_file()
+    assert install.binary_sha256 == _sha256(install.binary)
+    assert install.version == "fake-v1"
+    assert install.install_command == ("bun", "install", "--frozen-lockfile")
+    assert install.build_command == ("bun", "--cwd", "packages/cli", "run", "build", "--single", "--baseline")
+    assert _git(repo, "status", "--porcelain") == ""
+
+
+def test_prepare_install_reuses_exact_manifest_without_rebuilding(tmp_path: Path, monkeypatch):
+    repo, _, _ = _fake_opencode_repo(tmp_path)
+    fake_bun = _fake_bun(monkeypatch, tmp_path)
+    arm = runner.ArmConfig("procontract", repo, "HEAD", "procontract")
+
+    first = runner.prepare_install(arm, tmp_path / "installs")
+    second = runner.prepare_install(arm, tmp_path / "installs")
+
+    assert second == first
+    assert (fake_bun.parent / "build.log").read_text().splitlines() == ["build"]
+
+
+def test_prepare_install_rejects_moving_ref_instead_of_rebuilding(tmp_path: Path, monkeypatch):
+    repo, _, second = _fake_opencode_repo(tmp_path)
+    _fake_bun(monkeypatch, tmp_path)
+    arm = runner.ArmConfig("vanilla", repo, "HEAD", "vanilla")
+    root = tmp_path / "installs"
+    runner.prepare_install(arm, root)
+    _git(repo, "reset", "--hard", second)
+
+    with pytest.raises(runner.InstallError, match="identity|manifest"):
+        runner.prepare_install(arm, root)
+
+
+@pytest.mark.parametrize("dirty", ["tracked", "untracked"])
+def test_prepare_install_rejects_dirty_source_repo(tmp_path: Path, monkeypatch, dirty: str):
+    repo, _, _ = _fake_opencode_repo(tmp_path)
+    _fake_bun(monkeypatch, tmp_path)
+    if dirty == "tracked":
+        (repo / "VERSION").write_text("changed\n")
+    else:
+        (repo / "material.txt").write_text("changed\n")
+
+    with pytest.raises(runner.InstallError, match="clean"):
+        runner.prepare_install(runner.ArmConfig("procontract", repo, "HEAD", "procontract"), tmp_path / "installs")
+
+
+def test_prepare_install_uses_supplied_binary_without_worktree_or_build(tmp_path: Path, monkeypatch):
+    repo, first, _ = _fake_opencode_repo(tmp_path)
+    fake_bun = _fake_bun(monkeypatch, tmp_path)
+    binary = tmp_path / "opencode"
+    binary.write_text("#!/bin/sh\necho supplied-v1\n")
+    binary.chmod(0o755)
+
+    install = runner.prepare_install(
+        runner.ArmConfig("procontract", repo, "HEAD", "procontract", binary), tmp_path / "installs"
+    )
+
+    assert install.revision == first
+    assert install.worktree is None
+    assert install.binary == binary.resolve()
+    assert install.binary_sha256 == _sha256(binary)
+    assert install.version == "supplied-v1"
+    assert not (fake_bun.parent / "build.log").exists()
+
+
+def test_prepare_install_failure_preserves_prior_install_and_publishes_nothing_partial(tmp_path: Path, monkeypatch):
+    repo, _, _ = _fake_opencode_repo(tmp_path)
+    fake_bun = _fake_bun(monkeypatch, tmp_path)
+    arm = runner.ArmConfig("vanilla", repo, "HEAD", "vanilla")
+    root = tmp_path / "installs"
+    prior = runner.prepare_install(arm, root)
+    manifest = (root / arm.name / "install.json").read_bytes()
+    (repo / "VERSION").write_text("v2\n")
+    _git(repo, "add", "VERSION")
+    _git(repo, "commit", "-m", "v2")
+    fake_bun.write_text("#!/bin/sh\nexit 9\n")
+    fake_bun.chmod(0o755)
+
+    with pytest.raises(runner.InstallError, match="command"):
+        runner.prepare_install(runner.ArmConfig("procontract", repo, "HEAD", "procontract"), root)
+
+    assert (root / arm.name / "install.json").read_bytes() == manifest
+    assert runner.load_install_record(root / arm.name / "install.json") == prior
+    assert list(root.glob(".procontract-*")) == []
+
+
+def test_prepare_install_serializes_same_arm_and_rejects_conflicting_identity(tmp_path: Path, monkeypatch):
+    repo, _, second = _fake_opencode_repo(tmp_path)
+    _fake_bun(monkeypatch, tmp_path)
+    root = tmp_path / "installs"
+    same = runner.ArmConfig("procontract", repo, "HEAD", "procontract")
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first, other = pool.map(lambda _: runner.prepare_install(same, root), range(2))
+    assert first == other
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(
+            pool.map(
+                lambda arm: _install_result(arm, root),
+                (same, runner.ArmConfig("procontract", repo, second, "procontract")),
+            )
+        )
+    assert sum(isinstance(result, runner.InstallRecord) for result in results) == 1
+    assert sum(isinstance(result, runner.InstallError) for result in results) == 1
+
+
+def test_load_install_record_rejects_duplicate_keys_and_corrupt_hash(tmp_path: Path):
+    manifest = tmp_path / "install.json"
+    manifest.write_text('{"arm":"one","arm":"two"}')
+    with pytest.raises(runner.InstallError, match="manifest"):
+        runner.load_install_record(manifest)
+    manifest.write_text(
+        json.dumps(
+            {
+                "arm": "one",
+                "repo": "/repo",
+                "revision": "a" * 40,
+                "worktree": None,
+                "binary": "/binary",
+                "binary_sha256": "not-a-sha256",
+                "version": "one",
+                "install_command": [],
+                "build_command": [],
+                "smoke_command": ["/binary", "--version"],
+            }
+        )
+    )
+    with pytest.raises(runner.InstallError, match="manifest"):
+        runner.load_install_record(manifest)
+
+
+def _fake_opencode_repo(tmp_path: Path) -> tuple[Path, str, str]:
+    repo = tmp_path / "source"
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "config", "user.email", "test@example.invalid")
+    _git(repo, "config", "user.name", "Test User")
+    (repo / "packages/cli/script").mkdir(parents=True)
+    (repo / "VERSION").write_text("v1\n")
+    (repo / "packages/cli/script/build.sh").write_text(
+        "#!/bin/sh\nmkdir -p dist/cli-linux-x64-baseline/bin\n"
+        "printf '#!/bin/sh\\necho fake-%s\\n' \"$(cat ../../VERSION)\" > dist/cli-linux-x64-baseline/bin/lildax\n"
+        "chmod +x dist/cli-linux-x64-baseline/bin/lildax\n"
+    )
+    (repo / "packages/cli/script/build.sh").chmod(0o755)
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "v1")
+    first = _git(repo, "rev-parse", "HEAD")
+    (repo / "VERSION").write_text("v2\n")
+    _git(repo, "add", "VERSION")
+    _git(repo, "commit", "-m", "v2")
+    second = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "reset", "--hard", first)
+    return repo, first, second
+
+
+def _fake_bun(monkeypatch, tmp_path: Path) -> Path:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    bun = bin_dir / "bun"
+    bun.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = install ]; then exit 0; fi\n"
+        "if [ \"$1\" = --cwd ]; then cd \"$2\"; shift 2; fi\n"
+        "if [ \"$1\" = run ] && [ \"$2\" = build ]; then echo build >> \"$BUN_BUILD_LOG\"; exec sh script/build.sh; fi\n"
+        "exit 2\n"
+    )
+    bun.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("BUN_BUILD_LOG", str(bin_dir / "build.log"))
+    return bun
+
+
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, text=True).stdout.strip()
+
+
+def _sha256(path: Path) -> str:
+    return __import__("hashlib").sha256(path.read_bytes()).hexdigest()
+
+
+def _install_result(arm: runner.ArmConfig, root: Path):
+    try:
+        return runner.prepare_install(arm, root)
+    except runner.InstallError as error:
+        return error
