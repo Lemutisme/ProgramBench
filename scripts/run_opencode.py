@@ -178,6 +178,8 @@ class JobState:
     def __post_init__(self) -> None:
         if not isinstance(self.phase, str) or self.phase not in _PHASES:
             raise StateError(f"unknown job phase: {self.phase!r}")
+        if self.phase_timestamps is not None and not isinstance(self.phase_timestamps, Mapping):
+            raise StateError("phase timestamps must be a mapping")
         timestamps = {} if self.phase_timestamps is None else dict(self.phase_timestamps)
         if any(not isinstance(key, str) for key in timestamps):
             raise StateError("phase timestamps must have string keys")
@@ -206,6 +208,8 @@ class JobState:
             or self.cost < 0
         ):
             raise StateError("cost must be a nonnegative finite number")
+        if self.artifact_hashes is not None and not isinstance(self.artifact_hashes, Mapping):
+            raise StateError("artifact hashes must be a mapping")
         hashes = {} if self.artifact_hashes is None else dict(self.artifact_hashes)
         if any(not isinstance(key, str) or not isinstance(value, str) for key, value in hashes.items()):
             raise StateError("artifact hashes must map strings to strings")
@@ -299,7 +303,18 @@ class StateStore:
     def write(self, state: JobState) -> None:
         if not isinstance(state, JobState):
             raise StateError("state must be a JobState")
+        prior = self.read_optional()
+        if prior is not None and state.phase != prior.phase:
+            transitions = PHASE_TRANSITIONS.get(prior.phase)
+            if transitions is None or state.phase not in transitions:
+                raise StateError(f"illegal phase transition: {prior.phase} -> {state.phase}")
+        try:
+            previous_exists = self.path.exists()
+            previous_bytes = self.path.read_bytes() if previous_exists else None
+        except OSError as error:
+            raise StateError(f"could not read previous state: {self.path}") from error
         temporary_name: str | None = None
+        replaced = False
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             descriptor, temporary_name = tempfile.mkstemp(prefix=f".{self.path.name}.", dir=self.path.parent)
@@ -308,9 +323,15 @@ class StateStore:
                 temporary.flush()
                 os.fsync(temporary.fileno())
             Path(temporary_name).replace(self.path)
+            replaced = True
             temporary_name = None
             _sync_directory(self.path.parent)
         except (OSError, TypeError, ValueError) as error:
+            if replaced:
+                try:
+                    _restore_previous_state(self.path, previous_exists, previous_bytes)
+                except (OSError, TypeError, ValueError):
+                    pass
             raise StateError(f"could not write state: {self.path}") from error
         finally:
             if temporary_name is not None:
@@ -325,10 +346,15 @@ class StateStore:
         current_phase = self.read().phase if state is None else state.phase if isinstance(state, JobState) else state
         if not isinstance(current_phase, str) or current_phase not in _PHASES:
             raise StateError(f"unknown job phase: {current_phase!r}")
-        try:
-            return _NORMAL_NEXT[current_phase]
-        except KeyError as error:
-            raise StateError(f"phase {current_phase!r} has no next phase") from error
+        transitions = PHASE_TRANSITIONS.get(current_phase)
+        if transitions is None:
+            raise StateError(f"unknown job phase: {current_phase!r}")
+        candidates = tuple(phase for phase in transitions if phase not in ("failed", "interrupted"))
+        if not candidates:
+            raise StateError(f"phase {current_phase!r} has no next phase")
+        if len(candidates) != 1:
+            raise StateError(f"phase {current_phase!r} has ambiguous next phase")
+        return candidates[0]
 
 
 @dataclass(frozen=True)
@@ -377,17 +403,19 @@ def job_lock(path: Path) -> Iterator[Path]:
 
 def should_run(job: JobPaths, *, resume: bool, redo: bool, retry_infra: bool = False) -> bool:
     state = StateStore(job.state).read_optional()
+    if state is not None and state.phase == "failed":
+        return retry_infra and state.exit_class == "infrastructure_failed_before_provider"
+    if state is not None and state.phase == "done":
+        return redo
+    if not redo and _valid_submission(job.submission):
+        return False
     if state is None:
+        return True
+    if redo:
         return True
     if state.phase == "planned":
         return True
-    if state.phase == "done":
-        return redo or not _valid_submission(job.submission)
-    if state.phase == "failed":
-        return retry_infra and state.exit_class == "infrastructure_failed_before_provider"
-    if state.phase == "interrupted":
-        return resume or redo
-    return resume or redo
+    return resume
 
 
 def _read_lock_owner(path: Path) -> str | None:
@@ -403,6 +431,37 @@ def _sync_directory(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _restore_previous_state(path: Path, existed: bool, previous_bytes: bytes | None) -> None:
+    temporary_name: str | None = None
+    restore_error: OSError | None = None
+    try:
+        if not existed:
+            path.unlink(missing_ok=True)
+        else:
+            descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+            with os.fdopen(descriptor, "wb") as temporary:
+                temporary.write(previous_bytes or b"")
+                temporary.flush()
+                os.fsync(temporary.fileno())
+            Path(temporary_name).replace(path)
+            temporary_name = None
+    except OSError as error:
+        restore_error = error
+    try:
+        _sync_directory(path.parent)
+    except OSError as error:
+        if restore_error is None:
+            restore_error = error
+    finally:
+        if temporary_name is not None:
+            try:
+                os.unlink(temporary_name)
+            except OSError:
+                pass
+    if restore_error is not None:
+        raise restore_error
 
 
 def _valid_submission(path: Path) -> bool:
