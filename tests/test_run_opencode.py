@@ -604,6 +604,19 @@ def test_state_store_redo_reset_reopens_terminal_job_without_deleting_artifacts(
     store.write(JobState(phase="preparing"))
 
 
+def test_state_store_redo_reset_restarts_unfinished_job_from_planned(tmp_path: Path):
+    paths = JobPaths(tmp_path)
+    store = StateStore(paths.state)
+    store.write(JobState(phase="executing"))
+
+    assert should_run(paths, resume=False, redo=True) is True
+    store.reset_for_rerun(redo=True, retry_infra=False)
+
+    assert store.read().phase == "planned"
+    assert store.read().reset_reason == "redo"
+    store.write(JobState(phase="preparing"))
+
+
 def test_state_store_retry_infra_reset_reopens_only_eligible_failure(tmp_path: Path):
     path = tmp_path / "state.json"
     store = StateStore(path)
@@ -615,6 +628,28 @@ def test_state_store_retry_infra_reset_reopens_only_eligible_failure(tmp_path: P
     assert reset.phase == "planned"
     assert reset.reset_reason == "retry_infra"
     assert reset.reset_at is not None
+
+
+def test_state_store_resume_reset_reopens_only_interrupted_job(tmp_path: Path):
+    paths = JobPaths(tmp_path)
+    store = StateStore(paths.state)
+    store.write(JobState(phase="interrupted"))
+
+    assert should_run(paths, resume=True, redo=False) is True
+    assert should_run(paths, resume=False, redo=False) is False
+    store.reset_for_rerun(redo=False, retry_infra=False, resume=True)
+    assert store.read().phase == "planned"
+    assert store.read().reset_reason == "resume"
+    store.write(JobState(phase="preparing"))
+
+
+@pytest.mark.parametrize("phase", ["done", "failed"])
+def test_state_store_resume_reset_rejects_terminal_result(tmp_path: Path, phase: str):
+    store = StateStore(tmp_path / "state.json")
+    store.write(JobState(phase=phase, exit_class="provider_error" if phase == "failed" else None))
+
+    with pytest.raises(StateError, match="reset"):
+        store.reset_for_rerun(redo=False, retry_infra=False, resume=True)
 
 
 def test_state_store_reset_leaves_terminal_state_unchanged_when_write_fails(tmp_path: Path, monkeypatch):
@@ -637,7 +672,6 @@ def test_state_store_reset_leaves_terminal_state_unchanged_when_write_fails(tmp_
         ("done", None, False, False),
         ("done", None, False, True),
         ("failed", "provider_error", False, True),
-        ("executing", None, True, False),
         ("failed", "infrastructure_failed_before_provider", False, False),
     ],
 )

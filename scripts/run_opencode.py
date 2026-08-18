@@ -141,7 +141,6 @@ Phase = Literal[
 _PHASES = frozenset(
     {"planned", "preparing", "executing", "frozen", "packaged", "preflighted", "done", "failed", "interrupted"}
 )
-_TERMINAL_PHASES = frozenset({"done", "failed", "interrupted"})
 _NORMAL_NEXT: dict[str, Phase] = {
     "planned": "preparing",
     "preparing": "executing",
@@ -324,14 +323,23 @@ class StateStore:
     def write(self, state: JobState) -> None:
         self._write(state, enforce_transition=True)
 
-    def reset_for_rerun(self, *, redo: bool, retry_infra: bool) -> None:
+    def reset_for_rerun(self, *, redo: bool, retry_infra: bool, resume: bool = False) -> None:
+        """Reset an explicitly authorized existing job to ``planned``.
+
+        ``redo`` restarts any phase, ``retry_infra`` restarts only an eligible
+        infrastructure failure, and ``resume`` restarts only an interruption.
+        The reset bypasses the normal monotonic transition check but retains
+        all state metadata and on-disk artifacts.
+        """
         current = self.read()
-        if redo and current.phase in _TERMINAL_PHASES:
+        if redo:
             reason = "redo"
         elif (
             retry_infra and current.phase == "failed" and current.exit_class == "infrastructure_failed_before_provider"
         ):
             reason = "retry_infra"
+        elif resume and current.phase == "interrupted":
+            reason = "resume"
         else:
             raise StateError(f"reset is not allowed for phase {current.phase!r}")
         reset_at = time.time()
@@ -450,6 +458,14 @@ def job_lock(path: Path) -> Iterator[Path]:
 
 
 def should_run(job: JobPaths, *, resume: bool, redo: bool, retry_infra: bool = False) -> bool:
+    """Return whether a job is eligible for admission under the supplied flags.
+
+    ``redo`` makes every existing state actionable and requires
+    :meth:`StateStore.reset_for_rerun` before running from ``planned``.
+    ``resume`` makes only unfinished phases (including ``interrupted``)
+    actionable; terminal results remain skipped unless ``redo`` is explicit.
+    ``retry_infra`` is limited to pre-provider infrastructure failures.
+    """
     state = StateStore(job.state).read_optional()
     if redo:
         return True
