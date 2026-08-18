@@ -2,12 +2,14 @@ import json
 import os
 import subprocess
 import threading
+import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 
+import scripts.campaign_install as installer
 import scripts.run_opencode as runner
 from scripts.run_opencode import ConfigError, Job, expand_jobs, freeze_campaign_config, load_config, select_instances
 
@@ -494,10 +496,27 @@ def test_prepare_install_pins_detached_worktree_and_records_auditable_binary(tmp
         "--skip-embed-web-ui",
     )
     assert _git(install.worktree, "rev-parse", "HEAD") == first
-    assert subprocess.run(
-        ["git", "-C", str(install.worktree), "symbolic-ref", "-q", "HEAD"], capture_output=True, check=False
-    ).returncode == 1
+    assert (
+        subprocess.run(
+            ["git", "-C", str(install.worktree), "symbolic-ref", "-q", "HEAD"], capture_output=True, check=False
+        ).returncode
+        == 1
+    )
     assert _git(repo, "status", "--porcelain") == ""
+
+    assert runner.prepare_install is installer.prepare_install
+    assert runner.InstallRecord is installer.InstallRecord
+    manifest = json.loads((tmp_path / "installs/procontract/install.json").read_text())
+    assert manifest["requested_revision"] == "HEAD"
+    assert manifest["revision"] == first
+    assert manifest["repo_identity"] == f"local:{repo.resolve()}"
+    assert manifest["common_dir"] == str((repo / ".git").resolve())
+    assert manifest["source_dirty"] is False
+    assert manifest["platform"]
+    assert manifest["catalog_command"] == [str(install.binary), "models"]
+    assert bool(manifest["catalog_output_sha256"]) != bool(manifest["catalog_unavailable_reason"])
+    assert manifest["owned_paths"] == [str((tmp_path / "installs/procontract").resolve()), str(install.worktree)]
+    assert manifest["publication_phase"] == "manifest_published"
 
 
 def test_prepare_install_reuses_exact_manifest_without_rebuilding(tmp_path: Path, monkeypatch):
@@ -710,7 +729,9 @@ def test_prepare_install_normalizes_each_command_failure(tmp_path: Path, monkeyp
         return runner.run_checked(command, cwd)
 
     with pytest.raises(runner.InstallError, match=expected) as error:
-        runner.prepare_install(runner.ArmConfig("procontract", repo, "HEAD", "procontract"), tmp_path / "installs", fail_selected)
+        runner.prepare_install(
+            runner.ArmConfig("procontract", repo, "HEAD", "procontract"), tmp_path / "installs", fail_selected
+        )
 
     assert "exit=17" in str(error.value)
     assert "credential=secret" not in str(error.value)
@@ -739,6 +760,340 @@ def test_load_install_record_rejects_duplicate_keys_and_corrupt_hash(tmp_path: P
     )
     with pytest.raises(runner.InstallError, match="manifest"):
         runner.load_install_record(manifest)
+
+
+@pytest.mark.parametrize("phase", ["staging_metadata", "worktree_moved", "manifest_published"])
+def test_prepare_install_recovers_after_process_crash_at_durable_phase(tmp_path: Path, monkeypatch, phase: str):
+    repo, revision, _ = _fake_opencode_repo(tmp_path)
+    _fake_bun(monkeypatch, tmp_path)
+    root = tmp_path / "installs"
+    environment = os.environ.copy()
+    environment["_PROGRAMBENCH_TEST_INSTALL_CRASH_AFTER"] = phase
+    child = subprocess.run(
+        [
+            __import__("sys").executable,
+            "-c",
+            (
+                "from pathlib import Path\n"
+                "from scripts.campaign_install import ArmConfig, prepare_install\n"
+                f"prepare_install(ArmConfig('procontract', Path({str(repo)!r}), 'HEAD', 'procontract'), "
+                f"Path({str(root)!r}))\n"
+            ),
+        ],
+        cwd=Path(__file__).parents[1],
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+    assert child.returncode == 86
+    state = root / ".install-state/procontract.json"
+    assert state.exists()
+    assert json.loads(state.read_text())["phase"] == phase
+
+    install = runner.prepare_install(runner.ArmConfig("procontract", repo, "HEAD", "procontract"), root)
+
+    assert install.revision == revision
+    assert install.binary.is_file()
+    assert not state.exists()
+    assert runner.load_install_record(root / "procontract/install.json") == install
+
+
+def test_prepare_install_uses_real_process_flock_for_same_arm(tmp_path: Path):
+    repo, revision, _ = _fake_opencode_repo(tmp_path)
+    binary = tmp_path / "opencode"
+    binary.write_text("#!/bin/sh\necho supplied-v1\n")
+    binary.chmod(0o755)
+    root = tmp_path / "installs"
+    command = [
+        __import__("sys").executable,
+        "-c",
+        (
+            "from pathlib import Path\n"
+            "from scripts.campaign_install import ArmConfig, prepare_install\n"
+            f"print(prepare_install(ArmConfig('vanilla', Path({str(repo)!r}), 'HEAD', 'vanilla', "
+            f"Path({str(binary)!r})), Path({str(root)!r})).revision)\n"
+        ),
+    ]
+    children = [
+        subprocess.Popen(
+            command, cwd=Path(__file__).parents[1], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        for _ in range(2)
+    ]
+    outputs = [child.communicate(timeout=20) for child in children]
+
+    assert [child.returncode for child in children] == [0, 0]
+    assert [output.strip() for output, _ in outputs] == [revision, revision]
+    assert all(not error for _, error in outputs)
+    assert runner.load_install_record(root / "vanilla/install.json").revision == revision
+
+
+def test_prepare_install_recovers_after_worktree_parent_fsync_failure(tmp_path: Path, monkeypatch):
+    repo, revision, _ = _fake_opencode_repo(tmp_path)
+    _fake_bun(monkeypatch, tmp_path)
+    root = tmp_path / "installs"
+    original = installer._fsync_directory
+
+    def fail_after_move(path: Path):
+        if path == root / "worktrees" and (root / "worktrees" / f"procontract-{revision}").exists():
+            raise OSError("forced fsync failure")
+        original(path)
+
+    with monkeypatch.context() as context:
+        context.setattr(installer, "_fsync_directory", fail_after_move)
+        with pytest.raises(runner.InstallError, match="I/O"):
+            runner.prepare_install(runner.ArmConfig("procontract", repo, "HEAD", "procontract"), root)
+
+    state = root / ".install-state/procontract.json"
+    assert json.loads(state.read_text())["phase"] == "moving_worktree"
+    install = runner.prepare_install(runner.ArmConfig("procontract", repo, "HEAD", "procontract"), root)
+    assert install.revision == revision
+    assert not state.exists()
+
+
+def test_prepare_install_removes_only_stale_owned_final_worktree_registration(tmp_path: Path, monkeypatch):
+    repo, revision, _ = _fake_opencode_repo(tmp_path)
+    _fake_bun(monkeypatch, tmp_path)
+    root = tmp_path / "installs"
+    environment = os.environ.copy()
+    environment["_PROGRAMBENCH_TEST_INSTALL_CRASH_AFTER"] = "worktree_moved"
+    child = subprocess.run(
+        [
+            __import__("sys").executable,
+            "-c",
+            (
+                "from pathlib import Path\n"
+                "from scripts.campaign_install import ArmConfig, prepare_install\n"
+                f"prepare_install(ArmConfig('procontract', Path({str(repo)!r}), 'HEAD', 'procontract'), "
+                f"Path({str(root)!r}))\n"
+            ),
+        ],
+        cwd=Path(__file__).parents[1],
+        env=environment,
+    )
+    final_worktree = root / "worktrees" / f"procontract-{revision}"
+    assert child.returncode == 86
+    installer.shutil.rmtree(final_worktree)
+    assert str(final_worktree) in _git(repo, "worktree", "list", "--porcelain")
+
+    install = runner.prepare_install(runner.ArmConfig("procontract", repo, "HEAD", "procontract"), root)
+
+    assert install.worktree == final_worktree
+    assert _git(repo, "worktree", "list", "--porcelain").count(str(final_worktree)) == 1
+
+
+def test_prepare_install_refuses_stale_foreign_final_worktree_registration(tmp_path: Path, monkeypatch):
+    repo, revision, _ = _fake_opencode_repo(tmp_path)
+    _fake_bun(monkeypatch, tmp_path)
+    root = tmp_path / "installs"
+    final_worktree = root / "worktrees" / f"procontract-{revision}"
+    final_worktree.parent.mkdir(parents=True)
+    _git(repo, "worktree", "add", "--detach", str(final_worktree), revision)
+    installer.shutil.rmtree(final_worktree)
+
+    with pytest.raises(runner.InstallRecoveryError, match="foreign worktree registration"):
+        runner.prepare_install(runner.ArmConfig("procontract", repo, "HEAD", "procontract"), root)
+
+    assert str(final_worktree) in _git(repo, "worktree", "list", "--porcelain")
+    assert not (root / ".install-state/procontract.json").exists()
+
+
+def test_prepare_install_surfaces_cleanup_failure_and_reconciles_it_later(tmp_path: Path, monkeypatch):
+    repo, _, _ = _fake_opencode_repo(tmp_path)
+    _fake_bun(monkeypatch, tmp_path)
+    root = tmp_path / "installs"
+    original = installer.shutil.rmtree
+
+    def fail_cleanup(path: Path):
+        if Path(path).parent == root / ".install-staging":
+            raise OSError("forced cleanup failure")
+        original(path)
+
+    def fail_install(command, cwd):
+        if command == ("bun", "install", "--frozen-lockfile"):
+            return subprocess.CompletedProcess(command, 9, "", "")
+        return runner.run_checked(command, cwd)
+
+    with monkeypatch.context() as context:
+        context.setattr(installer.shutil, "rmtree", fail_cleanup)
+        with pytest.raises(runner.InstallCleanupError, match=r"retained path=.*phase=staging_metadata"):
+            runner.prepare_install(runner.ArmConfig("procontract", repo, "HEAD", "procontract"), root, fail_install)
+
+    assert (root / ".install-state/procontract.json").exists()
+    install = runner.prepare_install(runner.ArmConfig("procontract", repo, "HEAD", "procontract"), root)
+    assert install.binary.is_file()
+    assert not (root / ".install-state/procontract.json").exists()
+
+
+def test_prepare_install_refuses_foreign_final_path_and_preserves_it(tmp_path: Path, monkeypatch):
+    repo, _, _ = _fake_opencode_repo(tmp_path)
+    _fake_bun(monkeypatch, tmp_path)
+    final = tmp_path / "installs/procontract"
+    final.mkdir(parents=True)
+    evidence = final / "foreign.txt"
+    evidence.write_text("keep me")
+
+    with pytest.raises(runner.InstallRecoveryError, match="foreign final"):
+        runner.prepare_install(runner.ArmConfig("procontract", repo, "HEAD", "procontract"), tmp_path / "installs")
+
+    assert evidence.read_text() == "keep me"
+
+
+@pytest.mark.parametrize(
+    ("name", "mode"),
+    [("../procontract", "procontract"), ("/vanilla", "vanilla"), ("procontract", "vanilla")],
+)
+def test_prepare_install_rejects_arm_path_traversal_and_mode_mismatch(tmp_path: Path, name: str, mode: str):
+    repo, _, _ = _fake_opencode_repo(tmp_path)
+
+    with pytest.raises(runner.InstallError, match="exactly procontract or vanilla"):
+        runner.prepare_install(runner.ArmConfig(name, repo, "HEAD", mode), tmp_path / "installs")
+
+
+def test_prepare_install_reuses_deleted_selector_with_dirty_source(tmp_path: Path, monkeypatch):
+    repo, revision, _ = _fake_opencode_repo(tmp_path)
+    _fake_bun(monkeypatch, tmp_path)
+    _git(repo, "tag", "installation-selector", revision)
+    arm = runner.ArmConfig("vanilla", repo, "installation-selector", "vanilla")
+    root = tmp_path / "installs"
+    first = runner.prepare_install(arm, root)
+    _git(repo, "tag", "-d", "installation-selector")
+    (repo / "dirty.txt").write_text("dirty")
+
+    assert runner.prepare_install(arm, root) == first
+
+
+def test_supplied_binary_copy_and_commands_exclude_environment_secrets(tmp_path: Path, monkeypatch):
+    repo, _, _ = _fake_opencode_repo(tmp_path)
+    binary = tmp_path / "opencode"
+    binary.write_text('#!/bin/sh\nif [ -n "$CAMPAIGN_SECRET" ]; then echo "$CAMPAIGN_SECRET"; else echo safe-v1; fi\n')
+    binary.chmod(0o755)
+    monkeypatch.setenv("CAMPAIGN_SECRET", "must-not-leak")
+
+    install = runner.prepare_install(
+        runner.ArmConfig("vanilla", repo, "HEAD", "vanilla", binary), tmp_path / "installs"
+    )
+    binary.write_text("#!/bin/sh\necho mutated-source\n")
+
+    assert install.version == "safe-v1"
+    assert "must-not-leak" not in (tmp_path / "installs/vanilla/install.json").read_text()
+    assert (
+        subprocess.run([install.binary, "--version"], capture_output=True, text=True, env={}).stdout.strip()
+        == "safe-v1"
+    )
+
+
+@pytest.mark.parametrize("replacement", [None, "other"])
+def test_supplied_binary_reuse_requires_same_delivery_mode_and_source_path(tmp_path: Path, replacement: str | None):
+    repo, _, _ = _fake_opencode_repo(tmp_path)
+    binary = tmp_path / "opencode"
+    binary.write_text("#!/bin/sh\necho safe-v1\n")
+    binary.chmod(0o755)
+    root = tmp_path / "installs"
+    runner.prepare_install(runner.ArmConfig("vanilla", repo, "HEAD", "vanilla", binary), root)
+    other = None
+    if replacement:
+        other = tmp_path / replacement
+        other.write_bytes(binary.read_bytes())
+        other.chmod(0o755)
+
+    with pytest.raises(runner.InstallError, match="identity"):
+        runner.prepare_install(runner.ArmConfig("vanilla", repo, "HEAD", "vanilla", other), root)
+
+
+def test_interrupted_supplied_binary_recovery_requires_same_source_path(tmp_path: Path):
+    repo, _, _ = _fake_opencode_repo(tmp_path)
+    binary = tmp_path / "opencode"
+    binary.write_text("#!/bin/sh\necho safe-v1\n")
+    binary.chmod(0o755)
+    other = tmp_path / "other"
+    other.write_bytes(binary.read_bytes())
+    other.chmod(0o755)
+    root = tmp_path / "installs"
+    environment = os.environ.copy()
+    environment["_PROGRAMBENCH_TEST_INSTALL_CRASH_AFTER"] = "staged"
+    child = subprocess.run(
+        [
+            __import__("sys").executable,
+            "-c",
+            (
+                "from pathlib import Path\n"
+                "from scripts.campaign_install import ArmConfig, prepare_install\n"
+                f"prepare_install(ArmConfig('vanilla', Path({str(repo)!r}), 'HEAD', 'vanilla', "
+                f"Path({str(binary)!r})), Path({str(root)!r}))\n"
+            ),
+        ],
+        cwd=Path(__file__).parents[1],
+        env=environment,
+    )
+    assert child.returncode == 86
+
+    with pytest.raises(runner.InstallRecoveryError, match="identity"):
+        runner.prepare_install(runner.ArmConfig("vanilla", repo, "HEAD", "vanilla", other), root)
+
+    assert not (root / "vanilla/install.json").exists()
+
+
+def test_catalog_unavailable_reason_is_stable_and_sanitized(tmp_path: Path):
+    repo, _, _ = _fake_opencode_repo(tmp_path)
+    binary = tmp_path / "opencode"
+    binary.write_text('#!/bin/sh\nif [ "$1" = models ]; then echo credential=secret >&2; exit 4; fi\necho safe-v1\n')
+    binary.chmod(0o755)
+
+    install = runner.prepare_install(
+        runner.ArmConfig("vanilla", repo, "HEAD", "vanilla", binary), tmp_path / "installs"
+    )
+
+    assert install.catalog_output_sha256 is None
+    assert install.catalog_unavailable_reason == "catalog command exit=4"
+    assert "secret" not in (tmp_path / "installs/vanilla/install.json").read_text()
+
+
+def test_run_checked_timeout_kills_descendant_process_group(tmp_path: Path, monkeypatch):
+    pid_file = tmp_path / "descendant.pid"
+    command = tmp_path / "hang"
+    command.write_text(f"#!/bin/sh\nsh -c 'trap \"\" TERM; echo $$ > {pid_file}; while :; do sleep 1; done' &\nwait\n")
+    command.chmod(0o755)
+    monkeypatch.setitem(installer._ACTION_TIMEOUTS, "descendant-test", 0.1)
+
+    with pytest.raises(TimeoutError):
+        installer.run_checked((str(command),), action="descendant-test")
+
+    descendant = int(pid_file.read_text())
+    status = subprocess.run(["ps", "-o", "stat=", "-p", str(descendant)], capture_output=True, text=True).stdout.strip()
+    assert not status or status.startswith("Z")
+
+
+def test_run_checked_timeout_kills_descendant_that_escaped_process_group(tmp_path: Path, monkeypatch):
+    pid_file = tmp_path / "descendant.pid"
+    command = tmp_path / "escape"
+    command.write_text(f"#!/bin/sh\nsetsid sh -c 'trap \"\" TERM; echo $$ > {pid_file}; sleep 3' &\n")
+    command.chmod(0o755)
+    monkeypatch.setitem(installer._ACTION_TIMEOUTS, "escaped-descendant-test", 0.1)
+    monkeypatch.setattr(installer, "_TERMINATION_GRACE_SECONDS", 0.1)
+    started = time.monotonic()
+
+    with pytest.raises(TimeoutError):
+        installer.run_checked((str(command),), action="escaped-descendant-test")
+
+    assert time.monotonic() - started < 2
+    descendant = int(pid_file.read_text())
+    status = subprocess.run(["ps", "-o", "stat=", "-p", str(descendant)], capture_output=True, text=True).stdout.strip()
+    assert not status or status.startswith("Z")
+
+
+def test_run_checked_fails_closed_when_descendant_containment_is_unavailable(tmp_path: Path, monkeypatch):
+    marker = tmp_path / "executed"
+    command = tmp_path / "command"
+    command.write_text(f"#!/bin/sh\ntouch {marker}\n")
+    command.chmod(0o755)
+    monkeypatch.setattr(installer, "_create_command_cgroup", lambda: None)
+
+    with pytest.raises(runner.InstallError, match="containment"):
+        installer.run_checked((str(command),))
+
+    assert not marker.exists()
 
 
 def _fake_opencode_repo(tmp_path: Path) -> tuple[Path, str, str]:
@@ -772,9 +1127,9 @@ def _fake_bun(monkeypatch, tmp_path: Path) -> Path:
     bun = bin_dir / "bun"
     bun.write_text(
         "#!/bin/sh\n"
-        "if [ \"$1\" = install ]; then exit 0; fi\n"
-        "if [ \"$1\" = --cwd ]; then cwd=\"$2\"; cd \"$2\"; shift 2; fi\n"
-        "if [ \"$1\" = run ] && [ \"$2\" = build ]; then echo \"$cwd $*\" >> build.log; exec sh script/build.sh; fi\n"
+        'if [ "$1" = install ]; then exit 0; fi\n'
+        'if [ "$1" = --cwd ]; then cwd="$2"; cd "$2"; shift 2; fi\n'
+        'if [ "$1" = run ] && [ "$2" = build ]; then echo "$cwd $*" >> build.log; exec sh script/build.sh; fi\n'
         "exit 2\n"
     )
     bun.chmod(0o755)
