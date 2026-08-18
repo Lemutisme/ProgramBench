@@ -66,8 +66,8 @@ class Limits:
         object.__setattr__(self, "total_cost_hard", float(self.total_cost_hard))
         if not all(math.isfinite(value) for value in costs):
             raise ConfigError("cost limits must be finite")
-        if any(value < 0 for value in costs):
-            raise ConfigError("cost limits must be nonnegative")
+        if any(value <= 0 for value in costs):
+            raise ConfigError("cost limits must be positive")
         if self.total_cost_soft > self.total_cost_hard:
             raise ConfigError("soft cost limit must not exceed hard cost limit")
 
@@ -224,6 +224,7 @@ def freeze_campaign_config(config: CampaignConfig, manifest_path: Path) -> None:
             os.link(temporary_name, manifest_path)
         except FileExistsError:
             _compare_manifest(canonical, manifest_path)
+            _unlink_and_sync_parent(temporary_name, manifest_path.parent)
             return
         _unlink_and_sync_parent(temporary_name, manifest_path.parent)
     finally:

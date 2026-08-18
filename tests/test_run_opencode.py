@@ -334,6 +334,10 @@ def test_load_config_rejects_missing_required_schema_key(tmp_path: Path):
     "costs",
     [
         "total_cost_soft: -1\n  total_cost_hard: 2",
+        "total_cost_soft: 0\n  total_cost_hard: 2",
+        "total_cost_soft: -0.0\n  total_cost_hard: 2",
+        "total_cost_soft: 0\n  total_cost_hard: 0",
+        "total_cost_soft: 1\n  total_cost_hard: 0",
         "total_cost_soft: 3\n  total_cost_hard: 2",
         "total_cost_soft: .nan\n  total_cost_hard: 2",
         "total_cost_soft: .inf\n  total_cost_hard: .inf",
@@ -356,6 +360,27 @@ def test_freeze_campaign_config_manifest_does_not_allow_nonfinite_values(tmp_pat
 
     with pytest.raises(ConfigError, match="finite"):
         freeze_campaign_config(config, tmp_path / "campaign.json")
+
+
+def test_freeze_campaign_config_identical_concurrent_writers_reuse_one_manifest(tmp_path: Path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    manifest_path = tmp_path / "campaign.json"
+    config = load_config(_write_campaign(tmp_path / "campaign.yaml", repo))
+    barrier = threading.Barrier(2)
+    original_link = runner.os.link
+
+    def synchronized_link(source, destination):
+        barrier.wait(timeout=5)
+        return original_link(source, destination)
+
+    monkeypatch.setattr(runner.os, "link", synchronized_link)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: _freeze_result(config, manifest_path), (0, 1)))
+
+    assert results == [None, None]
+    assert manifest_path.exists()
+    assert list(tmp_path.glob(f".{manifest_path.name}.*")) == []
 
 
 def test_load_config_normalizes_missing_file_error(tmp_path: Path):
