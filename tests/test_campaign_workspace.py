@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 
 from scripts.campaign_install import InstallRecord
-from scripts.campaign_state import JobPaths
+from scripts.campaign_state import JobLease, JobPaths
 from scripts.campaign_workspace import (
     ContainerConflictError,
     DockerCommandError,
@@ -387,6 +387,35 @@ def test_workspace_constructs_redacted_dynamic_loopback_server(tmp_path: Path) -
     text = workspace.manifest_path.read_text()
     assert "OPENAI_API_KEY" in text and "secret-value" not in text
     assert docker.observed_phases == ["preparing", "launching"]
+
+
+def test_workspace_claim_accepts_lock_artifacts_from_active_job_lease(tmp_path: Path) -> None:
+    value = request(tmp_path, RecordingDocker())
+    value.job.root.mkdir(parents=True)
+
+    with JobLease(value.job, resume=True, redo=False, retry_infra=False), WorkspaceLease(value) as lease:
+        workspace = ensure_workspace_impl(value, lease)
+
+    assert workspace.manifest.phase == "running"
+
+
+def test_workspace_claim_accepts_custom_lock_artifacts_from_active_job_lease(tmp_path: Path) -> None:
+    value = request(tmp_path, RecordingDocker())
+    value = replace(
+        value,
+        job=JobPaths(
+            value.job.root,
+            state=value.job.root / "custom-state.json",
+            lock=value.job.root / "custom-job.lock",
+            submission=value.job.submission,
+        ),
+    )
+    value.job.root.mkdir(parents=True)
+
+    with JobLease(value.job, resume=True, redo=False, retry_infra=False), WorkspaceLease(value) as lease:
+        workspace = ensure_workspace_impl(value, lease)
+
+    assert workspace.manifest.phase == "running"
 
 
 def test_ensure_workspace_requires_active_matching_lease(tmp_path: Path) -> None:
@@ -957,7 +986,7 @@ def test_workspace_rejects_unsafe_root_overlaps(tmp_path: Path) -> None:
 def test_workspace_rejects_symlinked_derived_mount_before_journaling(tmp_path: Path, leaf: str) -> None:
     docker = RecordingDocker()
     value = request(tmp_path, docker)
-    campaign_workspace._claim_job_root(value.job.root, value)
+    campaign_workspace._claim_job_root(value.job, value)
     target = tmp_path / "outside"
     target.mkdir()
     if leaf == "candidate":

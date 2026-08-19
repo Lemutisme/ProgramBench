@@ -959,13 +959,13 @@ def _validate_request(request: WorkspaceRequest) -> WorkspaceRequest:
     expected_job_root = campaign_root / request.campaign / request.arm / request.instance_id
     if job_root != expected_job_root:
         raise WorkspaceError("job root must use the fixed campaign/arm/instance layout")
-    _claim_job_root(job_root, request)
     job = JobPaths(
         job_root,
         _canonical_job_path(request.job.state, job_root, "job state"),
         _canonical_job_path(request.job.lock, job_root, "job lock"),
         _canonical_job_path(request.job.submission, job_root, "job submission"),
     )
+    _claim_job_root(job, request)
     candidate = _canonical_root(request.candidate_root, "candidate root")
     state = _canonical_root(request.state_root, "state root")
     logs = _canonical_root(request.log_dir, "log root")
@@ -1011,7 +1011,8 @@ def _validate_request(request: WorkspaceRequest) -> WorkspaceRequest:
     )
 
 
-def _claim_job_root(job_root: Path, request: WorkspaceRequest) -> None:
+def _claim_job_root(job: JobPaths, request: WorkspaceRequest) -> None:
+    job_root = job.root
     marker = job_root / ".programbench-workspace-owner.json"
     expected = {
         "version": 1,
@@ -1026,7 +1027,20 @@ def _claim_job_root(job_root: Path, request: WorkspaceRequest) -> None:
         if marker.is_symlink() or _load_candidate_marker(marker) != expected:
             raise ContainerConflictError("job root ownership marker conflicts with this workspace")
         return
-    foreign = [path for path in job_root.iterdir() if path.name not in {".workspace.lock", "job.lock"}]
+    control = tuple(
+        path
+        for path in (
+            job_root / ".workspace.lock",
+            Path(job.lock),
+            Path(job.state).with_name(f"{Path(job.state).name}.lock"),
+        )
+        if path.exists()
+    )
+    foreign = [
+        path
+        for path in job_root.rglob("*")
+        if path not in control and not any(path in artifact.parents for artifact in control)
+    ]
     if foreign:
         raise ContainerConflictError("nonempty job root is not claimed by this campaign")
     _write_json(marker, expected)
