@@ -79,6 +79,22 @@ from scripts.campaign_vanilla import (
     VanillaResult,
     run_vanilla,
 )
+from scripts.campaign_procontract import (
+    ACCEPTANCE_POLICY,
+    PRINCIPAL_CLAIM,
+    REPLAY_POLICY,
+    HttpProContractApi,
+    ProContractApi,
+    ProContractCompletion,
+    ProContractConflictError,
+    ProContractDeliveryError,
+    ProContractError,
+    ProContractHttpError,
+    ProContractIssueRequest,
+    ProContractResult,
+    build_issue_payload,
+    run_procontract,
+)
 
 # Public compatibility re-exports for callers that historically imported state helpers here.
 import yaml
