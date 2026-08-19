@@ -789,11 +789,11 @@ def run_vanilla(
             break
         if status_value != "idle":
             inactive_messages = None
-            sleeper(poll_interval)
+            _sleep_before_deadline(clock, sleeper, poll_interval, wall_deadline)
             continue
         if inactive_messages != messages:
             inactive_messages = messages
-            sleeper(min(poll_interval, max(0.0, wall_deadline - clock())))
+            _sleep_before_deadline(clock, sleeper, poll_interval, wall_deadline)
             continue
         if rate_limited:
             completion = VanillaCompletion.PROVIDER_ERROR
@@ -807,7 +807,7 @@ def run_vanilla(
         if usage.provider_turns:
             completion = VanillaCompletion.IDLE
             break
-        sleeper(min(poll_interval, max(0.0, wall_deadline - clock())))
+        _sleep_before_deadline(clock, sleeper, poll_interval, wall_deadline)
 
     if workspace.lease._handle_active:
         workspace.stop()
@@ -888,11 +888,32 @@ def _backoff(
     poll_interval: float,
     deadline: float,
 ) -> bool:
-    while (
-        breaker.backoff_until is not None and clock() < min(breaker.backoff_until, deadline) and not breaker.stop_active
-    ):
-        sleeper(min(poll_interval, breaker.backoff_until - clock(), deadline - clock()))
-    return clock() >= deadline or breaker.stop_active
+    while breaker.backoff_until is not None and not breaker.stop_active:
+        now = clock()
+        until = min(breaker.backoff_until, deadline)
+        if now >= until:
+            return now >= deadline or breaker.stop_active
+        duration = min(poll_interval, until - now)
+        if duration <= 0:
+            return now >= deadline or breaker.stop_active
+        sleeper(duration)
+    return breaker.stop_active
+
+
+def _sleep_before_deadline(
+    clock: Callable[[], float],
+    sleeper: Callable[[float], None],
+    interval: float,
+    deadline: float,
+) -> bool:
+    now = clock()
+    if now >= deadline:
+        return False
+    duration = min(interval, deadline - now)
+    if duration <= 0:
+        return False
+    sleeper(duration)
+    return True
 
 
 def _safety_completion(
@@ -1572,14 +1593,20 @@ def _interrupt(
             workspace.stop()
             return True
     deadline = clock() + min(10.0, MAX_WALL_TIME_SECONDS)
-    while clock() < deadline:
+    while True:
+        now = clock()
+        if now >= deadline:
+            break
         try:
             if api.status(session_id) == "idle":
                 return False
         except VanillaError:
             workspace.stop()
             return True
-        sleeper(min(poll_interval, deadline - clock()))
+        duration = min(poll_interval, deadline - now)
+        if duration <= 0:
+            break
+        sleeper(duration)
     workspace.stop()
     return True
 

@@ -19,7 +19,7 @@ from scripts import campaign_freeze as freeze_module
 from scripts import run_opencode as campaign_entrypoint
 from scripts.campaign_install import InstallRecord
 from scripts.campaign_state import JobLease, JobPaths, JobState, StateConflictError, StateStore
-from scripts.campaign_usage import CircuitBreaker, summarize_usage
+from scripts.campaign_usage import CircuitBreaker, UsageSummary, summarize_usage
 from scripts.campaign_vanilla import (
     ORIGINAL_TASK,
     HttpOpenCodeApi,
@@ -127,6 +127,23 @@ class GuardClock(FakeClock):
         if self.sleep_calls > 5:
             raise AssertionError("adapter did not enforce its safety ceiling")
         super().sleep(seconds)
+
+
+class JumpingClock:
+    def __init__(self, *values: float) -> None:
+        self.values = list(values)
+        self.last = values[-1]
+        self.sleeps: list[float] = []
+
+    def __call__(self) -> float:
+        if self.values:
+            self.last = self.values.pop(0)
+        return self.last
+
+    def sleep(self, seconds: float) -> None:
+        if seconds <= 0:
+            raise ValueError("sleep duration must be positive")
+        self.sleeps.append(seconds)
 
 
 class FakeOpenCodeApi:
@@ -1302,6 +1319,17 @@ def test_perpetual_post_admission_429_stops_at_wall_deadline_with_bounded_calls(
     assert api.message_calls == 2
     assert api.interrupts == 1
     assert len(api.sessions) == len(api.prompts) == 1
+
+
+def test_backoff_clock_jump_never_schedules_negative_sleep_and_reaches_wall_safety() -> None:
+    clock = JumpingClock(100, 102, 102)
+    breaker = CircuitBreaker(clock=clock, retry_after_default=10)
+    breaker.observe_error(429, retry_after="10", now=100)
+    assert vanilla_module._backoff(breaker, clock, clock.sleep, 1, 101)
+    assert clock.sleeps == [1]
+    assert (
+        vanilla_module._safety_completion(breaker, UsageSummary(), limits(), clock, 101) is VanillaCompletion.WALL_TIME
+    )
 
 
 def test_projected_retry_part_feeds_429_backoff_once_then_allows_success(tmp_path: Path) -> None:
