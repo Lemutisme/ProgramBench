@@ -464,7 +464,10 @@ class CircuitBreaker:
 
     def acknowledge(self, reason: str | None = None) -> None:
         with self._lock:
+            self._apply_cost_caps()
             if reason == "soft":
+                if "soft" not in self._pause_causes:
+                    return
                 self._pause_causes.discard("soft")
                 self._soft_acknowledged = True
                 return
@@ -479,9 +482,13 @@ class CircuitBreaker:
                 return
             if reason is not None:
                 raise UsageParseError("unknown acknowledgement reason")
+            had_cache_pause = "cache" in self._pause_causes
+            had_soft_pause = "soft" in self._pause_causes
             self._pause_causes.difference_update({"auth", "cache", "soft"})
-            self._cache_acknowledged = True
-            self._soft_acknowledged = True
+            if had_cache_pause:
+                self._cache_acknowledged = True
+            if had_soft_pause:
+                self._soft_acknowledged = True
 
     def acknowledge_cache(self) -> None:
         self.acknowledge("cache")
@@ -498,6 +505,7 @@ class CircuitBreaker:
     def snapshot(self) -> dict[str, object]:
         with self._lock:
             self._release_backoff()
+            self._apply_cost_caps()
             return {
                 "version": 1,
                 "cache_warmup_turns": self.cache_warmup_turns,

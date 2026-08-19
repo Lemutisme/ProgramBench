@@ -449,6 +449,42 @@ def test_hard_cap_supersedes_soft_and_remains_after_lower_replacement() -> None:
     assert breaker.snapshot()["pause_causes"] == ["hard"]
 
 
+def test_inactive_soft_acknowledgement_is_noop_and_roundtrips() -> None:
+    breaker = CircuitBreaker(soft_cost_cap="1")
+    breaker.acknowledge("soft")
+    assert breaker.snapshot()["soft_cap_acknowledged"] is False
+    assert CircuitBreaker.from_snapshot(breaker.snapshot()).snapshot() == breaker.snapshot()
+
+
+def test_generic_acknowledgement_does_not_set_soft_ack_without_active_soft_pause() -> None:
+    empty = CircuitBreaker()
+    empty.acknowledge()
+    assert empty.snapshot()["soft_cap_acknowledged"] is False
+    auth = CircuitBreaker()
+    auth.observe_error(401)
+    auth.acknowledge()
+    assert auth.snapshot()["soft_cap_acknowledged"] is False
+    cache = CircuitBreaker()
+    cache.observe("job", 1, usage(turns=20, read=0))
+    cache.observe("job2", 1, usage(turns=20, read=0))
+    cache.acknowledge()
+    assert cache.snapshot()["soft_cap_acknowledged"] is False
+    hard = CircuitBreaker(hard_cost_cap="1")
+    hard.observe("job", 1, usage(turns=1, cost="1"))
+    hard.acknowledge()
+    assert hard.snapshot()["soft_cap_acknowledged"] is False
+
+
+def test_active_soft_acknowledgement_sets_marker_and_roundtrips() -> None:
+    breaker = CircuitBreaker(soft_cost_cap="1")
+    breaker.observe("job", 1, usage(turns=1, cost="1"))
+    breaker.acknowledge("soft")
+    assert breaker.snapshot()["soft_cap_acknowledged"] is True
+    restored = CircuitBreaker.from_snapshot(breaker.snapshot())
+    assert restored.admission_allowed
+    assert restored.snapshot() == breaker.snapshot()
+
+
 def test_acknowledged_recoverable_pause_round_trips_without_derived_drift() -> None:
     breaker = CircuitBreaker(soft_cost_cap="1")
     breaker.observe("job", 1, usage(turns=1, cost="1"))
