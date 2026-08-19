@@ -11,7 +11,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Callable, Mapping, Sequence
 
 
 class ProcessError(RuntimeError):
@@ -62,6 +62,7 @@ def run_checked(
     grace: float,
     output_limit: int,
     create_cgroup: Callable[[], Path | None] | None = None,
+    environment: Mapping[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run with bounded output in delegated cgroup v2, or fail before launch."""
     executable = shutil.which(command[0])
@@ -73,7 +74,7 @@ def run_checked(
         process = subprocess.Popen(
             _contained_invocation(cgroup, invocation),
             cwd=cwd,
-            env={"PATH": os.defpath, "LANG": "C", "LC_ALL": "C"},
+            env=dict(environment) if environment is not None else {"PATH": os.defpath, "LANG": "C", "LC_ALL": "C"},
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
@@ -257,7 +258,11 @@ def _remove_cgroup(cgroup: Path, grace: float) -> None:
 
 def _descendant_pids(root: int) -> set[int]:
     parents: dict[int, int] = {}
-    for entry in Path("/proc").iterdir():
+    try:
+        entries = tuple(Path("/proc").iterdir())
+    except OSError:
+        return set()
+    for entry in entries:
         if not entry.name.isdigit():
             continue
         try:

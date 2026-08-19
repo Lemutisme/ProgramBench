@@ -7,6 +7,7 @@ import signal
 import subprocess
 import threading
 import time
+from pathlib import Path
 
 
 class DockerProcessError(RuntimeError):
@@ -23,6 +24,9 @@ _TERMINATION_GRACE = 0.25
 
 def run_docker(command: tuple[str, ...], timeout: float) -> str:
     """Run one Docker command with capped output and descendant cleanup."""
+    contained = _run_contained(command, timeout)
+    if contained is not None:
+        return contained
     try:
         process = subprocess.Popen(
             command,
@@ -81,12 +85,48 @@ def run_docker(command: tuple[str, ...], timeout: float) -> str:
     return decoded
 
 
+def _run_contained(command: tuple[str, ...], timeout: float) -> str | None:
+    from scripts import campaign_process
+
+    try:
+        cgroup = campaign_process.create_command_cgroup()
+    except campaign_process.ProcessError:
+        return None
+    try:
+        result = campaign_process.run_checked(
+            command,
+            None,
+            timeout,
+            _TERMINATION_GRACE,
+            _OUTPUT_LIMIT,
+            lambda: cgroup,
+            os.environ,
+        )
+    except TimeoutError:
+        raise DockerProcessError("docker command timed out") from None
+    except campaign_process.ProcessOutputLimitError as error:
+        raise DockerProcessError(str(error).replace("command", "docker command", 1)) from None
+    except campaign_process.ProcessError as error:
+        raise DockerProcessError(f"docker contained cleanup failed ({type(error).__name__})") from None
+    output = result.stdout + result.stderr
+    if result.returncode != 0 and any(
+        marker in output.lower() for marker in ("no such object", "no such container", "no such image", "not found")
+    ):
+        raise DockerProcessNotFoundError("docker object was not found")
+    if result.returncode != 0:
+        raise DockerProcessError(f"docker command failed (exit {result.returncode})")
+    return output
+
+
 def _terminate(process: subprocess.Popen[bytes]) -> None:
+    descendants = _best_effort_descendants(process.pid)
     _signal_process_group(process.pid, signal.SIGTERM)
+    _signal_processes(descendants, signal.SIGTERM)
     deadline = time.monotonic() + _TERMINATION_GRACE
     while process.poll() is None and time.monotonic() < deadline:
         time.sleep(0.01)
     _signal_process_group(process.pid, signal.SIGKILL)
+    _signal_processes(descendants | _best_effort_descendants(process.pid), signal.SIGKILL)
     try:
         process.wait(timeout=_TERMINATION_GRACE)
     except subprocess.TimeoutExpired:
@@ -99,3 +139,34 @@ def _signal_process_group(process_group: int, requested_signal: signal.Signals) 
         os.killpg(process_group, requested_signal)
     except ProcessLookupError:
         return
+
+
+def _best_effort_descendants(root: int) -> set[int]:
+    parents: dict[int, int] = {}
+    try:
+        entries = tuple(Path("/proc").iterdir())
+    except OSError:
+        return set()
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            parent = next(line for line in (entry / "status").read_text().splitlines() if line.startswith("PPid:"))
+        except (OSError, StopIteration):
+            continue
+        parents[int(entry.name)] = int(parent.split()[1])
+    descendants: set[int] = set()
+    frontier = {root}
+    while frontier:
+        children = {pid for pid, parent in parents.items() if parent in frontier and pid not in descendants}
+        descendants.update(children)
+        frontier = children
+    return descendants
+
+
+def _signal_processes(processes: set[int], requested_signal: signal.Signals) -> None:
+    for process in processes:
+        try:
+            os.kill(process, requested_signal)
+        except ProcessLookupError:
+            continue

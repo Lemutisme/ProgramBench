@@ -48,6 +48,25 @@ def test_docker_runner_timeout_does_not_require_procfs(tmp_path: Path, monkeypat
         _run_docker((str(command),), 0.1)
 
 
+def test_docker_runner_timeout_kills_detached_pipe_holder(tmp_path: Path) -> None:
+    pid_file = tmp_path / "detached.pid"
+    command = tmp_path / "docker"
+    command.write_text(f"#!/bin/sh\nsetsid sh -c 'trap \"\" TERM; echo $$ > {pid_file}; sleep 30' &\nwait\n")
+    command.chmod(0o755)
+    started = time.monotonic()
+
+    with pytest.raises(DockerCommandError, match="timed out") as error:
+        _run_docker((str(command),), 0.1)
+
+    assert time.monotonic() - started < 2
+    assert len(str(error.value)) < 200
+    detached = int(pid_file.read_text())
+    status = subprocess.run(
+        ["ps", "-o", "stat=", "-p", str(detached)], capture_output=True, text=True, timeout=2
+    ).stdout.strip()
+    assert not status or status.startswith("Z")
+
+
 def test_docker_runner_never_reports_secret_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     secret = "workspace-secret-value"
     command = tmp_path / "docker"

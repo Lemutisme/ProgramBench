@@ -438,6 +438,25 @@ def test_workspace_lease_is_cross_process_and_preserves_journal(tmp_path: Path) 
         process.wait(timeout=5)
 
 
+@pytest.mark.parametrize("failure", [PermissionError("denied"), KeyboardInterrupt()])
+def test_workspace_lease_does_not_mask_unexpected_lock_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: BaseException
+) -> None:
+    value = request(tmp_path, RecordingDocker())
+
+    class FailingLock:
+        def __enter__(self):
+            raise failure
+
+        def __exit__(self, *_args):
+            return None
+
+    monkeypatch.setattr(campaign_workspace, "job_lock", lambda _path: FailingLock())
+
+    with pytest.raises(type(failure), match="denied" if isinstance(failure, PermissionError) else None):
+        WorkspaceLease(value).__enter__()
+
+
 def test_running_adoption_rejects_candidate_inode_substitution(tmp_path: Path) -> None:
     docker = RecordingDocker()
     value = request(tmp_path, docker)
@@ -464,6 +483,25 @@ def test_running_adoption_rejects_bind_root_inode_substitution(tmp_path: Path, r
     path.mkdir()
 
     with pytest.raises(ContainerConflictError):
+        ensure_workspace(value)
+
+
+@pytest.mark.parametrize("mutation", ["missing-candidate", "extra", "renamed"])
+def test_manifest_rejects_nonexact_phase_path_identity_schema(tmp_path: Path, mutation: str) -> None:
+    value = request(tmp_path, RecordingDocker())
+    workspace = ensure_workspace(value)
+    manifest = json.loads(workspace.manifest_path.read_text())
+    if mutation == "missing-candidate":
+        manifest["path_identities"] = [
+            identity for identity in manifest["path_identities"] if identity["name"] != "candidate"
+        ]
+    if mutation == "extra":
+        manifest["path_identities"].append({**manifest["path_identities"][0], "name": "foreign"})
+    if mutation == "renamed":
+        manifest["path_identities"][0]["name"] = "renamed"
+    workspace.manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(WorkspaceError):
         ensure_workspace(value)
 
 
@@ -980,6 +1018,34 @@ def test_retry_after_root_init_fault_repairs_unverified_candidate(tmp_path: Path
     assert sum(command[1] == "create" for command in docker.commands) == 1
 
 
+def test_retry_after_staging_journal_before_mkdir_creates_one_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    value = request(tmp_path, RecordingDocker())
+    write = campaign_workspace._write_json
+    faulted = False
+
+    def write_json(path: Path, payload: object) -> None:
+        nonlocal faulted
+        write(path, payload)
+        if not faulted and path.name == ".candidate-preparing.json":
+            faulted = True
+            raise RuntimeError("fault after staging journal")
+
+    monkeypatch.setattr(campaign_workspace, "_write_json", write_json)
+    with pytest.raises(RuntimeError, match="staging journal"):
+        ensure_workspace(value)
+    job_id = hashlib.sha256("\0".join((value.campaign, value.instance_id, value.arm)).encode()).hexdigest()
+    candidate = value.candidate_root / f"programbench-{job_id[:32]}"
+    assert not candidate.exists()
+    assert not candidate.with_name(f".{candidate.name}.staging").exists()
+
+    workspace = ensure_workspace(value)
+
+    assert workspace.candidate == candidate
+    assert len([path for path in value.candidate_root.iterdir() if not path.name.startswith(".")]) == 1
+
+
 def test_forged_ready_marker_with_wrong_candidate_mode_never_launches(tmp_path: Path) -> None:
     docker = RecordingDocker()
     value = request(tmp_path, docker)
@@ -1228,6 +1294,20 @@ def test_structurally_invalid_docker_inspect_drops_secret_document(kind: str) ->
     assert error.value.__context__ is None
 
 
+def test_foreign_command_metadata_is_absent_from_conflict_traceback(tmp_path: Path) -> None:
+    docker = RecordingDocker()
+    value = request(tmp_path, docker)
+    workspace = ensure_workspace(value)
+    secret = "fake-openai-key-in-foreign-command"
+    docker.containers[workspace.container_id]["Config"]["Cmd"] = [secret]
+
+    with pytest.raises(ContainerConflictError) as error:
+        ensure_workspace(value)
+
+    assert secret not in "".join(traceback.format_exception(error.value))
+    assert secret not in _traceback_locals(error.value)
+
+
 def test_invalid_manifest_json_is_a_sanitized_workspace_error(tmp_path: Path) -> None:
     secret = "fake-openai-key-in-invalid-manifest"
     path = tmp_path / "workspace.json"
@@ -1337,8 +1417,10 @@ def test_real_docker_runs_two_exact_isolated_workspaces(tmp_path: Path, monkeypa
         )
 
     values = [fixture_request(tmp_path / str(index), f"owner__fixture.{index}") for index in range(2)]
+    image_built = False
     try:
         _run_docker(("docker", "build", "--quiet", "-t", tag, str(context)), 300)
+        image_built = True
         with ThreadPoolExecutor(max_workers=2) as pool:
             workspaces.extend(pool.map(ensure_workspace, values))
 
@@ -1399,14 +1481,11 @@ def test_real_docker_runs_two_exact_isolated_workspaces(tmp_path: Path, monkeypa
             == ["agent"] * 4
             for workspace in workspaces
         )
-        inspected = [
-            campaign_workspace._inspect_container(docker, "docker", workspace.container_id) for workspace in workspaces
-        ]
-        sources = [{mount["Source"] for mount in value["Mounts"]} for value in inspected]
+        sources = [{str(mount.source) for mount in workspace.manifest.mounts} for workspace in workspaces]
         assert sources[0].isdisjoint(sources[1])
         assert all(
-            next(mount for mount in value["Mounts"] if mount["Destination"] == "/opencode")["RW"] is False
-            for value in inspected
+            next(mount for mount in workspace.manifest.mounts if mount.destination == "/opencode").read_only
+            for workspace in workspaces
         )
         assert all(
             _run_docker(("docker", "exec", workspace.container_id, "test", "-x", "/candidate/reference"), 30) == ""
@@ -1494,31 +1573,32 @@ def test_real_docker_runs_two_exact_isolated_workspaces(tmp_path: Path, monkeypa
             current = campaign_workspace._inspect_container(docker, "docker", workspace.container_id)
             assert current is not None and not campaign_workspace._running(current)
     finally:
-        try:
-            containers = _run_docker(
-                ("docker", "ps", "-aq", "--filter", f"label=programbench.campaign={campaign}"), 30
-            ).split()
-            if containers:
-                _run_docker(("docker", "rm", "-f", *containers), 60)
-        finally:
+        if image_built:
             try:
-                _run_docker(
-                    (
-                        "docker",
-                        "run",
-                        "--rm",
-                        "--user",
-                        "root",
-                        "-v",
-                        f"{tmp_path}:/cleanup",
-                        "--entrypoint",
-                        "chmod",
-                        tag,
-                        "-R",
-                        "a+rwX",
-                        "/cleanup",
-                    ),
-                    60,
-                )
+                containers = _run_docker(
+                    ("docker", "ps", "-aq", "--filter", f"label=programbench.campaign={campaign}"), 30
+                ).split()
+                if containers:
+                    _run_docker(("docker", "rm", "-f", *containers), 60)
             finally:
-                _run_docker(("docker", "rmi", "-f", tag), 60)
+                try:
+                    _run_docker(
+                        (
+                            "docker",
+                            "run",
+                            "--rm",
+                            "--user",
+                            "root",
+                            "-v",
+                            f"{tmp_path}:/cleanup",
+                            "--entrypoint",
+                            "chmod",
+                            tag,
+                            "-R",
+                            "a+rwX",
+                            "/cleanup",
+                        ),
+                        60,
+                    )
+                finally:
+                    _run_docker(("docker", "rmi", "-f", tag), 60)

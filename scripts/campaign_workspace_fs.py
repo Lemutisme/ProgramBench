@@ -20,6 +20,7 @@ class PathIdentity:
     path: Path
     device: int
     inode: int
+    kind: str
 
     @classmethod
     def capture(cls, name: str, path: Path) -> "PathIdentity":
@@ -27,7 +28,8 @@ class PathIdentity:
         if value.is_symlink() or value.resolve(strict=True) != value:
             raise WorkspaceFilesystemError(f"{name} must be a canonical non-symlink path")
         status = value.stat()
-        return cls(name, value, status.st_dev, status.st_ino)
+        kind = "directory" if value.is_dir() else "file" if value.is_file() else "other"
+        return cls(name, value, status.st_dev, status.st_ino, kind)
 
     def verify(self) -> None:
         try:
@@ -38,20 +40,28 @@ class PathIdentity:
             raise WorkspaceFilesystemError(f"{self.name} identity changed")
 
     def to_dict(self) -> dict[str, object]:
-        return {"name": self.name, "path": str(self.path), "device": self.device, "inode": self.inode}
+        return {
+            "name": self.name,
+            "path": str(self.path),
+            "device": self.device,
+            "inode": self.inode,
+            "kind": self.kind,
+        }
 
     @classmethod
     def from_dict(cls, raw: object) -> "PathIdentity":
         if (
             not isinstance(raw, dict)
-            or set(raw) != {"name", "path", "device", "inode"}
+            or set(raw) != {"name", "path", "device", "inode", "kind"}
             or not isinstance(raw["name"], str)
             or not isinstance(raw["path"], str)
+            or not isinstance(raw["kind"], str)
             or type(raw["device"]) is not int
             or type(raw["inode"]) is not int
+            or raw["kind"] not in {"directory", "file"}
         ):
             raise WorkspaceFilesystemError("filesystem identity is invalid")
-        return cls(raw["name"], Path(raw["path"]), raw["device"], raw["inode"])
+        return cls(raw["name"], Path(raw["path"]), raw["device"], raw["inode"], raw["kind"])
 
 
 def snapshot_binary(source: Path, destination: Path, expected_sha256: str) -> PathIdentity:

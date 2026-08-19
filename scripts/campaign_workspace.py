@@ -12,12 +12,13 @@ import time
 import uuid
 from dataclasses import dataclass, fields, replace
 from pathlib import Path, PurePosixPath
+from types import MappingProxyType
 from typing import Callable, Mapping
 from urllib.error import URLError
 from urllib.request import urlopen
 
 from scripts.campaign_install import InstallRecord
-from scripts.campaign_state import JobPaths, job_lock
+from scripts.campaign_state import JobLockedError, JobPaths, job_lock
 from scripts.campaign_workspace_fs import PathIdentity, WorkspaceFilesystemError, snapshot_binary, sync_tree
 
 
@@ -46,6 +47,16 @@ _ENV = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _CONTAINER_ID = re.compile(r"[0-9a-f]{12,64}\Z")
 _PHASES = frozenset({"planned", "preparing", "candidate_ready", "launching", "running", "stopped"})
 _CLEANROOM_PHASES = frozenset({"planned", "preparing", "candidate_ready", "launching"})
+REQUIRED_PATH_IDENTITIES_BY_PHASE = MappingProxyType(
+    {
+        "planned": frozenset({"job", "candidate-root", "state", "cache", "log", "binary"}),
+        "preparing": frozenset({"job", "candidate-root", "state", "cache", "log", "binary"}),
+        "candidate_ready": frozenset({"job", "candidate-root", "candidate", "state", "cache", "log", "binary"}),
+        "launching": frozenset({"job", "candidate-root", "candidate", "state", "cache", "log", "binary"}),
+        "running": frozenset({"job", "candidate-root", "candidate", "state", "cache", "log", "binary"}),
+        "stopped": frozenset({"job", "candidate-root", "candidate", "state", "cache", "log", "binary"}),
+    }
+)
 _FIXED_ENV = {
     "HOME": "/state/home",
     "XDG_CACHE_HOME": "/cache",
@@ -247,6 +258,7 @@ class WorkspaceManifest:
             or len({identity.name for identity in self.path_identities}) != len(self.path_identities)
         ):
             raise WorkspaceError("workspace filesystem identities must be a unique immutable tuple")
+        _validate_path_identity_schema(self)
         if (
             not isinstance(self.mounts, tuple)
             or not self.mounts
@@ -297,13 +309,15 @@ class WorkspaceManifest:
         for name in ("credential_env", "environment_names", "entrypoint", "command"):
             value[name] = list(value[name])
         value["mounts"] = [mount.to_dict() for mount in self.mounts]
-        value["path_identities"] = [identity.to_dict() for identity in self.path_identities]
-        return {"version": 6, **value}
+        value["path_identities"] = [
+            identity.to_dict() for identity in sorted(self.path_identities, key=lambda item: item.name)
+        ]
+        return {"version": 7, **value}
 
     @classmethod
     def from_dict(cls, raw: object) -> "WorkspaceManifest":
         expected = {field.name for field in fields(cls)}
-        if not isinstance(raw, dict) or set(raw) != {"version", *expected} or raw["version"] != 6:
+        if not isinstance(raw, dict) or set(raw) != {"version", *expected} or raw["version"] != 7:
             raise WorkspaceError("workspace manifest is invalid")
         paths = {
             "job_root",
@@ -360,7 +374,10 @@ class WorkspaceManifest:
         value.update({name: Path(raw[name]) for name in paths})
         value.update({name: tuple(raw[name]) for name in sequences})
         value["mounts"] = tuple(MountSpec.from_dict(mount) for mount in raw["mounts"])
-        value["path_identities"] = tuple(PathIdentity.from_dict(item) for item in raw["path_identities"])
+        try:
+            value["path_identities"] = tuple(PathIdentity.from_dict(item) for item in raw["path_identities"])
+        except WorkspaceFilesystemError:
+            raise WorkspaceError("workspace manifest has invalid filesystem identities") from None
         return cls(**value)
 
 
@@ -405,9 +422,12 @@ class WorkspaceLease:
         self._lock_context = job_lock(Path(self.identity[0]) / ".workspace.lock")
         try:
             self._lock_context.__enter__()
-        except BaseException:
+        except JobLockedError:
             self._lock_context = None
             raise WorkspaceError("workspace lease is already held") from None
+        except BaseException:
+            self._lock_context = None
+            raise
         self._owner = (os.getpid(), threading.get_ident())
         return self
 
@@ -997,26 +1017,47 @@ def _copy_cleanroom(runner: _DockerRunner, docker: str, manifest: WorkspaceManif
     ready_source = manifest.state_root / ".candidate-ready.pending.json"
     if manifest.candidate.is_symlink() or staging.is_symlink() or marker.is_symlink() or preparing_marker.is_symlink():
         raise WorkspaceError("candidate evidence contains a symlink")
+    preparation = _load_candidate_marker(preparing_marker)
     if manifest.candidate.exists():
         if manifest.phase != "preparing":
             _require_candidate_ready(manifest)
             _verify_candidate(runner, docker, manifest, publish=False)
             return
-        if _load_candidate_marker(preparing_marker) != _candidate_identity(manifest):
+        if not _candidate_preparation_matches(preparation, manifest, staging):
             raise ContainerConflictError("candidate preparation identity does not match persisted workspace")
         if marker.is_file() and _load_candidate_marker(marker) == _candidate_identity(manifest):
+            _require_moved_staging_identity(preparation, manifest.candidate)
             _verify_candidate(runner, docker, manifest, publish=False)
             _sync_candidate_ready(manifest)
             return
         if not manifest.candidate.is_dir():
             raise ContainerConflictError("candidate path is occupied by foreign evidence")
     elif staging.exists():
-        if not staging.is_dir() or _load_candidate_marker(preparing_marker) != _candidate_identity(manifest):
+        if not staging.is_dir() or not _candidate_preparation_matches(preparation, manifest, staging):
             raise ContainerConflictError("candidate staging path is occupied by foreign evidence")
+        recorded = preparation["staging_identity"]
+        if recorded is None:
+            if any(staging.iterdir()):
+                raise ContainerConflictError("unverified candidate staging directory is not empty")
+            staging.rmdir()
+            staging.mkdir(mode=0o700)
+            _sync_directory(staging.parent)
+            _write_json(preparing_marker, _candidate_preparation_identity(manifest, staging))
+        else:
+            try:
+                identity = PathIdentity.from_dict(recorded)
+                identity.verify()
+            except WorkspaceFilesystemError as error:
+                raise ContainerConflictError(str(error)) from None
     else:
+        expected = _candidate_preparation_identity(manifest, staging, capture=False)
+        if preparation is None:
+            _write_json(preparing_marker, expected)
+        elif preparation != expected:
+            raise ContainerConflictError("candidate preparation journal conflicts with staging path")
         staging.mkdir(mode=0o700)
         _sync_directory(staging.parent)
-        _write_json(preparing_marker, _candidate_identity(manifest))
+        _write_json(preparing_marker, _candidate_preparation_identity(manifest, staging))
     target = manifest.candidate if manifest.candidate.exists() else staging
     try:
         target_identity = PathIdentity.capture("candidate-stage", target)
@@ -1202,6 +1243,40 @@ def _candidate_identity(manifest: WorkspaceManifest) -> dict[str, str]:
     }
 
 
+def _candidate_preparation_identity(
+    manifest: WorkspaceManifest,
+    staging: Path,
+    *,
+    capture: bool = True,
+) -> dict[str, object]:
+    return {
+        **_candidate_identity(manifest),
+        "staging": str(staging),
+        "staging_identity": PathIdentity.capture("candidate-stage", staging).to_dict() if capture else None,
+    }
+
+
+def _candidate_preparation_matches(value: object, manifest: WorkspaceManifest, staging: Path) -> bool:
+    if not isinstance(value, dict):
+        return False
+    expected = _candidate_preparation_identity(manifest, staging, capture=False)
+    return all(value.get(key) == expected[key] for key in expected if key != "staging_identity") and set(value) == set(
+        expected
+    )
+
+
+def _require_moved_staging_identity(value: object, candidate: Path) -> None:
+    if not isinstance(value, dict) or not isinstance(value.get("staging_identity"), dict):
+        raise ContainerConflictError("candidate staging inode evidence is missing")
+    try:
+        recorded = PathIdentity.from_dict(value["staging_identity"])
+        current = PathIdentity.capture("candidate-stage", candidate)
+    except WorkspaceFilesystemError as error:
+        raise ContainerConflictError(str(error)) from None
+    if (recorded.device, recorded.inode, recorded.kind) != (current.device, current.inode, current.kind):
+        raise ContainerConflictError("candidate staging inode changed before publish")
+
+
 def _require_candidate_ready(manifest: WorkspaceManifest) -> None:
     marker = manifest.candidate / ".programbench-cleanroom.json"
     if (
@@ -1258,6 +1333,31 @@ def _formatted_environment_names(
 
 def _formatted_fixed_environment(runner: _DockerRunner, command: tuple[str, ...]) -> tuple[str, ...]:
     return _formatted_environment_names(runner, command, "inspect fixed container environment")
+
+
+def _evidence_hash(value: object) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _normalized_binds(value: object) -> object:
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        return {"invalid": type(value).__name__}
+    return sorted(value)
+
+
+def _normalized_mounts(value: object) -> object:
+    if not isinstance(value, list) or not all(isinstance(item, Mapping) for item in value):
+        return {"invalid": type(value).__name__}
+    return sorted(
+        (
+            str(item.get("Source")),
+            str(item.get("Destination")),
+            str(item.get("Mode")),
+            str(item.get("Type")),
+            item.get("RW") is True,
+        )
+        for item in value
+    )
 
 
 def _image_spec(runner: _DockerRunner, docker: str, image: str) -> tuple[str, str, tuple[str, ...]]:
@@ -1324,56 +1424,59 @@ def _inspect_container(runner: _DockerRunner, docker: str, name: str) -> Mapping
         2,
         "inspect container state",
     )
-    return {
-        "Id": values[0],
-        "Name": values[1],
-        "Image": values[2],
-        "Platform": values[3],
+    evidence = {
+        "Id": values[0] if isinstance(values[0], str) and _CONTAINER_ID.fullmatch(values[0]) else None,
+        "NameHash": _evidence_hash(values[1]),
+        "ImageHash": _evidence_hash(values[2]),
+        "PlatformHash": _evidence_hash(values[3]),
         "Config": {
-            "Image": values[4],
-            "User": values[5],
-            "WorkingDir": values[6],
-            "Entrypoint": values[7],
-            "Cmd": values[8],
+            "Hash": _evidence_hash(values[4:9]),
             "EnvironmentNames": environment_names,
             "MatchingFixedEnvironment": fixed_environment,
-            "Labels": dict(zip(_IDENTITY_LABEL_NAMES, values[13:18], strict=True)),
+            "LabelsHash": _evidence_hash(values[13:18]),
         },
         "HostConfig": {
-            "Init": values[9],
-            "NetworkMode": values[10],
-            "PortBindings": values[11],
-            "Binds": values[12],
+            "Hash": _evidence_hash((values[9], values[10], values[11], _normalized_binds(values[12]))),
         },
-        "Mounts": mounts,
+        "MountsHash": _evidence_hash(_normalized_mounts(mounts)),
         "NetworkSettings": {"Ports": ports},
         "State": {"Running": state[0], "ExitCode": state[1]},
     }
+    values = ()
+    mounts = None
+    return evidence
 
 
 def _require_exact_container(inspected: Mapping[str, object], manifest: WorkspaceManifest, *, check_port: bool) -> None:
     if manifest.container_id is not None and inspected.get("Id") != manifest.container_id:
         raise ContainerConflictError("container ID does not match persisted workspace")
     if (
-        inspected.get("Name") != f"/{manifest.container_name}"
-        or inspected.get("Image") != manifest.image_digest
-        or inspected.get("Platform") != manifest.platform.split("/", 1)[0]
+        inspected.get("NameHash") != _evidence_hash(f"/{manifest.container_name}")
+        or inspected.get("ImageHash") != _evidence_hash(manifest.image_digest)
+        or inspected.get("PlatformHash") != _evidence_hash(manifest.platform.split("/", 1)[0])
     ):
         raise ContainerConflictError("container name, image, or platform does not match")
     config = inspected.get("Config")
     host = inspected.get("HostConfig")
     if not isinstance(config, Mapping) or not isinstance(host, Mapping):
         raise ContainerConflictError("container configuration evidence is incomplete")
-    if (
-        config.get("Image") != manifest.image
-        or config.get("User") != manifest.container_user
-        or config.get("WorkingDir") != manifest.workdir
-        or config.get("Entrypoint") != list(manifest.entrypoint)
-        or config.get("Cmd") != list(manifest.command)
-        or host.get("Init") is not manifest.container_init
-        or host.get("NetworkMode") != manifest.network_mode
-        or host.get("PortBindings") != {"4096/tcp": [{"HostIp": "127.0.0.1", "HostPort": ""}]}
-    ):
+    expected_config = (
+        manifest.image,
+        manifest.container_user,
+        manifest.workdir,
+        list(manifest.entrypoint),
+        list(manifest.command),
+    )
+    expected_binds = sorted(
+        f"{mount.source}:{mount.destination}:{'ro' if mount.read_only else 'rw'}" for mount in manifest.mounts
+    )
+    expected_host = (
+        manifest.container_init,
+        manifest.network_mode,
+        {"4096/tcp": [{"HostIp": "127.0.0.1", "HostPort": ""}]},
+        expected_binds,
+    )
+    if config.get("Hash") != _evidence_hash(expected_config) or host.get("Hash") != _evidence_hash(expected_host):
         raise ContainerConflictError("container runtime configuration does not match")
     environment_names = config.get("EnvironmentNames")
     if environment_names != manifest.environment_names:
@@ -1381,10 +1484,7 @@ def _require_exact_container(inspected: Mapping[str, object], manifest: Workspac
     fixed_environment = config.get("MatchingFixedEnvironment")
     if fixed_environment != tuple(sorted(_FIXED_ENV)):
         raise ContainerConflictError("container HOME or XDG paths do not match")
-    labels = config.get("Labels")
-    if not isinstance(labels, Mapping) or any(
-        labels.get(key) != value for key, value in _identity_labels(manifest).items()
-    ):
+    if config.get("LabelsHash") != _evidence_hash(tuple(_identity_labels(manifest).values())):
         raise ContainerConflictError("container job identity does not match")
     expected_mounts = {
         (
@@ -1396,28 +1496,7 @@ def _require_exact_container(inspected: Mapping[str, object], manifest: Workspac
         )
         for mount in _mounts(manifest)
     }
-    binds = host.get("Binds")
-    if (
-        not isinstance(binds, list)
-        or not all(isinstance(value, str) for value in binds)
-        or set(binds) != {":".join(value[:3]) for value in expected_mounts}
-    ):
-        raise ContainerConflictError("container bind configuration does not match")
-    mounts = inspected.get("Mounts")
-    if not isinstance(mounts, list) or len(mounts) != len(expected_mounts):
-        raise ContainerConflictError("container mount evidence is incomplete")
-    actual_mounts = {
-        (
-            str(value.get("Source")),
-            str(value.get("Destination")),
-            str(value.get("Mode")),
-            str(value.get("Type")),
-            value.get("RW") is True,
-        )
-        for value in mounts
-        if isinstance(value, Mapping)
-    }
-    if actual_mounts != expected_mounts:
+    if inspected.get("MountsHash") != _evidence_hash(sorted(expected_mounts)):
         raise ContainerConflictError("container mounts do not match persisted workspace")
     if check_port:
         network = inspected.get("NetworkSettings")
@@ -1487,6 +1566,30 @@ def _requires_cleanroom_validation(manifest: WorkspaceManifest) -> bool:
     return manifest.phase in _CLEANROOM_PHASES and not manifest.candidate_mutable
 
 
+def _validate_path_identity_schema(manifest: WorkspaceManifest) -> None:
+    expected_paths = {
+        "job": manifest.job_root,
+        "candidate-root": manifest.candidate_root,
+        "candidate": manifest.candidate,
+        "state": manifest.state_dir,
+        "cache": manifest.cache_dir,
+        "log": manifest.log_dir,
+        "binary": manifest.binary,
+    }
+    required = REQUIRED_PATH_IDENTITIES_BY_PHASE[manifest.phase]
+    if {identity.name for identity in manifest.path_identities} != required:
+        raise WorkspaceError("workspace filesystem identities do not match phase requirements")
+    for identity in manifest.path_identities:
+        expected_kind = "file" if identity.name == "binary" else "directory"
+        if (
+            identity.path != expected_paths[identity.name]
+            or identity.kind != expected_kind
+            or identity.device < 0
+            or identity.inode <= 0
+        ):
+            raise WorkspaceError("workspace filesystem identity schema is invalid")
+
+
 def _capture_path_identities(manifest: WorkspaceManifest, *, include_candidate: bool) -> tuple[PathIdentity, ...]:
     values = [
         PathIdentity.capture("job", manifest.job_root),
@@ -1498,7 +1601,7 @@ def _capture_path_identities(manifest: WorkspaceManifest, *, include_candidate: 
     ]
     if include_candidate:
         values.append(PathIdentity.capture("candidate", manifest.candidate))
-    return tuple(values)
+    return tuple(sorted(values, key=lambda item: item.name))
 
 
 def _require_path_identities(manifest: WorkspaceManifest) -> None:
@@ -1510,6 +1613,14 @@ def _require_path_identities(manifest: WorkspaceManifest) -> None:
 
 
 def _require_manifest_identity(manifest: WorkspaceManifest, expected: WorkspaceManifest) -> None:
+    required = REQUIRED_PATH_IDENTITIES_BY_PHASE[manifest.phase]
+    expected = replace(
+        expected,
+        phase=manifest.phase,
+        candidate_mutable=manifest.candidate_mutable,
+        exit_code=manifest.exit_code,
+        path_identities=_capture_path_identities(expected, include_candidate="candidate" in required),
+    )
     if _static_identity(manifest) != _static_identity(expected):
         raise ContainerConflictError("persisted workspace identity does not match this job")
     _require_safe_manifest_paths(manifest)
@@ -1528,7 +1639,6 @@ def _static_identity(manifest: WorkspaceManifest) -> dict[str, object]:
             "port",
             "phase",
             "candidate_mutable",
-            "path_identities",
         }
     }
 
