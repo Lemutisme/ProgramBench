@@ -345,6 +345,7 @@ def _gated_invocation(
             "(os.execvp(sys.argv[3],sys.argv[3:]) if pid == 0 else None); "
             "_,status=os.waitpid(pid,0); code=os.waitstatus_to_exitcode(status); "
             "f=open(marker,'w'); f.write(str(code)+'\\n'); f.flush(); os.fsync(f.fileno()); f.close(); "
+            "d=os.open(os.path.dirname(marker) or '.',os.O_RDONLY); os.fsync(d); os.close(d); "
             "os._exit(code if code >= 0 else 1)",
             str(read_descriptor),
             str(completion_path),

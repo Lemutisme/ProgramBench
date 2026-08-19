@@ -8,6 +8,8 @@ import math
 import os
 import re
 import shutil
+import stat
+import subprocess
 import tempfile
 import time
 from contextlib import contextmanager
@@ -23,6 +25,7 @@ import fcntl
 from pydantic import ValidationError
 
 from programbench.eval.eval import EvaluationResult
+from programbench.constants import HF_REPO_ID, TASKS_DIR
 from programbench.submission import score_instance, test_results_map
 from programbench.utils.load_data import get_active_branches, get_ignored_tests, load_all_instances
 from scripts import campaign_process
@@ -41,6 +44,9 @@ EVAL_ARTIFACT_HASH_TIMEOUT_SECONDS = 30
 MAX_PRESERVED_EVAL_FILE_BYTES = 256 * 1024 * 1024
 MAX_PRESERVED_EVAL_TOTAL_BYTES = 512 * 1024 * 1024
 PRESERVED_EVAL_COPY_TIMEOUT_SECONDS = 30
+MAX_HF_BLOB_FILE_BYTES = 8 * 1024 * 1024 * 1024
+MAX_HF_BLOB_TOTAL_BYTES = 64 * 1024 * 1024 * 1024
+HF_BLOB_COPY_TIMEOUT_SECONDS = 1800
 _CREDENTIAL_ENV = ("OPENAI_API_KEY", "OPENCODE_SERVER_PASSWORD")
 _CREDENTIAL_PATTERN = re.compile(
     r"(?i)\b(?:authorization|api[_-]?key|password|token)\b\s*[:=]\s*[^\s,;]+"
@@ -235,11 +241,13 @@ def evaluate_campaign(
     cgroup_probe: Callable[[Path], bool] | None = None,
     container_probe: Callable[[str], bool] | None = None,
     container_cleanup: Callable[[str], tuple[str, ...]] | None = None,
+    hf_resolver: Callable[[str, str], str] | None = None,
+    blob_syncer: Callable[[str, tuple[str, ...]], Path] | None = None,
     sleeper: Callable[[float], None] = time.sleep,
     adoption_timeout: float = 60,
 ) -> CampaignEvaluationResult:
     """Evaluate both frozen arms at most once and write an exact paired report."""
-    root = Path(campaign_root).resolve()
+    root = _canonical_campaign_root(campaign_root)
     manifest_path = root / "campaign.json"
     manifest = _read_json(manifest_path, "campaign manifest")
     jobs = _manifest_jobs(manifest)
@@ -262,8 +270,16 @@ def evaluate_campaign(
     root.mkdir(parents=True, exist_ok=True)
     selected_ids = tuple(dict.fromkeys(instance_id for instance_id, _arm in jobs))
     scoring_metadata = {instance_id: _scoring_metadata(lookup[instance_id]) for instance_id in selected_ids}
-    image_identities = _resolve_evaluator_images(scoring_metadata, command_runner is None)
     with _campaign_lock(root / "evaluation.lock"):
+        hf_inputs = _load_or_plan_hf_inputs(
+            root,
+            selected_ids,
+            hf_resolver,
+            blob_syncer,
+            command_runner is None,
+        )
+        image_identities = _resolve_evaluator_images(scoring_metadata, command_runner is None)
+        image_plan = _prepare_campaign_image_tags(root, image_identities, command_runner is None)
         if retry_evaluator and not any(
             (state := _read_optional_json(root / "evaluation-state" / f"{arm}.json")) is not None
             and state.get("status") == "interrupted"
@@ -272,32 +288,37 @@ def evaluate_campaign(
             raise CampaignEvaluationError("--retry-evaluator requires an explicit interrupted state")
         evidence = _prepare_evidence(root, jobs)
         _preflight_foreign_eval_artifacts(root, jobs)
-        arm_states = {
-            arm: _evaluate_arm(
-                root,
-                arm,
-                tuple(instance_id for instance_id, candidate_arm in jobs if candidate_arm == arm),
-                evidence,
-                {instance_id: scoring_metadata[instance_id] for instance_id in manifest["selected_ids"]},
-                manifest,
-                image_identities,
-                retry_evaluator,
-                command_runner or campaign_process.run_checked,
-                process_probe or _process_identity_alive,
-                process_group_probe or _process_group_alive,
-                cgroup_probe or _cgroup_alive,
-                container_probe
-                or (_evaluator_containers_alive if command_runner is None else lambda _prefix: False),
-                container_cleanup
-                or (_cleanup_evaluator_containers if command_runner is None else lambda _prefix: ()),
-                sleeper,
-                adoption_timeout,
-            )
-            for arm in ARMS
-        }
-        _repair_comparison_bundle(root)
-        report = _comparison(root, manifest_path, manifest, jobs, evidence, lookup, arm_states)
-        comparison_path = _publish_comparison_bundle(root, report)
+        try:
+            arm_states = {
+                arm: _evaluate_arm(
+                    root,
+                    arm,
+                    tuple(instance_id for instance_id, candidate_arm in jobs if candidate_arm == arm),
+                    evidence,
+                    {instance_id: scoring_metadata[instance_id] for instance_id in manifest["selected_ids"]},
+                    manifest,
+                    image_plan,
+                    hf_inputs,
+                    retry_evaluator,
+                    command_runner or campaign_process.run_checked,
+                    process_probe or _process_identity_alive,
+                    process_group_probe or _process_group_alive,
+                    cgroup_probe or _cgroup_alive,
+                    container_probe
+                    or (_evaluator_containers_alive if command_runner is None else lambda _prefix: False),
+                    container_cleanup
+                    or (_cleanup_evaluator_containers if command_runner is None else lambda _prefix: ()),
+                    sleeper,
+                    adoption_timeout,
+                )
+                for arm in ARMS
+            }
+            _verify_campaign_image_tags(image_plan, command_runner is None)
+            _repair_comparison_bundle(root)
+            report = _comparison(root, manifest_path, manifest, jobs, evidence, lookup, arm_states)
+            comparison_path = _publish_comparison_bundle(root, report)
+        finally:
+            _cleanup_campaign_image_tags(image_plan, command_runner is None)
     aggregate = report["aggregate"]
     return CampaignEvaluationResult(
         str(report["status"]),
@@ -363,6 +384,11 @@ def _scoring_metadata(instance: Mapping[str, object]) -> dict[str, object]:
     )
     report = {
         "image_name": image_name,
+        "task_yaml_sha256": _optional_sha256(TASKS_DIR / str(instance_id) / "task.yaml"),
+        "tests_json_sha256": _optional_sha256(TASKS_DIR / str(instance_id) / "tests.json"),
+        "eval_clean_hashes": list(instance.get("eval_clean_hashes", []))
+        if isinstance(instance.get("eval_clean_hashes"), list)
+        else None,
         "active_branches": active,
         "ignored_tests": sorted(get_ignored_tests(dict(instance))),
         "expected_tests": {
@@ -422,6 +448,211 @@ def _resolve_evaluator_images(
                 raise CampaignEvaluationError(f"evaluator image digest unavailable: {reference}")
         result[instance_id] = {"reference": reference, "digest": digest}
     return result
+
+
+def _prepare_campaign_image_tags(
+    root: Path,
+    identities: Mapping[str, Mapping[str, object]],
+    manage: bool,
+) -> Mapping[str, object]:
+    # The campaign lock serializes tag creation/verification within this campaign. Docker daemon
+    # administrators remain outside this script-only threat boundary, so tags are reverified before
+    # every arm launch and after both arms finish.
+    tag = "campaign-" + hashlib.sha256(
+        str(root).encode() + b"\0" + _canonical_bytes(identities)
+    ).hexdigest()[:16]
+    images: dict[str, object] = {}
+    for instance_id, identity in identities.items():
+        reference = identity.get("reference")
+        digest = identity.get("digest")
+        if not isinstance(reference, str):
+            raise CampaignEvaluationError(f"evaluator image reference unavailable: {instance_id}")
+        repository = reference.rsplit(":", 1)[0]
+        target = f"{repository}:{tag}"
+        owned = False
+        if manage:
+            if not isinstance(digest, str):
+                raise CampaignEvaluationError(f"evaluator image digest unavailable: {instance_id}")
+            current = _docker_image_id(target)
+            if current is not None and current != digest:
+                raise CampaignEvaluationError(f"campaign evaluator tag conflicts: {target}")
+            if current is None:
+                tagged = _run_docker_evidence(("docker", "tag", digest, target), 60, 128 * 1024)
+                if tagged.returncode != 0:
+                    raise CampaignEvaluationError(f"campaign evaluator tag creation failed: {target}")
+                owned = True
+            if _docker_image_id(target) != digest:
+                raise CampaignEvaluationError(f"campaign evaluator tag digest conflicts: {target}")
+        images[instance_id] = {
+            "source_reference": reference,
+            "target_reference": target,
+            "digest": digest,
+            "owned": owned,
+        }
+    return {"version": 1, "tag": tag, "images": images}
+
+
+def _verify_campaign_image_tags(plan: Mapping[str, object], verify: bool) -> None:
+    if not verify:
+        return
+    images = plan.get("images")
+    if not isinstance(images, Mapping):
+        raise CampaignEvaluationError("campaign evaluator image map is malformed")
+    for instance_id, raw in images.items():
+        if not isinstance(raw, Mapping):
+            raise CampaignEvaluationError("campaign evaluator image entry is malformed")
+        target = raw.get("target_reference")
+        digest = raw.get("digest")
+        if not isinstance(target, str) or not isinstance(digest, str) or _docker_image_id(target) != digest:
+            raise CampaignEvaluationError(f"campaign evaluator image tag mutated: {instance_id}")
+
+
+def _cleanup_campaign_image_tags(plan: Mapping[str, object], cleanup: bool) -> None:
+    if not cleanup:
+        return
+    images = plan.get("images")
+    if not isinstance(images, Mapping):
+        return
+    for raw in images.values():
+        if not isinstance(raw, Mapping) or raw.get("owned") is not True:
+            continue
+        target = raw.get("target_reference")
+        if not isinstance(target, str):
+            continue
+        removed = _run_docker_evidence(("docker", "rmi", target), 60, 256 * 1024)
+        if removed.returncode != 0:
+            raise CampaignEvaluationError(f"campaign evaluator tag cleanup failed: {target}")
+
+
+def _docker_image_id(reference: str) -> str | None:
+    inspected = _run_docker_evidence(
+        ("docker", "image", "inspect", "--format", "{{.Id}}", reference),
+        30,
+        64 * 1024,
+    )
+    value = inspected.stdout.strip()
+    return value if inspected.returncode == 0 and value.startswith("sha256:") else None
+
+
+def _run_docker_evidence(
+    command: Sequence[str],
+    timeout: float,
+    output_limit: int,
+) -> subprocess.CompletedProcess[str]:
+    return campaign_process.run_checked(
+        command,
+        None,
+        timeout,
+        2,
+        output_limit,
+        environment={
+            name: value
+            for name in ("PATH", "DOCKER_HOST", "LANG", "LC_ALL")
+            if (value := os.environ.get(name))
+        },
+    )
+
+
+def _load_or_plan_hf_inputs(
+    root: Path,
+    instance_ids: tuple[str, ...],
+    resolver: Callable[[str, str], str] | None,
+    syncer: Callable[[str, tuple[str, ...]], Path] | None,
+    resolve_remote: bool,
+) -> Mapping[str, object]:
+    path = root / "evaluation-inputs.json"
+    if path.exists():
+        planned = _read_json(path, "evaluation input plan")
+        if planned.get("selected_ids") != list(instance_ids):
+            raise CampaignEvaluationError("evaluation input plan selection conflicts")
+        blob_root = planned.get("blob_root")
+        expected = planned.get("blob_sha256")
+        if isinstance(blob_root, str):
+            actual = _blob_hashes(Path(blob_root), instance_ids)
+            if not isinstance(expected, Mapping) or actual != dict(expected):
+                raise CampaignEvaluationError("evaluation input blob hashes conflict")
+        return planned
+
+    configured = os.environ.get("PROGRAMBENCH_BLOB_DIR")
+    if configured:
+        blob_root = _materialize_hf_blobs(
+            Path(configured).resolve(), root / "evaluation-blobs", instance_ids
+        )
+        hashes = _blob_hashes(blob_root, instance_ids)
+        commit = "local-" + hashlib.sha256(_canonical_bytes(hashes)).hexdigest()
+    elif resolver is not None or resolve_remote:
+        commit = (resolver or _resolve_hf_main)(HF_REPO_ID, "main")
+        if not isinstance(commit, str) or not commit or commit == "main":
+            raise CampaignEvaluationError("HuggingFace main did not resolve to an immutable commit")
+        blob_root = _materialize_hf_blobs(
+            (syncer or _sync_hf_blobs)(commit, instance_ids),
+            root / "evaluation-blobs",
+            instance_ids,
+        )
+        hashes = _blob_hashes(blob_root, instance_ids)
+        if not hashes:
+            raise CampaignEvaluationError("selected HuggingFace test blobs are unavailable")
+    else:
+        commit = "test-fixture"
+        blob_root = None
+        hashes = {}
+    planned = {
+        "version": 1,
+        "repository": HF_REPO_ID,
+        "commit": commit,
+        "selected_ids": list(instance_ids),
+        "blob_root": str(blob_root) if blob_root is not None else None,
+        "blob_sha256": hashes,
+    }
+    _atomic_json(path, planned)
+    return planned
+
+
+def _resolve_hf_main(repository: str, revision: str) -> str:
+    from huggingface_hub import HfApi
+
+    info = HfApi().repo_info(repository, repo_type="dataset", revision=revision)
+    if not isinstance(info.sha, str):
+        raise CampaignEvaluationError("HuggingFace revision has no immutable SHA")
+    return info.sha
+
+
+def _sync_hf_blobs(commit: str, instance_ids: tuple[str, ...]) -> Path:
+    from huggingface_hub import snapshot_download
+
+    return Path(
+        snapshot_download(
+            HF_REPO_ID,
+            repo_type="dataset",
+            revision=commit,
+            allow_patterns=[f"{instance_id}/**" for instance_id in instance_ids],
+        )
+    )
+
+
+def _materialize_hf_blobs(source: Path, target: Path, instance_ids: tuple[str, ...]) -> Path:
+    source = source.resolve()
+    _mkdir_contained(target, target.parent)
+    total = 0
+    deadline = time.monotonic() + HF_BLOB_COPY_TIMEOUT_SECONDS
+    cache_root = source.parent.parent if source.parent.name == "snapshots" else source
+    for instance_id in instance_ids:
+        current_root = source / instance_id
+        if not current_root.is_dir():
+            continue
+        for current in sorted(current_root.rglob("*")):
+            if not current.is_file():
+                continue
+            resolved = current.resolve(strict=True)
+            if current.is_symlink() and not resolved.is_relative_to(cache_root):
+                raise CampaignEvaluationError(f"HuggingFace blob symlink escapes cache: {current}")
+            size = resolved.stat().st_size
+            if size > MAX_HF_BLOB_FILE_BYTES or total + size > MAX_HF_BLOB_TOTAL_BYTES:
+                raise CampaignEvaluationError(f"HuggingFace blob materialization limit exceeded: {current}")
+            destination = target / current.relative_to(source)
+            total += _atomic_copy_bounded(resolved, destination, MAX_HF_BLOB_FILE_BYTES, deadline)
+    _sync_directory(target)
+    return target
 
 
 def _cleanup_evaluator_containers(prefix: str) -> tuple[str, ...]:
@@ -551,33 +782,93 @@ def _prepare_evidence(
 
 
 def _preflight_foreign_eval_artifacts(root: Path, jobs: Sequence[tuple[str, str]]) -> None:
-    foreign: list[tuple[str, Path]] = []
+    foreign: list[tuple[str, Path, int, int]] = []
     expected = {arm: {instance_id for instance_id, job_arm in jobs if job_arm == arm} for arm in ARMS}
     for arm in ARMS:
         arm_root = root / "evaluation" / arm
         if not arm_root.exists():
             continue
+        _require_owned_directory(arm_root, root, f"evaluation root for {arm}")
         for path in arm_root.iterdir():
             if path.name not in expected[arm] or not path.is_dir():
-                foreign.append((arm, path))
+                metadata = path.lstat()
+                if stat.S_ISLNK(metadata.st_mode):
+                    raise CampaignEvaluationError(f"foreign evaluator entry is a symlink: {path}")
+                foreign.append((arm, path, metadata.st_dev, metadata.st_ino))
     for instance_id, arm in jobs:
         if (root / "evaluation-state" / f"{arm}.json").exists():
             continue
         path = root / "evaluation" / arm / instance_id / f"{instance_id}.eval.json"
         if path.is_file():
-            foreign.append((arm, path))
+            metadata = path.lstat()
+            if stat.S_ISLNK(metadata.st_mode):
+                raise CampaignEvaluationError(f"foreign evaluator entry is a symlink: {path}")
+            foreign.append((arm, path, metadata.st_dev, metadata.st_ino))
     if not foreign:
         return
-    for arm, path in foreign:
+    for arm, path, device, inode in foreign:
         quarantine = root / "evaluation-state" / f"{arm}.foreign"
         _mkdir_contained(quarantine, root)
         if path.is_dir():
-            os.replace(path, quarantine / path.name)
+            target = quarantine / path.name
         else:
             digest = _eval_artifact_identity(path).sha256 or "hash-unavailable"
-            os.replace(path, quarantine / f"{path.parent.name}.{digest}.eval.json")
+            target = quarantine / f"{path.parent.name}.{digest}.eval.json"
+        _rename_owned_entry(path, target, root, device, inode)
         _sync_directory(quarantine)
     raise CampaignEvaluationError("foreign evaluator artifacts quarantined before launch")
+
+
+def _quarantine_partial_eval_outputs(
+    root: Path,
+    arm: str,
+    arm_root: Path,
+    state_path: Path,
+    submitted: Sequence[str],
+    state: Mapping[str, object],
+) -> Mapping[str, object]:
+    hashes = state.get("artifact_hashes")
+    sizes = state.get("artifact_sizes")
+    if not isinstance(hashes, Mapping) or not isinstance(sizes, Mapping):
+        raise CampaignEvaluationError("partial evaluator artifact state is malformed")
+    retained_hashes = dict(hashes)
+    retained_sizes = dict(sizes)
+    quarantined: list[str] = []
+    quarantine = root / "evaluation-state" / f"{arm}.partial"
+    _mkdir_contained(quarantine, root)
+    for instance_id in submitted:
+        path = arm_root / instance_id / f"{instance_id}.eval.json"
+        if not path.exists():
+            continue
+        sidecar = path.with_name(f"{instance_id}.eval.partial.provenance.json")
+        payload = _read_json(sidecar, f"partial eval provenance for {instance_id}")
+        identity = _eval_artifact_identity(path)
+        if (
+            payload.get("state") != "partial"
+            or payload.get("invocation_hash") != state.get("invocation_hash")
+            or identity.sha256 is None
+            or payload.get("eval_sha256") != identity.sha256
+            or retained_hashes.get(path.name) != identity.sha256
+            or retained_hashes.get(sidecar.name) != _sha256(sidecar)
+        ):
+            raise CampaignEvaluationError(f"partial eval provenance conflicts: {instance_id}")
+        for current in (path, sidecar):
+            metadata = current.lstat()
+            _rename_owned_entry(current, quarantine / current.name, root, metadata.st_dev, metadata.st_ino)
+            retained_hashes.pop(current.name, None)
+            retained_sizes.pop(current.name, None)
+        quarantined.append(instance_id)
+    updated = {
+        **state,
+        "artifact_hashes": retained_hashes,
+        "artifact_sizes": retained_sizes,
+        "eval_artifact_sizes": {},
+        "eval_hash_unavailable": {},
+        "partial_quarantine": quarantined,
+        "completion_disposition": "partial_quarantined",
+    }
+    _atomic_json(state_path, updated)
+    return updated
 
 
 def _evaluate_arm(
@@ -587,7 +878,8 @@ def _evaluate_arm(
     evidence: Mapping[tuple[str, str], Mapping[str, object]],
     scoring_metadata: Mapping[str, Mapping[str, object]],
     manifest: Mapping[str, object],
-    image_identities: Mapping[str, Mapping[str, object]],
+    image_plan: Mapping[str, object],
+    hf_inputs: Mapping[str, object],
     retry_evaluator: bool,
     command_runner: Callable[..., object],
     process_probe: Callable[[int, str], bool],
@@ -607,6 +899,9 @@ def _evaluate_arm(
     stderr_path = state_root / f"{arm}.stderr"
     completion_path = state_root / f"{arm}.completion"
     submitted = tuple(instance_id for instance_id in instance_ids if evidence[(instance_id, arm)]["submission"])
+    campaign_image_tag = image_plan.get("tag")
+    if not isinstance(campaign_image_tag, str):
+        raise CampaignEvaluationError("campaign evaluator image tag is invalid")
     argv = (
         "uv",
         "run",
@@ -619,6 +914,8 @@ def _evaluate_arm(
         "1",
         "--docker-cpus",
         "4",
+        "--image-tag",
+        campaign_image_tag,
     )
     cwd = Path(__file__).resolve().parents[1]
     evaluator_identity = _evaluator_identity(cwd)
@@ -626,9 +923,19 @@ def _evaluate_arm(
     container_prefix = "programbench-eval-" + hashlib.sha256(
         f"{root}:{arm}:{campaign_manifest_sha256}".encode()
     ).hexdigest()[:12]
-    blob_root = os.environ.get("PROGRAMBENCH_BLOB_DIR")
+    blob_root = hf_inputs.get("blob_root")
+    hf_revision = hf_inputs.get("commit")
     docker_org = os.environ.get("PROGRAMBENCH_DOCKER_ORG")
-    blob_hashes = _blob_hashes(Path(blob_root), submitted) if blob_root else {}
+    all_blob_hashes = hf_inputs.get("blob_sha256")
+    blob_hashes = (
+        {
+            name: digest
+            for name, digest in all_blob_hashes.items()
+            if any(name.startswith(f"{instance_id}/") for instance_id in submitted)
+        }
+        if isinstance(all_blob_hashes, Mapping)
+        else {}
+    )
     expected_executables = {
         instance_id: evidence[(instance_id, arm)].get("expected_executable_hash") for instance_id in submitted
     }
@@ -647,12 +954,14 @@ def _evaluate_arm(
         "campaign_manifest_sha256": campaign_manifest_sha256,
         "blob_root": blob_root,
         "blob_sha256": blob_hashes,
+        "hf_repository": hf_inputs.get("repository"),
+        "hf_commit": hf_revision,
         "expected_executable_sha256": expected_executables,
         "scoring_metadata": {instance_id: scoring_metadata[instance_id] for instance_id in submitted},
         "programbench": manifest.get("programbench"),
         "images": manifest.get("images"),
-        "evaluator_image_tag": "task_cleanroom_v6",
-        "evaluator_images": {instance_id: image_identities[instance_id] for instance_id in submitted},
+        "evaluator_image_tag": campaign_image_tag,
+        "evaluator_images": image_plan.get("images"),
         "docker_org": docker_org,
         "container_prefix": container_prefix,
         "workers": 8,
@@ -674,8 +983,17 @@ def _evaluate_arm(
             quarantine = state_root / f"{arm}.foreign"
             _mkdir_contained(quarantine, root)
             for path in foreign:
+                metadata = path.lstat()
+                if stat.S_ISLNK(metadata.st_mode):
+                    raise CampaignEvaluationError(f"foreign evaluator entry is a symlink: {path}")
                 digest = _eval_artifact_identity(path).sha256 or "hash-unavailable"
-                os.replace(path, quarantine / f"{path.parent.name}.{digest}.eval.json")
+                _rename_owned_entry(
+                    path,
+                    quarantine / f"{path.parent.name}.{digest}.eval.json",
+                    root,
+                    metadata.st_dev,
+                    metadata.st_ino,
+                )
             _sync_directory(quarantine)
             raise CampaignEvaluationError(f"foreign evaluator artifacts quarantined for {arm}")
     if existing is not None:
@@ -688,6 +1006,7 @@ def _evaluate_arm(
             or existing.get("cwd") != str(cwd)
             or existing.get("stdout_path") != str(stdout_path)
             or existing.get("stderr_path") != str(stderr_path)
+            or existing.get("completion_path") != str(completion_path)
             or existing.get("submitted_ids") != list(submitted)
             or existing.get("submission_sha256") != submission_hashes
             or existing.get("evaluator_identity") != evaluator_identity
@@ -734,6 +1053,8 @@ def _evaluate_arm(
                 _atomic_json(state_path, existing)
                 if container_probe(prefix):
                     raise CampaignEvaluationError(f"evaluator containers for {arm} remain active")
+            if existing.get("completion_disposition") == "exception":
+                existing = _quarantine_partial_eval_outputs(root, arm, arm_root, state_path, submitted, existing)
         if existing.get("status") in {"planned", "interrupted"}:
             reconciled = (
                 None
@@ -743,18 +1064,32 @@ def _evaluate_arm(
             if reconciled is not None:
                 return reconciled
         if existing.get("status") == "running":
-            alive = _evaluator_ownership_alive(
-                existing, process_probe, process_group_probe, cgroup_probe, container_probe
-            )
+            alive = _host_evaluator_ownership_alive(existing, process_probe, process_group_probe, cgroup_probe)
             if alive:
                 deadline = time.monotonic() + adoption_timeout
                 while time.monotonic() < deadline and alive:
                     sleeper(min(0.1, max(0, deadline - time.monotonic())))
-                    alive = _evaluator_ownership_alive(
-                        existing, process_probe, process_group_probe, cgroup_probe, container_probe
+                    alive = _host_evaluator_ownership_alive(
+                        existing, process_probe, process_group_probe, cgroup_probe
                     )
                 if alive:
                     raise CampaignEvaluationError(f"evaluator for {arm} is still running")
+            prefix = existing.get("container_prefix")
+            if isinstance(prefix, str) and container_probe(prefix):
+                recovered = container_cleanup(prefix)
+                prior = existing.get("recovered_container_ids")
+                existing = {
+                    **existing,
+                    "recovered_container_ids": sorted(
+                        {
+                            *(prior if isinstance(prior, list) else []),
+                            *recovered,
+                        }
+                    ),
+                }
+                _atomic_json(state_path, existing)
+                if container_probe(prefix):
+                    raise CampaignEvaluationError(f"evaluator containers for {arm} remain active")
             reconciled = _reconcile_complete(existing, state_path, stdout_path, stderr_path, arm_root, submitted)
             if reconciled is not None:
                 return reconciled
@@ -814,12 +1149,14 @@ def _evaluate_arm(
         "campaign_manifest_sha256": campaign_manifest_sha256,
         "blob_root": blob_root,
         "blob_sha256": blob_hashes,
+        "hf_repository": hf_inputs.get("repository"),
+        "hf_commit": hf_revision,
         "expected_executable_sha256": expected_executables,
         "scoring_metadata": {instance_id: scoring_metadata[instance_id] for instance_id in submitted},
         "programbench": manifest.get("programbench"),
         "images": manifest.get("images"),
-        "evaluator_image_tag": "task_cleanroom_v6",
-        "evaluator_images": {instance_id: image_identities[instance_id] for instance_id in submitted},
+        "evaluator_image_tag": campaign_image_tag,
+        "evaluator_images": image_plan.get("images"),
         "docker_org": docker_org,
         "container_prefix": container_prefix,
         "preserved_eval_hashes": preserved,
@@ -856,6 +1193,9 @@ def _evaluate_arm(
         }
         _atomic_json(state_path, done)
         return done
+    _verify_campaign_image_tags(image_plan, command_runner is campaign_process.run_checked)
+    if completion_path.is_symlink():
+        raise CampaignEvaluationError(f"completion marker path is a symlink: {completion_path}")
     completion_path.unlink(missing_ok=True)
     _sync_directory(state_root)
     _atomic_json(state_path, base)
@@ -890,6 +1230,10 @@ def _evaluate_arm(
         if (value := os.environ.get(name))
     }
     environment["PROGRAMBENCH_CONTAINER_PREFIX"] = container_prefix
+    if isinstance(blob_root, str):
+        environment["PROGRAMBENCH_BLOB_DIR"] = blob_root
+    if isinstance(hf_revision, str) and not hf_revision.startswith("local-"):
+        environment["PROGRAMBENCH_HF_REVISION"] = hf_revision
     deferred: BaseException | None = None
     normal_completion = False
     try:
@@ -963,6 +1307,8 @@ def _evaluate_arm(
         except CampaignEvaluationError:
             status = "failed"
             error = "invalid_output_provenance"
+    elif completion_disposition == "exception":
+        provenance_hashes = _bind_partial_eval_outputs(base, arm_root, submitted, error)
     hashes = {
         path.name: _sha256(path)
         for path in (stdout_path, stderr_path)
@@ -1346,15 +1692,14 @@ def _valid_result_metrics(result: Mapping[str, object], state: JobState, arm: st
     if (
         type(turns) is not int
         or turns < 0
+        or turns > 10**9
         or turns != state.provider_turns
         or type(actions) is not int
         or actions < 0
+        or actions > 10**9
         or actions != state.actions
-        or isinstance(elapsed, bool)
-        or not isinstance(elapsed, (int, float))
-        or not math.isfinite(float(elapsed))
-        or elapsed < 0
-        or any(type(value) is not int or value < 0 for value in cache)
+        or not _bounded_nonnegative_number(elapsed, 10**12)
+        or any(type(value) is not int or value < 0 or value > 10**15 for value in cache)
         or not isinstance(completion, str)
         or not completion
         or result.get("exit_class") != state.exit_class
@@ -1364,7 +1709,11 @@ def _valid_result_metrics(result: Mapping[str, object], state: JobState, arm: st
         cost = Decimal(str(result["cost"]))
     except (ArithmeticError, KeyError, TypeError, ValueError):
         return False
-    if not cost.is_finite() or cost < 0 or float(cost) != state.cost:
+    try:
+        comparable_cost = float(cost)
+    except (OverflowError, ValueError):
+        return False
+    if not cost.is_finite() or cost < 0 or not math.isfinite(comparable_cost) or comparable_cost != state.cost:
         return False
     if arm == "vanilla":
         return True
@@ -1374,6 +1723,16 @@ def _valid_result_metrics(result: Mapping[str, object], state: JobState, arm: st
         and isinstance(result.get("outstanding"), list)
         and all(isinstance(value, str) for value in result.get("outstanding", []))
     )
+
+
+def _bounded_nonnegative_number(value: object, maximum: float) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        converted = float(value)
+    except (OverflowError, ValueError):
+        return False
+    return math.isfinite(converted) and 0 <= converted <= maximum
 
 
 def _cache_report(result: Mapping[str, object]) -> dict[str, object]:
@@ -1466,7 +1825,11 @@ def _recorded_artifact_path(
     if name.endswith(".completion"):
         return state_root / name
     for instance_id in submitted:
-        if name in {f"{instance_id}.eval.json", f"{instance_id}.eval.provenance.json"}:
+        if name in {
+            f"{instance_id}.eval.json",
+            f"{instance_id}.eval.provenance.json",
+            f"{instance_id}.eval.partial.provenance.json",
+        }:
             return arm_root / instance_id / name
     raise CampaignEvaluationError(f"unknown recorded evaluator artifact: {name}")
 
@@ -1501,7 +1864,11 @@ def _verify_recorded_evaluator_artifacts(
     unavailable = state.get("eval_hash_unavailable")
     eval_sizes = state.get("eval_artifact_sizes")
     for instance_id in submitted:
-        for name in (f"{instance_id}.eval.json", f"{instance_id}.eval.provenance.json"):
+        for name in (
+            f"{instance_id}.eval.json",
+            f"{instance_id}.eval.provenance.json",
+            f"{instance_id}.eval.partial.provenance.json",
+        ):
             path = arm_root / instance_id / name
             if (
                 path.exists()
@@ -1772,6 +2139,42 @@ def _bind_eval_outputs(
     return result
 
 
+def _bind_partial_eval_outputs(
+    state: Mapping[str, object],
+    arm_root: Path,
+    submitted: Sequence[str],
+    error: str | None,
+) -> dict[str, str]:
+    invocation_hash = state.get("invocation_hash")
+    if not isinstance(invocation_hash, str):
+        raise CampaignEvaluationError("partial evaluator invocation is malformed")
+    result: dict[str, str] = {}
+    for instance_id in submitted:
+        path = arm_root / instance_id / f"{instance_id}.eval.json"
+        if not path.is_file():
+            continue
+        identity = _eval_artifact_identity(path)
+        if identity.sha256 is None:
+            raise CampaignEvaluationError(f"partial eval hash unavailable: {instance_id}")
+        metadata = path.stat()
+        sidecar = path.with_name(f"{instance_id}.eval.partial.provenance.json")
+        _atomic_json(
+            sidecar,
+            {
+                "version": 1,
+                "state": "partial",
+                "invocation_hash": invocation_hash,
+                "eval_sha256": identity.sha256,
+                "size_bytes": identity.size_bytes,
+                "inode": metadata.st_ino,
+                "mtime_ns": metadata.st_mtime_ns,
+                "error": error,
+            },
+        )
+        result[f"{instance_id}.eval.partial.provenance.json"] = _sha256(sidecar)
+    return result
+
+
 def _preserve_eval_results(
     state_root: Path,
     arm_root: Path,
@@ -1937,6 +2340,7 @@ def _evaluator_identity(root: Path) -> dict[str, object]:
     return {
         "programbench_version": version("programbench"),
         "programbench_source_sha256": _source_tree_hash(root / "src/programbench"),
+        "pyproject_sha256": _sha256(root / "pyproject.toml"),
         "uv_lock_sha256": _sha256(root / "uv.lock"),
         "uv": {"path": uv, "sha256": _sha256(Path(uv)) if uv else None},
     }
@@ -1952,6 +2356,10 @@ def _source_tree_hash(root: Path) -> str:
     return digest.hexdigest()
 
 
+def _optional_sha256(path: Path) -> str | None:
+    return _sha256(path) if path.is_file() else None
+
+
 def _reject_symlink_components(path: Path, root: Path, label: str) -> None:
     try:
         relative = path.relative_to(root)
@@ -1964,6 +2372,22 @@ def _reject_symlink_components(path: Path, root: Path, label: str) -> None:
         current /= part
         if current.is_symlink():
             raise CampaignEvaluationError(f"{label} contains a symlink: {current}")
+
+
+def _canonical_campaign_root(path: Path) -> Path:
+    candidate = Path(os.path.abspath(path))
+    current = Path(candidate.anchor)
+    for part in candidate.parts[1:]:
+        current /= part
+        try:
+            metadata = current.lstat()
+        except OSError as error:
+            raise CampaignEvaluationError(f"campaign root is unavailable: {candidate}") from error
+        if stat.S_ISLNK(metadata.st_mode):
+            raise CampaignEvaluationError(f"campaign root contains a symlink: {current}")
+    if not candidate.is_dir() or candidate.resolve(strict=True) != candidate:
+        raise CampaignEvaluationError(f"campaign root is not a canonical directory: {candidate}")
+    return candidate
 
 
 def _regular_contained(path: Path, root: Path, label: str) -> bool:
@@ -1984,6 +2408,42 @@ def _mkdir_contained(path: Path, root: Path) -> None:
         if current.is_symlink():
             raise CampaignEvaluationError(f"evaluator path contains a symlink: {current}")
         current.mkdir(exist_ok=True)
+
+
+def _require_owned_directory(path: Path, root: Path, label: str) -> None:
+    _reject_symlink_components(path, root, label)
+    metadata = path.lstat()
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise CampaignEvaluationError(f"{label} is not a directory: {path}")
+    if path.resolve(strict=True) != path:
+        raise CampaignEvaluationError(f"{label} is not canonical: {path}")
+
+
+def _rename_owned_entry(path: Path, target: Path, root: Path, device: int, inode: int) -> None:
+    _require_owned_directory(path.parent, root, "quarantine source directory")
+    _require_owned_directory(target.parent, root, "quarantine target directory")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    source_descriptor = os.open(path.parent, flags)
+    target_descriptor = os.open(target.parent, flags)
+    try:
+        current = os.stat(path.name, dir_fd=source_descriptor, follow_symlinks=False)
+        if current.st_dev != device or current.st_ino != inode or stat.S_ISLNK(current.st_mode):
+            raise CampaignEvaluationError(f"quarantine source changed before rename: {path}")
+        try:
+            os.stat(target.name, dir_fd=target_descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise CampaignEvaluationError(f"quarantine target already exists: {target}")
+        os.rename(
+            path.name,
+            target.name,
+            src_dir_fd=source_descriptor,
+            dst_dir_fd=target_descriptor,
+        )
+    finally:
+        os.close(source_descriptor)
+        os.close(target_descriptor)
 
 
 def _file_contains_secret(path: Path, secrets: Sequence[bytes]) -> bool:

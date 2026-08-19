@@ -352,6 +352,9 @@ def test_campaign_invokes_each_arm_once_with_exact_batch_argv(tmp_path: Path) ->
     result = evaluate_campaign(root, instances=instances, command_runner=_runner(calls))
 
     assert result.status == "completed"
+    tag = calls[0][0][-1]
+    assert tag.startswith("campaign-")
+    assert calls[1][0][-1] == tag
     assert [call[0] for call in calls] == [
         (
             "uv",
@@ -365,6 +368,8 @@ def test_campaign_invokes_each_arm_once_with_exact_batch_argv(tmp_path: Path) ->
             "1",
             "--docker-cpus",
             "4",
+            "--image-tag",
+            tag,
         ),
         (
             "uv",
@@ -378,6 +383,8 @@ def test_campaign_invokes_each_arm_once_with_exact_batch_argv(tmp_path: Path) ->
             "1",
             "--docker-cpus",
             "4",
+            "--image-tag",
+            tag,
         ),
     ]
     assert all("--force" not in call[0] for call in calls)
@@ -1233,6 +1240,45 @@ def test_exception_with_eval_files_never_marks_evaluator_done(
         assert reused.status == "evaluator_failed"
 
 
+def test_explicit_retry_quarantines_exception_partial_eval_and_sidecar(tmp_path: Path) -> None:
+    from scripts.campaign_evaluate import evaluate_campaign
+
+    root, instances = _campaign(tmp_path / "campaign")
+
+    def timeout_with_partial(command, _cwd, _timeout, _grace, _limit, _environment, *, on_start):
+        on_start(999999, 999999, "timeout")
+        path = Path(command[4]) / "one/one.eval.json"
+        _write_eval(path, statuses=("passed", "failure", "failure"))
+        raise TimeoutError
+
+    evaluate_campaign(root, instances=instances, command_runner=timeout_with_partial)
+    partial = root / "evaluation/procontract/one/one.eval.partial.provenance.json"
+    assert json.loads(partial.read_text())["state"] == "partial"
+
+    def retry(command, _cwd, _timeout, _grace, _limit, _environment, *, on_start):
+        on_start(os.getpid(), os.getpid(), "retry")
+        path = Path(command[4]) / "one/one.eval.json"
+        assert not path.exists()
+        assert not path.with_name("one.eval.partial.provenance.json").exists()
+        _write_eval(path, statuses=("passed", "failure", "failure"))
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    outcome = evaluate_campaign(
+        root,
+        instances=instances,
+        retry_evaluator=True,
+        command_runner=retry,
+        process_probe=lambda _pid, _started: False,
+        process_group_probe=lambda _pgid: False,
+        cgroup_probe=lambda _path: False,
+    )
+
+    assert outcome.status == "completed"
+    quarantine = root / "evaluation-state/procontract.partial"
+    assert (quarantine / "one.eval.json").is_file()
+    assert (quarantine / "one.eval.partial.provenance.json").is_file()
+
+
 def test_keyboard_interrupt_with_eval_file_persists_interrupted_then_reraises(tmp_path: Path) -> None:
     from scripts import campaign_evaluate
 
@@ -1260,10 +1306,16 @@ def test_evaluator_default_runner_persists_contained_cgroup_identity(
 
     root, instances = _campaign(tmp_path / "campaign")
     calls = []
+    blob = tmp_path / "blobs/one/tests/b1.tar.gz"
+    blob.parent.mkdir(parents=True)
+    blob.write_bytes(b"tests")
+    monkeypatch.setenv("PROGRAMBENCH_BLOB_DIR", str(tmp_path / "blobs"))
 
     def contained(command, cwd, timeout, grace, limit, *, environment, on_start=None, completion_path=None):
         if command[:3] == ("docker", "image", "inspect"):
             return subprocess.CompletedProcess(command, 0, "sha256:" + "d" * 64 + "\n", "")
+        if command[:2] in {("docker", "tag"), ("docker", "rmi")}:
+            return subprocess.CompletedProcess(command, 0, "", "")
         if command[:2] == ("docker", "ps"):
             return subprocess.CompletedProcess(command, 0, "", "")
         calls.append(tuple(command))
@@ -1303,6 +1355,10 @@ def test_contained_evaluator_timeout_removes_scoped_docker_containers(
 
     root, instances = _campaign(tmp_path / "campaign")
     containers = set()
+    blob = tmp_path / "blobs/one/tests/b1.tar.gz"
+    blob.parent.mkdir(parents=True)
+    blob.write_bytes(b"tests")
+    monkeypatch.setenv("PROGRAMBENCH_BLOB_DIR", str(tmp_path / "blobs"))
 
     def contained(command, cwd, timeout, grace, limit, *, environment, on_start=None, completion_path=None):
         if command[:3] == ("docker", "image", "inspect"):
@@ -1457,7 +1513,7 @@ def test_done_state_rejects_frozen_manifest_coordinate_change(tmp_path: Path) ->
     manifest["installs"]["procontract"]["revision"] = "changed-revision"
     _write_json(manifest_path, manifest)
 
-    with pytest.raises(CampaignEvaluationError, match="conflicts"):
+    with pytest.raises(CampaignEvaluationError, match="conflict"):
         evaluate_campaign(root, instances=instances, command_runner=lambda *_a, **_k: pytest.fail("must not run"))
 
 
@@ -1567,10 +1623,58 @@ def test_done_state_rejects_local_test_blob_content_change(
     blob.write_bytes(b"first-tests")
     monkeypatch.setenv("PROGRAMBENCH_BLOB_DIR", str(tmp_path / "blobs"))
     evaluate_campaign(root, instances=instances, command_runner=_runner([]))
-    blob.write_bytes(b"changed-tests")
+    planned = json.loads((root / "evaluation-inputs.json").read_text())
+    materialized = Path(planned["blob_root"]) / "one/tests/b1.tar.gz"
+    materialized.write_bytes(b"changed-tests")
 
-    with pytest.raises(CampaignEvaluationError, match="conflicts"):
+    with pytest.raises(CampaignEvaluationError, match="conflict"):
         evaluate_campaign(root, instances=instances, command_runner=lambda *_a, **_k: pytest.fail("must not run"))
+
+
+def test_hf_main_is_resolved_once_to_immutable_commit_and_mutation_conflicts(tmp_path: Path) -> None:
+    from scripts.campaign_evaluate import CampaignEvaluationError, evaluate_campaign
+
+    root, instances = _campaign(tmp_path / "campaign")
+    calls = []
+
+    def resolve(repository, revision):
+        calls.append((repository, revision))
+        return "a" * 40
+
+    def sync(commit, instance_ids):
+        blob_root = tmp_path / "hf-blobs"
+        for instance_id in instance_ids:
+            path = blob_root / instance_id / "tests/b1.tar.gz"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"tests")
+        return blob_root
+
+    evaluate_campaign(
+        root,
+        instances=instances,
+        command_runner=_runner([]),
+        hf_resolver=resolve,
+        blob_syncer=sync,
+    )
+    evaluate_campaign(
+        root,
+        instances=instances,
+        command_runner=lambda *_a, **_k: pytest.fail("done evaluator must reuse pinned commit"),
+        hf_resolver=lambda *_args: pytest.fail("main must not resolve on resume"),
+        blob_syncer=lambda *_args: pytest.fail("blobs must not resync on resume"),
+    )
+    assert len(calls) == 1
+    plan_path = root / "evaluation-inputs.json"
+    plan = json.loads(plan_path.read_text())
+    plan["commit"] = "b" * 40
+    _write_json(plan_path, plan)
+
+    with pytest.raises(CampaignEvaluationError, match="invocation conflicts"):
+        evaluate_campaign(
+            root,
+            instances=instances,
+            command_runner=lambda *_a, **_k: pytest.fail("mutated pin must not run"),
+        )
 
 
 def test_done_state_rejects_invocation_configuration_conflict(tmp_path: Path) -> None:
@@ -1703,6 +1807,36 @@ def test_submission_symlinked_parent_is_refused_before_evaluator_launch(tmp_path
 
     with pytest.raises(CampaignEvaluationError, match="symlink"):
         evaluate_campaign(root, instances=instances, command_runner=lambda *_a, **_k: pytest.fail("must not run"))
+
+
+def test_symlinked_evaluation_root_rejects_without_mutating_external_victim(tmp_path: Path) -> None:
+    from scripts.campaign_evaluate import CampaignEvaluationError, evaluate_campaign
+
+    root, instances = _campaign(tmp_path / "campaign")
+    victim = tmp_path / "victim"
+    foreign = victim / "procontract/foreign/submission.tar.gz"
+    foreign.parent.mkdir(parents=True)
+    foreign.write_bytes(b"victim-data")
+    (root / "evaluation").symlink_to(victim, target_is_directory=True)
+
+    with pytest.raises(CampaignEvaluationError, match="symlink"):
+        evaluate_campaign(root, instances=instances, command_runner=lambda *_a, **_k: pytest.fail("must not run"))
+
+    assert foreign.read_bytes() == b"victim-data"
+    assert not (root / "evaluation-state").exists()
+
+
+def test_symlinked_campaign_root_is_rejected_before_lock_or_manifest_access(tmp_path: Path) -> None:
+    from scripts.campaign_evaluate import CampaignEvaluationError, evaluate_campaign
+
+    root, instances = _campaign(tmp_path / "campaign")
+    link = tmp_path / "campaign-link"
+    link.symlink_to(root, target_is_directory=True)
+
+    with pytest.raises(CampaignEvaluationError, match="symlink"):
+        evaluate_campaign(link, instances=instances, command_runner=lambda *_a, **_k: pytest.fail("must not run"))
+
+    assert not (root / "evaluation.lock").exists()
 
 
 def test_terminal_result_must_match_job_artifact_seal(tmp_path: Path) -> None:
@@ -2041,4 +2175,4 @@ def test_real_calculator_evaluator_scores_two_tiny_submissions_when_docker_avail
             assert state["evaluator_images"][instance_id]["digest"].startswith("sha256:")
             assert pair[arm]["errors"] == []
     finally:
-        subprocess.run((docker, "rmi", "-f", image), capture_output=True, timeout=60)
+        subprocess.run((docker, "rmi", "-f", image), check=True, capture_output=True, timeout=60)
