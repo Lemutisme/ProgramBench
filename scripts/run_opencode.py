@@ -65,6 +65,19 @@ from scripts.campaign_workspace import (
     ensure_workspace,
     prepare_workspace,
 )
+from scripts.campaign_vanilla import (
+    ORIGINAL_TASK,
+    HttpClient,
+    HttpOpenCodeApi,
+    HttpResponse,
+    OpenCodeApi,
+    UrllibHttpClient,
+    VanillaCompletion,
+    VanillaError,
+    VanillaHttpError,
+    VanillaResult,
+    run_vanilla,
+)
 
 # Public compatibility re-exports for callers that historically imported state helpers here.
 import yaml
