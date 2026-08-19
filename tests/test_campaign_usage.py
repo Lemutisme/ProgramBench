@@ -285,6 +285,81 @@ def test_snapshot_rejects_underreported_derived_totals_and_job_schema() -> None:
         CircuitBreaker.from_snapshot(snapshot)
 
 
+def test_fractional_backoff_round_trips_and_fresh_http_date_is_exact() -> None:
+    now = [100.25]
+    breaker = CircuitBreaker(clock=lambda: now[0], retry_after_max=100)
+    breaker.observe_error(429, retry_after="1.5")
+    restored = CircuitBreaker.from_snapshot(json.dumps(breaker.snapshot()), clock=lambda: now[0])
+    assert restored.backoff_until == pytest.approx(101.75)
+    fresh = CircuitBreaker(clock=lambda: 100.25, retry_after_max=100)
+    fresh.observe_error(429, retry_after=format_datetime(datetime.fromtimestamp(103.25, timezone.utc), usegmt=True))
+    assert fresh.backoff_until == pytest.approx(103.0)
+
+
+def test_persistence_rejects_corrupt_cache_failures_and_job_turn_aggregates() -> None:
+    breaker = CircuitBreaker()
+    breaker.observe("job", 1, usage(turns=1, cost="0.1"))
+    corrupt = breaker.snapshot()
+    corrupt["cache_failures"] = 999
+    with pytest.raises(UsageParseError):
+        CircuitBreaker.from_snapshot(corrupt)
+    corrupt = breaker.snapshot()
+    corrupt["jobs"]["job"]["usage"]["input"] = 999
+    with pytest.raises(UsageParseError):
+        CircuitBreaker.from_snapshot(corrupt)
+
+
+def test_exact_decimal_sum_spans_exponents_and_cost_cap() -> None:
+    result = summarize_usage(
+        b'{"data":[{"type":"assistant","cost":1e100,"tokens":{"input":1,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"content":"ok"},{"type":"assistant","cost":0.1,"tokens":{"input":1,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"content":"ok"}]}'
+    )
+    assert result.cost == Decimal(
+        "10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000.1"
+    )
+    breaker = CircuitBreaker(hard_cost_cap=Decimal("1e100"))
+    breaker.observe("job", 1, result)
+    assert breaker.hard_stopped
+
+
+def test_projected_cost_missing_or_null_is_zero_but_string_is_invalid() -> None:
+    base = {
+        "type": "assistant",
+        "tokens": {"input": 1, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}},
+        "content": "ok",
+    }
+    assert summarize_usage({"data": [{**base}, {**base, "cost": None}]}).cost == 0
+    info = {"role": "assistant", "tokens": base["tokens"]}
+    assert (
+        summarize_usage({"data": [{"info": info, "parts": []}, {"info": {**info, "cost": None}, "parts": []}]}).cost
+        == 0
+    )
+    with pytest.raises(UsageParseError):
+        summarize_usage({"data": [{**base, "cost": "0"}]})
+
+
+def test_snapshot_requires_strict_version_and_nonempty_job_ids() -> None:
+    breaker = CircuitBreaker()
+    breaker.observe("job", 1, usage(turns=1))
+    snapshot = breaker.snapshot()
+    snapshot["version"] = True
+    with pytest.raises(UsageParseError):
+        CircuitBreaker.from_snapshot(snapshot)
+    snapshot = breaker.snapshot()
+    snapshot["jobs"][""] = snapshot["jobs"].pop("job")
+    with pytest.raises(UsageParseError):
+        CircuitBreaker.from_snapshot(snapshot)
+
+
+def test_newer_generation_lower_usage_replaces_and_decreases_totals() -> None:
+    breaker = CircuitBreaker()
+    higher = usage(turns=2, cost="0.2")
+    lower = usage(turns=1, cost="0.1")
+    breaker.observe("job", 1, higher)
+    breaker.observe("job", 2, lower)
+    assert breaker.campaign_usage.provider_turns == 1
+    assert breaker.campaign_usage.cost == Decimal("0.1")
+
+
 def test_acknowledged_recoverable_pause_round_trips_without_derived_drift() -> None:
     breaker = CircuitBreaker(soft_cost_cap="1")
     breaker.observe("job", 1, usage(turns=1, cost="1"))

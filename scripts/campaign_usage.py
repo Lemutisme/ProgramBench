@@ -8,7 +8,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import timezone
-from decimal import Decimal, InvalidOperation, localcontext
+from decimal import Decimal, InvalidOperation
 from email.utils import parsedate_to_datetime
 from typing import Callable, Mapping
 
@@ -189,7 +189,7 @@ def _projected_turn(message: object) -> TurnUsage | None:
         if not isinstance(message.get("content"), str):
             raise UsageParseError("flat user message requires content")
         return None
-    if message_type != "assistant" or not {"type", "cost", "tokens", "content"} <= set(message):
+    if message_type != "assistant" or not {"type", "tokens", "content"} <= set(message):
         raise UsageParseError("flat assistant message requires type, cost, tokens, and content")
     if not isinstance(message["content"], str):
         raise UsageParseError("flat assistant content must be a string")
@@ -541,7 +541,12 @@ class CircuitBreaker:
                 "jobs",
             },
         )
-        if raw["version"] != 1 or type(raw["cache_failures"]) is not int or raw["cache_failures"] < 0:
+        if (
+            type(raw["version"]) is not int
+            or raw["version"] != 1
+            or type(raw["cache_failures"]) is not int
+            or raw["cache_failures"] < 0
+        ):
             raise UsageParseError("invalid breaker snapshot version or cache failures")
         causes = raw["pause_causes"]
         if (
@@ -583,7 +588,9 @@ class CircuitBreaker:
                 raise UsageParseError("invalid breaker job generation")
             if type(item["terminal"]) is not bool:
                 raise UsageParseError("invalid breaker job terminal flag")
-            restored[job] = (generation, _summary_from_dict(item["usage"]), item["terminal"])
+            if not job:
+                raise UsageParseError("breaker job ID must be nonempty")
+            restored[job] = (generation, _summary_from_dict(item["usage"], require_turns=True), item["terminal"])
         sequence = raw["terminal_sequence"]
         if (
             not isinstance(sequence, list)
@@ -598,7 +605,8 @@ class CircuitBreaker:
         if type(raw["soft_acknowledged"]) is not bool:
             raise UsageParseError("invalid soft-cap acknowledgement")
         with breaker._lock:
-            breaker._cache_failures = raw["cache_failures"]
+            persisted_cache_failures = raw["cache_failures"]
+            breaker._cache_failures = persisted_cache_failures
             breaker._cache_acknowledged = raw["cache_acknowledged"]
             breaker._soft_acknowledged = raw["soft_acknowledged"]
             breaker._pause_causes = set(causes)
@@ -607,9 +615,10 @@ class CircuitBreaker:
             breaker._jobs = restored
             breaker._terminal_sequence = list(sequence)
             serialized_causes = set(causes)
-            expected = CircuitBreaker._derived_from_jobs(breaker)
-            if expected != (campaign, breaker._cache_failures):
+            expected_usage, expected_cache_failures = CircuitBreaker._derived_from_jobs(breaker)
+            if expected_usage != campaign or expected_cache_failures != persisted_cache_failures:
                 raise UsageParseError("breaker snapshot derived state is inconsistent")
+            breaker._cache_failures = persisted_cache_failures
             if breaker._cache_acknowledged and "cache" in serialized_causes:
                 raise UsageParseError("acknowledged cache pause is inconsistent")
             if (
@@ -712,7 +721,9 @@ def _decimal(value: object) -> Decimal:
 
 
 def _usage_cost(value: object) -> Decimal:
-    if value is None or isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
+    if value is None:
+        return Decimal(0)
+    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
         raise UsageParseError("projected message cost must be a JSON number")
     return _decimal(value)
 
@@ -726,17 +737,17 @@ def _decimal_string(value: Decimal) -> str:
 
 def _sum_decimals(values: object) -> Decimal:
     decimals = tuple(values)
-    precision = (
-        max(
-            (len(value.as_tuple().digits) for value in decimals if isinstance(value, Decimal)),
-            default=1,
-        )
-        + len(decimals)
-        + 8
+    if not decimals:
+        return Decimal(0)
+    minimum_exponent = min(value.as_tuple().exponent for value in decimals)
+    total = sum(
+        int("".join(str(digit) for digit in value.as_tuple().digits) or "0")
+        * (10 ** (value.as_tuple().exponent - minimum_exponent))
+        for value in decimals
     )
-    with localcontext() as context:
-        context.prec = max(context.prec, precision)
-        return sum(decimals, Decimal(0))
+    if total == 0:
+        return Decimal(0)
+    return Decimal((0, tuple(int(digit) for digit in str(total)), minimum_exponent))
 
 
 def _coerce_summary(value: UsageSummary | Mapping[str, object]) -> UsageSummary:
@@ -747,7 +758,7 @@ def _coerce_summary(value: UsageSummary | Mapping[str, object]) -> UsageSummary:
     return _summary_from_dict(value)
 
 
-def _summary_from_dict(value: object) -> UsageSummary:
+def _summary_from_dict(value: object, *, require_turns: bool = False) -> UsageSummary:
     if not isinstance(value, Mapping):
         raise UsageParseError("usage summary must be an object")
     required = {
@@ -769,6 +780,8 @@ def _summary_from_dict(value: object) -> UsageSummary:
     turns_value = value["turns"]
     if not isinstance(turns_value, list):
         raise UsageParseError("usage turns must be a list")
+    if require_turns and not turns_value:
+        raise UsageParseError("job usage must include per-turn records")
     turns: list[TurnUsage] = []
     for item in turns_value:
         if not isinstance(item, Mapping) or set(item) != {
@@ -812,6 +825,24 @@ def _summary_from_dict(value: object) -> UsageSummary:
         raise UsageParseError("usage summary turn counts are inconsistent")
     if summary.turns_with_cache + summary.turns_without_cache != summary.provider_turns:
         raise UsageParseError("usage summary turn counts are inconsistent")
+    if turns:
+        recomputed = UsageSummary(
+            provider_turns=len(turns),
+            input=sum(turn.input for turn in turns),
+            output=sum(turn.output for turn in turns),
+            reasoning=sum(turn.reasoning for turn in turns),
+            cache_read=sum(turn.cache_read for turn in turns),
+            cache_write=sum(turn.cache_write for turn in turns),
+            prompt_total=sum(turn.prompt_total for turn in turns),
+            turns_with_cache=sum(turn.cache_hit for turn in turns),
+            turns_without_cache=sum(not turn.cache_hit for turn in turns),
+            max_prompt_total=max(turn.prompt_total for turn in turns),
+            cost=_sum_decimals(turn.cost for turn in turns),
+            telemetry_gap=any(turn.cache_read > 0 and turn.cache_write == 0 for turn in turns),
+            turns=tuple(turns),
+        )
+        if summary != recomputed:
+            raise UsageParseError("usage summary does not match per-turn records")
     return summary
 
 
@@ -838,7 +869,7 @@ def _add(total: UsageSummary, delta: UsageSummary, observed_max: int) -> UsageSu
 
 
 def _finite_time(value: object) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)) or not math.isfinite(float(value)):
         raise UsageParseError("time must be finite")
     return float(value)
 
