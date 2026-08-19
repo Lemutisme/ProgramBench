@@ -3,6 +3,8 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass, replace
 from decimal import Decimal
+from datetime import datetime, timezone
+from email.utils import format_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +15,7 @@ from urllib.parse import urlparse
 import pytest
 
 from scripts import campaign_vanilla as vanilla_module
+from scripts import campaign_freeze as freeze_module
 from scripts import run_opencode as campaign_entrypoint
 from scripts.campaign_install import InstallRecord
 from scripts.campaign_state import JobLease, JobPaths, JobState, StateConflictError, StateStore
@@ -103,22 +106,25 @@ def v2_assistant() -> dict[str, object]:
 class FakeClock:
     def __init__(self) -> None:
         self.now = 100.0
+        self.sleeps: list[float] = []
 
     def __call__(self) -> float:
         return self.now
 
     def sleep(self, seconds: float) -> None:
+        assert seconds >= 0
+        self.sleeps.append(seconds)
         self.now += seconds
 
 
 class GuardClock(FakeClock):
     def __init__(self) -> None:
         super().__init__()
-        self.sleeps = 0
+        self.sleep_calls = 0
 
     def sleep(self, seconds: float) -> None:
-        self.sleeps += 1
-        if self.sleeps > 5:
+        self.sleep_calls += 1
+        if self.sleep_calls > 5:
             raise AssertionError("adapter did not enforce its safety ceiling")
         super().sleep(seconds)
 
@@ -369,6 +375,19 @@ class MutatingTerminalApi(FakeOpenCodeApi):
         return "idle"
 
 
+class OscillatingIdleApi(FakeOpenCodeApi):
+    def __init__(self, workspace: FakeWorkspace) -> None:
+        super().__init__([([user(), assistant()], "idle")])
+        self.workspace = workspace
+        self.status_calls = 0
+
+    def status(self, session_id: str) -> str:
+        self.status_calls += 1
+        if self.workspace.stops == 0:
+            self.workspace.candidate.joinpath("background.log").write_text("B" if self.status_calls == 1 else "A")
+        return "idle"
+
+
 class IdleRateApi(FakeOpenCodeApi):
     def __init__(self, retry: dict[str, object]) -> None:
         super().__init__([])
@@ -578,6 +597,9 @@ def test_vanilla_runs_exactly_one_ordinary_session_and_freezes_on_idle(tmp_path:
     assert result.cost == Decimal("0.25")
     assert result.cache_read == 50
     assert result.workspace_frozen
+    assert result.container_stopped_for_freeze
+    assert not result.forced_stop
+    assert workspace.stops == 1
     assert paths.root.joinpath("subject/source.py").read_text() == "print('candidate')\n"
     assert StateStore(paths.state).read().phase == "frozen"
     assert tree_snapshot(workspace.candidate) == candidate_before
@@ -612,6 +634,34 @@ def test_vanilla_runs_exactly_one_ordinary_session_and_freezes_on_idle(tmp_path:
             permission=(("*", "*", "allow"),),
         ).sha256
     )
+
+
+def test_natural_idle_stops_container_before_freezing_background_writer(tmp_path: Path) -> None:
+    paths, record, request, workspace = prepared(tmp_path)
+    workspace.candidate.joinpath("background.log").write_text("A")
+    api = OscillatingIdleApi(workspace)
+    clock = FakeClock()
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease.claim_handle(request)
+        result = run_vanilla(
+            job,
+            StateStore(paths.state),
+            workspace,
+            record,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=limits(),
+            breaker=CircuitBreaker(clock=clock),
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+        )
+    assert result.completion is VanillaCompletion.IDLE
+    assert result.container_stopped_for_freeze
+    assert not result.forced_stop
+    assert workspace.stops == 1
+    assert workspace.candidate.joinpath("background.log").read_text() == "A"
+    assert paths.root.joinpath("subject/background.log").read_text() == "A"
 
 
 def test_freeze_excludes_only_trusted_root_markers_not_candidate_files_with_same_name(tmp_path: Path) -> None:
@@ -858,6 +908,37 @@ def test_crash_after_state_cas_recovers_matching_progress_snapshot(tmp_path: Pat
     assert result.provider_turns == 1
 
 
+def test_resume_reconciles_breaker_after_usage_cas_before_any_prompt_wake(tmp_path: Path) -> None:
+    paths, record, request, workspace = prepared(tmp_path)
+    messages = [user(), assistant(cost=0.25)]
+    api = SafetyApi([(messages, "busy")])
+    clock = FakeClock()
+    breaker = CircuitBreaker(hard_cost_cap="0.25", clock=clock)
+    kwargs = {
+        "model": "openai/gpt-5.6-luna",
+        "variant": "max",
+        "limits": limits(),
+        "breaker": breaker,
+        "api": api,
+        "clock": clock,
+        "sleeper": clock.sleep,
+    }
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease.claim_handle(request)
+        with pytest.raises(InjectedCrash):
+            run_vanilla(job, CrashAfterCommitStateStore(paths.state), workspace, record, **kwargs)
+    assert len(api.prompt_requests) == 1
+
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease.claim_handle(request)
+        result = run_vanilla(job, StateStore(paths.state), workspace, record, **kwargs)
+    assert result.completion is VanillaCompletion.HARD_COST
+    assert breaker.hard_stopped
+    assert breaker.campaign_usage.cost == Decimal("0.25")
+    assert len(api.prompt_requests) == 1
+    assert api.interrupts == 1
+
+
 def test_corrupt_resumed_progress_after_prompt_is_quiesced_before_invalid_freeze(tmp_path: Path) -> None:
     paths, record, request, workspace = prepared(tmp_path)
     api = CrashThenTransientApi()
@@ -964,7 +1045,8 @@ def test_safety_ceiling_interrupts_once_then_freezes(
     assert result.completion is reason
     assert result.workspace_frozen
     assert api.interrupts == 1
-    assert workspace.stops == 0
+    assert result.container_stopped_for_freeze
+    assert workspace.stops == 1
 
 
 def test_provider_turn_poll_overshoot_records_exact_absolute_evidence_without_breaker_truncation(
@@ -1163,6 +1245,38 @@ def test_status_429_backs_off_then_retries_same_session_and_prompt(tmp_path: Pat
     assert len(api.sessions) == len(api.prompts) == 1
     assert clock.now >= 102
     assert api.interrupts == 0
+
+
+@pytest.mark.parametrize(
+    "retry_after",
+    ["0", format_datetime(datetime.fromtimestamp(50, timezone.utc), usegmt=True)],
+)
+def test_post_admission_429_enforces_positive_minimum_delay(tmp_path: Path, retry_after: str) -> None:
+    paths, record, request, workspace = prepared(tmp_path)
+    api = ErrorApi(
+        [VanillaHttpError("rate limited", status_code=429, retry_after=retry_after), None],
+        [([user(), assistant()], "idle")],
+    )
+    clock = FakeClock()
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease.claim_handle(request)
+        result = run_vanilla(
+            job,
+            StateStore(paths.state),
+            workspace,
+            record,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=limits(),
+            breaker=CircuitBreaker(clock=clock),
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+        )
+    assert result.completion is VanillaCompletion.IDLE
+    assert clock.sleeps
+    assert min(clock.sleeps) > 0
+    assert clock.now >= 101
 
 
 def test_perpetual_post_admission_429_stops_at_wall_deadline_with_bounded_calls(tmp_path: Path) -> None:
@@ -1550,7 +1664,7 @@ def test_inventory_stops_scandir_before_enumerating_past_file_limit(
     root.mkdir()
     for index in range(20):
         root.joinpath(f"file-{index}").write_text("x")
-    real_scandir = vanilla_module.os.scandir
+    real_scandir = freeze_module.os.scandir
     calls = 0
 
     class SentinelScandir:
@@ -1573,10 +1687,10 @@ def test_inventory_stops_scandir_before_enumerating_past_file_limit(
                 raise AssertionError("inventory enumerated beyond its bound")
             return next(self.iterator)
 
-    monkeypatch.setattr(vanilla_module, "MAX_FREEZE_FILES", 3)
-    monkeypatch.setattr(vanilla_module.os, "scandir", SentinelScandir)
+    monkeypatch.setattr(freeze_module, "MAX_FREEZE_FILES", 3)
+    monkeypatch.setattr(freeze_module.os, "scandir", SentinelScandir)
     with pytest.raises(VanillaError, match="file count"):
-        vanilla_module._inventory(root)
+        freeze_module._inventory(root)
     assert 0 < calls <= 4
 
 
@@ -1585,7 +1699,7 @@ def test_inventory_does_not_follow_symlink_cycles(tmp_path: Path) -> None:
     root.mkdir()
     root.joinpath("child").mkdir()
     root.joinpath("child/cycle").symlink_to(root, target_is_directory=True)
-    inventory = vanilla_module._inventory(root)
+    inventory = freeze_module._inventory(root)
     assert len(inventory) == 3
     assert sum(item["kind"] == "symlink" for item in inventory) == 1
 
@@ -1595,9 +1709,9 @@ def test_inventory_enforces_per_directory_entry_bound(tmp_path: Path, monkeypatc
     root.mkdir()
     root.joinpath("one").write_text("1")
     root.joinpath("two").write_text("2")
-    monkeypatch.setattr(vanilla_module, "MAX_DIRECTORY_ENTRIES", 1)
+    monkeypatch.setattr(freeze_module, "MAX_DIRECTORY_ENTRIES", 1)
     with pytest.raises(VanillaError, match="directory entry count"):
-        vanilla_module._inventory(root)
+        freeze_module._inventory(root)
 
 
 def test_inventory_rejects_file_swapped_to_symlink_before_open(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1607,7 +1721,7 @@ def test_inventory_rejects_file_swapped_to_symlink_before_open(tmp_path: Path, m
     victim.write_text("inside")
     external = tmp_path / "outside"
     external.write_text("must not be read")
-    real_open = vanilla_module.os.open
+    real_open = freeze_module.os.open
     swapped = False
 
     def swap_open(path, flags: int, mode: int = 0o777, *, dir_fd: int | None = None):
@@ -1618,9 +1732,9 @@ def test_inventory_rejects_file_swapped_to_symlink_before_open(tmp_path: Path, m
             victim.symlink_to(external)
         return real_open(path, flags, mode, dir_fd=dir_fd)
 
-    monkeypatch.setattr(vanilla_module.os, "open", swap_open)
+    monkeypatch.setattr(freeze_module.os, "open", swap_open)
     with pytest.raises(VanillaError, match="identity changed"):
-        vanilla_module._inventory(root)
+        freeze_module._inventory(root)
     assert swapped
 
 
@@ -1632,9 +1746,9 @@ def test_inventory_checks_deadline_during_directory_enumeration(
     root.joinpath("one").write_text("1")
     root.joinpath("two").write_text("2")
     ticks = iter([0.0, 0.0, 301.0])
-    monkeypatch.setattr(vanilla_module.time, "monotonic", lambda: next(ticks, 301.0))
+    monkeypatch.setattr(freeze_module.time, "monotonic", lambda: next(ticks, 301.0))
     with pytest.raises(VanillaError, match="enumeration exceeded time"):
-        vanilla_module._inventory(root)
+        freeze_module._inventory(root)
 
 
 def test_terminal_model_error_is_frozen_without_a_new_trajectory(tmp_path: Path) -> None:
@@ -2165,8 +2279,7 @@ def test_resumed_confirmed_session_is_interrupted_by_preexisting_global_stop(tmp
         result = run_vanilla(job, StateStore(paths.state), workspace, record, **kwargs)
     assert result.completion is VanillaCompletion.AUTH
     assert api.interrupts == 1
-    assert len(api.prompt_requests) == 2
-    assert api.prompt_requests[-1]["resume"] is False
+    assert len(api.prompt_requests) == 1
 
 
 @pytest.mark.parametrize("lost", [False, True])
@@ -2195,9 +2308,7 @@ def test_expired_executing_resume_adopts_session_before_wall_safety(tmp_path: Pa
         workspace.lease.claim_handle(request)
         result = run_vanilla(job, StateStore(paths.state), workspace, record, **kwargs)
     assert result.exit_class == ("lost_server" if lost else "wall_time")
-    assert len(api.prompt_requests) == (1 if lost else 2)
-    if not lost:
-        assert api.prompt_requests[-1]["resume"] is False
+    assert len(api.prompt_requests) == 1
 
 
 def test_frozen_invocation_returns_persisted_result_without_api_or_second_freeze(tmp_path: Path) -> None:
@@ -2379,7 +2490,7 @@ def test_real_http_adapter_matches_origin_dev_paths_and_payloads_without_contrac
                 variant="max",
                 limits=limits(),
                 breaker=CircuitBreaker(clock=clock),
-                api=HttpOpenCodeApi(server.url),
+                api=HttpOpenCodeApi(server.url, expected_port=server.port),
                 clock=clock,
                 sleeper=clock.sleep,
             )
@@ -2412,11 +2523,74 @@ def test_real_http_adapter_matches_origin_dev_paths_and_payloads_without_contrac
 
 
 def test_injected_http_client_bounds_provider_error_strings() -> None:
-    api = HttpOpenCodeApi("http://127.0.0.1:4096", http_client=SecretErrorHttpClient())
+    api = HttpOpenCodeApi("http://127.0.0.1:4096", expected_port=4096, http_client=SecretErrorHttpClient())
     with pytest.raises(VanillaHttpError) as raised:
         api.get_session("ses_owned")
     assert raised.value.status_code == 500
     assert "credential-value" not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("url", "port"),
+    [
+        ("http://localhost:4096", 4096),
+        ("http://127.0.0.2:4096", 4096),
+        ("http://user@127.0.0.1:4096", 4096),
+        ("http://127.0.0.1:4096/#fragment", 4096),
+        ("http://127.0.0.1:4097", 4096),
+    ],
+)
+def test_http_api_rejects_nonexact_loopback_origin(url: str, port: int) -> None:
+    with pytest.raises(VanillaError, match="loopback HTTP origin"):
+        HttpOpenCodeApi(url, expected_port=port)
+
+
+def test_urllib_transport_never_follows_redirect_to_other_origin() -> None:
+    target_requests = 0
+
+    class TargetHandler(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+        def do_GET(self) -> None:
+            nonlocal target_requests
+            target_requests += 1
+            self.send_response(200)
+            self.end_headers()
+
+    target = ThreadingHTTPServer(("127.0.0.1", 0), TargetHandler)
+    target_thread = threading.Thread(target=target.serve_forever, daemon=True)
+    target_thread.start()
+
+    class RedirectHandler(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+        def do_GET(self) -> None:
+            self.send_response(302)
+            self.send_header("location", f"http://127.0.0.1:{target.server_address[1]}/target")
+            self.end_headers()
+
+    redirect = ThreadingHTTPServer(("127.0.0.1", 0), RedirectHandler)
+    redirect_thread = threading.Thread(target=redirect.serve_forever, daemon=True)
+    redirect_thread.start()
+    try:
+        api = HttpOpenCodeApi(
+            f"http://127.0.0.1:{redirect.server_address[1]}",
+            expected_port=redirect.server_address[1],
+        )
+        with pytest.raises(VanillaHttpError) as raised:
+            api.get_session("ses_owned")
+        assert raised.value.status_code == 302
+        assert "target" not in str(raised.value)
+        assert target_requests == 0
+    finally:
+        redirect.shutdown()
+        target.shutdown()
+        redirect_thread.join(timeout=5)
+        target_thread.join(timeout=5)
+        redirect.server_close()
+        target.server_close()
 
 
 @pytest.mark.parametrize(
@@ -2450,7 +2624,7 @@ def test_http_prompt_rejects_malformed_or_conflicting_admission(overrides: dict[
     )
     try:
         with pytest.raises(VanillaError, match="admission"):
-            HttpOpenCodeApi(server.url).prompt(request)
+            HttpOpenCodeApi(server.url, expected_port=server.port).prompt(request)
     finally:
         server.stop()
 
@@ -2660,6 +2834,10 @@ class OriginDevServer:
     @property
     def url(self) -> str:
         return f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    @property
+    def port(self) -> int:
+        return self.server.server_address[1]
 
     def start(self) -> None:
         self.thread.start()

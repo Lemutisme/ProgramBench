@@ -7,18 +7,13 @@ import json
 import math
 import os
 import re
-import shutil
-import stat
 import tempfile
 import time
 from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation, localcontext
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Literal, Mapping, Protocol
-from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode, urlparse
-from urllib.request import Request, urlopen
+from typing import TYPE_CHECKING, Callable, Literal, Mapping
 
 from scripts.campaign_install import InstallRecord
 from scripts.campaign_state import JobLease, JobState, StateStore
@@ -30,52 +25,38 @@ from scripts.campaign_usage import (
     summarize_usage,
 )
 from scripts.campaign_workspace import DockerWorkspace, WorkspaceError
+from scripts.campaign_freeze import (
+    CredentialLeakError,
+    _inventory,
+    _make_read_only,
+    _remove_tree,
+    _snapshot_candidate,
+    _verify_no_credentials,
+)
+from scripts.campaign_vanilla_http import (  # noqa: F401
+    ORIGINAL_TASK,
+    HttpClient,
+    HttpOpenCodeApi,
+    HttpResponse,
+    OpenCodeApi,
+    UrllibHttpClient,
+    VanillaError,
+    VanillaHttpError,
+    VanillaPromptRequest,
+)
 
 if TYPE_CHECKING:
     from scripts.run_opencode import Limits
 
 
-ORIGINAL_TASK = (
-    "Implement the documented program in this cleanroom. Produce source, a relocatable compile.sh, and "
-    "./executable. Use the reference only for black-box experiments."
-)
 MAX_WALL_TIME_SECONDS = 21600
 MAX_PROVIDER_TURNS = 1000
 MAX_EVIDENCE_MESSAGES = 2001
 MAX_ARTIFACT_BYTES = 8 * 1024 * 1024
-MAX_FREEZE_FILES = 100_000
-MAX_FREEZE_BYTES = 4 * 1024 * 1024 * 1024
-MAX_DIRECTORY_ENTRIES = 10_000
-MAX_INVENTORY_SECONDS = 300.0
 _SECRET = re.compile(r"(?i)(authorization\s*[:=]\s*(?:bearer\s+)?|api[_-]?key\s*[:=]\s*|token\s*[:=]\s*)[^\s,;\"']+")
 _SENSITIVE_KEY = re.compile(
     r"(?i)authorization|api[-_]?key|access[-_]?token|refresh[-_]?token|id[-_]?token|(?:^|[-_])token(?:$|[-_])|secret|credential|signature"
 )
-
-
-class VanillaError(RuntimeError):
-    """Raised when a vanilla trajectory cannot be safely run or adopted."""
-
-
-class VanillaHttpError(VanillaError):
-    """Bounded, sanitized failure from the public OpenCode HTTP API."""
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        status_code: int | None = None,
-        retry_after: str | None = None,
-        transient: bool = False,
-    ) -> None:
-        self.status_code = status_code
-        self.retry_after = retry_after
-        self.transient = transient
-        super().__init__(_sanitize_text(message))
-
-
-class CredentialLeakError(VanillaError):
-    """Raised before publication when credential material is observed."""
 
 
 class SessionConflictError(VanillaError):
@@ -90,66 +71,6 @@ class VanillaCompletion(str, Enum):
     HARD_COST = "hard_cost"
     PROVIDER_ERROR = "provider_error"
     INTERRUPTED = "interrupted"
-
-
-@dataclass(frozen=True)
-class VanillaPromptRequest:
-    session_id: str
-    message_id: str
-    text: str
-    delivery: Literal["steer", "queue"]
-    model: str
-    variant: str
-    directory: str
-    agent: str | None
-    files: tuple[Mapping[str, object], ...]
-    permission: tuple[tuple[str, str, str], ...]
-
-    def __post_init__(self) -> None:
-        if (
-            not self.session_id.startswith("ses_")
-            or not self.message_id.startswith("msg_")
-            or not self.text
-            or self.text != ORIGINAL_TASK
-            or self.delivery != "steer"
-            or self.model != "openai/gpt-5.6-luna"
-            or self.variant != "max"
-            or self.directory != "/candidate"
-            or self.agent is not None
-            or self.files
-            or self.permission != (("*", "*", "allow"),)
-        ):
-            raise VanillaError("vanilla prompt request is invalid")
-        json.dumps(self.to_dict(), allow_nan=False, sort_keys=True)
-
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "session_id": self.session_id,
-            "message_id": self.message_id,
-            "text": self.text,
-            "delivery": self.delivery,
-            "model": self.model,
-            "variant": self.variant,
-            "directory": self.directory,
-            "agent": self.agent,
-            "files": [dict(file) for file in self.files],
-            "permission": [
-                {"permission": permission, "pattern": pattern, "action": action}
-                for permission, pattern, action in self.permission
-            ],
-        }
-
-    @property
-    def sha256(self) -> str:
-        return hashlib.sha256(
-            json.dumps(self.to_dict(), allow_nan=False, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest()
-
-    def api_payload(self, *, resume: bool) -> dict[str, object]:
-        prompt: dict[str, object] = {"text": self.text}
-        if self.files:
-            prompt["files"] = [dict(file) for file in self.files]
-        return {"id": self.message_id, "prompt": prompt, "delivery": self.delivery, "resume": resume}
 
 
 @dataclass(frozen=True)
@@ -169,6 +90,7 @@ class VanillaResult:
     max_prompt_total: int
     limit_overshoot: int
     workspace_frozen: bool
+    container_stopped_for_freeze: bool
     interrupt_attempted: bool
     forced_stop: bool
     exit_class: str
@@ -192,6 +114,7 @@ class VanillaResult:
             "max_prompt_total": self.max_prompt_total,
             "limit_overshoot": self.limit_overshoot,
             "workspace_frozen": self.workspace_frozen,
+            "container_stopped_for_freeze": self.container_stopped_for_freeze,
             "interrupt_attempted": self.interrupt_attempted,
             "forced_stop": self.forced_stop,
             "exit_class": self.exit_class,
@@ -217,6 +140,7 @@ class VanillaResult:
             "max_prompt_total",
             "limit_overshoot",
             "workspace_frozen",
+            "container_stopped_for_freeze",
             "interrupt_attempted",
             "forced_stop",
             "exit_class",
@@ -240,6 +164,7 @@ class VanillaResult:
                 max_prompt_total=raw["max_prompt_total"],
                 limit_overshoot=raw["limit_overshoot"],
                 workspace_frozen=raw["workspace_frozen"],
+                container_stopped_for_freeze=raw["container_stopped_for_freeze"],
                 interrupt_attempted=raw["interrupt_attempted"],
                 forced_stop=raw["forced_stop"],
                 exit_class=raw["exit_class"],
@@ -270,307 +195,15 @@ class VanillaResult:
             or not math.isfinite(result.elapsed_seconds)
             or result.elapsed_seconds < 0
             or type(result.workspace_frozen) is not bool
+            or type(result.container_stopped_for_freeze) is not bool
             or type(result.interrupt_attempted) is not bool
             or type(result.forced_stop) is not bool
-            or result.forced_stop
-            and not result.interrupt_attempted
             or not isinstance(result.exit_class, str)
             or result.error is not None
             and not isinstance(result.error, str)
         ):
             raise VanillaError("persisted vanilla result is invalid")
         return result
-
-
-class OpenCodeApi(Protocol):
-    def get_session(self, session_id: str) -> Mapping[str, object] | None: ...
-
-    def create_session(
-        self, session_id: str, *, model: str, variant: str, directory: str, agent: str | None
-    ) -> Mapping[str, object]: ...
-
-    def allow_permissions(self, session_id: str, *, directory: str) -> None: ...
-
-    def get_message(self, session_id: str, message_id: str) -> Mapping[str, object] | None: ...
-
-    def prompt(self, request: VanillaPromptRequest, *, resume: bool = True) -> None: ...
-
-    def messages(self, session_id: str) -> Mapping[str, object]: ...
-
-    def status(self, session_id: str) -> str: ...
-
-    def interrupt(self, session_id: str) -> None: ...
-
-
-@dataclass(frozen=True)
-class HttpResponse:
-    status: int
-    headers: Mapping[str, str]
-    body: bytes
-
-
-class HttpClient(Protocol):
-    def request(
-        self,
-        method: str,
-        url: str,
-        *,
-        body: bytes | None,
-        headers: Mapping[str, str],
-        timeout: float,
-        max_bytes: int,
-    ) -> HttpResponse: ...
-
-
-class UrllibHttpClient:
-    def request(
-        self,
-        method: str,
-        url: str,
-        *,
-        body: bytes | None,
-        headers: Mapping[str, str],
-        timeout: float,
-        max_bytes: int,
-    ) -> HttpResponse:
-        request = Request(url, data=body, headers=dict(headers), method=method)
-        try:
-            with urlopen(request, timeout=timeout) as response:
-                payload = response.read(max_bytes + 1)
-                if len(payload) > max_bytes:
-                    raise VanillaHttpError("OpenCode API response exceeds size limit", transient=True)
-                return HttpResponse(
-                    response.status,
-                    {key.lower(): value for key, value in response.headers.items()},
-                    payload,
-                )
-        except HTTPError as error:
-            payload = error.read(max_bytes + 1)
-            raise VanillaHttpError(
-                f"OpenCode API request failed with HTTP {error.code}"
-                + (" and an oversized response" if len(payload) > max_bytes else ""),
-                status_code=error.code,
-                retry_after=error.headers.get("retry-after"),
-                transient=error.code >= 500,
-            ) from None
-        except (OSError, URLError) as error:
-            raise VanillaHttpError(f"OpenCode API network failure: {error}", transient=True) from None
-
-
-class HttpOpenCodeApi:
-    """Small bounded client for the current public origin/dev Session API."""
-
-    def __init__(
-        self,
-        base_url: str,
-        *,
-        http_client: HttpClient | None = None,
-        request_timeout: float = 10.0,
-        max_response_bytes: int = MAX_ARTIFACT_BYTES,
-    ) -> None:
-        parsed = urlparse(base_url)
-        if (
-            parsed.scheme != "http"
-            or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
-            or parsed.port is None
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.path not in {"", "/"}
-            or parsed.query
-            or parsed.fragment
-        ):
-            raise VanillaError("OpenCode API must use a loopback HTTP origin")
-        if not 0 < request_timeout <= 30 or not 0 < max_response_bytes <= MAX_ARTIFACT_BYTES:
-            raise VanillaError("OpenCode API bounds are invalid")
-        self.base_url = base_url.rstrip("/")
-        self.http_client = http_client or UrllibHttpClient()
-        self.request_timeout = request_timeout
-        self.max_response_bytes = max_response_bytes
-
-    def get_session(self, session_id: str) -> Mapping[str, object] | None:
-        try:
-            return self._envelope(self._request("GET", f"/api/session/{_id(session_id, 'ses_')}"))
-        except VanillaHttpError as error:
-            if error.status_code == 404:
-                return None
-            raise
-
-    def create_session(
-        self,
-        session_id: str,
-        *,
-        model: str,
-        variant: str,
-        directory: str,
-        agent: str | None,
-    ) -> Mapping[str, object]:
-        provider_id, model_id = model.split("/", 1)
-        return self._envelope(
-            self._request(
-                "POST",
-                "/api/session",
-                {
-                    "id": _id(session_id, "ses_"),
-                    "model": {"id": model_id, "providerID": provider_id, "variant": variant},
-                    "location": {"directory": directory},
-                    **({"agent": agent} if agent is not None else {}),
-                },
-            )
-        )
-
-    def allow_permissions(self, session_id: str, *, directory: str) -> None:
-        self._request(
-            "PATCH",
-            f"/session/{_id(session_id, 'ses_')}?{urlencode({'directory': directory})}",
-            {"permission": [{"permission": "*", "pattern": "*", "action": "allow"}]},
-        )
-
-    def get_message(self, session_id: str, message_id: str) -> Mapping[str, object] | None:
-        try:
-            return self._envelope(
-                self._request(
-                    "GET",
-                    f"/api/session/{_id(session_id, 'ses_')}/message/{_id(message_id, 'msg_')}",
-                )
-            )
-        except VanillaHttpError as error:
-            if error.status_code == 404:
-                return None
-            raise
-
-    def prompt(self, request: VanillaPromptRequest, *, resume: bool = True) -> None:
-        admitted = self._envelope(
-            self._request(
-                "POST",
-                f"/api/session/{_id(request.session_id, 'ses_')}/prompt",
-                request.api_payload(resume=resume),
-            )
-        )
-        _validate_admitted(admitted, request)
-
-    def messages(self, session_id: str) -> Mapping[str, object]:
-        messages: list[object] = []
-        cursor = None
-        while True:
-            query = {"limit": 200, **({"order": "asc"} if cursor is None else {"cursor": cursor})}
-            raw = self._json(
-                self._request(
-                    "GET",
-                    f"/api/session/{_id(session_id, 'ses_')}/message?{urlencode(query)}",
-                )
-            )
-            if (
-                not isinstance(raw, Mapping)
-                or set(raw) != {"data", "cursor"}
-                or not isinstance(raw["data"], list)
-                or not isinstance(raw["cursor"], Mapping)
-            ):
-                raise VanillaError("OpenCode projected messages response is invalid")
-            messages.extend(raw["data"])
-            if len(messages) > 10_000:
-                raise VanillaError("OpenCode projected message count exceeds campaign limit")
-            next_cursor = raw["cursor"].get("next")
-            if not raw["data"] or next_cursor is None:
-                return {"data": messages}
-            if not isinstance(next_cursor, str) or not next_cursor or next_cursor == cursor:
-                raise VanillaError("OpenCode projected message cursor is invalid")
-            cursor = next_cursor
-
-    def status(self, session_id: str) -> str:
-        raw = self._envelope(self._request("GET", "/api/session/active"))
-        if any(not isinstance(key, str) or not isinstance(value, Mapping) for key, value in raw.items()):
-            raise VanillaError("OpenCode Session status response is invalid")
-        status_value = raw.get(session_id)
-        if status_value is not None and status_value.get("type") != "running":
-            raise VanillaError("OpenCode Session status entry is invalid")
-        return "busy" if status_value is not None else "idle"
-
-    def interrupt(self, session_id: str) -> None:
-        self._request("POST", f"/api/session/{_id(session_id, 'ses_')}/interrupt", expected=(204,))
-
-    def _request(
-        self,
-        method: str,
-        path: str,
-        payload: object | None = None,
-        *,
-        expected: tuple[int, ...] = (200,),
-    ) -> HttpResponse:
-        body = None if payload is None else json.dumps(payload, allow_nan=False, separators=(",", ":")).encode()
-        if body is not None and len(body) > 1024 * 1024:
-            raise VanillaError("OpenCode API request exceeds size limit")
-        response = self.http_client.request(
-            method,
-            self.base_url + path,
-            body=body,
-            headers={"Accept": "application/json", **({"Content-Type": "application/json"} if body else {})},
-            timeout=self.request_timeout,
-            max_bytes=self.max_response_bytes,
-        )
-        if response.status not in expected:
-            raise VanillaHttpError(
-                f"OpenCode API request failed with HTTP {response.status}",
-                status_code=response.status,
-                retry_after=response.headers.get("retry-after"),
-                transient=response.status >= 500,
-            )
-        return response
-
-    def _envelope(self, response: HttpResponse) -> Mapping[str, object]:
-        raw = self._json(response)
-        if not isinstance(raw, Mapping) or set(raw) != {"data"} or not isinstance(raw["data"], Mapping):
-            raise VanillaError("OpenCode API response envelope is invalid")
-        return raw["data"]
-
-    def _json(self, response: HttpResponse) -> object:
-        try:
-            return json.loads(
-                response.body,
-                object_pairs_hook=_unique_pairs,
-                parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)),
-            )
-        except (UnicodeError, ValueError) as error:
-            raise VanillaError("OpenCode API returned invalid JSON") from error
-
-
-def _id(value: str, prefix: str) -> str:
-    if not isinstance(value, str) or not value.startswith(prefix) or len(value) > 256:
-        raise VanillaError("OpenCode ID is invalid")
-    return quote(value, safe="_-.")
-
-
-def _unique_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    result: dict[str, object] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f"duplicate JSON key: {key}")
-        result[key] = value
-    return result
-
-
-def _validate_admitted(admitted: Mapping[str, object], request: VanillaPromptRequest) -> None:
-    required = {"admittedSeq", "id", "sessionID", "prompt", "delivery", "timeCreated"}
-    if frozenset(admitted) not in {frozenset(required), frozenset({*required, "promotedSeq"})}:
-        raise VanillaError("OpenCode prompt admission response has invalid fields")
-    admitted_seq = admitted["admittedSeq"]
-    promoted_seq = admitted.get("promotedSeq")
-    time_created = admitted["timeCreated"]
-    expected_prompt = request.api_payload(resume=True)["prompt"]
-    if (
-        type(admitted_seq) is not int
-        or admitted_seq < 0
-        or promoted_seq is not None
-        and (type(promoted_seq) is not int or promoted_seq < 0)
-        or isinstance(time_created, bool)
-        or not isinstance(time_created, (int, float))
-        or not math.isfinite(time_created)
-        or time_created < 0
-        or admitted["id"] != request.message_id
-        or admitted["sessionID"] != request.session_id
-        or admitted["prompt"] != expected_prompt
-        or admitted["delivery"] != request.delivery
-    ):
-        raise VanillaError("OpenCode prompt admission response conflicts with persisted request")
 
 
 def run_vanilla(
@@ -707,6 +340,7 @@ def run_vanilla(
             messages={"data": []},
             observe_breaker=False,
         )
+    _reconcile_breaker_usage(breaker, workspace.manifest.job_id, state.generation, usage)
     while True:
         try:
             found = api.get_session(session_id)
@@ -726,14 +360,8 @@ def run_vanilla(
                         messages,
                         max(0.0, clock() - float(started_at)),
                     )
-                if breaker.stop_active or clock() >= wall_deadline:
-                    completion = (
-                        VanillaCompletion.AUTH
-                        if breaker.pause_reason == "provider authentication failure"
-                        else VanillaCompletion.HARD_COST
-                        if breaker.stop_active
-                        else VanillaCompletion.WALL_TIME
-                    )
+                safety = _safety_completion(breaker, usage, limits, clock, wall_deadline)
+                if safety is not None:
                     return _finish_early_stop(
                         job,
                         state_store,
@@ -751,7 +379,7 @@ def run_vanilla(
                         clock,
                         sleeper,
                         poll_interval,
-                        completion=completion,
+                        completion=safety,
                         error_text=breaker.pause_reason or "wall time safety ceiling reached",
                         confirmed=False,
                         usage=usage,
@@ -770,14 +398,8 @@ def run_vanilla(
             if execution.get("session_confirmed") is not True:
                 execution = {**execution, "session_confirmed": True}
                 _write_json(execution_path, execution)
-            if breaker.stop_active:
-                execution = _mark_prompt_may_be_active(execution_path)
-                _reconcile_admission(api, prompt_request)
-                completion = (
-                    VanillaCompletion.AUTH
-                    if breaker.pause_reason == "provider authentication failure"
-                    else VanillaCompletion.HARD_COST
-                )
+            safety = _safety_completion(breaker, usage, limits, clock, wall_deadline)
+            if safety is not None:
                 return _finish_early_stop(
                     job,
                     state_store,
@@ -795,35 +417,8 @@ def run_vanilla(
                     clock,
                     sleeper,
                     poll_interval,
-                    completion=completion,
-                    error_text=breaker.pause_reason or completion.value,
-                    confirmed=True,
-                    usage=usage,
-                    actions=actions,
-                    messages=messages,
-                )
-            if clock() >= wall_deadline:
-                execution = _mark_prompt_may_be_active(execution_path)
-                _reconcile_admission(api, prompt_request)
-                return _finish_early_stop(
-                    job,
-                    state_store,
-                    state,
-                    workspace,
-                    command_identity,
-                    session_id,
-                    message_id,
-                    session,
-                    execution_path,
-                    execution,
-                    breaker,
-                    api,
-                    max(0.0, clock() - float(started_at)),
-                    clock,
-                    sleeper,
-                    poll_interval,
-                    completion=VanillaCompletion.WALL_TIME,
-                    error_text="wall time safety ceiling reached",
+                    completion=safety,
+                    error_text=breaker.pause_reason or safety.value,
                     confirmed=True,
                     usage=usage,
                     actions=actions,
@@ -836,7 +431,7 @@ def run_vanilla(
         except VanillaHttpError as error:
             if execution.get("prompt_may_be_active") is True:
                 if error.status_code == 429:
-                    breaker.observe_error(429, retry_after=error.retry_after, detail=str(error))
+                    _observe_rate_limit(breaker, error.retry_after, str(error), clock, wall_deadline)
                     if _backoff(breaker, clock, sleeper, poll_interval, wall_deadline):
                         completion = _safety_completion(breaker, usage, limits, clock, wall_deadline)
                         if completion is not None:
@@ -896,7 +491,7 @@ def run_vanilla(
                     messages=messages,
                 )
             if error.status_code == 429:
-                breaker.observe_error(429, retry_after=error.retry_after, detail=str(error))
+                _observe_rate_limit(breaker, error.retry_after, str(error), clock, wall_deadline)
                 if _backoff(breaker, clock, sleeper, poll_interval, wall_deadline):
                     completion = _safety_completion(breaker, usage, limits, clock, wall_deadline)
                     if completion is not None:
@@ -1068,7 +663,7 @@ def run_vanilla(
             messages = sanitized
         except VanillaHttpError as error:
             if error.status_code == 429:
-                breaker.observe_error(429, retry_after=error.retry_after, detail=str(error))
+                _observe_rate_limit(breaker, error.retry_after, str(error), clock, wall_deadline)
                 _backoff(breaker, clock, sleeper, poll_interval, wall_deadline)
                 continue
             if error.status_code in {401, 403, 429}:
@@ -1138,7 +733,7 @@ def run_vanilla(
         if provider_error is not None and provider_error[0] == 429:
             if provider_error[3] not in observed_provider_errors:
                 observed_provider_errors.add(provider_error[3])
-                breaker.observe_error(429, retry_after=provider_error[1], detail=provider_error[2])
+                _observe_rate_limit(breaker, provider_error[1], provider_error[2], clock, wall_deadline)
                 _backoff(breaker, clock, sleeper, poll_interval, wall_deadline)
                 continue
             provider_error = None
@@ -1174,7 +769,7 @@ def run_vanilla(
             status_value = api.status(session_id)
         except VanillaHttpError as error:
             if error.status_code == 429:
-                breaker.observe_error(429, retry_after=error.retry_after, detail=str(error))
+                _observe_rate_limit(breaker, error.retry_after, str(error), clock, wall_deadline)
                 _backoff(breaker, clock, sleeper, poll_interval, wall_deadline)
                 continue
             if error.status_code in {401, 403, 429}:
@@ -1214,6 +809,8 @@ def run_vanilla(
             break
         sleeper(min(poll_interval, max(0.0, wall_deadline - clock())))
 
+    if workspace.lease._handle_active:
+        workspace.stop()
     result = _result(
         session_id,
         message_id,
@@ -1222,6 +819,7 @@ def run_vanilla(
         actions,
         max(0.0, clock() - float(started_at)),
         workspace_frozen=True,
+        container_stopped_for_freeze=True,
         interrupt_attempted=_execution_interrupt_attempted(execution_path),
         forced_stop=stopped,
         exit_class="invalid_usage_regression" if invalid_error is not None else None,
@@ -1264,11 +862,23 @@ def run_vanilla(
         artifact_hashes=hashes,
     )
     _verify_no_credentials(job.job.root, workspace.manifest.credential_env)
-    if not stopped:
-        workspace.release()
     if invalid_error is not None:
         raise VanillaError(f"{invalid_error}; invalid trajectory evidence frozen")
     return result
+
+
+def _observe_rate_limit(
+    breaker: CircuitBreaker,
+    retry_after: object,
+    detail: object,
+    clock: Callable[[], float],
+    deadline: float,
+) -> None:
+    now = clock()
+    breaker.observe_error(429, retry_after=retry_after, detail=detail, now=now)
+    if now >= deadline or breaker.backoff_until is not None and breaker.backoff_until > now:
+        return
+    breaker.observe_error(429, retry_after=str(min(1.0, deadline - now)), detail=detail, now=now)
 
 
 def _backoff(
@@ -1316,6 +926,19 @@ def _observe_terminal_usage(
         breaker.observe_terminal_overshoot(job_id, generation, usage)
         return
     breaker.observe(job_id, generation, usage, terminal=True)
+
+
+def _reconcile_breaker_usage(
+    breaker: CircuitBreaker,
+    job_id: str,
+    generation: int,
+    usage: UsageSummary,
+) -> None:
+    """Restore exact durable job usage before any prompt wake or retry."""
+    if usage.provider_turns > MAX_PROVIDER_TURNS:
+        breaker.observe_terminal_overshoot(job_id, generation, usage)
+        return
+    breaker.observe(job_id, generation, usage, terminal=False)
 
 
 def _usage_from_state(state: JobState) -> UsageSummary:
@@ -1727,6 +1350,7 @@ def _credential_leak_result(
         actions,
         elapsed,
         workspace_frozen=False,
+        container_stopped_for_freeze=True,
         interrupt_attempted=interrupt_attempted,
         forced_stop=already_stopped and interrupt_attempted,
         exit_class=exit_class,
@@ -1790,6 +1414,8 @@ def _finish_early_stop(
         if confirmed
         else False
     )
+    if workspace.lease._handle_active:
+        workspace.stop()
     result = _result(
         session_id,
         message_id,
@@ -1798,6 +1424,7 @@ def _finish_early_stop(
         actions,
         elapsed,
         workspace_frozen=True,
+        container_stopped_for_freeze=True,
         interrupt_attempted=_execution_interrupt_attempted(execution_path),
         forced_stop=stopped,
         error=error_text,
@@ -1839,8 +1466,6 @@ def _finish_early_stop(
         },
     )
     _verify_no_credentials(job.job.root, workspace.manifest.credential_env)
-    if not stopped:
-        workspace.release()
     return result
 
 
@@ -1868,6 +1493,8 @@ def _lost_server(
     ):
         workspace.stop()
         stopped = True
+    if workspace.lease._handle_active:
+        workspace.stop()
     result = _result(
         session_id,
         message_id,
@@ -1876,6 +1503,8 @@ def _lost_server(
         actions,
         elapsed,
         workspace_frozen=True,
+        container_stopped_for_freeze=True,
+        forced_stop=stopped,
         exit_class="lost_server",
         error="persisted OpenCode Session is missing",
     )
@@ -1903,7 +1532,7 @@ def _lost_server(
             breaker,
             execution_path,
             elapsed,
-            already_stopped=False,
+            already_stopped=stopped,
         )
     _verify_no_credentials(job.job.root, workspace.manifest.credential_env)
     _observe_terminal_usage(breaker, workspace.manifest.job_id, state.generation, usage)
@@ -1921,8 +1550,6 @@ def _lost_server(
         },
     )
     _verify_no_credentials(job.job.root, workspace.manifest.credential_env)
-    if not stopped:
-        workspace.release()
     return result
 
 
@@ -2174,6 +1801,7 @@ def _result(
     elapsed: float,
     *,
     workspace_frozen: bool,
+    container_stopped_for_freeze: bool = False,
     interrupt_attempted: bool = False,
     forced_stop: bool = False,
     exit_class: str | None = None,
@@ -2195,6 +1823,7 @@ def _result(
         max_prompt_total=usage.max_prompt_total,
         limit_overshoot=max(0, usage.provider_turns - MAX_PROVIDER_TURNS),
         workspace_frozen=workspace_frozen,
+        container_stopped_for_freeze=container_stopped_for_freeze,
         interrupt_attempted=interrupt_attempted,
         forced_stop=forced_stop,
         exit_class=exit_class or completion.value,
@@ -2297,284 +1926,6 @@ def _materialize_freeze(job_root: Path, subject: Path, result: VanillaResult) ->
     return stored_result
 
 
-def _open_directory(path: Path) -> int:
-    try:
-        return os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
-    except OSError as error:
-        raise VanillaError("workspace directory identity changed") from error
-
-
-def _scan_names(descriptor: int, deadline: float, count: list[int]) -> list[str]:
-    names: list[str] = []
-    with os.scandir(descriptor) as iterator:
-        for entry in iterator:
-            if time.monotonic() > deadline:
-                raise VanillaError("workspace freeze enumeration exceeded time limit")
-            if len(names) >= MAX_DIRECTORY_ENTRIES:
-                raise VanillaError("workspace freeze directory entry count exceeds limit")
-            count[0] += 1
-            if count[0] > MAX_FREEZE_FILES:
-                raise VanillaError("workspace freeze file count exceeds limit")
-            names.append(entry.name)
-    names.sort()
-    return names
-
-
-def _open_verified(parent: int, name: str, expected: os.stat_result, *, directory: bool) -> tuple[int, os.stat_result]:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    if directory:
-        flags |= getattr(os, "O_DIRECTORY", 0)
-    try:
-        descriptor = os.open(name, flags, dir_fd=parent)
-    except OSError as error:
-        raise VanillaError("workspace entry identity changed during freeze") from error
-    current = os.fstat(descriptor)
-    expected_kind = stat.S_ISDIR(expected.st_mode) if directory else stat.S_ISREG(expected.st_mode)
-    current_kind = stat.S_ISDIR(current.st_mode) if directory else stat.S_ISREG(current.st_mode)
-    if not expected_kind or not current_kind or (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino):
-        os.close(descriptor)
-        raise VanillaError("workspace entry identity changed during freeze")
-    return descriptor, current
-
-
-def _hash_descriptor(descriptor: int, deadline: float, remaining: int) -> tuple[str, int]:
-    digest = hashlib.sha256()
-    size = 0
-    while chunk := os.read(descriptor, 1024 * 1024):
-        if time.monotonic() > deadline:
-            raise VanillaError("workspace freeze hashing exceeded time limit")
-        size += len(chunk)
-        if size > remaining:
-            raise VanillaError("workspace freeze byte count exceeds limit")
-        digest.update(chunk)
-    return digest.hexdigest(), size
-
-
-def _inventory_item(
-    relative: str,
-    status: os.stat_result,
-    kind: str,
-    *,
-    read_only_modes: bool,
-    target: str | None = None,
-    size: int | None = None,
-    digest: str | None = None,
-) -> dict[str, object]:
-    item: dict[str, object] = {
-        "path_sha256": hashlib.sha256(relative.encode()).hexdigest(),
-        "device": status.st_dev,
-        "inode": status.st_ino,
-        "mode": stat.S_IMODE(status.st_mode) & (~0o222 if read_only_modes and kind != "symlink" else 0o777),
-        "kind": kind,
-    }
-    if target is not None:
-        item["target_sha256"] = hashlib.sha256(target.encode()).hexdigest()
-    if size is not None:
-        item["size"] = size
-    if digest is not None:
-        item["sha256"] = digest
-    return item
-
-
-def _inventory(
-    root: Path,
-    *,
-    excluded: tuple[str, ...] = (),
-    read_only_modes: bool = False,
-) -> list[dict[str, object]]:
-    if root.is_symlink() or not root.is_dir():
-        raise VanillaError("workspace candidate must be a real directory")
-    result: list[dict[str, object]] = []
-    total = 0
-    count = [1]
-    deadline = time.monotonic() + MAX_INVENTORY_SECONDS
-    root_fd = _open_directory(root)
-    frames: list[list[object]] = []
-    try:
-        result.append(_inventory_item(".", os.fstat(root_fd), "directory", read_only_modes=read_only_modes))
-        frames.append([root_fd, ".", _scan_names(root_fd, deadline, count), 0])
-        root_fd = -1
-        while frames:
-            descriptor, relative, names, index = frames[-1]
-            if not isinstance(descriptor, int) or not isinstance(relative, str) or not isinstance(names, list):
-                raise VanillaError("workspace inventory traversal state is invalid")
-            if index >= len(names):
-                os.close(descriptor)
-                frames.pop()
-                continue
-            name = names[index]
-            frames[-1][3] = index + 1
-            child_relative = name if relative == "." else f"{relative}/{name}"
-            if any(child_relative == value or child_relative.startswith(value + "/") for value in excluded):
-                continue
-            status = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
-            if stat.S_ISLNK(status.st_mode):
-                result.append(
-                    _inventory_item(
-                        child_relative,
-                        status,
-                        "symlink",
-                        read_only_modes=read_only_modes,
-                        target=os.readlink(name, dir_fd=descriptor),
-                    )
-                )
-                continue
-            if stat.S_ISDIR(status.st_mode):
-                child_fd, current = _open_verified(descriptor, name, status, directory=True)
-                result.append(_inventory_item(child_relative, current, "directory", read_only_modes=read_only_modes))
-                frames.append([child_fd, child_relative, _scan_names(child_fd, deadline, count), 0])
-                continue
-            if not stat.S_ISREG(status.st_mode):
-                raise VanillaError("workspace contains an unsupported filesystem object")
-            child_fd, current = _open_verified(descriptor, name, status, directory=False)
-            try:
-                digest, size = _hash_descriptor(child_fd, deadline, MAX_FREEZE_BYTES - total)
-            finally:
-                os.close(child_fd)
-            total += size
-            result.append(
-                _inventory_item(
-                    child_relative,
-                    current,
-                    "file",
-                    read_only_modes=read_only_modes,
-                    size=size,
-                    digest=digest,
-                )
-            )
-    finally:
-        if root_fd >= 0:
-            os.close(root_fd)
-        for frame in frames:
-            if isinstance(frame[0], int):
-                try:
-                    os.close(frame[0])
-                except OSError:
-                    pass
-    return result
-
-
-def _make_read_only(root: Path) -> None:
-    count = 1
-    deadline = time.monotonic() + MAX_INVENTORY_SECONDS
-    stack = [(root, False)]
-    while stack:
-        if time.monotonic() > deadline:
-            raise VanillaError("workspace freeze permission walk exceeded time limit")
-        path, visited = stack.pop()
-        status = path.lstat()
-        if stat.S_ISLNK(status.st_mode):
-            continue
-        if stat.S_ISDIR(status.st_mode) and not visited:
-            stack.append((path, True))
-            entries: list[Path] = []
-            with os.scandir(path) as iterator:
-                for entry in iterator:
-                    if time.monotonic() > deadline:
-                        raise VanillaError("workspace freeze permission walk exceeded time limit")
-                    if len(entries) >= MAX_DIRECTORY_ENTRIES:
-                        raise VanillaError("workspace freeze directory entry count exceeds limit")
-                    count += 1
-                    if count > MAX_FREEZE_FILES:
-                        raise VanillaError("workspace freeze file count exceeds limit")
-                    entries.append(Path(entry.path))
-            entries.sort(key=lambda value: value.name, reverse=True)
-            stack.extend((entry, False) for entry in entries)
-            continue
-        os.chmod(path, stat.S_IMODE(status.st_mode) & ~0o222)
-
-
-def _snapshot_candidate(source: Path, destination: Path) -> None:
-    count = [1]
-    total = 0
-    deadline = time.monotonic() + MAX_INVENTORY_SECONDS
-    root_fd = _open_directory(source)
-    frames: list[list[object]] = []
-    try:
-        frames.append([root_fd, destination, True, ".", _scan_names(root_fd, deadline, count), 0])
-        root_fd = -1
-        while frames:
-            descriptor, target, root, relative, names, index = frames[-1]
-            if (
-                not isinstance(descriptor, int)
-                or not isinstance(target, Path)
-                or not isinstance(relative, str)
-                or not isinstance(names, list)
-            ):
-                raise VanillaError("workspace snapshot traversal state is invalid")
-            if index >= len(names):
-                os.close(descriptor)
-                frames.pop()
-                continue
-            name = names[index]
-            frames[-1][5] = index + 1
-            if root is True and name in {"reference", ".programbench-cleanroom.json"}:
-                continue
-            child_relative = name if relative == "." else f"{relative}/{name}"
-            child = target / name
-            if os.path.lexists(child):
-                raise VanillaError("credential-safe workspace path collision")
-            status = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
-            if stat.S_ISLNK(status.st_mode):
-                link = os.readlink(name, dir_fd=descriptor)
-                child.symlink_to(link)
-                continue
-            if stat.S_ISDIR(status.st_mode):
-                child_fd, current = _open_verified(descriptor, name, status, directory=True)
-                child.mkdir(mode=stat.S_IMODE(current.st_mode))
-                frames.append([child_fd, child, False, child_relative, _scan_names(child_fd, deadline, count), 0])
-                continue
-            if not stat.S_ISREG(status.st_mode):
-                raise VanillaError("workspace contains an unsupported filesystem object")
-            child_fd, current = _open_verified(descriptor, name, status, directory=False)
-            try:
-                size = _copy_descriptor(
-                    child_fd,
-                    child,
-                    deadline,
-                    MAX_FREEZE_BYTES - total,
-                )
-            finally:
-                os.close(child_fd)
-            total += size
-            os.chmod(child, stat.S_IMODE(current.st_mode))
-    finally:
-        if root_fd >= 0:
-            os.close(root_fd)
-        for frame in frames:
-            if isinstance(frame[0], int):
-                try:
-                    os.close(frame[0])
-                except OSError:
-                    pass
-
-
-def _copy_descriptor(
-    descriptor: int,
-    destination: Path,
-    deadline: float,
-    remaining: int,
-) -> int:
-    size = 0
-    with destination.open("xb") as writer:
-        while chunk := os.read(descriptor, 1024 * 1024):
-            if time.monotonic() > deadline:
-                raise VanillaError("workspace freeze copy exceeded time limit")
-            size += len(chunk)
-            if size > remaining:
-                raise VanillaError("workspace freeze byte count exceeds limit")
-            writer.write(chunk)
-    return size
-
-
-def _remove_tree(root: Path) -> None:
-    def writable(function: Callable[[str], None], path: str, exception: object) -> None:
-        os.chmod(path, 0o700)
-        function(path)
-
-    shutil.rmtree(root, onerror=writable)
-
-
 def _sanitize(value: object, credential_names: tuple[str, ...]) -> object:
     secrets = _credential_values(credential_names)
     if isinstance(value, str):
@@ -2625,6 +1976,7 @@ def _reject_failure_schema_credentials(
             "max_prompt_total": 0,
             "limit_overshoot": 0,
             "workspace_frozen": False,
+            "container_stopped_for_freeze": False,
             "interrupt_attempted": False,
             "forced_stop": False,
             "exit_class": "credential_leak",
@@ -2727,89 +2079,6 @@ def _contains_credential(value: object, secrets: tuple[str, ...]) -> bool:
     return False
 
 
-def _verify_no_credentials(root: Path, names: tuple[str, ...], *, published_only: bool = True) -> None:
-    secrets = tuple(secret.encode() for secret in _credential_values(names))
-    if not secrets:
-        return
-    deadline = time.monotonic() + MAX_INVENTORY_SECONDS
-    count = [1]
-    total = 0
-    root_fd = _open_directory(root)
-    frames: list[list[object]] = []
-    try:
-        frames.append([root_fd, ".", _scan_names(root_fd, deadline, count), 0])
-        root_fd = -1
-        while frames:
-            descriptor, relative, entries, index = frames[-1]
-            if not isinstance(descriptor, int) or not isinstance(relative, str) or not isinstance(entries, list):
-                raise VanillaError("credential scan traversal state is invalid")
-            if index >= len(entries):
-                os.close(descriptor)
-                frames.pop()
-                continue
-            name = entries[index]
-            frames[-1][3] = index + 1
-            child_relative = name if relative == "." else f"{relative}/{name}"
-            if (
-                published_only
-                and relative == "."
-                and name
-                not in {
-                    "state.json",
-                    "vanilla-execution.json",
-                    "vanilla-progress.json",
-                    "trajectory.json",
-                    "usage.json",
-                    "workspace-inventory.json",
-                    "vanilla-result.json",
-                    "subject",
-                }
-            ):
-                continue
-            if any(secret in child_relative.encode() for secret in secrets):
-                raise CredentialLeakError("provider credential appears in a persisted path")
-            status = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
-            if stat.S_ISLNK(status.st_mode):
-                target = os.readlink(name, dir_fd=descriptor).encode()
-                if any(secret in target for secret in secrets):
-                    raise CredentialLeakError("provider credential appears in a persisted symlink")
-                continue
-            if stat.S_ISDIR(status.st_mode):
-                child_fd, _ = _open_verified(descriptor, name, status, directory=True)
-                frames.append([child_fd, child_relative, _scan_names(child_fd, deadline, count), 0])
-                continue
-            if not stat.S_ISREG(status.st_mode):
-                continue
-            child_fd, _ = _open_verified(descriptor, name, status, directory=False)
-            try:
-                overlap = max(len(secret) for secret in secrets) - 1
-                pending = b""
-                while chunk := os.read(child_fd, 1024 * 1024):
-                    if time.monotonic() > deadline:
-                        raise VanillaError("credential scan exceeded time limit")
-                    total += len(chunk)
-                    if total > MAX_FREEZE_BYTES:
-                        raise VanillaError("credential scan byte count exceeds limit")
-                    pending += chunk
-                    split = max(0, len(pending) - overlap)
-                    if any(secret in pending[: split + overlap] for secret in secrets):
-                        raise CredentialLeakError("provider credential appears in persisted artifact bytes")
-                    pending = pending[split:]
-                if any(secret in pending for secret in secrets):
-                    raise CredentialLeakError("provider credential appears in persisted artifact bytes")
-            finally:
-                os.close(child_fd)
-    finally:
-        if root_fd >= 0:
-            os.close(root_fd)
-        for frame in frames:
-            if isinstance(frame[0], int):
-                try:
-                    os.close(frame[0])
-                except OSError:
-                    pass
-
-
 def _sanitize_text(value: str) -> str:
     return _SECRET.sub(lambda match: match.group(1) + "[REDACTED]", value)[:1000]
 
@@ -2886,6 +2155,15 @@ def _write_json(path: Path, value: object) -> None:
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
+
+
+def _unique_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise VanillaError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
 
 
 def _read_json(path: Path) -> object:
