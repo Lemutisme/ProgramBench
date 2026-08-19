@@ -1281,6 +1281,34 @@ def test_explicit_retry_quarantines_exception_partial_eval_and_sidecar(tmp_path:
     assert len(list(quarantine.glob("attempt-*/*.one.eval.partial.provenance.json"))) == 1
 
 
+def test_more_than_sixteen_explicit_retries_are_allowed_while_quarantine_is_within_cap(tmp_path: Path) -> None:
+    from scripts.campaign_evaluate import evaluate_campaign
+
+    root, instances = _campaign(tmp_path / "campaign")
+
+    def fail(command, _cwd, _timeout, _grace, _limit, _environment, *, on_start):
+        on_start(999999, 999999, "retry")
+        path = Path(command[4]) / "one/one.eval.json"
+        _write_eval(path, statuses=("passed", "failure", "failure"))
+        raise TimeoutError
+
+    evaluate_campaign(root, instances=instances, command_runner=fail)
+    for _ in range(16):
+        evaluate_campaign(
+            root,
+            instances=instances,
+            retry_evaluator=True,
+            command_runner=fail,
+            process_probe=lambda _pid, _started: False,
+            process_group_probe=lambda _pgid: False,
+            cgroup_probe=lambda _path: False,
+        )
+
+    state = json.loads((root / "evaluation-state/procontract.json").read_text())
+    assert state["attempt"] == 17
+    assert len(list((root / "evaluation-state/procontract.partial").glob("attempt-*"))) == 16
+
+
 def test_keyboard_interrupt_with_eval_file_persists_interrupted_then_reraises(tmp_path: Path) -> None:
     from scripts import campaign_evaluate
 
@@ -1732,6 +1760,57 @@ def test_preexisting_blob_target_symlink_rejects_without_external_mutation(
     assert marker.read_bytes() == b"safe"
 
 
+def test_blob_publish_recovers_crash_after_rename_before_plan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import campaign_evaluate
+
+    source = tmp_path / "source-blobs/one/tests/b1.tar.gz"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"tests")
+    monkeypatch.setenv("PROGRAMBENCH_BLOB_DIR", str(tmp_path / "source-blobs"))
+    root, instances = _campaign(tmp_path / "campaign")
+    marker = campaign_evaluate._write_blob_owner_marker
+    crashed = False
+
+    def crash_marker(*args, **kwargs):
+        nonlocal crashed
+        if not crashed:
+            crashed = True
+            raise OSError("after rename")
+        return marker(*args, **kwargs)
+
+    monkeypatch.setattr(campaign_evaluate, "_write_blob_owner_marker", crash_marker)
+    with pytest.raises(OSError, match="after rename"):
+        campaign_evaluate.evaluate_campaign(root, instances=instances, command_runner=_runner([]))
+    assert (root / "evaluation-blobs").is_dir()
+    assert json.loads((root / "evaluation-blobs.owner.json").read_text())["status"] in {
+        "ready_to_publish",
+        "published",
+    }
+
+    monkeypatch.setattr(campaign_evaluate, "_write_blob_owner_marker", marker)
+    outcome = campaign_evaluate.evaluate_campaign(root, instances=instances, command_runner=_runner([]))
+
+    assert outcome.status == "completed"
+    assert json.loads((root / "evaluation-blobs.owner.json").read_text())["status"] == "complete"
+
+
+def test_hf_keyboard_interrupt_propagates_without_wrapping(tmp_path: Path) -> None:
+    from scripts.campaign_evaluate import evaluate_campaign
+
+    root, instances = _campaign(tmp_path / "campaign")
+
+    with pytest.raises(KeyboardInterrupt):
+        evaluate_campaign(
+            root,
+            instances=instances,
+            command_runner=_runner([]),
+            hf_resolver=lambda *_args: (_ for _ in ()).throw(KeyboardInterrupt()),
+        )
+
+
 def test_done_state_rejects_invocation_configuration_conflict(tmp_path: Path) -> None:
     from scripts.campaign_evaluate import CampaignEvaluationError, evaluate_campaign
 
@@ -1744,6 +1823,29 @@ def test_done_state_rejects_invocation_configuration_conflict(tmp_path: Path) ->
 
     with pytest.raises(CampaignEvaluationError, match="conflicts"):
         evaluate_campaign(root, instances=instances, command_runner=lambda *_a, **_k: pytest.fail("must not run"))
+
+
+def test_canonical_invocation_mutation_and_rehashed_forgery_both_reject(tmp_path: Path) -> None:
+    from scripts import campaign_evaluate
+
+    root, instances = _campaign(tmp_path / "campaign")
+    campaign_evaluate.evaluate_campaign(root, instances=instances, command_runner=_runner([]))
+    state_path = root / "evaluation-state/procontract.json"
+    original = json.loads(state_path.read_text())
+    mutated = json.loads(state_path.read_text())
+    mutated["invocation"]["hf_commit"] = "forged"
+    _write_json(state_path, mutated)
+
+    with pytest.raises(campaign_evaluate.CampaignEvaluationError, match="invocation"):
+        campaign_evaluate.evaluate_campaign(root, instances=instances, command_runner=lambda *_a, **_k: None)
+
+    mutated["invocation_hash"] = hashlib.sha256(
+        campaign_evaluate._canonical_bytes(mutated["invocation"])
+    ).hexdigest()
+    _write_json(state_path, mutated)
+    with pytest.raises(campaign_evaluate.CampaignEvaluationError, match="invocation"):
+        campaign_evaluate.evaluate_campaign(root, instances=instances, command_runner=lambda *_a, **_k: None)
+    _write_json(state_path, original)
 
 
 def test_done_state_rejects_output_path_configuration_conflict(tmp_path: Path) -> None:

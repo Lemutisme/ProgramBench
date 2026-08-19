@@ -45,10 +45,11 @@ EVAL_ARTIFACT_HASH_TIMEOUT_SECONDS = 30
 MAX_PRESERVED_EVAL_FILE_BYTES = 256 * 1024 * 1024
 MAX_PRESERVED_EVAL_TOTAL_BYTES = 512 * 1024 * 1024
 PRESERVED_EVAL_COPY_TIMEOUT_SECONDS = 30
-MAX_EVALUATOR_ATTEMPTS = 16
 MAX_HF_BLOB_FILE_BYTES = 8 * 1024 * 1024 * 1024
 MAX_HF_BLOB_TOTAL_BYTES = 64 * 1024 * 1024 * 1024
 HF_BLOB_COPY_TIMEOUT_SECONDS = 1800
+MAX_PARTIAL_QUARANTINE_FILES = 128
+MAX_PARTIAL_QUARANTINE_BYTES = 512 * 1024 * 1024
 _CREDENTIAL_ENV = ("OPENAI_API_KEY", "OPENCODE_SERVER_PASSWORD")
 _CREDENTIAL_PATTERN = re.compile(
     r"(?i)\b(?:authorization|api[_-]?key|password|token)\b\s*[:=]\s*[^\s,;]+"
@@ -634,7 +635,7 @@ def _load_or_plan_hf_inputs(
             hashes = {}
     except CampaignEvaluationError:
         raise
-    except BaseException as error:
+    except Exception as error:
         raise CampaignEvaluationError(f"HuggingFace input planning failed: {type(error).__name__}") from None
     planned = {
         "version": 1,
@@ -674,48 +675,154 @@ def _sync_hf_blobs(commit: str, instance_ids: tuple[str, ...]) -> Path:
 
 def _materialize_hf_blobs(source: Path, target: Path, instance_ids: tuple[str, ...]) -> Path:
     source = source.resolve()
-    if target.exists() or target.is_symlink():
-        raise CampaignEvaluationError(f"foreign HuggingFace blob target exists: {target}")
+    source_files = _hf_source_files(source, instance_ids)
     _require_owned_directory(target.parent, target.parent, "HuggingFace blob target parent")
-    staging = target.parent / f".{target.name}.{uuid.uuid4().hex}.staging"
-    staging.mkdir(mode=0o700)
-    staging_stat = staging.lstat()
-    _atomic_json(
-        target.parent / f"{target.name}.owner.json",
-        {
-            "version": 1,
-            "status": "copying",
-            "staging": str(staging),
-            "device": staging_stat.st_dev,
-            "inode": staging_stat.st_ino,
-        },
-    )
+    journal_path = target.parent / f"{target.name}.owner.json"
+    journal = _read_optional_json(journal_path)
+    if target.exists() or target.is_symlink():
+        if journal is None or journal.get("status") not in {"ready_to_publish", "published"}:
+            raise CampaignEvaluationError(f"foreign HuggingFace blob target exists: {target}")
+        _verify_blob_publish_journal(target, journal, source_files)
+        if journal.get("status") == "ready_to_publish":
+            published = {
+                **journal,
+                "status": "published",
+                "final_device": target.lstat().st_dev,
+                "final_inode": target.lstat().st_ino,
+            }
+            _atomic_json(journal_path, published)
+        return target
+    if journal is not None and journal.get("status") == "ready_to_publish":
+        staging = Path(str(journal.get("staging")))
+        metadata = staging.lstat()
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_dev != journal.get("staging_device")
+            or metadata.st_ino != journal.get("staging_inode")
+            or journal.get("source_sha256") != {name: value[0] for name, value in source_files.items()}
+            or not isinstance(journal.get("tree_sha256"), Mapping)
+        ):
+            raise CampaignEvaluationError("HuggingFace ready blob journal conflicts")
+        selected = tuple(sorted({name.split("/", 1)[0] for name in journal["tree_sha256"] if "/" in name}))
+        if _blob_hashes(staging, selected) != dict(journal["tree_sha256"]):
+            raise CampaignEvaluationError("HuggingFace ready blob hashes conflict")
+        _rename_owned_entry(staging, target, target.parent, metadata.st_dev, metadata.st_ino)
+        _sync_directory(target.parent)
+        published = {
+            **journal,
+            "status": "published",
+            "final_device": target.lstat().st_dev,
+            "final_inode": target.lstat().st_ino,
+        }
+        _atomic_json(journal_path, published)
+        return target
+    if journal is not None and journal.get("status") == "copying":
+        staging = Path(str(journal.get("staging")))
+        if not staging.exists():
+            quarantine = target.parent / "evaluation-blob-journals.foreign"
+            _mkdir_contained(quarantine, target.parent)
+            metadata = journal_path.lstat()
+            _rename_owned_entry(
+                journal_path,
+                quarantine / f"copying-{uuid.uuid4().hex}.json",
+                target.parent,
+                metadata.st_dev,
+                metadata.st_ino,
+            )
+            journal = None
+        if journal is not None:
+            staging_stat = staging.lstat()
+        else:
+            staging = target.parent / f".{target.name}.{uuid.uuid4().hex}.staging"
+            staging.mkdir(mode=0o700)
+            staging_stat = staging.lstat()
+            _atomic_json(
+                journal_path,
+                {
+                    "version": 1,
+                    "status": "copying",
+                    "staging": str(staging),
+                    "staging_device": staging_stat.st_dev,
+                    "staging_inode": staging_stat.st_ino,
+                    "final": str(target),
+                    "source_sha256": {name: value[0] for name, value in source_files.items()},
+                },
+            )
+        if journal is not None and (
+            not stat.S_ISDIR(staging_stat.st_mode)
+            or staging_stat.st_dev != journal.get("staging_device")
+            or staging_stat.st_ino != journal.get("staging_inode")
+            or journal.get("source_sha256") != {name: value[0] for name, value in source_files.items()}
+        ):
+            raise CampaignEvaluationError("HuggingFace blob staging journal conflicts")
+    else:
+        if journal is not None:
+            raise CampaignEvaluationError("HuggingFace blob publish journal conflicts")
+        staging = target.parent / f".{target.name}.{uuid.uuid4().hex}.staging"
+        staging.mkdir(mode=0o700)
+        staging_stat = staging.lstat()
+        _atomic_json(
+            journal_path,
+            {
+                "version": 1,
+                "status": "copying",
+                "staging": str(staging),
+                "staging_device": staging_stat.st_dev,
+                "staging_inode": staging_stat.st_ino,
+                "final": str(target),
+                "source_sha256": {name: value[0] for name, value in source_files.items()},
+            },
+        )
     total = 0
     deadline = time.monotonic() + HF_BLOB_COPY_TIMEOUT_SECONDS
-    cache_root = source.parent.parent if source.parent.name == "snapshots" else source
     try:
-        for instance_id in instance_ids:
-            current_root = source / instance_id
-            if not current_root.is_dir():
+        for relative, (_digest, size, resolved) in source_files.items():
+            if size > MAX_HF_BLOB_FILE_BYTES or total + size > MAX_HF_BLOB_TOTAL_BYTES:
+                raise CampaignEvaluationError(f"HuggingFace blob materialization limit exceeded: {relative}")
+            destination = staging / relative
+            destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            if destination.exists():
+                if destination.is_symlink() or _sha256(destination) != _digest:
+                    raise CampaignEvaluationError(f"HuggingFace blob staging file conflicts: {relative}")
+                total += size
                 continue
-            for current in sorted(current_root.rglob("*")):
-                if not current.is_file():
-                    continue
-                resolved = current.resolve(strict=True)
-                if current.is_symlink() and not resolved.is_relative_to(cache_root):
-                    raise CampaignEvaluationError(f"HuggingFace blob symlink escapes cache: {current}")
-                metadata = resolved.stat()
-                if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-                    raise CampaignEvaluationError(f"HuggingFace blob is not an owned regular file: {current}")
-                if metadata.st_size > MAX_HF_BLOB_FILE_BYTES or total + metadata.st_size > MAX_HF_BLOB_TOTAL_BYTES:
-                    raise CampaignEvaluationError(f"HuggingFace blob materialization limit exceeded: {current}")
-                destination = staging / current.relative_to(source)
-                destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-                total += _copy_blob_exclusive(resolved, destination, deadline)
+            total += _copy_blob_exclusive(resolved, destination, deadline)
+        tree_hashes = _blob_hashes(staging, instance_ids)
         for path in sorted(staging.rglob("*"), reverse=True):
             path.chmod(0o444 if path.is_file() else 0o555)
         staging.chmod(0o555)
+        for directory in (staging, *[path for path in staging.rglob("*") if path.is_dir()]):
+            _sync_directory(directory)
+        _atomic_json(
+            journal_path,
+            {
+                "version": 1,
+                "status": "ready_to_publish",
+                "staging": str(staging),
+                "staging_device": staging_stat.st_dev,
+                "staging_inode": staging_stat.st_ino,
+                "final": str(target),
+                "source_sha256": {name: value[0] for name, value in source_files.items()},
+                "tree_sha256": tree_hashes,
+            },
+        )
         _rename_owned_entry(staging, target, target.parent, staging_stat.st_dev, staging_stat.st_ino)
+        _sync_directory(target.parent)
+        _atomic_json(
+            journal_path,
+            {
+                "version": 1,
+                "status": "published",
+                "staging": str(staging),
+                "staging_device": staging_stat.st_dev,
+                "staging_inode": staging_stat.st_ino,
+                "final": str(target),
+                "final_device": target.lstat().st_dev,
+                "final_inode": target.lstat().st_ino,
+                "source_sha256": {name: value[0] for name, value in source_files.items()},
+                "tree_sha256": tree_hashes,
+            },
+        )
     except BaseException:
         if staging.exists() and staging.lstat().st_ino == staging_stat.st_ino:
             for path in (staging, *staging.rglob("*")):
@@ -725,8 +832,54 @@ def _materialize_hf_blobs(source: Path, target: Path, instance_ids: tuple[str, .
                     pass
             shutil.rmtree(staging)
         raise
-    _sync_directory(target.parent)
     return target
+
+
+def _hf_source_files(
+    source: Path,
+    instance_ids: tuple[str, ...],
+) -> dict[str, tuple[str, int, Path]]:
+    cache_root = source.parent.parent if source.parent.name == "snapshots" else source
+    result: dict[str, tuple[str, int, Path]] = {}
+    for instance_id in instance_ids:
+        current_root = source / instance_id
+        if not current_root.is_dir():
+            continue
+        for current in sorted(current_root.rglob("*")):
+            if not current.is_file():
+                continue
+            resolved = current.resolve(strict=True)
+            if current.is_symlink() and not resolved.is_relative_to(cache_root):
+                raise CampaignEvaluationError(f"HuggingFace blob symlink escapes cache: {current}")
+            metadata = resolved.stat()
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                raise CampaignEvaluationError(f"HuggingFace blob is not an owned regular file: {current}")
+            result[str(current.relative_to(source))] = (_sha256(resolved), metadata.st_size, resolved)
+    return result
+
+
+def _verify_blob_publish_journal(
+    target: Path,
+    journal: Mapping[str, object],
+    source_files: Mapping[str, tuple[str, int, Path]],
+) -> None:
+    metadata = target.lstat()
+    if (
+        journal.get("final") != str(target)
+        or metadata.st_dev != journal.get("staging_device")
+        or metadata.st_ino != journal.get("staging_inode")
+        or journal.get("source_sha256") != {name: value[0] for name, value in source_files.items()}
+        or not isinstance(journal.get("tree_sha256"), Mapping)
+    ):
+        raise CampaignEvaluationError("HuggingFace blob publish journal conflicts")
+    expected = journal["tree_sha256"]
+    selected = tuple(sorted({name.split("/", 1)[0] for name in expected if "/" in name}))
+    if _blob_hashes(target, selected) != dict(expected):
+        raise CampaignEvaluationError("HuggingFace published blob tree conflicts")
+    for path in (target, *target.rglob("*")):
+        current = path.lstat()
+        if stat.S_ISLNK(current.st_mode) or current.st_mode & 0o222:
+            raise CampaignEvaluationError(f"HuggingFace published blob tree is mutable: {path}")
 
 
 def _write_blob_owner_marker(root: Path, blob_root: Path, plan: Mapping[str, object]) -> None:
@@ -974,6 +1127,11 @@ def _quarantine_partial_eval_outputs(
         / f"{arm}.partial"
         / f"attempt-{attempt:03d}-{invocation_hash[:12]}"
     )
+    quarantine_root = root / "evaluation-state" / f"{arm}.partial"
+    retained = [path for path in quarantine_root.rglob("*") if path.is_file()] if quarantine_root.exists() else []
+    retained_bytes = sum(path.stat().st_size for path in retained)
+    if len(retained) + 2 > MAX_PARTIAL_QUARANTINE_FILES:
+        raise CampaignEvaluationError("partial quarantine file cap reached; archive or clean retained evidence")
     _mkdir_contained(quarantine, root)
     total = 0
     for instance_id in submitted:
@@ -993,9 +1151,11 @@ def _quarantine_partial_eval_outputs(
             or retained_hashes.get(sidecar.name) != _sha256(sidecar)
         ):
             raise CampaignEvaluationError(f"partial eval provenance conflicts: {instance_id}")
+        if len(retained) + len(quarantined) * 2 + 2 > MAX_PARTIAL_QUARANTINE_FILES:
+            raise CampaignEvaluationError("partial quarantine file cap reached; archive or clean retained evidence")
         total += path.stat().st_size + sidecar.stat().st_size
-        if total > MAX_PRESERVED_EVAL_TOTAL_BYTES:
-            raise CampaignEvaluationError("partial evaluator quarantine size limit exceeded")
+        if retained_bytes + total > MAX_PARTIAL_QUARANTINE_BYTES:
+            raise CampaignEvaluationError("partial quarantine byte cap reached; archive or clean retained evidence")
         for current in (path, sidecar):
             metadata = current.lstat()
             target = quarantine / f"{identity.sha256}.{current.name}"
@@ -1142,6 +1302,9 @@ def _evaluate_arm(
             _sync_directory(quarantine)
             raise CampaignEvaluationError(f"foreign evaluator artifacts quarantined for {arm}")
     if existing is not None:
+        if type(existing.get("attempt")) is not int or existing["attempt"] < 1:
+            raise CampaignEvaluationError("evaluator attempt state is invalid")
+        _validate_persisted_invocation(existing, invocation, invocation_hash)
         if existing.get("status") not in {"planned", "running", "done", "failed", "interrupted"}:
             raise CampaignEvaluationError(f"evaluator state has invalid status for {arm}")
         if (
@@ -1269,8 +1432,6 @@ def _evaluate_arm(
     )
     prestate = _capture_eval_prestate(arm_root, submitted, invocation_hash, existing)
     attempt = int(existing.get("attempt", 0)) + 1 if existing is not None else 1
-    if attempt > MAX_EVALUATOR_ATTEMPTS:
-        raise CampaignEvaluationError("evaluator attempt limit exceeded")
     started_at = time.time()
     started_at_ns = time.time_ns()
     base = {
@@ -1278,6 +1439,7 @@ def _evaluate_arm(
         "attempt": attempt,
         "status": "planned",
         "invocation_hash": invocation_hash,
+        "invocation": invocation,
         "argv": list(argv),
         "cwd": str(cwd),
         "started_at": started_at,
@@ -1706,20 +1868,12 @@ def _comparison(
             "arms": {
                 arm: {
                     "invocation_hash": state["invocation_hash"],
-                    "argv": state["argv"],
-                    "cwd": state["cwd"],
+                    "invocation": state["invocation"],
                     "state_sha256": _sha256(state_root / f"{arm}.json"),
                     "artifact_hashes": state.get("artifact_hashes", {}),
                     "status": state.get("status"),
                     "exit_code": state.get("exit_code"),
                     "error": state.get("error"),
-                    "evaluator_images": state.get("evaluator_images"),
-                    "expected_executable_sha256": state.get("expected_executable_sha256"),
-                    "scoring_metadata": state.get("scoring_metadata"),
-                    "hf_repository": state.get("hf_repository"),
-                    "hf_commit": state.get("hf_commit"),
-                    "blob_root": state.get("blob_root"),
-                    "blob_sha256": state.get("blob_sha256"),
                 }
                 for arm, state in arm_states.items()
             },
@@ -2113,7 +2267,8 @@ def _result_markdown(report: Mapping[str, object], comparison_sha256: str) -> st
     evaluator = report.get("coordinates", {}).get("evaluator", {})
     arms = evaluator.get("arms", {}) if isinstance(evaluator, Mapping) else {}
     first_arm = next(iter(arms.values()), {}) if isinstance(arms, Mapping) else {}
-    image_map = first_arm.get("evaluator_images", {}) if isinstance(first_arm, Mapping) else {}
+    invocation = first_arm.get("invocation", {}) if isinstance(first_arm, Mapping) else {}
+    image_map = invocation.get("evaluator_images", {}) if isinstance(invocation, Mapping) else {}
     image_summary = ", ".join(
         f"{instance_id}={value.get('digest')}"
         for instance_id, value in image_map.items()
@@ -2134,8 +2289,8 @@ def _result_markdown(report: Mapping[str, object], comparison_sha256: str) -> st
             f"Valid pairs: {aggregate['valid_pairs']}",
             f"Invalid pairs: {aggregate['invalid_pairs']}",
             f"Comparison SHA-256: {comparison_sha256}",
-            f"HF repository: {first_arm.get('hf_repository') if isinstance(first_arm, Mapping) else None}",
-            f"HF commit: {first_arm.get('hf_commit') if isinstance(first_arm, Mapping) else None}",
+            f"HF repository: {invocation.get('hf_repository') if isinstance(invocation, Mapping) else None}",
+            f"HF commit: {invocation.get('hf_commit') if isinstance(invocation, Mapping) else None}",
             f"Evaluator images: {image_summary}",
             "",
             *rows,
@@ -2503,6 +2658,24 @@ def _sync_directory(path: Path) -> None:
 
 def _canonical_bytes(value: object) -> bytes:
     return json.dumps(value, allow_nan=False, sort_keys=True, separators=(",", ":")).encode()
+
+
+def _validate_persisted_invocation(
+    state: Mapping[str, object],
+    current: Mapping[str, object],
+    current_hash: str,
+) -> None:
+    stored = state.get("invocation")
+    stored_hash = state.get("invocation_hash")
+    if (
+        not isinstance(stored, Mapping)
+        or set(stored) != set(current)
+        or not isinstance(stored_hash, str)
+        or hashlib.sha256(_canonical_bytes(stored)).hexdigest() != stored_hash
+        or stored_hash != current_hash
+        or dict(stored) != dict(current)
+    ):
+        raise CampaignEvaluationError("persisted evaluator invocation conflicts with current frozen inputs")
 
 
 def _sha256(path: Path) -> str:
