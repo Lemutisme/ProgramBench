@@ -610,6 +610,10 @@ def test_concurrent_multi_job_snapshots_have_deterministic_aggregate_order() -> 
 def test_usage_json_numeric_bounds_fail_closed_without_raw_errors() -> None:
     with pytest.raises(UsageParseError):
         summarize_usage(
+            b'{"data":[{"type":"assistant","cost":1e10000,"tokens":{"input":1,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"content":"ok"}]}'
+        )
+    with pytest.raises(UsageParseError):
+        summarize_usage(
             b'{"data":[{"type":"assistant","tokens":{"input":1e10000000,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"content":"ok"}]}'
         )
     with pytest.raises(UsageParseError):
@@ -679,6 +683,56 @@ def test_large_campaign_summary_has_structural_turn_count() -> None:
     for index in range(200):
         breaker.observe(f"job-{index:03d}", 1, summary)
     assert len(breaker.campaign_usage.turns) == 200 * 1000
+
+
+def test_large_job_owned_snapshot_uses_compact_campaign_totals() -> None:
+    breaker = CircuitBreaker()
+    summary = usage(turns=1000)
+    for index in range(50):
+        breaker.observe(f"job-{index:03d}", 1, summary)
+    snapshot = breaker.snapshot()
+    encoded = json.dumps(snapshot, separators=(",", ":"))
+    assert len(encoded.encode()) < 64 * 1024 * 1024
+    assert "turns" not in snapshot["campaign_usage"]
+    assert CircuitBreaker.from_snapshot(encoded).snapshot() == snapshot
+
+
+def test_null_assistant_tokens_and_user_cost_are_rejected() -> None:
+    base = {
+        "type": "assistant",
+        "content": "ok",
+        "tokens": {"input": 1, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}},
+    }
+    with pytest.raises(UsageParseError):
+        summarize_usage({"data": [{**base, "tokens": None}]})
+    with pytest.raises(UsageParseError):
+        summarize_usage({"data": [{"type": "user", "content": "x", "cost": 1}]})
+    with pytest.raises(UsageParseError):
+        summarize_usage({"data": [{"info": {"role": "user", "cost": 1}, "parts": []}]})
+
+
+def test_direct_summary_and_observation_reject_more_than_1000_turns() -> None:
+    turns = tuple(TurnUsage() for _ in range(1001))
+    with pytest.raises(UsageParseError):
+        UsageSummary(
+            provider_turns=1001,
+            turns=turns,
+        )
+
+
+def test_observation_failure_is_snapshot_atomic() -> None:
+    breaker = CircuitBreaker()
+    breaker.observe("job", 1, usage(turns=1, cost="0.1"))
+    before = breaker.snapshot()
+    with pytest.raises(UsageParseError):
+        breaker.observe("job", 2, {"provider_turns": 1, "input": 1})
+    assert breaker.snapshot() == before
+
+
+def test_past_retry_after_date_is_immediate_on_fresh_breaker() -> None:
+    breaker = CircuitBreaker(clock=lambda: 100.0, retry_after_default=7)
+    breaker.observe_error(429, retry_after="Thu, 01 Jan 1970 00:01:39 GMT")
+    assert breaker.backoff_until == 100.0
 
 
 def test_acknowledged_recoverable_pause_round_trips_without_derived_drift() -> None:

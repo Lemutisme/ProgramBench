@@ -19,10 +19,12 @@ class UsageParseError(ValueError):
 
 
 MAX_PROJECTED_PAYLOAD_BYTES = 8 * 1024 * 1024
+MAX_SNAPSHOT_BYTES = 64 * 1024 * 1024
 MAX_MESSAGES_PER_JOB = 1001
+MAX_PROVIDER_TURNS = 1000
 MAX_TOKEN_COUNT = 10**12
 MAX_DECIMAL_DIGITS = 256
-MAX_DECIMAL_EXPONENT_SPAN = 10000
+MAX_DECIMAL_EXPONENT_SPAN = 4096
 
 
 class StaleObservationError(UsageParseError):
@@ -72,6 +74,7 @@ class UsageSummary:
     cost: Decimal = Decimal(0)
     telemetry_gap: bool = False
     turns: tuple[TurnUsage, ...] = ()
+    allow_large: bool = field(default=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         for name in (
@@ -89,6 +92,10 @@ class UsageSummary:
             value = getattr(self, name)
             if type(value) is not int or value < 0 or value > MAX_TOKEN_COUNT:
                 raise UsageParseError(f"{name} must be a nonnegative integer")
+        if type(self.allow_large) is not bool:
+            raise UsageParseError("invalid usage summary size mode")
+        if self.provider_turns > MAX_PROVIDER_TURNS and not self.allow_large:
+            raise UsageParseError("provider turns exceed limit")
         if not isinstance(self.cost, Decimal) or not self.cost.is_finite() or self.cost < 0:
             raise UsageParseError("cost must be a nonnegative finite decimal")
         _validate_decimal_bounds(self.cost)
@@ -213,8 +220,8 @@ def _projected_turn(message: object) -> TurnUsage | None:
             raise UsageParseError("upstream info contains flat-only fields")
         role = source.get("role")
         if role == "user":
-            if "tokens" in source:
-                raise UsageParseError("user message cannot contain usage tokens")
+            if {"tokens", "cost"} & set(source):
+                raise UsageParseError("user message cannot contain usage telemetry")
             return None
         if role != "assistant":
             raise UsageParseError("upstream message role must be assistant or user")
@@ -223,8 +230,8 @@ def _projected_turn(message: object) -> TurnUsage | None:
         raise UsageParseError("mixed projected message schema")
     message_type = message.get("type")
     if message_type == "user":
-        if "tokens" in message:
-            raise UsageParseError("user message cannot contain usage tokens")
+        if {"tokens", "cost"} & set(message):
+            raise UsageParseError("user message cannot contain usage telemetry")
         if not isinstance(message.get("content"), str):
             raise UsageParseError("flat user message requires content")
         return None
@@ -309,7 +316,24 @@ class _CampaignTotals:
             cost=self.cost,
             telemetry_gap=self.telemetry_gaps > 0,
             turns=turns,
+            allow_large=True,
         )
+
+    def compact_dict(self) -> dict[str, object]:
+        return {
+            "provider_turns": self.provider_turns,
+            "input": self.input,
+            "output": self.output,
+            "reasoning": self.reasoning,
+            "cache_read": self.cache_read,
+            "cache_write": self.cache_write,
+            "prompt_total": self.prompt_total,
+            "turns_with_cache": self.turns_with_cache,
+            "turns_without_cache": self.turns_without_cache,
+            "max_prompt_total": max(self.max_prompts, default=0),
+            "cost": _decimal_string(self.cost),
+            "telemetry_gap": self.telemetry_gaps > 0,
+        }
 
 
 class CircuitBreaker:
@@ -341,6 +365,8 @@ class CircuitBreaker:
             hard_cost_cap = total_cost_hard
         if type(cache_warmup_turns) is not int or cache_warmup_turns < 0:
             raise UsageParseError("cache warmup turns must be a nonnegative integer")
+        if minimum_cache_ratio is None:
+            raise UsageParseError("minimum cache ratio must be numeric")
         ratio = _decimal(minimum_cache_ratio)
         if not 0 <= ratio <= 1:
             raise UsageParseError("minimum cache ratio must be finite and between zero and one")
@@ -368,6 +394,7 @@ class CircuitBreaker:
         self._totals = _CampaignTotals()
         self._campaign_usage = UsageSummary()
         self._usage_version = 0
+        self._state_version = 0
         self._materialized_version = 0
         self._jobs: dict[str, tuple[int, UsageSummary, bool]] = {}
         self._terminal_sequence: list[str] = []
@@ -431,7 +458,6 @@ class CircuitBreaker:
     @property
     def backoff_until(self) -> float | None:
         with self._lock:
-            self._release_backoff()
             return self._backoff_until
 
     @property
@@ -493,6 +519,7 @@ class CircuitBreaker:
                 if effective_terminal != previous[2]:
                     self._jobs[resolved_job] = (previous[0], previous[1], effective_terminal)
                     self._terminal_sequence.append(resolved_job)
+                    self._state_version += 1
                     self._recompute_cache()
                 return
             was_terminal = previous[2] if previous is not None else False
@@ -502,6 +529,7 @@ class CircuitBreaker:
                 self._totals.add(previous[1], -1)
             self._totals.add(resolved_usage, 1)
             self._usage_version += 1
+            self._state_version += 1
             if is_terminal and not was_terminal:
                 self._terminal_sequence.append(resolved_job)
                 self._cache_acknowledged = False
@@ -550,11 +578,13 @@ class CircuitBreaker:
         with self._lock:
             if status_code in (401, 403):
                 self._pause_causes.add("auth")
+                self._state_version += 1
                 return
             if status_code != 429:
                 return
             delay = _retry_after_seconds(retry_after, current, self._retry_after_default, self._retry_after_max)
             self._backoff_until = max(self._backoff_until or current, current + delay)
+            self._state_version += 1
 
     def observe_usage(
         self,
@@ -577,17 +607,20 @@ class CircuitBreaker:
                     return
                 self._pause_causes.discard("soft")
                 self._soft_acknowledged = True
+                self._state_version += 1
                 return
             if reason == "cache":
                 if "cache" not in self._pause_causes:
                     return
                 self._pause_causes.discard("cache")
                 self._cache_acknowledged = True
+                self._state_version += 1
                 return
             if reason == "auth":
                 if "auth" not in self._pause_causes:
                     return
                 self._pause_causes.discard("auth")
+                self._state_version += 1
                 return
             if reason == "hard":
                 return
@@ -600,6 +633,7 @@ class CircuitBreaker:
                 self._cache_acknowledged = True
             if had_soft_pause:
                 self._soft_acknowledged = True
+            self._state_version += 1
 
     def acknowledge_cache(self) -> None:
         self.acknowledge("cache")
@@ -614,30 +648,36 @@ class CircuitBreaker:
         return
 
     def snapshot(self) -> dict[str, object]:
-        with self._lock:
-            self._release_backoff()
-            self._materialize_usage()
-            return {
-                "version": 1,
-                "cache_warmup_turns": self.cache_warmup_turns,
-                "minimum_cache_ratio": _decimal_string(self.minimum_cache_ratio),
-                "consecutive_failures": self.consecutive_failures,
-                "retry_after_default": self._retry_after_default,
-                "retry_after_max": self._retry_after_max,
-                "cache_failures": self._cache_failures,
-                "cache_acknowledged": self._cache_acknowledged,
-                "soft_cap_acknowledged": self._soft_acknowledged,
-                "pause_causes": sorted(self._pause_causes),
-                "terminal_sequence": list(self._terminal_sequence),
-                "backoff_until": self._backoff_until,
-                "soft_cost_cap": None if self.soft_cost_cap is None else _decimal_string(self.soft_cost_cap),
-                "hard_cost_cap": None if self.hard_cost_cap is None else _decimal_string(self.hard_cost_cap),
-                "campaign_usage": self._campaign_usage.to_dict(),
-                "jobs": {
-                    job: {"generation": generation, "usage": summary.to_dict(), "terminal": terminal}
-                    for job, (generation, summary, terminal) in sorted(self._jobs.items())
-                },
+        for _ in range(3):
+            with self._lock:
+                self._release_backoff()
+                version = self._state_version
+                jobs = dict(self._jobs)
+                state = {
+                    "version": 1,
+                    "cache_warmup_turns": self.cache_warmup_turns,
+                    "minimum_cache_ratio": _decimal_string(self.minimum_cache_ratio),
+                    "consecutive_failures": self.consecutive_failures,
+                    "retry_after_default": self._retry_after_default,
+                    "retry_after_max": self._retry_after_max,
+                    "cache_failures": self._cache_failures,
+                    "cache_acknowledged": self._cache_acknowledged,
+                    "soft_cap_acknowledged": self._soft_acknowledged,
+                    "pause_causes": sorted(self._pause_causes),
+                    "terminal_sequence": list(self._terminal_sequence),
+                    "backoff_until": self._backoff_until,
+                    "soft_cost_cap": None if self.soft_cost_cap is None else _decimal_string(self.soft_cost_cap),
+                    "hard_cost_cap": None if self.hard_cost_cap is None else _decimal_string(self.hard_cost_cap),
+                    "campaign_usage": self._totals.compact_dict(),
+                }
+            state["jobs"] = {
+                job: {"generation": generation, "usage": summary.to_dict(), "terminal": terminal}
+                for job, (generation, summary, terminal) in sorted(jobs.items())
             }
+            with self._lock:
+                if self._state_version == version:
+                    return state
+        raise UsageParseError("campaign changed during snapshot")
 
     @classmethod
     def from_snapshot(
@@ -647,7 +687,7 @@ class CircuitBreaker:
         clock: Callable[[], float] = time.time,
         **kwargs: object,
     ) -> CircuitBreaker:
-        raw = _load_json(snapshot)
+        raw = _load_json(snapshot, max_bytes=MAX_SNAPSHOT_BYTES)
         if not isinstance(raw, Mapping):
             raise UsageParseError("breaker snapshot must be an object")
         _require_keys(
@@ -705,7 +745,7 @@ class CircuitBreaker:
             raise UsageParseError("soft pause requires a soft cost cap")
         if "hard" in causes and breaker.hard_cost_cap is None:
             raise UsageParseError("hard pause requires a hard cost cap")
-        campaign = _summary_from_dict(raw["campaign_usage"])
+        campaign_fields = _compact_summary_fields(raw["campaign_usage"])
         jobs = raw["jobs"]
         if not isinstance(jobs, Mapping):
             raise UsageParseError("breaker jobs must be an object")
@@ -745,14 +785,18 @@ class CircuitBreaker:
             breaker._soft_acknowledged = raw["soft_cap_acknowledged"]
             breaker._pause_causes = set(causes)
             breaker._backoff_until = backoff
-            breaker._campaign_usage = campaign
+            breaker._campaign_usage = UsageSummary()
             breaker._jobs = restored
             breaker._terminal_sequence = list(sequence)
             serialized_causes = set(causes)
             expected_usage, expected_cache_failures = CircuitBreaker._derived_from_jobs(breaker)
-            if expected_usage != campaign or expected_cache_failures != persisted_cache_failures:
+            if (
+                _compact_summary_fields(_compact_summary_dict(expected_usage)) != campaign_fields
+                or expected_cache_failures != persisted_cache_failures
+            ):
                 raise UsageParseError("breaker snapshot derived state is inconsistent")
             breaker._cache_failures = persisted_cache_failures
+            campaign = expected_usage
             breaker._apply_cost_caps()
             if {cause for cause in serialized_causes if cause in {"soft", "hard"}} != {
                 cause for cause in breaker._pause_causes if cause in {"soft", "hard"}
@@ -826,15 +870,15 @@ class CircuitBreaker:
         self._pause_causes.add("soft")
 
 
-def _load_json(payload: Mapping[str, object] | bytes | str) -> object:
+def _load_json(payload: Mapping[str, object] | bytes | str, *, max_bytes: int = MAX_PROJECTED_PAYLOAD_BYTES) -> object:
     if isinstance(payload, Mapping):
         return payload
     if not isinstance(payload, (bytes, str)):
         raise UsageParseError("payload must be an object or JSON bytes")
-    if isinstance(payload, str) and len(payload) > MAX_PROJECTED_PAYLOAD_BYTES * 4:
+    if isinstance(payload, str) and len(payload) > max_bytes * 4:
         raise UsageParseError("serialized payload exceeds size limit")
     payload_size = len(payload) if isinstance(payload, bytes) else len(payload.encode())
-    if payload_size > MAX_PROJECTED_PAYLOAD_BYTES:
+    if payload_size > max_bytes:
         raise UsageParseError("serialized payload exceeds size limit")
 
     def duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -851,7 +895,10 @@ def _load_json(payload: Mapping[str, object] | bytes | str) -> object:
     def parse_int(value: str) -> int:
         if len(value.lstrip("-")) > MAX_DECIMAL_DIGITS:
             raise UsageParseError("integer exceeds size limit")
-        result = int(value)
+        try:
+            result = int(value)
+        except (ValueError, OverflowError) as error:
+            raise UsageParseError("integer exceeds size limit") from error
         if abs(result) > MAX_TOKEN_COUNT:
             raise UsageParseError("integer exceeds size limit")
         return result
@@ -876,9 +923,7 @@ def _load_json(payload: Mapping[str, object] | bytes | str) -> object:
 
 
 def _token(value: object) -> int:
-    if value is None:
-        return 0
-    if type(value) is not int or value < 0:
+    if type(value) is not int or value < 0 or value > MAX_TOKEN_COUNT:
         raise UsageParseError("token counts must be nonnegative integers")
     return value
 
@@ -890,7 +935,7 @@ def _decimal(value: object) -> Decimal:
         raise UsageParseError("cost must be numeric")
     try:
         result = Decimal(str(value))
-    except (InvalidOperation, ValueError) as error:
+    except (InvalidOperation, ValueError, OverflowError, TypeError) as error:
         raise UsageParseError("cost must be numeric") from error
     _validate_decimal_bounds(result)
     if result < 0:
@@ -960,6 +1005,52 @@ def _summary_fields(turns: tuple[TurnUsage, ...]) -> tuple[object, ...]:
         _sum_decimals(turn.cost for turn in turns),
         any(turn.cache_read > 0 and turn.cache_write == 0 for turn in turns),
     )
+
+
+def _compact_summary_dict(summary: UsageSummary) -> dict[str, object]:
+    result = summary.to_dict()
+    result.pop("turns")
+    return result
+
+
+def _compact_summary_fields(value: object) -> tuple[object, ...]:
+    if not isinstance(value, Mapping):
+        raise UsageParseError("campaign totals must be an object")
+    required = {
+        "provider_turns",
+        "input",
+        "output",
+        "reasoning",
+        "cache_read",
+        "cache_write",
+        "prompt_total",
+        "turns_with_cache",
+        "turns_without_cache",
+        "max_prompt_total",
+        "cost",
+        "telemetry_gap",
+    }
+    _require_keys(value, required)
+    numbers = tuple(
+        _token(value[name])
+        for name in (
+            "provider_turns",
+            "input",
+            "output",
+            "reasoning",
+            "cache_read",
+            "cache_write",
+            "prompt_total",
+            "turns_with_cache",
+            "turns_without_cache",
+            "max_prompt_total",
+        )
+    )
+    if numbers[6] != numbers[1] + numbers[4] + numbers[5] or numbers[7] + numbers[8] != numbers[0]:
+        raise UsageParseError("campaign totals are inconsistent")
+    if numbers[9] > numbers[6] or type(value["telemetry_gap"]) is not bool:
+        raise UsageParseError("campaign totals are inconsistent")
+    return (*numbers, _decimal(value["cost"]), value["telemetry_gap"])
 
 
 def _coerce_summary(value: UsageSummary | Mapping[str, object]) -> UsageSummary:
@@ -1099,9 +1190,11 @@ def _ratio_at_least(read: int, prompt_total: int, threshold: Decimal) -> bool:
 def _retry_after_seconds(value: object, now: float, default: int, maximum: int) -> float:
     if value is None:
         return float(default)
+    is_http_date = False
     try:
         seconds = float(Decimal(str(value)))
     except (InvalidOperation, ValueError, OverflowError):
+        is_http_date = True
         try:
             parsed = parsedate_to_datetime(str(value))
         except (TypeError, ValueError, OverflowError):
@@ -1113,6 +1206,6 @@ def _retry_after_seconds(value: object, now: float, default: int, maximum: int) 
         seconds = parsed.timestamp() - now
     if not math.isfinite(seconds):
         return float(default)
-    if seconds < 0:
+    if seconds < 0 and not is_http_date:
         return float(default)
     return max(0.0, min(float(maximum), seconds))
