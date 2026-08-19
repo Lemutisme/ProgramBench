@@ -11,6 +11,7 @@ import pytest
 from scripts.campaign_usage import (
     CircuitBreaker,
     StaleObservationError,
+    TurnUsage,
     UsageParseError,
     UsageSummary,
     summarize_usage,
@@ -502,6 +503,83 @@ def test_inactive_auth_ack_cannot_pre_authorize_future_auth_failure() -> None:
     assert breaker.admission_allowed
     breaker.observe_error(401)
     assert breaker.paused
+
+
+def test_turn_usage_constructor_enforces_tokens_prompt_and_decimal_cost() -> None:
+    valid = TurnUsage(
+        input=1, output=2, reasoning=3, cache_read=4, cache_write=5, prompt_total=10, cost=Decimal("-0.0")
+    )
+    assert valid.cost == Decimal(0)
+    for field, value in (("input", True), ("output", -1), ("cache_read", 1.0)):
+        with pytest.raises(UsageParseError):
+            TurnUsage(**{field: value})
+    with pytest.raises(UsageParseError):
+        TurnUsage(input=1, prompt_total=0)
+    for value in (0.1, "0.1", Decimal("-0.1"), Decimal("NaN")):
+        with pytest.raises(UsageParseError):
+            TurnUsage(cost=value)
+
+
+def test_summary_constructor_recomputes_every_field_and_empty_is_zero_only() -> None:
+    turn = TurnUsage(input=1, output=2, reasoning=3, cache_read=4, cache_write=5, prompt_total=10, cost=Decimal("0.1"))
+    valid = UsageSummary(
+        provider_turns=1,
+        input=1,
+        output=2,
+        reasoning=3,
+        cache_read=4,
+        cache_write=5,
+        prompt_total=10,
+        turns_with_cache=1,
+        turns_without_cache=0,
+        max_prompt_total=10,
+        cost=Decimal("0.1"),
+        telemetry_gap=False,
+        turns=(turn,),
+    )
+    assert valid.turns == (turn,)
+    with pytest.raises(UsageParseError):
+        UsageSummary(provider_turns=1)
+    with pytest.raises(UsageParseError):
+        UsageSummary(**{**valid.__dict__, "output": 99})
+    forged = object.__new__(UsageSummary)
+    object.__setattr__(forged, "provider_turns", 1)
+    object.__setattr__(forged, "input", 1)
+    object.__setattr__(forged, "output", 2)
+    object.__setattr__(forged, "reasoning", 3)
+    object.__setattr__(forged, "cache_read", 4)
+    object.__setattr__(forged, "cache_write", 5)
+    object.__setattr__(forged, "prompt_total", 10)
+    object.__setattr__(forged, "turns_with_cache", 1)
+    object.__setattr__(forged, "turns_without_cache", 0)
+    object.__setattr__(forged, "max_prompt_total", 10)
+    object.__setattr__(forged, "cost", Decimal("0.1"))
+    object.__setattr__(forged, "telemetry_gap", True)
+    object.__setattr__(forged, "turns", (turn,))
+    with pytest.raises(UsageParseError):
+        CircuitBreaker().observe("forged", 1, forged)
+
+
+def test_valid_direct_summary_roundtrips_through_breaker_snapshot() -> None:
+    turn = TurnUsage(input=1, output=2, reasoning=0, cache_read=0, cache_write=0, prompt_total=1, cost=Decimal("0.1"))
+    summary = UsageSummary(
+        provider_turns=1,
+        input=1,
+        output=2,
+        reasoning=0,
+        cache_read=0,
+        cache_write=0,
+        prompt_total=1,
+        turns_with_cache=0,
+        turns_without_cache=1,
+        max_prompt_total=1,
+        cost=Decimal("0.1"),
+        telemetry_gap=False,
+        turns=(turn,),
+    )
+    breaker = CircuitBreaker()
+    breaker.observe("job", 1, summary)
+    assert CircuitBreaker.from_snapshot(breaker.snapshot()).campaign_usage == summary
 
 
 def test_acknowledged_recoverable_pause_round_trips_without_derived_drift() -> None:

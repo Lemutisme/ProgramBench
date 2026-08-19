@@ -31,6 +31,18 @@ class TurnUsage:
     prompt_total: int = 0
     cost: Decimal = Decimal(0)
 
+    def __post_init__(self) -> None:
+        for name in ("input", "output", "reasoning", "cache_read", "cache_write", "prompt_total"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise UsageParseError(f"{name} must be a nonnegative integer")
+        if self.prompt_total != self.input + self.cache_read + self.cache_write:
+            raise UsageParseError("turn prompt total is inconsistent with token totals")
+        if not isinstance(self.cost, Decimal) or not self.cost.is_finite() or self.cost < 0:
+            raise UsageParseError("turn cost must be a nonnegative finite decimal")
+        if self.cost.is_zero():
+            object.__setattr__(self, "cost", Decimal(0))
+
     @property
     def cache_hit(self) -> bool:
         return self.cache_read > 0
@@ -70,20 +82,29 @@ class UsageSummary:
                 raise UsageParseError(f"{name} must be a nonnegative integer")
         if not isinstance(self.cost, Decimal) or not self.cost.is_finite() or self.cost < 0:
             raise UsageParseError("cost must be a nonnegative finite decimal")
+        if self.cost.is_zero():
+            object.__setattr__(self, "cost", Decimal(0))
         if type(self.telemetry_gap) is not bool or not isinstance(self.turns, tuple):
             raise UsageParseError("invalid usage summary shape")
-        if self.prompt_total != self.input + self.cache_read + self.cache_write:
-            raise UsageParseError("prompt total is inconsistent with token totals")
-        if self.turns_with_cache + self.turns_without_cache != self.provider_turns:
-            raise UsageParseError("cache hit counts are inconsistent with provider turns")
-        if self.turns and len(self.turns) != self.provider_turns:
-            raise UsageParseError("per-turn records are inconsistent with provider turns")
-        if self.max_prompt_total > self.prompt_total:
-            raise UsageParseError("maximum prompt exceeds prompt total")
-        if self.turns and self.telemetry_gap != any(
-            turn.cache_read > 0 and turn.cache_write == 0 for turn in self.turns
-        ):
-            raise UsageParseError("telemetry gap is inconsistent with per-turn cache totals")
+        if any(not isinstance(turn, TurnUsage) for turn in self.turns):
+            raise UsageParseError("turn records must be immutable TurnUsage values")
+        expected = _summary_fields(self.turns)
+        actual = (
+            self.provider_turns,
+            self.input,
+            self.output,
+            self.reasoning,
+            self.cache_read,
+            self.cache_write,
+            self.prompt_total,
+            self.turns_with_cache,
+            self.turns_without_cache,
+            self.max_prompt_total,
+            self.cost,
+            self.telemetry_gap,
+        )
+        if actual != expected:
+            raise UsageParseError("usage summary does not match per-turn records")
 
     @property
     def prompt_tokens(self) -> int:
@@ -412,7 +433,7 @@ class CircuitBreaker:
     def _recompute_usage(self) -> None:
         total = UsageSummary()
         for _, summary, _ in self._jobs.values():
-            total = _add(total, summary, summary.max_prompt_total)
+            total = _add(total, summary)
         self._campaign_usage = total
 
     def _recompute_cache(self) -> None:
@@ -802,9 +823,40 @@ def _sum_decimals(values: object) -> Decimal:
     return Decimal((0, tuple(int(digit) for digit in str(total)), minimum_exponent))
 
 
+def _summary_fields(turns: tuple[TurnUsage, ...]) -> tuple[object, ...]:
+    return (
+        len(turns),
+        sum(turn.input for turn in turns),
+        sum(turn.output for turn in turns),
+        sum(turn.reasoning for turn in turns),
+        sum(turn.cache_read for turn in turns),
+        sum(turn.cache_write for turn in turns),
+        sum(turn.prompt_total for turn in turns),
+        sum(turn.cache_hit for turn in turns),
+        sum(not turn.cache_hit for turn in turns),
+        max((turn.prompt_total for turn in turns), default=0),
+        _sum_decimals(turn.cost for turn in turns),
+        any(turn.cache_read > 0 and turn.cache_write == 0 for turn in turns),
+    )
+
+
 def _coerce_summary(value: UsageSummary | Mapping[str, object]) -> UsageSummary:
     if isinstance(value, UsageSummary):
-        return value
+        return UsageSummary(
+            provider_turns=value.provider_turns,
+            input=value.input,
+            output=value.output,
+            reasoning=value.reasoning,
+            cache_read=value.cache_read,
+            cache_write=value.cache_write,
+            prompt_total=value.prompt_total,
+            turns_with_cache=value.turns_with_cache,
+            turns_without_cache=value.turns_without_cache,
+            max_prompt_total=value.max_prompt_total,
+            cost=value.cost,
+            telemetry_gap=value.telemetry_gap,
+            turns=value.turns,
+        )
     if isinstance(value, Mapping) and "data" in value:
         return summarize_usage(value)
     return _summary_from_dict(value)
@@ -903,20 +955,23 @@ def _require_keys(value: Mapping[str, object], allowed: set[str]) -> None:
         raise UsageParseError("snapshot contains unknown or missing fields")
 
 
-def _add(total: UsageSummary, delta: UsageSummary, observed_max: int) -> UsageSummary:
+def _add(total: UsageSummary, delta: UsageSummary) -> UsageSummary:
+    turns = total.turns + delta.turns
+    fields = _summary_fields(turns)
     return UsageSummary(
-        provider_turns=total.provider_turns + delta.provider_turns,
-        input=total.input + delta.input,
-        output=total.output + delta.output,
-        reasoning=total.reasoning + delta.reasoning,
-        cache_read=total.cache_read + delta.cache_read,
-        cache_write=total.cache_write + delta.cache_write,
-        prompt_total=total.prompt_total + delta.prompt_total,
-        turns_with_cache=total.turns_with_cache + delta.turns_with_cache,
-        turns_without_cache=total.turns_without_cache + delta.turns_without_cache,
-        max_prompt_total=max(total.max_prompt_total, observed_max),
-        cost=_sum_decimals((total.cost, delta.cost)),
-        telemetry_gap=total.telemetry_gap or delta.telemetry_gap,
+        provider_turns=fields[0],
+        input=fields[1],
+        output=fields[2],
+        reasoning=fields[3],
+        cache_read=fields[4],
+        cache_write=fields[5],
+        prompt_total=fields[6],
+        turns_with_cache=fields[7],
+        turns_without_cache=fields[8],
+        max_prompt_total=fields[9],
+        cost=fields[10],
+        telemetry_gap=fields[11],
+        turns=turns,
     )
 
 
