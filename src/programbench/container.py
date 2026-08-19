@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
+import os
 import subprocess
 import uuid
 from pathlib import Path
@@ -33,7 +34,10 @@ class ContainerEnvironment:
         self.executable = executable
         self.default_timeout = timeout
         self.cpus = cpus
-        self._name = f"programbench-{uuid.uuid4().hex[:12]}"
+        prefix = os.environ.get("PROGRAMBENCH_CONTAINER_PREFIX", "programbench")
+        if not prefix or any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-" for character in prefix):
+            raise ValueError("PROGRAMBENCH_CONTAINER_PREFIX is invalid")
+        self._name = f"{prefix}-{uuid.uuid4().hex[:12]}"
         run_args = list(run_args or [])
         env_dict = {"PYTEST_XDIST_AUTO_NUM_WORKERS": str(cpus), **(env or {})}
         env_args: list[str] = []

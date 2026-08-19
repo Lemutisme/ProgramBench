@@ -64,6 +64,9 @@ def run_checked(
     output_limit: int,
     create_cgroup: Callable[[], Path | None] | None = None,
     environment: Mapping[str, str] | None = None,
+    *,
+    on_start: Callable[[int, int, str, Path], None] | None = None,
+    completion_path: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run with bounded output in delegated cgroup v2, or fail before launch."""
     executable = shutil.which(command[0])
@@ -71,18 +74,39 @@ def run_checked(
     cgroup = create_cgroup() if create_cgroup else create_command_cgroup()
     if cgroup is None:
         raise ProcessContainmentError("subprocess descendant containment is unavailable")
+    read_descriptor, write_descriptor = os.pipe()
     try:
         process = subprocess.Popen(
-            _contained_invocation(cgroup, invocation),
+            _gated_invocation(read_descriptor, invocation, completion_path),
             cwd=cwd,
             env=dict(environment) if environment is not None else {"PATH": os.defpath, "LANG": "C", "LC_ALL": "C"},
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
+            pass_fds=(read_descriptor,),
         )
-    except OSError:
+    except BaseException:
+        os.close(read_descriptor)
+        os.close(write_descriptor)
         _remove_cgroup(cgroup, grace)
         raise
+    os.close(read_descriptor)
+    try:
+        (cgroup / "cgroup.procs").write_text(str(process.pid))
+        if on_start is not None:
+            on_start(process.pid, process.pid, _process_start_identity(process.pid), cgroup)
+        os.write(write_descriptor, b"run\n")
+    except BaseException:
+        os.close(write_descriptor)
+        _terminate(process, cgroup, grace)
+        _kill_cgroup(cgroup)
+        if process.stdout:
+            process.stdout.close()
+        if process.stderr:
+            process.stderr.close()
+        _remove_cgroup(cgroup, grace)
+        raise
+    os.close(write_descriptor)
     output = _BoundedOutput(output_limit)
     readers = (
         threading.Thread(
@@ -104,8 +128,15 @@ def run_checked(
     except subprocess.TimeoutExpired:
         timed_out = True
         _terminate(process, cgroup, grace)
+    except BaseException:
+        _terminate(process, cgroup, grace)
+        raise
     finally:
         _kill_cgroup(cgroup)
+        if process.poll() is None:
+            _terminate(process, cgroup, grace)
+        else:
+            process.wait()
         _join_readers(process, readers, cgroup, grace)
         if output.cleanup_error:
             raise output.cleanup_error
@@ -187,7 +218,12 @@ def run_bounded(
     except subprocess.TimeoutExpired:
         timed_out = True
         _terminate_bounded(process, grace)
+    except BaseException:
+        _terminate_bounded(process, grace)
+        raise
     finally:
+        if process.poll() is None:
+            _terminate_bounded(process, grace)
         _join_bounded_readers(process, readers, grace)
     if output.cleanup_error:
         raise output.cleanup_error
@@ -291,6 +327,35 @@ def _contained_invocation(cgroup: Path, invocation: Sequence[str]) -> Sequence[s
         'printf "%s\\n" "$$" > "$1/cgroup.procs" || exit 125; shift; exec "$@"',
         "programbench-cgroup",
         str(cgroup),
+        *invocation,
+    )
+
+
+def _gated_invocation(
+    read_descriptor: int,
+    invocation: Sequence[str],
+    completion_path: Path | None = None,
+) -> Sequence[str]:
+    if completion_path is not None:
+        return (
+            sys.executable,
+            "-c",
+            "import os,sys; fd=int(sys.argv[1]); marker=sys.argv[2]; token=os.read(fd,4); os.close(fd); "
+            "token == b'run\\n' or sys.exit(125); pid=os.fork(); "
+            "(os.execvp(sys.argv[3],sys.argv[3:]) if pid == 0 else None); "
+            "_,status=os.waitpid(pid,0); code=os.waitstatus_to_exitcode(status); "
+            "f=open(marker,'w'); f.write(str(code)+'\\n'); f.flush(); os.fsync(f.fileno()); f.close(); "
+            "os._exit(code if code >= 0 else 1)",
+            str(read_descriptor),
+            str(completion_path),
+            *invocation,
+        )
+    return (
+        sys.executable,
+        "-c",
+        "import os,sys; fd=int(sys.argv[1]); token=os.read(fd,4); os.close(fd); "
+        "token == b'run\\n' or sys.exit(125); os.execvp(sys.argv[2], sys.argv[2:])",
+        str(read_descriptor),
         *invocation,
     )
 
