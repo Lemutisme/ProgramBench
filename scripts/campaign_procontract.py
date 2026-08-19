@@ -406,6 +406,8 @@ class ProContractIssueRequest:
 
 
 class ProContractApi(Protocol):
+    def rebind(self, base_url: str) -> None: ...
+
     def issue(self, payload: dict[str, object]) -> Mapping[str, object]: ...
 
     def get_contract(self, contract_id: str) -> Mapping[str, object] | None: ...
@@ -423,6 +425,17 @@ class ProContractApi(Protocol):
     def export(self, workspace: DockerWorkspace, contract_id: str, destination: Path) -> Mapping[str, object]: ...
 
     def attest(self, contract_id: str, evidence_hash: str) -> Mapping[str, object]: ...
+
+
+class ProContractWorkspace(Protocol):
+    manifest: object
+    lease: object
+    candidate: Path
+    base_url: str
+
+    def stop_for_freeze(self) -> None: ...
+
+    def restart(self) -> "ProContractWorkspace": ...
 
 
 class HttpProContractApi:
@@ -468,15 +481,26 @@ class HttpProContractApi:
         ):
             raise ProContractError("principal server credential is required for native Contract mutations")
         self.base_url = base_url.rstrip("/")
+        self._owns_http_client = http_client is None
         self.http_client = http_client or UrllibHttpClient()
         self.request_timeout = request_timeout
         self.max_response_bytes = max_response_bytes
         self._authorization = "Basic " + base64.b64encode(f"{resolved_username}:{resolved_password}".encode()).decode()
 
-    def rebind(self, port: int) -> None:
-        if type(port) is not int or not 0 < port < 65536:
-            raise ProContractError("OpenCode rebound port is invalid")
-        self.base_url = f"http://127.0.0.1:{port}"
+    def rebind(self, base_url: str) -> None:
+        parsed = urlparse(base_url)
+        if (
+            parsed.scheme != "http"
+            or parsed.hostname not in {"127.0.0.1", "::1"}
+            or parsed.port is None
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ProContractError("OpenCode rebound origin is invalid")
+        self.base_url = base_url.rstrip("/")
+        if self._owns_http_client:
+            self.http_client = UrllibHttpClient()
 
     def issue(self, payload: dict[str, object]) -> Mapping[str, object]:
         return self._mapping(self._request("POST", "/api/contract", payload))
@@ -722,7 +746,7 @@ def run_procontract(
         return result
     except (VanillaError, UsageParseError, StateError):
         if workspace.lease._handle_active:
-            workspace.stop()
+            workspace.stop_for_freeze()
         raise
 
 
@@ -749,7 +773,7 @@ def _run_procontract(
     if state.phase in {"done", "failed", "interrupted"} and result_path.is_file():
         result = ProContractResult.from_dict(_read_json(result_path))
         if workspace.lease._handle_active:
-            workspace.stop()
+            workspace.stop_for_freeze()
         _scan_terminal_credentials(job.job.root, workspace, result.contract_id)
         _verify_terminal_artifacts(job.job.root, state, result)
         return result
@@ -1366,7 +1390,7 @@ def _deliver(
         ):
             raise ProContractConflictError("Contract handoff changed while its exact subject was exported")
         if workspace.lease._handle_active:
-            workspace.stop()
+            workspace.stop_for_freeze()
         if direct_success:
             _write_export_complete(
                 complete_path,
@@ -1412,14 +1436,14 @@ def _deliver(
         raise
     except ProContractConflictError:
         if workspace.lease._handle_active:
-            workspace.stop()
+            workspace.stop_for_freeze()
         raise
     except ProContractError:
         if workspace.lease._handle_active:
-            workspace.stop()
+            workspace.stop_for_freeze()
         raise ProContractDeliveryError("Contract export could not be reconciled with current public evidence") from None
     if workspace.lease._handle_active:
-        workspace.stop()
+        workspace.stop_for_freeze()
     if workspace.lease._handle_active:
         raise ProContractError("workspace writer remained active after stop")
     subject = Path(workspace.manifest.subject_dir)
@@ -1434,7 +1458,7 @@ def _deliver(
     if not os.access(subject / "compile.sh", os.X_OK) or not os.access(subject / "executable", os.X_OK):
         raise ProContractDeliveryError("exported Contract delivery files are not executable")
     if workspace.lease._handle_active:
-        workspace.stop()
+        workspace.stop_for_freeze()
     _scan_all_credentials(job.job.root, workspace, export_dir)
     if state.phase == "executing":
         state = state_store.transition(
@@ -1567,10 +1591,8 @@ def _deliver(
         raise ProContractDeliveryError("principal evidence hash must be distinct from native replay evidence")
 
     try:
-        if hasattr(workspace, "restart"):
-            workspace = workspace.restart()
-        if hasattr(api, "rebind"):
-            api.rebind(workspace.port)  # type: ignore[attr-defined]
+        workspace = workspace.restart()
+        api.rebind(workspace.base_url)
     except WorkspaceError:
         raise ProContractNativeOutcome(
             ProContractCompletion.LOST_SERVER,
@@ -1802,7 +1824,7 @@ def _deliver(
             },
         )
     if workspace.lease._handle_active:
-        workspace.stop()
+        workspace.stop_for_freeze()
     _scan_all_credentials(job.job.root, workspace, export_dir)
     result = _result(
         payload,
@@ -3118,7 +3140,7 @@ def _finish_without_delivery(
     interrupt_attempted: bool = False,
 ) -> ProContractResult:
     if workspace.lease._handle_active:
-        workspace.stop()
+        workspace.stop_for_freeze()
     _scan_terminal_credentials(job.job.root, workspace, str(payload["id"]))
     discharge_path = job.job.root / "procontract-discharge.json"
     effective_contract = contract
@@ -3211,7 +3233,7 @@ def _fail_issue_admission(
     status_code: int | None,
 ) -> None:
     if workspace.lease._handle_active:
-        workspace.stop()
+        workspace.stop_for_freeze()
     path = job.job.root / "procontract-admission-error.json"
     _write_json(
         path,
@@ -3261,7 +3283,7 @@ def _resume_discharged(
     if result.contract_id != payload["id"] or result.attestation_id != contract.get("attestationID"):
         raise ProContractConflictError("discharged Contract conflicts with durable delivery result")
     if workspace.lease._handle_active:
-        workspace.stop()
+        workspace.stop_for_freeze()
     return result
 
 

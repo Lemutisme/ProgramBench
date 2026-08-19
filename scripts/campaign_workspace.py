@@ -509,10 +509,39 @@ class DockerWorkspace:
     def release(self) -> None:
         self.lease.release_handle()
 
+    @property
+    def base_url(self) -> str:
+        return f"http://127.0.0.1:{self.port}"
+
+    def stop_for_freeze(self) -> None:
+        self.stop()
+
     def restart(self) -> "DockerWorkspace":
         if self.lease._handle_active:
             raise WorkspaceError("running workspace must be stopped before restart")
-        return ensure_workspace(self.request, self.lease)
+        try:
+            return ensure_workspace(self.request, self.lease)
+        except BaseException:
+            self.lease._handle_active = True
+            current = _load_manifest(self.manifest_path)
+            inspected = _inspect_container(self.docker_runner, self.docker, current.container_name)
+            if inspected is not None and _running(inspected):
+                _docker(self.docker_runner, (self.docker, "stop", "--time", "10", self.container_id), 30, "stop")
+                inspected = _inspect_container(self.docker_runner, self.docker, current.container_name)
+            if inspected is not None and not _running(inspected):
+                _write_manifest(
+                    self.manifest_path,
+                    replace(
+                        current,
+                        phase="stopped",
+                        container_id=self.container_id,
+                        port=current.port or self.manifest.port,
+                        candidate_mutable=True,
+                        exit_code=_exit_code(inspected),
+                    ),
+                )
+            self.lease.release_handle()
+            raise
 
     def stop(self, lease: WorkspaceLease | None = None) -> None:
         active = self.lease if lease is None else lease

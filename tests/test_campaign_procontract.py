@@ -75,6 +75,10 @@ class FakeApi:
         self.attestations: list[tuple[str, str]] = []
         self.interrupts: list[str] = []
         self.exports: list[tuple[str, Path]] = []
+        self.rebinds: list[str] = []
+
+    def rebind(self, base_url: str) -> None:
+        self.rebinds.append(base_url)
 
     def issue(self, payload: dict[str, object]) -> dict[str, object]:
         self.issues.append(payload)
@@ -615,6 +619,8 @@ class FakeWorkspace:
         self.manifest = manifest
         self.lease = lease
         self.stops = 0
+        self.restarts = 0
+        self._port = 4096
 
     @property
     def container_id(self) -> str:
@@ -623,6 +629,19 @@ class FakeWorkspace:
     @property
     def candidate(self) -> Path:
         return self.manifest.candidate
+
+    @property
+    def base_url(self) -> str:
+        return f"http://127.0.0.1:{self._port}"
+
+    def stop_for_freeze(self) -> None:
+        self.stop()
+
+    def restart(self) -> "FakeWorkspace":
+        self.restarts += 1
+        self._port += 1
+        self.lease._handle_active = True
+        return self
 
     def stop(self) -> None:
         self.stops += 1
@@ -802,7 +821,9 @@ def test_happy_lifecycle_uses_native_scheduler_and_exact_delivery(tmp_path: Path
     assert issue["model"] == {"providerID": "openai", "id": "gpt-5.6-luna", "variant": "max"}
     assert issue["resolution"] == {"maxAttempts": 1, "retryDelay": 0}
     assert ORIGINAL_TASK in issue["brief"]
-    assert workspace.stops == 1
+    assert workspace.stops == 2
+    assert workspace.restarts == 1
+    assert api.rebinds == ["http://127.0.0.1:4097"]
     assert api.interrupts == []
     assert api.attestations[0][1] != "native-replay"
     assert (paths.root / "procontract-issue.json").is_file()
@@ -3354,12 +3375,12 @@ def test_done_result_is_idempotent_and_makes_no_public_api_mutation(tmp_path: Pa
 
     assert second == first
     assert (len(api.issues), len(api.exports), len(api.attestations)) == mutations == (1, 1, 1)
-    assert workspace.stops == 2
+    assert workspace.stops == 3
     paths.root.joinpath(workspace.manifest.instance_id, "submission.tar.gz").unlink()
     with pytest.raises(ProContractConflictError):
         invoke()
     assert (len(api.issues), len(api.exports), len(api.attestations)) == mutations
-    assert workspace.stops == 3
+    assert workspace.stops == 4
 
 
 def test_interrupted_result_is_idempotently_adopted_without_api_calls(tmp_path: Path) -> None:
