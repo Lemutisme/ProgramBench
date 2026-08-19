@@ -22,6 +22,7 @@ MAX_PROJECTED_PAYLOAD_BYTES = 8 * 1024 * 1024
 MAX_SNAPSHOT_BYTES = 64 * 1024 * 1024
 MAX_MESSAGES_PER_JOB = 1001
 MAX_PROVIDER_TURNS = 1000
+MAX_EVIDENCE_MESSAGES = 2001
 MAX_TOKEN_COUNT = 10**12
 MAX_DECIMAL_DIGITS = 64
 MAX_DECIMAL_EXPONENT_SPAN = 128
@@ -177,10 +178,21 @@ UsageTurn = TurnUsage
 
 def summarize_usage(messages: Mapping[str, object] | bytes | str) -> UsageSummary:
     """Aggregate assistant usage from an OpenCode projected ``{"data": [...]}`` response."""
+    return _summarize_usage(messages, max_messages=MAX_MESSAGES_PER_JOB, allow_large=False)
+
+
+def summarize_evidence_usage(messages: Mapping[str, object] | bytes | str) -> UsageSummary:
+    """Parse bounded absolute evidence without relaxing normal campaign accounting limits."""
+    return _summarize_usage(messages, max_messages=MAX_EVIDENCE_MESSAGES, allow_large=True)
+
+
+def _summarize_usage(
+    messages: Mapping[str, object] | bytes | str, *, max_messages: int, allow_large: bool
+) -> UsageSummary:
     payload = _load_json(messages)
     if not isinstance(payload, Mapping) or set(payload) != {"data"} or not isinstance(payload["data"], list):
         raise UsageParseError("projected messages must contain only a data list")
-    if len(payload["data"]) > MAX_MESSAGES_PER_JOB:
+    if len(payload["data"]) > max_messages:
         raise UsageParseError("projected message count exceeds limit")
 
     turns: list[TurnUsage] = []
@@ -203,6 +215,7 @@ def summarize_usage(messages: Mapping[str, object] | bytes | str) -> UsageSummar
         cost=_sum_decimals(turn.cost for turn in turns),
         telemetry_gap=any(turn.cache_read > 0 and turn.cache_write == 0 for turn in turns),
         turns=tuple(turns),
+        allow_large=allow_large,
     )
 
 

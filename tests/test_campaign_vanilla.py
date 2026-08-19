@@ -270,10 +270,12 @@ class SetupErrorApi(FakeOpenCodeApi):
 class SetupRateApi(FakeOpenCodeApi):
     def __init__(self) -> None:
         super().__init__([])
+        self.attempts = 0
 
     def create_session(
         self, session_id: str, *, model: str, variant: str, directory: str, agent: str | None
     ) -> dict[str, object]:
+        self.attempts += 1
         raise VanillaHttpError("rate limited", status_code=429, retry_after="10")
 
 
@@ -293,6 +295,24 @@ class AuthSetupApi(SafetyApi):
         if self.stage == "prompt":
             raise VanillaHttpError("bad credential", status_code=403)
         super().prompt(request, resume=resume)
+
+
+class ResponseLostAfterAdmissionApi(SafetyApi):
+    def __init__(self, workspace: FakeWorkspace) -> None:
+        super().__init__([([], "busy")])
+        self.workspace = workspace
+        self.lost = False
+
+    def prompt(self, request: VanillaPromptRequest, *, resume: bool = True) -> None:
+        super().prompt(request, resume=resume)
+        if not self.lost:
+            self.lost = True
+            self.workspace.candidate.joinpath("live.log").write_text("before-interrupt")
+            raise VanillaHttpError("response lost after admission", transient=True)
+
+    def interrupt(self, session_id: str) -> None:
+        self.workspace.candidate.joinpath("live.log").write_text("at-interrupt")
+        super().interrupt(session_id)
 
 
 class InterruptFailureApi(FakeOpenCodeApi):
@@ -752,8 +772,10 @@ def test_resume_rejects_existing_session_switched_to_custom_agent(tmp_path: Path
     session["agent"] = "custom"
     with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
         workspace.lease.claim_handle(request)
-        with pytest.raises(VanillaError, match="conflicts"):
-            run_vanilla(job, StateStore(paths.state), workspace, record, **kwargs)
+        result = run_vanilla(job, StateStore(paths.state), workspace, record, **kwargs)
+    assert result.completion is VanillaCompletion.PROVIDER_ERROR
+    assert result.interrupt_attempted
+    assert api.interrupts == 1
     assert len(api.prompt_requests) == 1
 
 
@@ -812,6 +834,39 @@ def test_crash_after_state_cas_recovers_matching_progress_snapshot(tmp_path: Pat
         result = run_vanilla(job, StateStore(paths.state), workspace, record, **kwargs)
     assert result.completion is VanillaCompletion.IDLE
     assert result.provider_turns == 1
+
+
+def test_corrupt_resumed_progress_after_prompt_is_quiesced_before_invalid_freeze(tmp_path: Path) -> None:
+    paths, record, request, workspace = prepared(tmp_path)
+    api = CrashThenTransientApi()
+    clock = FakeClock()
+    kwargs = {
+        "model": "openai/gpt-5.6-luna",
+        "variant": "max",
+        "limits": limits(),
+        "breaker": CircuitBreaker(clock=clock),
+        "api": api,
+        "clock": clock,
+        "sleeper": clock.sleep,
+    }
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease.claim_handle(request)
+        with pytest.raises(InjectedCrash):
+            run_vanilla(job, StateStore(paths.state), workspace, record, **kwargs)
+    progress = json.loads(paths.root.joinpath("vanilla-progress.json").read_text())
+    progress["current"]["messages"]["data"].append(copy.deepcopy(progress["current"]["messages"]["data"][-1]))
+    paths.root.joinpath("vanilla-progress.json").write_text(json.dumps(progress))
+
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease.claim_handle(request)
+        result = run_vanilla(job, StateStore(paths.state), workspace, record, **kwargs)
+    assert result.completion is VanillaCompletion.PROVIDER_ERROR
+    assert result.interrupt_attempted
+    assert api.interrupts == 1
+    state = StateStore(paths.state).read()
+    assert state.phase == "frozen"
+    assert result.provider_turns == state.provider_turns == 1
+    assert result.cost == Decimal(str(state.cost)) == Decimal("0.25")
 
 
 def _assert_crash_resume(tmp_path: Path, stage: str) -> None:
@@ -890,6 +945,90 @@ def test_safety_ceiling_interrupts_once_then_freezes(
     assert workspace.stops == 0
 
 
+def test_provider_turn_poll_overshoot_records_exact_absolute_evidence_without_breaker_truncation(
+    tmp_path: Path,
+) -> None:
+    paths, record, request, workspace = prepared(tmp_path)
+
+    def turn(index: int, *, tool: bool = False) -> dict[str, object]:
+        message = v2_assistant()
+        message["id"] = f"msg_turn_{index}"
+        message["cost"] = 0.01
+        message["tokens"] = {
+            "input": 1,
+            "output": 1,
+            "reasoning": 0,
+            "cache": {"read": 0, "write": 0},
+        }
+        if tool:
+            message["content"].append(
+                {
+                    "type": "tool",
+                    "id": f"prt_tool_{index}",
+                    "name": "bash",
+                    "state": {"status": "completed"},
+                    "time": {"created": 1, "completed": 2},
+                }
+            )
+        return message
+
+    first = [v2_user(), *(turn(index) for index in range(999))]
+    second = [*first, *(turn(index, tool=True) for index in range(999, 1003))]
+    api = SafetyApi([(first, "busy"), (second, "busy")])
+    clock = FakeClock()
+    breaker = CircuitBreaker(clock=clock)
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease.claim_handle(request)
+        result = run_vanilla(
+            job,
+            StateStore(paths.state),
+            workspace,
+            record,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=limits(),
+            breaker=breaker,
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+        )
+    assert result.completion is VanillaCompletion.PROVIDER_TURNS
+    assert result.provider_turns == 1003
+    assert result.limit_overshoot == 3
+    assert result.actions == 4
+    assert result.cost == Decimal("10.03")
+    assert StateStore(paths.state).read().provider_turns == 1003
+    assert breaker.snapshot()["jobs"][workspace.manifest.job_id]["usage"]["provider_turns"] == 999
+
+
+def test_overshoot_resume_restores_previous_safe_breaker_snapshot(tmp_path: Path) -> None:
+    def turns(count: int) -> dict[str, object]:
+        return {"data": [assistant(f"msg_turn_{index}", cost=0.01) for index in range(count)]}
+
+    progress = tmp_path / "vanilla-progress.json"
+    vanilla_module._write_progress(progress, 3, turns(999))
+    vanilla_module._write_progress(progress, 4, turns(1003))
+    usage, actions, messages, breaker_usage = vanilla_module._restore_progress(
+        progress,
+        JobState("executing", provider_turns=1003, cost=10.03, generation=4),
+    )
+    assert usage.provider_turns == 1003
+    assert actions == 0
+    assert len(messages["data"]) == 1003
+    assert breaker_usage.provider_turns == 999
+
+
+def test_absolute_evidence_bound_applies_before_v2_nonturn_filtering() -> None:
+    messages = {
+        "data": [
+            {"id": f"msg_system_{index}", "type": "system", "text": "system", "time": {"created": index}}
+            for index in range(vanilla_module.MAX_EVIDENCE_MESSAGES + 1)
+        ]
+    }
+    with pytest.raises(VanillaError, match="absolute evidence limit"):
+        vanilla_module._summarize_usage(messages)
+
+
 def test_failed_interrupt_stops_exact_owned_container_before_freeze(tmp_path: Path) -> None:
     paths, record, request, workspace = prepared(tmp_path)
     api = InterruptFailureApi([([user(), assistant()], "busy")])
@@ -915,7 +1054,7 @@ def test_failed_interrupt_stops_exact_owned_container_before_freeze(tmp_path: Pa
     assert result.workspace_frozen
 
 
-@pytest.mark.parametrize(("turns_before", "phase", "frozen"), [(0, "failed", False), (1, "frozen", True)])
+@pytest.mark.parametrize(("turns_before", "phase", "frozen"), [(0, "frozen", True), (1, "frozen", True)])
 def test_status_transport_failure_uses_provider_turn_boundary(
     tmp_path: Path, turns_before: int, phase: str, frozen: bool
 ) -> None:
@@ -939,7 +1078,8 @@ def test_status_transport_failure_uses_provider_turn_boundary(
         )
     assert result.workspace_frozen is frozen
     assert StateStore(paths.state).read().phase == phase
-    assert result.exit_class == ("infrastructure_failed_before_provider" if turns_before == 0 else "provider_error")
+    assert result.exit_class == "provider_error"
+    assert api.interrupts == 1
 
 
 def test_429_backs_off_then_resumes_the_same_session_and_prompt(tmp_path: Path) -> None:
@@ -967,10 +1107,9 @@ def test_429_backs_off_then_resumes_the_same_session_and_prompt(tmp_path: Path) 
             sleeper=clock.sleep,
         )
 
-    assert result.completion is VanillaCompletion.IDLE
+    assert result.completion is VanillaCompletion.PROVIDER_ERROR
     assert len(api.sessions) == len(api.prompts) == 1
-    assert clock.now >= 102
-    assert api.interrupts == 0
+    assert api.interrupts == 1
 
 
 def test_projected_retry_part_feeds_429_backoff_once_then_allows_success(tmp_path: Path) -> None:
@@ -1489,7 +1628,7 @@ def test_active_terminal_provider_error_stops_container_before_freeze_and_preven
     assert workspace.candidate.joinpath("live.log").read_text() == frozen
 
 
-@pytest.mark.parametrize(("turns_before", "expected_phase", "frozen"), [(0, "failed", False), (1, "frozen", True)])
+@pytest.mark.parametrize(("turns_before", "expected_phase", "frozen"), [(0, "frozen", True), (1, "frozen", True)])
 def test_transient_infrastructure_failure_is_retryable_only_before_a_provider_turn(
     tmp_path: Path, turns_before: int, expected_phase: str, frozen: bool
 ) -> None:
@@ -1517,10 +1656,8 @@ def test_transient_infrastructure_failure_is_retryable_only_before_a_provider_tu
 
     assert result.workspace_frozen is frozen
     assert StateStore(paths.state).read().phase == expected_phase
-    assert StateStore(paths.state).read().exit_class == (
-        "infrastructure_failed_before_provider" if turns_before == 0 else "provider_error"
-    )
-    assert api.interrupts == turns_before
+    assert StateStore(paths.state).read().exit_class == "provider_error"
+    assert api.interrupts == 1
 
 
 def prepared(tmp_path: Path) -> tuple[JobPaths, InstallRecord, SimpleNamespace, FakeWorkspace]:
@@ -1534,11 +1671,11 @@ def prepared(tmp_path: Path) -> tuple[JobPaths, InstallRecord, SimpleNamespace, 
 def test_usage_actions_and_cache_gate_use_strict_projected_messages(tmp_path: Path) -> None:
     paths, record, request, workspace = prepared(tmp_path)
     parts = [
-        {"type": "tool", "callID": "pending", "state": {"status": "pending"}},
-        {"type": "tool", "callID": "running", "state": {"status": "running"}},
-        {"type": "tool", "callID": "done", "state": {"status": "completed"}},
-        {"type": "tool", "callID": "failed", "state": {"status": "error"}},
-        {"type": "tool", "callID": "done", "state": {"status": "completed"}},
+        {"id": "prt_pending", "type": "tool", "callID": "pending", "state": {"status": "pending"}},
+        {"id": "prt_running", "type": "tool", "callID": "running", "state": {"status": "running"}},
+        {"id": "prt_done", "type": "tool", "callID": "done", "state": {"status": "completed"}},
+        {"id": "prt_failed", "type": "tool", "callID": "failed", "state": {"status": "error"}},
+        {"id": "prt_done_2", "type": "tool", "callID": "done", "state": {"status": "completed"}},
     ]
     api = FakeOpenCodeApi([([user(), assistant(cache_read=0, parts=parts)], "idle")])
     clock = FakeClock()
@@ -1604,8 +1741,8 @@ def test_tool_actions_are_keyed_by_durable_message_and_part_not_reused_provider_
 def test_tool_action_part_id_cannot_collide_with_index_fallback(tmp_path: Path) -> None:
     paths, record, request, workspace = prepared(tmp_path)
     parts = [
-        {"id": "index:1", "type": "tool", "callID": "one", "state": {"status": "completed"}},
-        {"type": "tool", "callID": "two", "state": {"status": "completed"}},
+        {"id": "prt_one", "type": "tool", "callID": "one", "state": {"status": "completed"}},
+        {"id": "prt_two", "type": "tool", "callID": "two", "state": {"status": "completed"}},
     ]
     api = FakeOpenCodeApi([([user(), assistant(parts=parts)], "idle")])
     clock = FakeClock()
@@ -1625,6 +1762,38 @@ def test_tool_action_part_id_cannot_collide_with_index_fallback(tmp_path: Path) 
             sleeper=clock.sleep,
         )
     assert result.actions == 2
+
+
+@pytest.mark.parametrize("schema", ["legacy", "v2"])
+def test_tool_action_requires_nonempty_durable_message_and_part_ids(schema: str) -> None:
+    if schema == "legacy":
+        message = assistant(parts=[{"type": "tool", "callID": "call", "state": {"status": "completed"}}])
+    else:
+        message = v2_assistant()
+        message["content"].append(
+            {"type": "tool", "name": "bash", "state": {"status": "completed"}, "time": {"created": 1}}
+        )
+    with pytest.raises(VanillaError, match="invalid.*schema"):
+        vanilla_module._actions({"data": [message]})
+
+
+@pytest.mark.parametrize("schema", ["legacy", "v2"])
+def test_tool_action_rejects_duplicate_part_identity_within_message(schema: str) -> None:
+    if schema == "legacy":
+        part = {"id": "prt_duplicate", "type": "tool", "callID": "call", "state": {"status": "completed"}}
+        message = assistant(parts=[part, copy.deepcopy(part)])
+    else:
+        part = {
+            "id": "prt_duplicate",
+            "type": "tool",
+            "name": "bash",
+            "state": {"status": "completed"},
+            "time": {"created": 1},
+        }
+        message = v2_assistant()
+        message["content"].extend([part, copy.deepcopy(part)])
+    with pytest.raises(VanillaError, match="duplicated"):
+        vanilla_module._actions({"data": [message]})
 
 
 def test_v2_projected_messages_account_usage_actions_and_terminal_errors(tmp_path: Path) -> None:
@@ -1786,7 +1955,7 @@ def test_live_poll_regression_interrupts_and_freezes_without_decreasing_breaker_
     tmp_path: Path, field: str
 ) -> None:
     paths, record, request, workspace = prepared(tmp_path)
-    first = assistant(parts=[{"type": "tool", "callID": "call", "state": {"status": "completed"}}])
+    first = assistant(parts=[{"id": "prt_call", "type": "tool", "callID": "call", "state": {"status": "completed"}}])
     second = copy.deepcopy(first)
     first_data = [user(), first]
     second_data = [user(), second]
@@ -2208,8 +2377,13 @@ def test_http_prompt_rejects_malformed_or_conflicting_admission(overrides: dict[
         server.stop()
 
 
-@pytest.mark.parametrize("stage", ["create", "prompt"])
-def test_transient_setup_failure_before_provider_is_explicitly_retryable(tmp_path: Path, stage: str) -> None:
+@pytest.mark.parametrize(
+    ("stage", "expected"),
+    [("create", "infrastructure_failed_before_provider"), ("prompt", "provider_error")],
+)
+def test_transient_setup_failure_before_provider_is_explicitly_retryable(
+    tmp_path: Path, stage: str, expected: str
+) -> None:
     paths, record, request, workspace = prepared(tmp_path)
     api = SetupErrorApi(stage)
     clock = FakeClock()
@@ -2228,14 +2402,43 @@ def test_transient_setup_failure_before_provider_is_explicitly_retryable(tmp_pat
             clock=clock,
             sleeper=clock.sleep,
         )
-    assert result.exit_class == "infrastructure_failed_before_provider"
-    assert not result.workspace_frozen
-    assert StateStore(paths.state).read().phase == "failed"
+    assert result.exit_class == expected
+    assert result.workspace_frozen is (stage == "prompt")
+    assert StateStore(paths.state).read().phase == ("frozen" if stage == "prompt" else "failed")
+
+
+def test_response_loss_after_prompt_admission_quiesces_and_freezes_nonretryable_evidence(tmp_path: Path) -> None:
+    paths, record, request, workspace = prepared(tmp_path)
+    api = ResponseLostAfterAdmissionApi(workspace)
+    clock = FakeClock()
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease.claim_handle(request)
+        result = run_vanilla(
+            job,
+            StateStore(paths.state),
+            workspace,
+            record,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=limits(),
+            breaker=CircuitBreaker(clock=clock),
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+        )
+    assert result.completion is VanillaCompletion.PROVIDER_ERROR
+    assert result.exit_class == "provider_error"
+    assert result.interrupt_attempted
+    assert api.interrupts == 1
+    assert StateStore(paths.state).read().phase == "frozen"
+    assert json.loads(paths.root.joinpath("vanilla-execution.json").read_text())["prompt_may_be_active"] is True
+    assert paths.root.joinpath("subject/live.log").read_text() == "at-interrupt"
 
 
 def test_setup_429_backoff_cannot_overshoot_wall_deadline(tmp_path: Path) -> None:
     paths, record, request, workspace = prepared(tmp_path)
     clock = GuardClock()
+    api = SetupRateApi()
     with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
         workspace.lease.claim_handle(request)
         result = run_vanilla(
@@ -2247,13 +2450,14 @@ def test_setup_429_backoff_cannot_overshoot_wall_deadline(tmp_path: Path) -> Non
             variant="max",
             limits=limits(wall=2),
             breaker=CircuitBreaker(clock=clock, retry_after_default=10, retry_after_max=10),
-            api=SetupRateApi(),
+            api=api,
             clock=clock,
             sleeper=clock.sleep,
         )
     assert result.completion is VanillaCompletion.WALL_TIME
     assert result.workspace_frozen
     assert clock.now == 102
+    assert api.attempts == 1
 
 
 @pytest.mark.parametrize(("stage", "interrupts"), [("create", 0), ("prompt", 1)])

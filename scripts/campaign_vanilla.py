@@ -22,7 +22,14 @@ from urllib.request import Request, urlopen
 
 from scripts.campaign_install import InstallRecord
 from scripts.campaign_state import JobLease, JobState, StateStore
-from scripts.campaign_usage import CircuitBreaker, UsageSummary, summarize_usage
+from scripts.campaign_usage import (
+    MAX_EVIDENCE_MESSAGES,
+    CircuitBreaker,
+    TurnUsage,
+    UsageParseError,
+    UsageSummary,
+    summarize_evidence_usage,
+)
 from scripts.campaign_workspace import DockerWorkspace, WorkspaceError
 
 if TYPE_CHECKING:
@@ -69,6 +76,10 @@ class VanillaHttpError(VanillaError):
 
 class CredentialLeakError(VanillaError):
     """Raised before publication when credential material is observed."""
+
+
+class SessionConflictError(VanillaError):
+    """Raised when persisted Session identity conflicts with this job."""
 
 
 class VanillaCompletion(str, Enum):
@@ -156,6 +167,7 @@ class VanillaResult:
     cache_read: int
     cache_write: int
     max_prompt_total: int
+    limit_overshoot: int
     workspace_frozen: bool
     interrupt_attempted: bool
     forced_stop: bool
@@ -178,6 +190,7 @@ class VanillaResult:
             "cache_read": self.cache_read,
             "cache_write": self.cache_write,
             "max_prompt_total": self.max_prompt_total,
+            "limit_overshoot": self.limit_overshoot,
             "workspace_frozen": self.workspace_frozen,
             "interrupt_attempted": self.interrupt_attempted,
             "forced_stop": self.forced_stop,
@@ -202,6 +215,7 @@ class VanillaResult:
             "cache_read",
             "cache_write",
             "max_prompt_total",
+            "limit_overshoot",
             "workspace_frozen",
             "interrupt_attempted",
             "forced_stop",
@@ -224,6 +238,7 @@ class VanillaResult:
                 cache_read=raw["cache_read"],
                 cache_write=raw["cache_write"],
                 max_prompt_total=raw["max_prompt_total"],
+                limit_overshoot=raw["limit_overshoot"],
                 workspace_frozen=raw["workspace_frozen"],
                 interrupt_attempted=raw["interrupt_attempted"],
                 forced_stop=raw["forced_stop"],
@@ -247,6 +262,7 @@ class VanillaResult:
                     result.cache_read,
                     result.cache_write,
                     result.max_prompt_total,
+                    result.limit_overshoot,
                 )
             )
             or not result.cost.is_finite()
@@ -659,8 +675,38 @@ def run_vanilla(
         raise VanillaError("vanilla adapter can only adopt its exact executing state")
 
     progress_path = job.job.root / "vanilla-progress.json"
-    usage, actions, messages = _restore_progress(progress_path, state)
     session: Mapping[str, object] = {"id": session_id, "status": "unconfirmed"}
+    try:
+        usage, actions, messages, restored_breaker_usage = _restore_progress(progress_path, state)
+    except (UsageParseError, VanillaError):
+        if execution.get("prompt_may_be_active") is not True:
+            raise
+        known_usage = _usage_from_state(state)
+        return _finish_early_stop(
+            job,
+            state_store,
+            state,
+            workspace,
+            command_identity,
+            session_id,
+            message_id,
+            session,
+            execution_path,
+            execution,
+            breaker,
+            api,
+            max(0.0, clock() - float(started_at)),
+            clock,
+            sleeper,
+            poll_interval,
+            completion=VanillaCompletion.PROVIDER_ERROR,
+            error_text="persisted trajectory progress is invalid after prompt admission",
+            confirmed=execution.get("session_confirmed") is True,
+            usage=known_usage,
+            actions=state.actions,
+            messages={"data": []},
+            observe_breaker=False,
+        )
     while True:
         try:
             found = api.get_session(session_id)
@@ -725,6 +771,7 @@ def run_vanilla(
                 execution = {**execution, "session_confirmed": True}
                 _write_json(execution_path, execution)
             if breaker.stop_active:
+                execution = _mark_prompt_may_be_active(execution_path)
                 _reconcile_admission(api, prompt_request)
                 completion = (
                     VanillaCompletion.AUTH
@@ -756,6 +803,7 @@ def run_vanilla(
                     messages=messages,
                 )
             if clock() >= wall_deadline:
+                execution = _mark_prompt_may_be_active(execution_path)
                 _reconcile_admission(api, prompt_request)
                 return _finish_early_stop(
                     job,
@@ -782,12 +830,70 @@ def run_vanilla(
                     messages=messages,
                 )
             api.allow_permissions(session_id, directory="/candidate")
+            execution = _mark_prompt_may_be_active(execution_path)
             api.prompt(prompt_request)
             break
         except VanillaHttpError as error:
+            if execution.get("prompt_may_be_active") is True:
+                if error.status_code in {401, 403}:
+                    breaker.observe_error(error.status_code, detail=str(error))
+                return _finish_early_stop(
+                    job,
+                    state_store,
+                    state,
+                    workspace,
+                    command_identity,
+                    session_id,
+                    message_id,
+                    session,
+                    execution_path,
+                    execution,
+                    breaker,
+                    api,
+                    max(0.0, clock() - float(started_at)),
+                    clock,
+                    sleeper,
+                    poll_interval,
+                    completion=VanillaCompletion.AUTH
+                    if error.status_code in {401, 403}
+                    else VanillaCompletion.PROVIDER_ERROR,
+                    error_text="provider authentication failure"
+                    if error.status_code in {401, 403}
+                    else "provider API response was ambiguous after prompt admission",
+                    confirmed=execution.get("session_confirmed") is True,
+                    usage=usage,
+                    actions=actions,
+                    messages=messages,
+                )
             if error.status_code == 429:
                 breaker.observe_error(429, retry_after=error.retry_after, detail=str(error))
-                _backoff(breaker, clock, sleeper, poll_interval, wall_deadline)
+                if _backoff(breaker, clock, sleeper, poll_interval, wall_deadline):
+                    completion = _safety_completion(breaker, usage, limits, clock, wall_deadline)
+                    if completion is not None:
+                        return _finish_early_stop(
+                            job,
+                            state_store,
+                            state,
+                            workspace,
+                            command_identity,
+                            session_id,
+                            message_id,
+                            session,
+                            execution_path,
+                            execution,
+                            breaker,
+                            api,
+                            max(0.0, clock() - float(started_at)),
+                            clock,
+                            sleeper,
+                            poll_interval,
+                            completion=completion,
+                            error_text=breaker.pause_reason or completion.value,
+                            confirmed=execution.get("session_confirmed") is True,
+                            usage=usage,
+                            actions=actions,
+                            messages=messages,
+                        )
                 continue
             if error.status_code in {401, 403}:
                 breaker.observe_error(error.status_code, detail=str(error))
@@ -854,15 +960,71 @@ def run_vanilla(
                     max(0.0, clock() - float(started_at)),
                 )
             raise
+        except SessionConflictError:
+            if execution.get("prompt_may_be_active") is not True:
+                raise
+            return _finish_early_stop(
+                job,
+                state_store,
+                state,
+                workspace,
+                command_identity,
+                session_id,
+                message_id,
+                session,
+                execution_path,
+                execution,
+                breaker,
+                api,
+                max(0.0, clock() - float(started_at)),
+                clock,
+                sleeper,
+                poll_interval,
+                completion=VanillaCompletion.PROVIDER_ERROR,
+                error_text="persisted Session conflicts after prompt admission",
+                confirmed=execution.get("session_confirmed") is True,
+                usage=usage,
+                actions=actions,
+                messages=messages,
+            )
+        except VanillaError:
+            if execution.get("prompt_may_be_active") is not True:
+                raise
+            return _finish_early_stop(
+                job,
+                state_store,
+                state,
+                workspace,
+                command_identity,
+                session_id,
+                message_id,
+                session,
+                execution_path,
+                execution,
+                breaker,
+                api,
+                max(0.0, clock() - float(started_at)),
+                clock,
+                sleeper,
+                poll_interval,
+                completion=VanillaCompletion.PROVIDER_ERROR,
+                error_text="provider API response was invalid after prompt admission",
+                confirmed=execution.get("session_confirmed") is True,
+                usage=usage,
+                actions=actions,
+                messages=messages,
+            )
 
     stopped = False
     error_text = None
+    breaker_usage = restored_breaker_usage
     invalid_error: VanillaError | None = None
     observed_provider_errors: set[str] = set()
     inactive_messages: Mapping[str, object] | None = None
     while True:
-        if clock() >= wall_deadline:
-            completion = VanillaCompletion.WALL_TIME
+        safety = _safety_completion(breaker, usage, limits, clock, wall_deadline)
+        if safety is not None:
+            completion = safety
             stopped = _interrupt(api, session_id, workspace, execution_path, execution, clock, sleeper, poll_interval)
             break
         previous_usage = usage
@@ -875,37 +1037,33 @@ def run_vanilla(
                 raise VanillaError("sanitized projected messages are invalid")
             messages = sanitized
         except VanillaHttpError as error:
-            if error.status_code == 429:
-                breaker.observe_error(429, retry_after=error.retry_after, detail=str(error))
-                _backoff(breaker, clock, sleeper, poll_interval, wall_deadline)
-                continue
-            if error.status_code in {401, 403}:
-                breaker.observe_error(error.status_code, detail=str(error))
-                completion = VanillaCompletion.AUTH
-                error_text = "provider authentication failure"
-                stopped = _interrupt(
-                    api, session_id, workspace, execution_path, execution, clock, sleeper, poll_interval
-                )
-                break
-            if error.transient and max(state.provider_turns, usage.provider_turns) == 0:
-                return _fail_before_provider(
-                    job,
-                    state_store,
-                    state,
-                    workspace,
-                    command_identity,
-                    session_id,
-                    message_id,
-                    session,
-                    messages,
-                    max(0.0, clock() - float(started_at)),
-                )
-            completion = VanillaCompletion.PROVIDER_ERROR
-            error_text = "provider error"
+            if error.status_code in {401, 403, 429}:
+                breaker.observe_error(error.status_code, retry_after=error.retry_after, detail=str(error))
+            completion = VanillaCompletion.AUTH if error.status_code in {401, 403} else VanillaCompletion.PROVIDER_ERROR
+            error_text = (
+                "provider authentication failure"
+                if error.status_code in {401, 403}
+                else "provider API failure after prompt admission"
+            )
             stopped = _interrupt(api, session_id, workspace, execution_path, execution, clock, sleeper, poll_interval)
             break
-        usage = _summarize_usage(messages)
-        actions = _actions(messages)
+        except VanillaError:
+            completion = VanillaCompletion.PROVIDER_ERROR
+            error_text = "invalid provider API response after prompt admission"
+            stopped = _interrupt(api, session_id, workspace, execution_path, execution, clock, sleeper, poll_interval)
+            break
+        try:
+            usage = _summarize_usage(messages)
+            actions = _actions(messages)
+        except (UsageParseError, VanillaError) as error:
+            stopped = _interrupt(api, session_id, workspace, execution_path, execution, clock, sleeper, poll_interval)
+            usage = previous_usage
+            actions = previous_actions
+            messages = previous_messages
+            completion = VanillaCompletion.PROVIDER_ERROR
+            error_text = "malformed OpenCode trajectory evidence"
+            invalid_error = VanillaError(str(error))
+            break
         try:
             _require_monotonic(previous_usage, usage, previous_actions, actions, previous_messages, messages)
         except VanillaError as error:
@@ -936,7 +1094,12 @@ def run_vanilla(
                 actions=actions,
                 cost=float(usage.cost),
             )
+        if usage.provider_turns > MAX_PROVIDER_TURNS:
+            completion = VanillaCompletion.PROVIDER_TURNS
+            stopped = _interrupt(api, session_id, workspace, execution_path, execution, clock, sleeper, poll_interval)
+            break
         breaker.observe(workspace.manifest.job_id, state.generation, usage, terminal=False)
+        breaker_usage = usage
         provider_error = _provider_error(messages)
         rate_limited = provider_error is not None and provider_error[0] == 429
         if provider_error is not None and provider_error[0] == 429:
@@ -977,33 +1140,19 @@ def run_vanilla(
         try:
             status_value = api.status(session_id)
         except VanillaHttpError as error:
-            if error.status_code == 429:
-                breaker.observe_error(429, retry_after=error.retry_after, detail=str(error))
-                _backoff(breaker, clock, sleeper, poll_interval, wall_deadline)
-                continue
-            if error.status_code in {401, 403}:
-                breaker.observe_error(error.status_code, detail=str(error))
-                completion = VanillaCompletion.AUTH
-                error_text = "provider authentication failure"
-                stopped = _interrupt(
-                    api, session_id, workspace, execution_path, execution, clock, sleeper, poll_interval
-                )
-                break
-            if error.transient and max(state.provider_turns, usage.provider_turns) == 0:
-                return _fail_before_provider(
-                    job,
-                    state_store,
-                    state,
-                    workspace,
-                    command_identity,
-                    session_id,
-                    message_id,
-                    session,
-                    messages,
-                    max(0.0, clock() - float(started_at)),
-                )
+            if error.status_code in {401, 403, 429}:
+                breaker.observe_error(error.status_code, retry_after=error.retry_after, detail=str(error))
+            completion = VanillaCompletion.AUTH if error.status_code in {401, 403} else VanillaCompletion.PROVIDER_ERROR
+            error_text = (
+                "provider authentication failure"
+                if error.status_code in {401, 403}
+                else "provider status failure after prompt admission"
+            )
+            stopped = _interrupt(api, session_id, workspace, execution_path, execution, clock, sleeper, poll_interval)
+            break
+        except VanillaError:
             completion = VanillaCompletion.PROVIDER_ERROR
-            error_text = "provider error"
+            error_text = "invalid provider status response after prompt admission"
             stopped = _interrupt(api, session_id, workspace, execution_path, execution, clock, sleeper, poll_interval)
             break
         if status_value != "idle":
@@ -1062,7 +1211,7 @@ def run_vanilla(
             already_stopped=stopped,
         )
     _verify_no_credentials(job.job.root, workspace.manifest.credential_env)
-    breaker.observe(workspace.manifest.job_id, state.generation, usage, terminal=True)
+    breaker.observe(workspace.manifest.job_id, state.generation, breaker_usage, terminal=True)
     hashes = {
         name: _sha256(job.job.root / name)
         for name in ("trajectory.json", "usage.json", "workspace-inventory.json", "vanilla-result.json")
@@ -1091,11 +1240,50 @@ def _backoff(
     sleeper: Callable[[float], None],
     poll_interval: float,
     deadline: float,
-) -> None:
+) -> bool:
     while (
         breaker.backoff_until is not None and clock() < min(breaker.backoff_until, deadline) and not breaker.stop_active
     ):
         sleeper(min(poll_interval, breaker.backoff_until - clock(), deadline - clock()))
+    return clock() >= deadline or breaker.stop_active
+
+
+def _safety_completion(
+    breaker: CircuitBreaker,
+    usage: UsageSummary,
+    limits: Limits,
+    clock: Callable[[], float],
+    deadline: float,
+) -> VanillaCompletion | None:
+    if breaker.stop_active:
+        return (
+            VanillaCompletion.AUTH
+            if breaker.pause_reason == "provider authentication failure"
+            else VanillaCompletion.HARD_COST
+        )
+    if usage.provider_turns >= limits.provider_turns:
+        return VanillaCompletion.PROVIDER_TURNS
+    if clock() >= deadline:
+        return VanillaCompletion.WALL_TIME
+    return None
+
+
+def _usage_from_state(state: JobState) -> UsageSummary:
+    if state.provider_turns == 0:
+        if state.cost != 0:
+            raise VanillaError("persisted state cost has no provider turn")
+        return UsageSummary()
+    turns = (
+        TurnUsage(prompt_total=0, cost=Decimal(str(state.cost))),
+        *(TurnUsage() for _ in range(state.provider_turns - 1)),
+    )
+    return UsageSummary(
+        provider_turns=state.provider_turns,
+        turns_without_cache=state.provider_turns,
+        cost=Decimal(str(state.cost)),
+        turns=turns,
+        allow_large=state.provider_turns > MAX_PROVIDER_TURNS,
+    )
 
 
 def _reconcile_admission(api: OpenCodeApi, request: VanillaPromptRequest) -> None:
@@ -1111,15 +1299,16 @@ def _summarize_usage(messages: Mapping[str, object]) -> UsageSummary:
     data = messages.get("data")
     if set(messages) != {"data"} or not isinstance(data, list):
         raise VanillaError("projected messages have an invalid usage schema")
+    if len(data) > MAX_EVIDENCE_MESSAGES:
+        raise VanillaError("projected raw message count exceeds absolute evidence limit")
     if not data:
-        return summarize_usage(messages)
+        return summarize_evidence_usage(messages)
     legacy = [isinstance(message, Mapping) and "info" in message for message in data]
     if any(legacy):
         if not all(legacy):
             raise VanillaError("projected messages mix legacy and V2 schemas")
-        return summarize_usage(messages)
+        return summarize_evidence_usage(messages)
     projected: list[dict[str, object]] = []
-    provider_turns = 0
     for message in data:
         if not isinstance(message, Mapping) or not isinstance(message.get("type"), str):
             raise VanillaError("projected V2 message has an invalid schema")
@@ -1130,16 +1319,14 @@ def _summarize_usage(messages: Mapping[str, object]) -> UsageSummary:
             projected.append({"type": "user", "content": message["text"]})
             continue
         if message_type == "compaction":
-            if provider_turns < MAX_PROVIDER_TURNS:
-                projected.append(
-                    {
-                        "type": "assistant",
-                        "content": "",
-                        "tokens": {"input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}},
-                        "cost": None,
-                    }
-                )
-            provider_turns += 1
+            projected.append(
+                {
+                    "type": "assistant",
+                    "content": "",
+                    "tokens": {"input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}},
+                    "cost": None,
+                }
+            )
             continue
         if message_type != "assistant":
             if message_type not in {
@@ -1150,9 +1337,6 @@ def _summarize_usage(messages: Mapping[str, object]) -> UsageSummary:
                 "shell",
             }:
                 raise VanillaError("projected V2 message type is unknown")
-            continue
-        provider_turns += 1
-        if provider_turns > MAX_PROVIDER_TURNS:
             continue
         if not isinstance(message.get("id"), str) or not isinstance(message.get("content"), list):
             raise VanillaError("projected V2 assistant message has an invalid schema")
@@ -1175,7 +1359,7 @@ def _summarize_usage(messages: Mapping[str, object]) -> UsageSummary:
                 "cost": message.get("cost"),
             }
         )
-    return summarize_usage({"data": projected})
+    return summarize_evidence_usage({"data": projected})
 
 
 def _require_monotonic(
@@ -1224,6 +1408,7 @@ def _message_ids(messages: Mapping[str, object]) -> tuple[str, ...]:
     if not isinstance(data, list):
         raise VanillaError("projected messages have an invalid identity schema")
     result: list[str] = []
+    seen: set[str] = set()
     for message in data:
         if not isinstance(message, Mapping):
             raise VanillaError("projected message has an invalid identity schema")
@@ -1231,6 +1416,9 @@ def _message_ids(messages: Mapping[str, object]) -> tuple[str, ...]:
         message_id = info.get("id") if isinstance(info, Mapping) else message.get("id")
         if not isinstance(message_id, str):
             raise VanillaError("projected message is missing its identity")
+        if not message_id or message_id in seen:
+            raise VanillaError("projected message identity is missing or duplicated")
+        seen.add(message_id)
         result.append(message_id)
     return tuple(result)
 
@@ -1473,7 +1661,12 @@ def _credential_leak_result(
     _write_json(job.job.root / "usage.json", result.to_dict())
     _write_json(job.job.root / "vanilla-result.json", result.to_dict())
     _verify_no_credentials(job.job.root, workspace.manifest.credential_env)
-    breaker.observe(workspace.manifest.job_id, state.generation, usage, terminal=True)
+    breaker.observe(
+        workspace.manifest.job_id,
+        state.generation,
+        usage if usage.provider_turns <= MAX_PROVIDER_TURNS else UsageSummary(),
+        terminal=True,
+    )
     state_store.transition(
         "failed",
         command_identity=command_identity,
@@ -1514,6 +1707,7 @@ def _finish_early_stop(
     usage: UsageSummary,
     actions: int,
     messages: Mapping[str, object],
+    observe_breaker: bool = True,
 ) -> VanillaResult:
     stopped = (
         _interrupt(api, session_id, workspace, execution_path, execution, clock, sleeper, poll_interval)
@@ -1553,7 +1747,13 @@ def _finish_early_stop(
             already_stopped=stopped,
         )
     _verify_no_credentials(job.job.root, workspace.manifest.credential_env)
-    breaker.observe(workspace.manifest.job_id, state.generation, usage, terminal=True)
+    if observe_breaker:
+        breaker.observe(
+            workspace.manifest.job_id,
+            state.generation,
+            usage if usage.provider_turns <= MAX_PROVIDER_TURNS else UsageSummary(),
+            terminal=True,
+        )
     state_store.transition(
         "frozen",
         command_identity=command_identity,
@@ -1587,6 +1787,16 @@ def _lost_server(
     messages: Mapping[str, object],
     elapsed: float,
 ) -> VanillaResult:
+    execution_path = job.job.root / "vanilla-execution.json"
+    execution = _read_json(execution_path)
+    stopped = False
+    if (
+        isinstance(execution, Mapping)
+        and execution.get("prompt_may_be_active") is True
+        and workspace.lease._handle_active
+    ):
+        workspace.stop()
+        stopped = True
     result = _result(
         session_id,
         message_id,
@@ -1620,12 +1830,17 @@ def _lost_server(
             usage,
             actions,
             breaker,
-            job.job.root / "vanilla-execution.json",
+            execution_path,
             elapsed,
             already_stopped=False,
         )
     _verify_no_credentials(job.job.root, workspace.manifest.credential_env)
-    breaker.observe(workspace.manifest.job_id, state.generation, usage, terminal=True)
+    breaker.observe(
+        workspace.manifest.job_id,
+        state.generation,
+        usage if usage.provider_turns <= MAX_PROVIDER_TURNS else UsageSummary(),
+        terminal=True,
+    )
     state_store.transition(
         "frozen",
         command_identity=command_identity,
@@ -1640,7 +1855,8 @@ def _lost_server(
         },
     )
     _verify_no_credentials(job.job.root, workspace.manifest.credential_env)
-    workspace.release()
+    if not stopped:
+        workspace.release()
     return result
 
 
@@ -1680,6 +1896,17 @@ def _execution_interrupt_attempted(path: Path) -> bool:
     if not isinstance(execution, Mapping) or type(execution.get("interrupt_attempted")) is not bool:
         raise VanillaError("persisted vanilla interrupt state is invalid")
     return execution["interrupt_attempted"]
+
+
+def _mark_prompt_may_be_active(path: Path) -> Mapping[str, object]:
+    execution = _read_json(path)
+    if not isinstance(execution, Mapping) or type(execution.get("prompt_may_be_active")) is not bool:
+        raise VanillaError("persisted vanilla prompt activity state is invalid")
+    if execution["prompt_may_be_active"] is True:
+        return execution
+    updated = {**execution, "prompt_may_be_active": True}
+    _write_json(path, updated)
+    return updated
 
 
 def _validate_inputs(
@@ -1771,6 +1998,7 @@ def _execution(
         "started_at": clock(),
         "interrupt_attempted": False,
         "session_confirmed": False,
+        "prompt_may_be_active": False,
     }
     _reject_credentials(expected, credential_names)
     if state.phase == "planned":
@@ -1786,6 +2014,7 @@ def _execution(
         or raw.get("prompt_request") != prompt_request.to_dict()
         or raw.get("prompt_request_sha256") != prompt_request.sha256
         or type(raw.get("session_confirmed")) is not bool
+        or type(raw.get("prompt_may_be_active")) is not bool
         or type(raw.get("interrupt_attempted")) is not bool
     ):
         raise VanillaError("persisted vanilla execution identity is invalid")
@@ -1811,7 +2040,7 @@ def _validate_session(
         or agent is not None
         and session.get("agent") != agent
     ):
-        raise VanillaError("OpenCode Session identity, location, or model conflicts with the campaign")
+        raise SessionConflictError("OpenCode Session identity, location, or model conflicts with the campaign")
 
 
 def _validate_prompt(prompt: Mapping[str, object], message_id: str) -> None:
@@ -1827,38 +2056,46 @@ def _actions(messages: Mapping[str, object]) -> int:
         if isinstance(message, Mapping) and message.get("type") == "assistant":
             message_id = message.get("id")
             content = message.get("content")
-            if not isinstance(message_id, str) or not isinstance(content, list):
+            if not isinstance(message_id, str) or not message_id or not isinstance(content, list):
                 raise VanillaError("projected V2 assistant content has an invalid action schema")
-            for index, part in enumerate(content):
+            identities: set[str] = set()
+            for part in content:
                 if not isinstance(part, Mapping) or part.get("type") != "tool":
                     continue
                 state = part.get("state")
                 part_id = part.get("id")
-                if not isinstance(state, Mapping) or part_id is not None and not isinstance(part_id, str):
+                if not isinstance(state, Mapping) or not isinstance(part_id, str) or not part_id:
                     raise VanillaError("projected V2 tool has an invalid action schema")
+                if part_id in identities:
+                    raise VanillaError("projected V2 tool identity is duplicated")
+                identities.add(part_id)
                 status_value = state.get("status")
                 if status_value not in {"pending", "running", "completed", "error"}:
                     raise VanillaError("projected V2 tool has an unknown state")
                 if status_value != "pending":
-                    calls.add((message_id, "id", part_id) if part_id else (message_id, "index", str(index)))
+                    calls.add((message_id, "id", part_id))
             continue
         if not isinstance(message, Mapping) or not isinstance(message.get("parts"), list):
             continue
         info = message.get("info")
-        if not isinstance(info, Mapping) or not isinstance(info.get("id"), str):
+        if not isinstance(info, Mapping) or not isinstance(info.get("id"), str) or not info["id"]:
             raise VanillaError("projected assistant message has an invalid action identity")
-        for index, part in enumerate(message["parts"]):
+        identities: set[str] = set()
+        for part in message["parts"]:
             if not isinstance(part, Mapping) or part.get("type") != "tool":
                 continue
             state = part.get("state")
             part_id = part.get("id")
-            if not isinstance(state, Mapping) or part_id is not None and not isinstance(part_id, str):
+            if not isinstance(state, Mapping) or not isinstance(part_id, str) or not part_id:
                 raise VanillaError("projected tool part has an invalid action schema")
+            if part_id in identities:
+                raise VanillaError("projected tool part identity is duplicated")
+            identities.add(part_id)
             status_value = state.get("status")
             if status_value not in {"pending", "running", "completed", "error"}:
                 raise VanillaError("projected tool part has an unknown state")
             if status_value != "pending":
-                calls.add((info["id"], "id", part_id) if part_id else (info["id"], "index", str(index)))
+                calls.add((info["id"], "id", part_id))
     return len(calls)
 
 
@@ -1890,6 +2127,7 @@ def _result(
         cache_read=usage.cache_read,
         cache_write=usage.cache_write,
         max_prompt_total=usage.max_prompt_total,
+        limit_overshoot=max(0, usage.provider_turns - MAX_PROVIDER_TURNS),
         workspace_frozen=workspace_frozen,
         interrupt_attempted=interrupt_attempted,
         forced_stop=forced_stop,
@@ -2319,6 +2557,7 @@ def _reject_failure_schema_credentials(
             "cache_read": 0,
             "cache_write": 0,
             "max_prompt_total": 0,
+            "limit_overshoot": 0,
             "workspace_frozen": False,
             "interrupt_attempted": False,
             "forced_stop": False,
@@ -2355,6 +2594,7 @@ def _reject_failure_schema_credentials(
             "started_at": 0,
             "interrupt_attempted": False,
             "session_confirmed": False,
+            "prompt_may_be_active": False,
         },
         "vanilla-progress.json": {
             "version": 1,
@@ -2508,9 +2748,10 @@ def _sanitize_text(value: str) -> str:
     return _SECRET.sub(lambda match: match.group(1) + "[REDACTED]", value)[:1000]
 
 
-def _restore_progress(path: Path, state: JobState) -> tuple[UsageSummary, int, Mapping[str, object]]:
+def _restore_progress(path: Path, state: JobState) -> tuple[UsageSummary, int, Mapping[str, object], UsageSummary]:
     if not (state.provider_turns or state.actions or state.cost):
-        return UsageSummary(), 0, {"data": []}
+        empty = UsageSummary()
+        return empty, 0, {"data": []}, empty
     progress = _read_json(path)
     if (
         not isinstance(progress, Mapping)
@@ -2519,17 +2760,26 @@ def _restore_progress(path: Path, state: JobState) -> tuple[UsageSummary, int, M
     ):
         raise VanillaError("persisted vanilla progress is invalid")
     snapshots = [value for value in (progress["current"], progress["previous"]) if isinstance(value, Mapping)]
-    selected = next((value for value in snapshots if value.get("generation") == state.generation), None)
-    if selected is None or set(selected) != {"generation", "messages"}:
+    parsed: list[tuple[int, UsageSummary, int, Mapping[str, object]]] = []
+    for snapshot in snapshots:
+        snapshot_messages = snapshot.get("messages")
+        generation = snapshot.get("generation")
+        if type(generation) is not int or not isinstance(snapshot_messages, Mapping):
+            raise VanillaError("persisted vanilla progress is invalid")
+        _message_ids(snapshot_messages)
+        parsed.append((generation, _summarize_usage(snapshot_messages), _actions(snapshot_messages), snapshot_messages))
+    selected = next((value for value in parsed if value[0] == state.generation), None)
+    if selected is None:
         raise VanillaError("persisted vanilla progress is invalid")
-    messages = selected["messages"]
-    if not isinstance(messages, Mapping):
-        raise VanillaError("persisted vanilla progress is invalid")
-    usage = _summarize_usage(messages)
-    actions = _actions(messages)
+    _, usage, actions, messages = selected
     if usage.provider_turns != state.provider_turns or actions != state.actions or float(usage.cost) != state.cost:
         raise VanillaError("persisted vanilla progress conflicts with job state")
-    return usage, actions, messages
+    safe = max(
+        (value for value in parsed if value[1].provider_turns <= MAX_PROVIDER_TURNS),
+        key=lambda value: value[0],
+        default=None,
+    )
+    return usage, actions, messages, safe[1] if safe is not None else UsageSummary()
 
 
 def _write_progress(path: Path, generation: int, messages: object) -> None:
