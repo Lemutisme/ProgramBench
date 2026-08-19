@@ -1306,9 +1306,35 @@ def test_more_than_sixteen_explicit_retries_are_allowed_while_quarantine_is_with
 
     state = json.loads((root / "evaluation-state/procontract.json").read_text())
     assert state["attempt"] == 17
-    assert [record["attempt"] for record in state["partial_attempt_records"]] == list(range(1, 17))
-    assert all(len(record["record_hash"]) == 64 for record in state["partial_attempt_records"])
-    assert sum(record["raw_retained"] for record in state["partial_attempt_records"]) <= 1
+    history = state["partial_attempt_history"]
+    assert history["total_count"] == 16
+    assert len(history["head_hash"]) == 64
+    assert [record["attempt"] for record in history["recent"]] == list(range(1, 17))
+    assert sum(record["raw_retained"] for record in history["recent"]) <= 1
+
+
+def test_partial_attempt_history_compacts_one_thousand_records_with_hash_chain(tmp_path: Path) -> None:
+    from scripts import campaign_evaluate
+
+    path = tmp_path / "attempts.json"
+    for attempt in range(1, 1001):
+        campaign_evaluate._append_partial_attempt_record(
+            path,
+            {
+                "attempt": attempt,
+                "invocation_hash": "a" * 64,
+                "artifacts": [],
+                "quarantine_path": str(tmp_path / f"attempt-{attempt}"),
+                "raw_retained": False,
+            },
+        )
+    history = campaign_evaluate._load_partial_history(path)
+
+    assert history["total_count"] == 1000
+    assert history["checkpoint"]["pruned_count"] == 936
+    assert len(history["records"]) == 64
+    assert len(history["head_hash"]) == 64
+    assert path.stat().st_size < 128 * 1024
 
 
 def test_keyboard_interrupt_with_eval_file_persists_interrupted_then_reraises(tmp_path: Path) -> None:
