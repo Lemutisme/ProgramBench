@@ -484,6 +484,20 @@ def workspace_fixture(tmp_path: Path, paths: JobPaths, record: InstallRecord) ->
     return request, FakeWorkspace(manifest, lease)
 
 
+def tree_snapshot(root: Path) -> dict[str, tuple[object, ...]]:
+    result: dict[str, tuple[object, ...]] = {}
+    for path in [root, *sorted(root.rglob("*"))]:
+        status = path.lstat()
+        relative = "." if path == root else path.relative_to(root).as_posix()
+        result[relative] = (
+            status.st_dev,
+            status.st_ino,
+            status.st_mode,
+            path.readlink().as_posix() if path.is_symlink() else path.read_bytes() if path.is_file() else None,
+        )
+    return result
+
+
 def test_vanilla_runs_exactly_one_ordinary_session_and_freezes_on_idle(tmp_path: Path) -> None:
     paths = JobPaths(tmp_path / "pilot/vanilla/testorg__calculator.abc1234")
     StateStore(paths.state).write(JobState("planned"))
@@ -491,6 +505,7 @@ def test_vanilla_runs_exactly_one_ordinary_session_and_freezes_on_idle(tmp_path:
     request, workspace = workspace_fixture(tmp_path, paths, record)
     api = FakeOpenCodeApi([([user(), assistant(cache_read=50)], "idle")])
     clock = FakeClock()
+    candidate_before = tree_snapshot(workspace.candidate)
 
     with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
         workspace.lease.claim_handle(request)
@@ -523,6 +538,7 @@ def test_vanilla_runs_exactly_one_ordinary_session_and_freezes_on_idle(tmp_path:
     assert result.workspace_frozen
     assert paths.root.joinpath("subject/source.py").read_text() == "print('candidate')\n"
     assert StateStore(paths.state).read().phase == "frozen"
+    assert tree_snapshot(workspace.candidate) == candidate_before
     execution = json.loads(paths.root.joinpath("vanilla-execution.json").read_text())
     assert (
         execution["prompt_request"]
@@ -685,9 +701,8 @@ def test_same_prompt_id_rejects_conflicting_durable_request_fields(changes: dict
     )
     api = FakeOpenCodeApi([])
     api.prompt(request)
-    with pytest.raises(VanillaHttpError) as raised:
-        api.prompt(replace(request, **changes))
-    assert raised.value.status_code == 409
+    with pytest.raises(VanillaError, match="prompt request is invalid"):
+        replace(request, **changes)
     assert len(api.prompts) == 1
 
 
@@ -710,10 +725,36 @@ def test_resume_with_changed_delivery_fails_before_reissuing_durable_prompt(tmp_
             run_vanilla(job, StateStore(paths.state), workspace, record, **kwargs)
     with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
         workspace.lease.claim_handle(request)
-        with pytest.raises(VanillaError, match="identity"):
+        with pytest.raises(VanillaError, match="admission is fixed"):
             run_vanilla(job, StateStore(paths.state), workspace, record, delivery="queue", **kwargs)
     assert len(api.prompt_requests) == 1
     assert len(api.prompts) == 1
+
+
+def test_resume_rejects_existing_session_switched_to_custom_agent(tmp_path: Path) -> None:
+    paths, record, request, workspace = prepared(tmp_path)
+    api = CrashApi("prompt", [([user(), assistant()], "idle")])
+    clock = FakeClock()
+    kwargs = {
+        "model": "openai/gpt-5.6-luna",
+        "variant": "max",
+        "limits": limits(),
+        "breaker": CircuitBreaker(clock=clock),
+        "api": api,
+        "clock": clock,
+        "sleeper": clock.sleep,
+    }
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease.claim_handle(request)
+        with pytest.raises(InjectedCrash):
+            run_vanilla(job, StateStore(paths.state), workspace, record, **kwargs)
+    session = next(iter(api.sessions.values()))
+    session["agent"] = "custom"
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease.claim_handle(request)
+        with pytest.raises(VanillaError, match="conflicts"):
+            run_vanilla(job, StateStore(paths.state), workspace, record, **kwargs)
+    assert len(api.prompt_requests) == 1
 
 
 def test_resume_transport_failure_preserves_prior_provider_progress(tmp_path: Path) -> None:
@@ -1094,7 +1135,7 @@ def test_401_trips_campaign_auth_breaker_interrupts_and_sanitizes(
     assert "credential-value" not in paths.root.joinpath("trajectory.json").read_text()
 
 
-def test_one_character_credential_is_absent_from_artifact_bytes_paths_and_symlink_targets(
+def test_credential_leak_fails_closed_without_mutating_or_freezing_candidate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     paths, record, request, workspace = prepared(tmp_path)
@@ -1111,9 +1152,10 @@ def test_one_character_credential_is_absent_from_artifact_bytes_paths_and_symlin
     failed["parts"] = [{"type": "text", "text": "message Q"}]
     api = FakeOpenCodeApi([([user("task Q"), failed], "idle")])
     clock = FakeClock()
+    candidate_before = tree_snapshot(workspace.candidate)
     with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
         workspace.lease.claim_handle(request)
-        run_vanilla(
+        result = run_vanilla(
             job,
             StateStore(paths.state),
             workspace,
@@ -1126,12 +1168,30 @@ def test_one_character_credential_is_absent_from_artifact_bytes_paths_and_symlin
             clock=clock,
             sleeper=clock.sleep,
         )
-    for path in paths.root.rglob("*"):
-        assert "Q" not in path.relative_to(paths.root).as_posix()
-        if path.is_symlink():
-            assert "Q" not in path.readlink().as_posix()
-        elif path.is_file():
-            assert b"Q" not in path.read_bytes()
+    assert result.exit_class == "credential_leak"
+    assert not result.workspace_frozen
+    assert StateStore(paths.state).read().phase == "failed"
+    assert tree_snapshot(workspace.candidate) == candidate_before
+    assert not paths.root.joinpath("subject").exists()
+    assert not paths.root.joinpath("workspace-inventory.json").exists()
+    for name in ("trajectory.json", "usage.json", "vanilla-result.json"):
+        assert b"Q" not in paths.root.joinpath(name).read_bytes()
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease.claim_handle(request)
+        persisted = run_vanilla(
+            job,
+            StateStore(paths.state),
+            workspace,
+            record,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=limits(),
+            breaker=CircuitBreaker(clock=clock),
+            api=ForbiddenApi([]),
+            clock=clock,
+            sleeper=clock.sleep,
+        )
+    assert persisted == result
 
 
 def test_credential_that_collides_with_fixed_request_schema_fails_before_adapter_publication(
@@ -1143,7 +1203,7 @@ def test_credential_that_collides_with_fixed_request_schema_fails_before_adapter
     clock = FakeClock()
     with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
         workspace.lease.claim_handle(request)
-        with pytest.raises(VanillaError, match="contains a provider credential"):
+        with pytest.raises(VanillaError, match="provider credential"):
             run_vanilla(
                 job,
                 StateStore(paths.state),
@@ -1171,9 +1231,10 @@ def test_multisegment_credential_is_removed_from_full_snapshot_relative_path(
     workspace.candidate.joinpath("foo/bar").write_text("safe")
     api = FakeOpenCodeApi([([user(), assistant()], "idle")])
     clock = FakeClock()
+    before = tree_snapshot(workspace.candidate)
     with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
         workspace.lease.claim_handle(request)
-        run_vanilla(
+        result = run_vanilla(
             job,
             StateStore(paths.state),
             workspace,
@@ -1186,18 +1247,36 @@ def test_multisegment_credential_is_removed_from_full_snapshot_relative_path(
             clock=clock,
             sleeper=clock.sleep,
         )
-    assert all("foo/bar" not in path.relative_to(paths.root).as_posix() for path in paths.root.rglob("*"))
+    assert result.exit_class == "credential_leak"
+    assert tree_snapshot(workspace.candidate) == before
+    assert not paths.root.joinpath("subject").exists()
 
 
-def test_json_escaped_credential_in_prompt_files_is_rejected_logically_before_encoding(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "provider_error",
+        "failed",
+        "completion",
+        "credential_leak",
+        "messages",
+        "session",
+        "phase_timestamps",
+        "artifact_hashes",
+        "container_ids",
+        "preparing",
+        "executing",
+    ],
+)
+def test_credential_colliding_with_failure_schema_is_rejected_before_adapter_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, secret: str
 ) -> None:
     paths, record, request, workspace = prepared(tmp_path)
-    monkeypatch.setenv("OPENAI_API_KEY", 'a"b')
+    monkeypatch.setenv("OPENAI_API_KEY", secret)
     clock = FakeClock()
     with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
         workspace.lease.claim_handle(request)
-        with pytest.raises(VanillaError, match="contains a provider credential"):
+        with pytest.raises(VanillaError, match="provider credential"):
             run_vanilla(
                 job,
                 StateStore(paths.state),
@@ -1210,8 +1289,41 @@ def test_json_escaped_credential_in_prompt_files_is_rejected_logically_before_en
                 api=FakeOpenCodeApi([]),
                 clock=clock,
                 sleeper=clock.sleep,
-                files=({"uri": "data:text/plain,a%22b", "mime": "text/plain", "name": 'a"b'},),
             )
+    assert not paths.root.joinpath("vanilla-execution.json").exists()
+
+
+def test_credential_matching_actual_container_id_is_rejected_before_execution_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths, record, request, workspace = prepared(tmp_path)
+    monkeypatch.setenv("OPENAI_API_KEY", workspace.container_id)
+    clock = FakeClock()
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease.claim_handle(request)
+        with pytest.raises(VanillaError, match="fixed failure artifact schema"):
+            run_vanilla(
+                job,
+                StateStore(paths.state),
+                workspace,
+                record,
+                model="openai/gpt-5.6-luna",
+                variant="max",
+                limits=limits(),
+                breaker=CircuitBreaker(clock=clock),
+                api=FakeOpenCodeApi([]),
+                clock=clock,
+                sleeper=clock.sleep,
+            )
+    assert not paths.root.joinpath("vanilla-execution.json").exists()
+
+
+def test_json_escaped_credential_in_prompt_files_is_rejected_logically_before_encoding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", 'a"b')
+    with pytest.raises(VanillaError, match="contains a provider credential"):
+        vanilla_module._reject_credentials({"name": 'a"b'}, ("OPENAI_API_KEY",))
 
 
 def test_inventory_stops_scandir_before_enumerating_past_file_limit(
@@ -1453,12 +1565,66 @@ def test_usage_actions_and_cache_gate_use_strict_projected_messages(tmp_path: Pa
             sleeper=clock.sleep,
         )
 
-    assert result.actions == 3
+    assert result.actions == 4
     assert result.input_tokens == 100
     assert result.output_tokens == 20
     assert result.reasoning_tokens == 10
     assert result.max_prompt_total == 100
     assert breaker.pause_reason == "cache health below campaign threshold"
+
+
+def test_tool_actions_are_keyed_by_durable_message_and_part_not_reused_provider_call_id(tmp_path: Path) -> None:
+    paths, record, request, workspace = prepared(tmp_path)
+    part = {"type": "tool", "callID": "reused", "state": {"status": "completed"}}
+    messages = [
+        user(),
+        assistant("msg_first", parts=[{**part, "id": "prt_same"}]),
+        assistant("msg_second", parts=[{**part, "id": "prt_same"}]),
+    ]
+    api = FakeOpenCodeApi([(messages, "busy"), (copy.deepcopy(messages), "idle")])
+    clock = FakeClock()
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease.claim_handle(request)
+        result = run_vanilla(
+            job,
+            StateStore(paths.state),
+            workspace,
+            record,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=limits(),
+            breaker=CircuitBreaker(clock=clock),
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+        )
+    assert result.actions == 2
+
+
+def test_tool_action_part_id_cannot_collide_with_index_fallback(tmp_path: Path) -> None:
+    paths, record, request, workspace = prepared(tmp_path)
+    parts = [
+        {"id": "index:1", "type": "tool", "callID": "one", "state": {"status": "completed"}},
+        {"type": "tool", "callID": "two", "state": {"status": "completed"}},
+    ]
+    api = FakeOpenCodeApi([([user(), assistant(parts=parts)], "idle")])
+    clock = FakeClock()
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease.claim_handle(request)
+        result = run_vanilla(
+            job,
+            StateStore(paths.state),
+            workspace,
+            record,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=limits(),
+            breaker=CircuitBreaker(clock=clock),
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+        )
+    assert result.actions == 2
 
 
 def test_v2_projected_messages_account_usage_actions_and_terminal_errors(tmp_path: Path) -> None:
@@ -1704,6 +1870,7 @@ def test_preexisting_global_stop_freezes_without_starting_model_work(tmp_path: P
         breaker.observe_error(401)
     else:
         breaker.observe("other-job", 1, summarize_usage({"data": [assistant(cost=0.25)]}), terminal=False)
+    api = FakeOpenCodeApi([])
     with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
         workspace.lease.claim_handle(request)
         result = run_vanilla(
@@ -1715,12 +1882,14 @@ def test_preexisting_global_stop_freezes_without_starting_model_work(tmp_path: P
             variant="max",
             limits=limits(),
             breaker=breaker,
-            api=ForbiddenApi([]),
+            api=api,
             clock=clock,
             sleeper=clock.sleep,
         )
     assert result.completion is (VanillaCompletion.AUTH if cause == "auth" else VanillaCompletion.HARD_COST)
     assert result.workspace_frozen
+    assert not api.sessions
+    assert not api.prompt_requests
 
 
 def test_resumed_confirmed_session_is_interrupted_by_preexisting_global_stop(tmp_path: Path) -> None:
@@ -1751,6 +1920,37 @@ def test_resumed_confirmed_session_is_interrupted_by_preexisting_global_stop(tmp
     assert api.interrupts == 1
     assert len(api.prompt_requests) == 2
     assert api.prompt_requests[-1]["resume"] is False
+
+
+@pytest.mark.parametrize("lost", [False, True])
+def test_expired_executing_resume_adopts_session_before_wall_safety(tmp_path: Path, lost: bool) -> None:
+    paths, record, request, workspace = prepared(tmp_path)
+    api = CrashApi("prompt", [([], "busy")])
+    clock = FakeClock()
+    kwargs = {
+        "model": "openai/gpt-5.6-luna",
+        "variant": "max",
+        "limits": limits(wall=1),
+        "breaker": CircuitBreaker(clock=clock),
+        "api": api,
+        "clock": clock,
+        "sleeper": clock.sleep,
+    }
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease.claim_handle(request)
+        with pytest.raises(InjectedCrash):
+            run_vanilla(job, StateStore(paths.state), workspace, record, **kwargs)
+    if lost:
+        api.sessions.clear()
+    clock.sleep(2)
+
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease.claim_handle(request)
+        result = run_vanilla(job, StateStore(paths.state), workspace, record, **kwargs)
+    assert result.exit_class == ("lost_server" if lost else "wall_time")
+    assert len(api.prompt_requests) == (1 if lost else 2)
+    if not lost:
+        assert api.prompt_requests[-1]["resume"] is False
 
 
 def test_frozen_invocation_returns_persisted_result_without_api_or_second_freeze(tmp_path: Path) -> None:
@@ -1828,6 +2028,7 @@ def test_lost_server_freezes_interrupted_evidence_without_creating_another_sessi
         with pytest.raises(InjectedCrash):
             run_vanilla(job, StateStore(paths.state), workspace, record, **kwargs)
     api.sessions.clear()
+    kwargs["breaker"].observe_error(401)
 
     with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
         workspace.lease.claim_handle(request)
@@ -1880,6 +2081,38 @@ def test_active_job_and_workspace_leases_are_required(tmp_path: Path) -> None:
     with JobLease(paths, resume=True, redo=False, retry_infra=False) as job:
         with pytest.raises(Exception, match="WorkspaceLease"):
             run_vanilla(job, StateStore(paths.state), workspace, record, **kwargs)
+
+
+@pytest.mark.parametrize(
+    "alternate",
+    [
+        {"delivery": "queue"},
+        {"agent": "custom"},
+        {"files": ({"uri": "data:text/plain,hi", "mime": "text/plain"},)},
+    ],
+)
+def test_fixed_benchmark_admission_rejects_alternates_before_api(tmp_path: Path, alternate: dict[str, object]) -> None:
+    paths, record, request, workspace = prepared(tmp_path)
+    api = FakeOpenCodeApi([])
+    clock = FakeClock()
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease.claim_handle(request)
+        with pytest.raises(VanillaError, match="admission is fixed"):
+            run_vanilla(
+                job,
+                StateStore(paths.state),
+                workspace,
+                record,
+                model="openai/gpt-5.6-luna",
+                variant="max",
+                limits=limits(),
+                breaker=CircuitBreaker(clock=clock),
+                api=api,
+                clock=clock,
+                sleeper=clock.sleep,
+                **alternate,
+            )
+    assert not api.sessions
 
 
 def test_real_http_adapter_matches_origin_dev_paths_and_payloads_without_contract_calls(tmp_path: Path) -> None:
@@ -1937,6 +2170,42 @@ def test_injected_http_client_bounds_provider_error_strings() -> None:
         api.get_session("ses_owned")
     assert raised.value.status_code == 500
     assert "credential-value" not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"admittedSeq": -1},
+        {"id": "msg_conflict"},
+        {"sessionID": "ses_conflict"},
+        {"prompt": {"text": "different"}},
+        {"delivery": "queue"},
+        {"timeCreated": "not-a-number"},
+        {"promotedSeq": -1},
+        {"unexpected": True},
+    ],
+)
+def test_http_prompt_rejects_malformed_or_conflicting_admission(overrides: dict[str, object]) -> None:
+    server = OriginDevServer()
+    server.admission_overrides = overrides
+    server.start()
+    request = VanillaPromptRequest(
+        session_id="ses_owned",
+        message_id="msg_owned",
+        text=ORIGINAL_TASK,
+        delivery="steer",
+        model="openai/gpt-5.6-luna",
+        variant="max",
+        directory="/candidate",
+        agent=None,
+        files=(),
+        permission=(("*", "*", "allow"),),
+    )
+    try:
+        with pytest.raises(VanillaError, match="admission"):
+            HttpOpenCodeApi(server.url).prompt(request)
+    finally:
+        server.stop()
 
 
 @pytest.mark.parametrize("stage", ["create", "prompt"])
@@ -2054,7 +2323,18 @@ class OriginDevServer:
                 if self.path.endswith("/prompt"):
                     assert isinstance(body, dict)
                     owner.prompt = {"id": body["id"], "type": "user", "text": body["prompt"]["text"]}
-                    self.send(200, {"data": {"id": body["id"]}})
+                    session_id = self.path.split("/")[3]
+                    admitted = {
+                        "admittedSeq": 0,
+                        "id": body["id"],
+                        "sessionID": session_id,
+                        "prompt": body["prompt"],
+                        "delivery": body["delivery"],
+                        "timeCreated": 1,
+                        "promotedSeq": 1,
+                        **getattr(owner, "admission_overrides", {}),
+                    }
+                    self.send(200, {"data": admitted})
                     return
                 if self.path.endswith("/interrupt"):
                     self.send(204)
@@ -2084,12 +2364,16 @@ class OriginDevServer:
                     self.send(404, {"message": "legacy observation unavailable"})
                     return
                 if path.startswith("/api/session/"):
+                    if not hasattr(owner, "session"):
+                        self.send(404, {"message": "missing"})
+                        return
                     self.send(200, {"data": owner.session})
                     return
                 self.send(404, {"message": "missing"})
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.admission_overrides: dict[str, object] = {}
 
     @property
     def url(self) -> str:

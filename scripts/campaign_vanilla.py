@@ -67,6 +67,10 @@ class VanillaHttpError(VanillaError):
         super().__init__(_sanitize_text(message))
 
 
+class CredentialLeakError(VanillaError):
+    """Raised before publication when credential material is observed."""
+
+
 class VanillaCompletion(str, Enum):
     IDLE = "idle"
     WALL_TIME = "wall_time"
@@ -95,14 +99,14 @@ class VanillaPromptRequest:
             not self.session_id.startswith("ses_")
             or not self.message_id.startswith("msg_")
             or not self.text
-            or self.delivery not in {"steer", "queue"}
-            or "/" not in self.model
-            or not self.variant
+            or self.text != ORIGINAL_TASK
+            or self.delivery != "steer"
+            or self.model != "openai/gpt-5.6-luna"
+            or self.variant != "max"
             or self.directory != "/candidate"
             or self.agent is not None
-            and not self.agent
-            or any(not isinstance(file, Mapping) for file in self.files)
-            or any(len(rule) != 3 or rule[2] not in {"allow", "ask", "deny"} for rule in self.permission)
+            or self.files
+            or self.permission != (("*", "*", "allow"),)
         ):
             raise VanillaError("vanilla prompt request is invalid")
         json.dumps(self.to_dict(), allow_nan=False, sort_keys=True)
@@ -426,8 +430,7 @@ class HttpOpenCodeApi:
                 request.api_payload(resume=resume),
             )
         )
-        if admitted.get("id") != request.message_id:
-            raise VanillaError("OpenCode admitted a different prompt message ID")
+        _validate_admitted(admitted, request)
 
     def messages(self, session_id: str) -> Mapping[str, object]:
         messages: list[object] = []
@@ -529,6 +532,31 @@ def _unique_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return result
 
 
+def _validate_admitted(admitted: Mapping[str, object], request: VanillaPromptRequest) -> None:
+    required = {"admittedSeq", "id", "sessionID", "prompt", "delivery", "timeCreated"}
+    if frozenset(admitted) not in {frozenset(required), frozenset({*required, "promotedSeq"})}:
+        raise VanillaError("OpenCode prompt admission response has invalid fields")
+    admitted_seq = admitted["admittedSeq"]
+    promoted_seq = admitted.get("promotedSeq")
+    time_created = admitted["timeCreated"]
+    expected_prompt = request.api_payload(resume=True)["prompt"]
+    if (
+        type(admitted_seq) is not int
+        or admitted_seq < 0
+        or promoted_seq is not None
+        and (type(promoted_seq) is not int or promoted_seq < 0)
+        or isinstance(time_created, bool)
+        or not isinstance(time_created, (int, float))
+        or not math.isfinite(time_created)
+        or time_created < 0
+        or admitted["id"] != request.message_id
+        or admitted["sessionID"] != request.session_id
+        or admitted["prompt"] != expected_prompt
+        or admitted["delivery"] != request.delivery
+    ):
+        raise VanillaError("OpenCode prompt admission response conflicts with persisted request")
+
+
 def run_vanilla(
     job: JobLease,
     state_store: StateStore,
@@ -548,7 +576,19 @@ def run_vanilla(
     files: tuple[Mapping[str, object], ...] = (),
 ) -> VanillaResult:
     """Run or adopt one durable vanilla trajectory and freeze its candidate once."""
-    _validate_inputs(job, state_store, workspace, install, model, variant, limits, poll_interval)
+    _validate_inputs(
+        job,
+        state_store,
+        workspace,
+        install,
+        model,
+        variant,
+        limits,
+        poll_interval,
+        delivery,
+        agent,
+        files,
+    )
     result_path = job.job.root / "vanilla-result.json"
     state = state_store.read()
     if state.phase in {"frozen", "packaged", "preflighted", "done", "failed", "interrupted"}:
@@ -576,6 +616,13 @@ def run_vanilla(
     )
     _reject_credentials(prompt_request.to_dict(), workspace.manifest.credential_env)
     command_identity = _command_identity(prompt_request, install, limits)
+    _reject_failure_schema_credentials(
+        workspace.manifest.credential_env,
+        state=state,
+        container_id=workspace.container_id,
+        command_identity=command_identity,
+        prompt_request=prompt_request,
+    )
     execution_path = job.job.root / "vanilla-execution.json"
     execution = _execution(
         execution_path,
@@ -590,7 +637,6 @@ def run_vanilla(
         raise VanillaError("persisted vanilla start time is invalid")
     wall_deadline = float(started_at) + limits.wall_time_seconds
 
-    newly_executing = False
     if state.phase == "planned":
         state = state_store.transition(
             "preparing",
@@ -609,75 +655,15 @@ def run_vanilla(
             container_ids=(workspace.container_id,),
             exit_class=None,
         )
-        newly_executing = True
     if state.phase != "executing" or state.command_identity != command_identity:
         raise VanillaError("vanilla adapter can only adopt its exact executing state")
 
     progress_path = job.job.root / "vanilla-progress.json"
     usage, actions, messages = _restore_progress(progress_path, state)
     session: Mapping[str, object] = {"id": session_id, "status": "unconfirmed"}
-    if breaker.stop_active:
-        if execution.get("session_confirmed") is True:
-            _reconcile_admission(api, prompt_request)
-        completion = (
-            VanillaCompletion.AUTH
-            if breaker.pause_reason == "provider authentication failure"
-            else VanillaCompletion.HARD_COST
-        )
-        return _finish_early_stop(
-            job,
-            state_store,
-            state,
-            workspace,
-            command_identity,
-            session_id,
-            message_id,
-            session,
-            execution_path,
-            execution,
-            breaker,
-            api,
-            max(0.0, clock() - float(started_at)),
-            clock,
-            sleeper,
-            poll_interval,
-            completion=completion,
-            error_text=breaker.pause_reason or completion.value,
-            confirmed=execution.get("session_confirmed") is True,
-            usage=usage,
-            actions=actions,
-            messages=messages,
-        )
     while True:
-        if clock() >= wall_deadline:
-            if execution.get("session_confirmed") is True:
-                _reconcile_admission(api, prompt_request)
-            return _finish_early_stop(
-                job,
-                state_store,
-                state,
-                workspace,
-                command_identity,
-                session_id,
-                message_id,
-                session,
-                execution_path,
-                execution,
-                breaker,
-                api,
-                max(0.0, clock() - float(started_at)),
-                clock,
-                sleeper,
-                poll_interval,
-                completion=VanillaCompletion.WALL_TIME,
-                error_text="wall time safety ceiling reached",
-                confirmed=execution.get("session_confirmed") is True,
-                usage=usage,
-                actions=actions,
-                messages=messages,
-            )
         try:
-            found = None if newly_executing else api.get_session(session_id)
+            found = api.get_session(session_id)
             if found is None:
                 if execution.get("session_confirmed") is True:
                     return _lost_server(
@@ -694,6 +680,38 @@ def run_vanilla(
                         messages,
                         max(0.0, clock() - float(started_at)),
                     )
+                if breaker.stop_active or clock() >= wall_deadline:
+                    completion = (
+                        VanillaCompletion.AUTH
+                        if breaker.pause_reason == "provider authentication failure"
+                        else VanillaCompletion.HARD_COST
+                        if breaker.stop_active
+                        else VanillaCompletion.WALL_TIME
+                    )
+                    return _finish_early_stop(
+                        job,
+                        state_store,
+                        state,
+                        workspace,
+                        command_identity,
+                        session_id,
+                        message_id,
+                        session,
+                        execution_path,
+                        execution,
+                        breaker,
+                        api,
+                        max(0.0, clock() - float(started_at)),
+                        clock,
+                        sleeper,
+                        poll_interval,
+                        completion=completion,
+                        error_text=breaker.pause_reason or "wall time safety ceiling reached",
+                        confirmed=False,
+                        usage=usage,
+                        actions=actions,
+                        messages=messages,
+                    )
                 found = api.create_session(
                     session_id,
                     model=model,
@@ -706,7 +724,63 @@ def run_vanilla(
             if execution.get("session_confirmed") is not True:
                 execution = {**execution, "session_confirmed": True}
                 _write_json(execution_path, execution)
-            newly_executing = False
+            if breaker.stop_active:
+                _reconcile_admission(api, prompt_request)
+                completion = (
+                    VanillaCompletion.AUTH
+                    if breaker.pause_reason == "provider authentication failure"
+                    else VanillaCompletion.HARD_COST
+                )
+                return _finish_early_stop(
+                    job,
+                    state_store,
+                    state,
+                    workspace,
+                    command_identity,
+                    session_id,
+                    message_id,
+                    session,
+                    execution_path,
+                    execution,
+                    breaker,
+                    api,
+                    max(0.0, clock() - float(started_at)),
+                    clock,
+                    sleeper,
+                    poll_interval,
+                    completion=completion,
+                    error_text=breaker.pause_reason or completion.value,
+                    confirmed=True,
+                    usage=usage,
+                    actions=actions,
+                    messages=messages,
+                )
+            if clock() >= wall_deadline:
+                _reconcile_admission(api, prompt_request)
+                return _finish_early_stop(
+                    job,
+                    state_store,
+                    state,
+                    workspace,
+                    command_identity,
+                    session_id,
+                    message_id,
+                    session,
+                    execution_path,
+                    execution,
+                    breaker,
+                    api,
+                    max(0.0, clock() - float(started_at)),
+                    clock,
+                    sleeper,
+                    poll_interval,
+                    completion=VanillaCompletion.WALL_TIME,
+                    error_text="wall time safety ceiling reached",
+                    confirmed=True,
+                    usage=usage,
+                    actions=actions,
+                    messages=messages,
+                )
             api.allow_permissions(session_id, directory="/candidate")
             api.prompt(prompt_request)
             break
@@ -967,7 +1041,26 @@ def run_vanilla(
         exit_class="invalid_usage_regression" if invalid_error is not None else None,
         error=error_text,
     )
-    result = _freeze(job.job.root, workspace, result, session, messages)
+    try:
+        result = _freeze(job.job.root, workspace, result, session, messages)
+    except CredentialLeakError:
+        return _credential_leak_result(
+            job,
+            state_store,
+            state,
+            workspace,
+            command_identity,
+            session_id,
+            message_id,
+            session,
+            messages,
+            usage,
+            actions,
+            breaker,
+            execution_path,
+            max(0.0, clock() - float(started_at)),
+            already_stopped=stopped,
+        )
     _verify_no_credentials(job.job.root, workspace.manifest.credential_env)
     breaker.observe(workspace.manifest.job_id, state.generation, usage, terminal=True)
     hashes = {
@@ -1334,6 +1427,69 @@ def _fail_before_provider(
     return result
 
 
+def _credential_leak_result(
+    job: JobLease,
+    state_store: StateStore,
+    state: JobState,
+    workspace: DockerWorkspace,
+    command_identity: str,
+    session_id: str,
+    message_id: str,
+    session: Mapping[str, object],
+    messages: Mapping[str, object],
+    usage: UsageSummary,
+    actions: int,
+    breaker: CircuitBreaker,
+    execution_path: Path,
+    elapsed: float,
+    *,
+    already_stopped: bool,
+) -> VanillaResult:
+    if workspace.lease._handle_active:
+        workspace.stop()
+    interrupt_attempted = _execution_interrupt_attempted(execution_path)
+    exit_class = _credential_safe_marker("credential_leak", workspace.manifest.credential_env)
+    error_text = _credential_safe_marker("credential leak detected", workspace.manifest.credential_env)
+    result = _result(
+        session_id,
+        message_id,
+        VanillaCompletion.PROVIDER_ERROR,
+        usage,
+        actions,
+        elapsed,
+        workspace_frozen=False,
+        interrupt_attempted=interrupt_attempted,
+        forced_stop=already_stopped and interrupt_attempted,
+        exit_class=exit_class,
+        error=error_text,
+    )
+    _write_json(
+        job.job.root / "trajectory.json",
+        {
+            "session": _sanitize(session, workspace.manifest.credential_env),
+            "messages": _sanitize(messages, workspace.manifest.credential_env),
+        },
+    )
+    _write_json(job.job.root / "usage.json", result.to_dict())
+    _write_json(job.job.root / "vanilla-result.json", result.to_dict())
+    _verify_no_credentials(job.job.root, workspace.manifest.credential_env)
+    breaker.observe(workspace.manifest.job_id, state.generation, usage, terminal=True)
+    state_store.transition(
+        "failed",
+        command_identity=command_identity,
+        expected_generation=state.generation,
+        exit_class=result.exit_class,
+        provider_turns=usage.provider_turns,
+        actions=actions,
+        cost=float(usage.cost),
+        artifact_hashes={
+            name: _sha256(job.job.root / name) for name in ("trajectory.json", "usage.json", "vanilla-result.json")
+        },
+    )
+    _verify_no_credentials(job.job.root, workspace.manifest.credential_env)
+    return result
+
+
 def _finish_early_stop(
     job: JobLease,
     state_store: StateStore,
@@ -1376,7 +1532,26 @@ def _finish_early_stop(
         forced_stop=stopped,
         error=error_text,
     )
-    result = _freeze(job.job.root, workspace, result, session, messages)
+    try:
+        result = _freeze(job.job.root, workspace, result, session, messages)
+    except CredentialLeakError:
+        return _credential_leak_result(
+            job,
+            state_store,
+            state,
+            workspace,
+            command_identity,
+            session_id,
+            message_id,
+            session,
+            messages,
+            usage,
+            actions,
+            breaker,
+            execution_path,
+            elapsed,
+            already_stopped=stopped,
+        )
     _verify_no_credentials(job.job.root, workspace.manifest.credential_env)
     breaker.observe(workspace.manifest.job_id, state.generation, usage, terminal=True)
     state_store.transition(
@@ -1423,13 +1598,32 @@ def _lost_server(
         exit_class="lost_server",
         error="persisted OpenCode Session is missing",
     )
-    result = _freeze(
-        job.job.root,
-        workspace,
-        result,
-        {"id": session_id, "status": "missing"},
-        messages,
-    )
+    try:
+        result = _freeze(
+            job.job.root,
+            workspace,
+            result,
+            {"id": session_id, "status": "missing"},
+            messages,
+        )
+    except CredentialLeakError:
+        return _credential_leak_result(
+            job,
+            state_store,
+            state,
+            workspace,
+            command_identity,
+            session_id,
+            message_id,
+            {"id": session_id, "status": "missing"},
+            messages,
+            usage,
+            actions,
+            breaker,
+            job.job.root / "vanilla-execution.json",
+            elapsed,
+            already_stopped=False,
+        )
     _verify_no_credentials(job.job.root, workspace.manifest.credential_env)
     breaker.observe(workspace.manifest.job_id, state.generation, usage, terminal=True)
     state_store.transition(
@@ -1497,6 +1691,9 @@ def _validate_inputs(
     variant: str,
     limits: Limits,
     poll_interval: float,
+    delivery: str,
+    agent: str | None,
+    files: tuple[Mapping[str, object], ...],
 ) -> None:
     if not isinstance(job, JobLease) or job._lock_context is None:
         raise VanillaError("vanilla execution requires an active JobLease")
@@ -1515,6 +1712,8 @@ def _validate_inputs(
         raise VanillaError("vanilla installation does not match the running workspace")
     if model != "openai/gpt-5.6-luna" or variant != "max":
         raise VanillaError("vanilla campaign requires openai/gpt-5.6-luna variant max")
+    if delivery != "steer" or agent is not None or files:
+        raise VanillaError("vanilla campaign admission is fixed to steer with no custom agent or files")
     if (
         limits.wall_time_seconds > MAX_WALL_TIME_SECONDS
         or limits.provider_turns > MAX_PROVIDER_TURNS
@@ -1607,6 +1806,8 @@ def _validate_session(
         or selected.get("providerID") != provider_id
         or selected.get("id") != model_id
         or selected.get("variant") != variant
+        or agent is None
+        and session.get("agent") is not None
         or agent is not None
         and session.get("agent") != agent
     ):
@@ -1621,39 +1822,43 @@ def _validate_prompt(prompt: Mapping[str, object], message_id: str) -> None:
 def _actions(messages: Mapping[str, object]) -> int:
     if set(messages) != {"data"} or not isinstance(messages["data"], list):
         raise VanillaError("projected messages have an invalid action schema")
-    calls: set[str] = set()
+    calls: set[tuple[str, str, str]] = set()
     for message in messages["data"]:
         if isinstance(message, Mapping) and message.get("type") == "assistant":
+            message_id = message.get("id")
             content = message.get("content")
-            if not isinstance(content, list):
+            if not isinstance(message_id, str) or not isinstance(content, list):
                 raise VanillaError("projected V2 assistant content has an invalid action schema")
-            for part in content:
+            for index, part in enumerate(content):
                 if not isinstance(part, Mapping) or part.get("type") != "tool":
                     continue
                 state = part.get("state")
-                call_id = part.get("id")
-                if not isinstance(state, Mapping) or not isinstance(call_id, str):
+                part_id = part.get("id")
+                if not isinstance(state, Mapping) or part_id is not None and not isinstance(part_id, str):
                     raise VanillaError("projected V2 tool has an invalid action schema")
                 status_value = state.get("status")
                 if status_value not in {"pending", "running", "completed", "error"}:
                     raise VanillaError("projected V2 tool has an unknown state")
                 if status_value != "pending":
-                    calls.add(call_id)
+                    calls.add((message_id, "id", part_id) if part_id else (message_id, "index", str(index)))
             continue
         if not isinstance(message, Mapping) or not isinstance(message.get("parts"), list):
             continue
-        for part in message["parts"]:
+        info = message.get("info")
+        if not isinstance(info, Mapping) or not isinstance(info.get("id"), str):
+            raise VanillaError("projected assistant message has an invalid action identity")
+        for index, part in enumerate(message["parts"]):
             if not isinstance(part, Mapping) or part.get("type") != "tool":
                 continue
             state = part.get("state")
-            call_id = part.get("callID")
-            if not isinstance(state, Mapping) or not isinstance(call_id, str):
+            part_id = part.get("id")
+            if not isinstance(state, Mapping) or part_id is not None and not isinstance(part_id, str):
                 raise VanillaError("projected tool part has an invalid action schema")
             status_value = state.get("status")
             if status_value not in {"pending", "running", "completed", "error"}:
                 raise VanillaError("projected tool part has an unknown state")
             if status_value != "pending":
-                calls.add(call_id)
+                calls.add((info["id"], "id", part_id) if part_id else (info["id"], "index", str(index)))
     return len(calls)
 
 
@@ -1708,10 +1913,11 @@ def _freeze(
         return _materialize_freeze(job_root, subject, result)
     if workspace.candidate.joinpath(".programbench/vanilla-freeze").exists():
         raise VanillaError("workspace contains the reserved vanilla freeze path")
+    _verify_no_credentials(workspace.candidate, workspace.manifest.credential_env, published_only=False)
     workspace_inventory = _inventory(workspace.candidate)
     temporary = Path(tempfile.mkdtemp(prefix=".subject.", dir=subject.parent))
     try:
-        _snapshot_candidate(workspace.candidate, temporary, workspace.manifest.credential_env)
+        _snapshot_candidate(workspace.candidate, temporary)
         if _inventory(workspace.candidate) != workspace_inventory:
             raise VanillaError("workspace changed while its freeze snapshot was captured")
         staged_metadata = temporary / ".programbench/vanilla-freeze"
@@ -1974,9 +2180,7 @@ def _make_read_only(root: Path) -> None:
         os.chmod(path, stat.S_IMODE(status.st_mode) & ~0o222)
 
 
-def _snapshot_candidate(source: Path, destination: Path, credential_names: tuple[str, ...]) -> None:
-    secrets = _credential_values(credential_names)
-    encoded = tuple(secret.encode() for secret in secrets)
+def _snapshot_candidate(source: Path, destination: Path) -> None:
     count = [1]
     total = 0
     deadline = time.monotonic() + MAX_INVENTORY_SECONDS
@@ -2003,25 +2207,13 @@ def _snapshot_candidate(source: Path, destination: Path, credential_names: tuple
             if root is True and name in {"reference", ".programbench-cleanroom.json"}:
                 continue
             child_relative = name if relative == "." else f"{relative}/{name}"
-            safe_name = (
-                _opaque_filename(child_relative, secrets)
-                if any(secret in child_relative for secret in secrets)
-                else name
-            )
-            child = target / safe_name
+            child = target / name
             if os.path.lexists(child):
                 raise VanillaError("credential-safe workspace path collision")
             status = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
             if stat.S_ISLNK(status.st_mode):
                 link = os.readlink(name, dir_fd=descriptor)
-                safe = (
-                    link
-                    if not Path(link).is_absolute()
-                    and ".." not in Path(link).parts
-                    and not any(secret in link for secret in secrets)
-                    else _opaque_filename(link, secrets)
-                )
-                child.symlink_to(safe)
+                child.symlink_to(link)
                 continue
             if stat.S_ISDIR(status.st_mode):
                 child_fd, current = _open_verified(descriptor, name, status, directory=True)
@@ -2032,10 +2224,9 @@ def _snapshot_candidate(source: Path, destination: Path, credential_names: tuple
                 raise VanillaError("workspace contains an unsupported filesystem object")
             child_fd, current = _open_verified(descriptor, name, status, directory=False)
             try:
-                size = _copy_redacted_descriptor(
+                size = _copy_descriptor(
                     child_fd,
                     child,
-                    encoded,
                     deadline,
                     MAX_FREEZE_BYTES - total,
                 )
@@ -2054,29 +2245,12 @@ def _snapshot_candidate(source: Path, destination: Path, credential_names: tuple
                     pass
 
 
-def _opaque_filename(value: str, secrets: tuple[str, ...]) -> str:
-    blocked = set("".join(secrets))
-    alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-~!@$%^&+="
-    allowed = "".join(character for character in alphabet if character not in blocked)
-    if len(allowed) < 2:
-        raise VanillaError("credentials exhaust the safe filename alphabet")
-    number = int.from_bytes(hashlib.sha256(value.encode()).digest(), "big")
-    encoded = ""
-    while number:
-        number, remainder = divmod(number, len(allowed))
-        encoded = allowed[remainder] + encoded
-    return allowed[0] * 2 + (encoded or allowed[0])
-
-
-def _copy_redacted_descriptor(
+def _copy_descriptor(
     descriptor: int,
     destination: Path,
-    secrets: tuple[bytes, ...],
     deadline: float,
     remaining: int,
 ) -> int:
-    overlap = max((len(secret) for secret in secrets), default=1) - 1
-    pending = b""
     size = 0
     with destination.open("xb") as writer:
         while chunk := os.read(descriptor, 1024 * 1024):
@@ -2085,22 +2259,8 @@ def _copy_redacted_descriptor(
             size += len(chunk)
             if size > remaining:
                 raise VanillaError("workspace freeze byte count exceeds limit")
-            pending += chunk
-            split = max(0, len(pending) - overlap)
-            for secret in secrets:
-                position = pending.rfind(secret, 0, split + len(secret))
-                if position >= 0 and position < split < position + len(secret):
-                    split = position
-            writer.write(_redact_bytes(pending[:split], secrets))
-            pending = pending[split:]
-        writer.write(_redact_bytes(pending, secrets))
+            writer.write(chunk)
     return size
-
-
-def _redact_bytes(value: bytes, secrets: tuple[bytes, ...]) -> bytes:
-    for secret in secrets:
-        value = value.replace(secret, b"")
-    return value
 
 
 def _remove_tree(root: Path) -> None:
@@ -2132,6 +2292,115 @@ def _sanitize(value: object, credential_names: tuple[str, ...]) -> object:
 
 def _credential_values(names: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(secret for name in names if (secret := os.environ.get(name)))
+
+
+def _reject_failure_schema_credentials(
+    names: tuple[str, ...],
+    *,
+    state: JobState,
+    container_id: str,
+    command_identity: str,
+    prompt_request: VanillaPromptRequest,
+) -> None:
+    prospective = {
+        "trajectory.json": {"session": {}, "messages": {"data": []}},
+        "usage.json": {
+            "version": 1,
+            "session_id": "",
+            "message_id": "",
+            "completion": "provider_error",
+            "provider_turns": 0,
+            "actions": 0,
+            "cost": "0",
+            "elapsed_seconds": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_tokens": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "max_prompt_total": 0,
+            "workspace_frozen": False,
+            "interrupt_attempted": False,
+            "forced_stop": False,
+            "exit_class": "credential_leak",
+            "error": "credential leak detected",
+        },
+        "state.json": {
+            "phase": "failed",
+            "phase_timestamps": {"failed": 0},
+            "pid": None,
+            "container_ids": [],
+            "exit_class": "credential_leak",
+            "provider_turns": 0,
+            "actions": 0,
+            "cost": 0,
+            "artifact_hashes": {
+                "trajectory.json": "",
+                "usage.json": "",
+                "vanilla-result.json": "",
+            },
+            "command_identity": "",
+            "reset_reason": None,
+            "reset_at": None,
+            "generation": 0,
+        },
+        "vanilla-execution.json": {
+            "version": 1,
+            "planned_generation": 0,
+            "session_id": "",
+            "message_id": "",
+            "command_identity": "",
+            "prompt_request": {},
+            "prompt_request_sha256": "",
+            "started_at": 0,
+            "interrupt_attempted": False,
+            "session_confirmed": False,
+        },
+        "vanilla-progress.json": {
+            "version": 1,
+            "current": {"generation": 0, "messages": {"data": []}},
+            "previous": None,
+        },
+        "actual_states": [
+            {
+                **state.to_dict(),
+                "phase": phase,
+                "phase_timestamps": {**dict(state.phase_timestamps or {}), phase: 0},
+                "container_ids": [container_id],
+                "exit_class": "credential_leak" if phase == "failed" else None,
+                "artifact_hashes": {
+                    "trajectory.json": "",
+                    "usage.json": "",
+                    "vanilla-result.json": "",
+                }
+                if phase == "failed"
+                else {},
+                "command_identity": command_identity,
+                "generation": state.generation + index + 1,
+            }
+            for index, phase in enumerate(("preparing", "executing", "failed"))
+        ],
+        "actual_prompt_request": prompt_request.to_dict(),
+    }
+    if _contains_credential(prospective, _credential_values(names)):
+        raise VanillaError("provider credential conflicts with fixed failure artifact schema")
+
+
+def _credential_safe_marker(value: str, names: tuple[str, ...]) -> str:
+    secrets = _credential_values(names)
+    if not any(secret in value for secret in secrets):
+        return value
+    blocked = set("".join(secrets))
+    alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-~!@$%^&+="
+    allowed = "".join(character for character in alphabet if character not in blocked)
+    if len(allowed) < 2:
+        raise CredentialLeakError("credential-safe result marker cannot be encoded")
+    number = int.from_bytes(hashlib.sha256(value.encode()).digest(), "big")
+    encoded = ""
+    while number:
+        number, remainder = divmod(number, len(allowed))
+        encoded = allowed[remainder] + encoded
+    return allowed[0] * 2 + (encoded or allowed[0])
 
 
 def _reject_credentials(value: object, names: tuple[str, ...]) -> None:
@@ -2192,12 +2461,12 @@ def _verify_no_credentials(root: Path, names: tuple[str, ...], *, published_only
             ):
                 continue
             if any(secret in child_relative.encode() for secret in secrets):
-                raise VanillaError("provider credential appears in a persisted path")
+                raise CredentialLeakError("provider credential appears in a persisted path")
             status = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
             if stat.S_ISLNK(status.st_mode):
                 target = os.readlink(name, dir_fd=descriptor).encode()
                 if any(secret in target for secret in secrets):
-                    raise VanillaError("provider credential appears in a persisted symlink")
+                    raise CredentialLeakError("provider credential appears in a persisted symlink")
                 continue
             if stat.S_ISDIR(status.st_mode):
                 child_fd, _ = _open_verified(descriptor, name, status, directory=True)
@@ -2218,10 +2487,10 @@ def _verify_no_credentials(root: Path, names: tuple[str, ...], *, published_only
                     pending += chunk
                     split = max(0, len(pending) - overlap)
                     if any(secret in pending[: split + overlap] for secret in secrets):
-                        raise VanillaError("provider credential appears in persisted artifact bytes")
+                        raise CredentialLeakError("provider credential appears in persisted artifact bytes")
                     pending = pending[split:]
                 if any(secret in pending for secret in secrets):
-                    raise VanillaError("provider credential appears in persisted artifact bytes")
+                    raise CredentialLeakError("provider credential appears in persisted artifact bytes")
             finally:
                 os.close(child_fd)
     finally:
