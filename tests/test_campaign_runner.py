@@ -1,3 +1,4 @@
+import json
 import threading
 import time
 import subprocess
@@ -64,6 +65,32 @@ def test_scheduler_leaves_unadmitted_jobs_pending_when_breaker_pauses():
     assert started == ["task-0/procontract"]
     assert result.pending == tuple(job(index) for index in range(1, 4))
     assert result.pause_reason == "provider authentication failure"
+
+
+def test_scheduler_drains_running_jobs_before_returning_paused():
+    from scripts.campaign_runner import run_campaign
+
+    breaker = CircuitBreaker()
+    ready = threading.Barrier(2)
+    first_finished = threading.Event()
+    second_finished = threading.Event()
+
+    def execute(candidate, _stop):
+        if candidate.instance_id == "task-0":
+            ready.wait(1)
+            breaker.observe_error(401)
+            first_finished.set()
+            return
+        ready.wait(1)
+        assert first_finished.wait(1)
+        second_finished.set()
+
+    result = run_campaign(tuple(job(index) for index in range(3)), workers=2, breaker=breaker, execute=execute)
+
+    assert second_finished.is_set()
+    assert result.paused
+    assert result.running == 0
+    assert result.pending == (job(2),)
 
 
 def test_scheduler_waits_for_rate_limit_backoff_before_admitting_next_job():
@@ -167,6 +194,26 @@ def test_keyboard_interrupt_stops_active_workers_and_cancels_admission():
     assert result.pending == ()
 
 
+def test_keyboard_interrupt_raises_when_worker_ignores_stop_until_released():
+    from scripts.campaign_runner import CampaignShutdownError, run_campaign
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def execute(candidate, _stop):
+        if candidate.instance_id == "task-0":
+            assert started.wait(1)
+            raise KeyboardInterrupt
+        started.set()
+        release.wait(2)
+
+    try:
+        with pytest.raises(CampaignShutdownError):
+            run_campaign(tuple(job(index) for index in range(2)), workers=2, execute=execute, interrupt_timeout=0.01)
+    finally:
+        release.set()
+
+
 def test_expand_campaign_pairs_every_selected_instance_in_seeded_order():
     from scripts.campaign_runner import expand_campaign_jobs
 
@@ -202,6 +249,10 @@ def test_cli_limit_and_all_conflict_and_non_dry_requires_output():
         parse_args(["--config", "campaign.yaml", "--all", "--limit=8", "--dry-run"])
     with pytest.raises(SystemExit, match="2"):
         parse_args(["--config", "campaign.yaml"])
+    with pytest.raises(SystemExit, match="2"):
+        parse_args(["--config", "campaign.yaml", "--workers", "9", "--dry-run"])
+    with pytest.raises(SystemExit, match="2"):
+        parse_args(["--config", "campaign.yaml", "--redo", "--retry-infra", "--dry-run"])
 
 
 def test_direct_script_cli_help_is_import_safe():
@@ -245,6 +296,28 @@ def test_plan_dry_run_prepares_each_arm_once_without_workspace(tmp_path: Path):
     assert len(plan.jobs) == 4
     assert plan.manifest_path.is_file()
     assert not (tmp_path / "out" / "vanilla").exists()
+
+
+def test_plan_uses_programbench_regex_filter_and_all_after_exclusions(tmp_path: Path):
+    from scripts.campaign_runner import plan_campaign
+    from scripts.run_opencode import load_config
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config_path = tmp_path / "campaign.yaml"
+    config_path.write_text(_config(repo).replace("excluded: []", "excluded:\n  - skip__three"))
+    plan = plan_campaign(
+        load_config(config_path),
+        [
+            {"instance_id": "keep__one", "difficulty": "easy", "language": "python", "image_name": "one"},
+            {"instance_id": "keep__two", "difficulty": "hard", "language": "rust", "image_name": "two"},
+            {"instance_id": "skip__three", "difficulty": "hard", "language": "rust", "image_name": "three"},
+        ],
+        output=tmp_path / "out", instance_filter="keep__.*", all_instances=True, dry_run=True,
+        prepare_install_fn=lambda arm, _root: {"arm": arm.name},
+    )
+
+    assert set(plan.selected_ids) == {"keep__one", "keep__two"}
 
 
 def test_resume_uses_frozen_install_data_without_resolving_moving_refs(tmp_path: Path):
@@ -291,6 +364,59 @@ def test_resume_rejects_changed_frozen_selection_options(tmp_path: Path):
             load_config(config_path), instances, output=tmp_path / "out", limit=2, seed=42, dry_run=True, resume=True,
             prepare_install_fn=lambda *_: pytest.fail("resume must not resolve installs"),
         )
+
+
+def test_resume_acknowledges_recoverable_breaker_pause_but_not_hard_stop(tmp_path: Path):
+    from scripts.campaign_runner import plan_campaign
+    from scripts.run_opencode import load_config
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config_path = tmp_path / "campaign.yaml"
+    config_path.write_text(_config(repo))
+    instances = [{"instance_id": "one", "difficulty": "easy", "language": "python", "image_name": "one"}]
+    config = load_config(config_path)
+    plan_campaign(config, instances, output=tmp_path / "out", limit=1, dry_run=True, prepare_install_fn=lambda arm, _: {"arm": arm.name})
+    breaker = CircuitBreaker()
+    breaker.observe_error(401)
+    (tmp_path / "out/breaker.json").write_text(json.dumps(breaker.snapshot()))
+
+    plan_campaign(config, instances, output=tmp_path / "out", limit=1, dry_run=True, resume=True, acknowledge="auth")
+
+
+
+@pytest.mark.parametrize("phase", ["planned", "preparing", "executing", "frozen", "packaged", "preflighted"])
+def test_resume_preserves_unfinished_state_without_reset(tmp_path: Path, monkeypatch, phase: str):
+    from scripts import campaign_runner
+    from scripts.run_opencode import load_config
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config_path = tmp_path / "campaign.yaml"
+    config_path.write_text(_config(repo))
+    plan = campaign_runner.CampaignPlan(tmp_path / "out", tmp_path / "manifest", load_config(config_path), ("one",), (), {}, False)
+    candidate = campaign_runner.CampaignJob("one", "vanilla", "one-image")
+    paths = campaign_runner.JobPaths(plan.output / candidate.arm / candidate.instance_id)
+    store = campaign_runner.StateStore(paths.state)
+    store.write(campaign_runner.JobState("planned"))
+    while store.read().phase != phase:
+        state = store.read()
+        store.transition(store.next_phase(state), command_identity="resume", expected_generation=state.generation)
+    before = store.read().generation
+    monkeypatch.setattr(campaign_runner, "_install_for", lambda *_: object())
+
+    class Workspace:
+        base_url = "http://127.0.0.1:9999"
+        port = 9999
+        def stop_for_freeze(self): pass
+
+    seen = []
+    campaign_runner.run_job(
+        plan, candidate, breaker=CircuitBreaker(), resume=True, workspace_factory=lambda *_: Workspace(),
+        vanilla_runner=lambda _lease, state, *_args, **_kwargs: seen.append(state.read().generation), vanilla_api_factory=lambda _: object(),
+    )
+
+    assert seen == [before]
 
 
 def test_run_job_dispatches_vanilla_once_and_skips_a_terminal_retry(tmp_path: Path, monkeypatch):

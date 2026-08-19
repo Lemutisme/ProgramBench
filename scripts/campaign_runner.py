@@ -26,6 +26,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from programbench.utils.load_data import load_all_instances
+from programbench.utils.instance_filters import filter_instances
 from scripts.campaign_install import InstallRecord, prepare_install
 from scripts.campaign_procontract import HttpProContractApi, run_procontract
 from scripts.campaign_state import JobLease, JobPaths, JobState, StateStore
@@ -46,6 +47,10 @@ class CampaignError(RuntimeError):
 
 class CampaignPausedError(CampaignError):
     """Raised rather than silently clearing persisted safety pauses."""
+
+
+class CampaignShutdownError(CampaignError):
+    """Raised when a worker ignores a bounded campaign shutdown request."""
 
 
 @dataclass(frozen=True)
@@ -77,6 +82,8 @@ class CampaignResult:
     pending: tuple[CampaignJob, ...]
     running: int
     pause_reason: str | None
+    paused: bool = False
+    interrupted: bool = False
 
 
 @dataclass(frozen=True)
@@ -106,6 +113,7 @@ def plan_campaign(
     all_instances: bool = False,
     dry_run: bool = False,
     resume: bool = False,
+    acknowledge: str | None = None,
     prepare_install_fn: Callable[[object, Path], object] = prepare_install,
 ) -> CampaignPlan:
     """Freeze exact selection and arm installs before any workspace can start."""
@@ -122,6 +130,12 @@ def plan_campaign(
         breaker_path = root / "breaker.json"
         if breaker_path.exists():
             breaker = CircuitBreaker.from_snapshot(_read_json(breaker_path))
+            if acknowledge is not None:
+                if acknowledge == "all":
+                    breaker.acknowledge()
+                else:
+                    breaker.acknowledge(acknowledge)
+                _persist_breaker(breaker_path, breaker)
             if breaker.paused:
                 raise CampaignPausedError(
                     f"campaign is paused ({breaker.pause_reason}); acknowledge it through the persisted breaker state before --resume"
@@ -136,15 +150,15 @@ def plan_campaign(
             raise CampaignError("campaign manifest conflicts with requested selection")
         return _plan_from_manifest(config, root, manifest_path, frozen, dry_run)
 
-    filtered = tuple(
-        instance
-        for instance in instances
-        if instance_filter is None or instance_filter in str(instance.get("instance_id", ""))
-    )
+    filtered = tuple(filter_instances([dict(instance) for instance in instances], filter_spec=instance_filter or ""))
+    eligible = tuple(instance for instance in filtered if str(instance.get("instance_id", "")) not in config.excluded)
+    selection_limit = len(eligible) if all_instances else limit
+    if selection_limit <= 0:
+        raise CampaignError("no eligible ProgramBench instances match selection")
     selected = select_instances(
         tuple(_selection_instance(instance) for instance in filtered),
         seed=str(seed),
-        limit=len(filtered) if all_instances else limit,
+        limit=selection_limit,
         excluded=config.excluded,
     )
     selected_ids = tuple(str(instance["instance_id"]) for instance in selected)
@@ -197,11 +211,13 @@ def run_campaign(
     failed = 0
     executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="campaign")
     interrupted = False
+    paused = False
     try:
         while pending or running:
             if pending and not running and not stop.is_set() and not breaker.admission_allowed:
                 delay = _backoff_delay(breaker, clock)
                 if delay is None:
+                    paused = True
                     break
                 sleeper(delay)
                 continue
@@ -232,9 +248,13 @@ def run_campaign(
                 break
             if not breaker.admission_allowed:
                 delay = _backoff_delay(breaker, clock)
-                if delay is None:
-                    break
-                sleeper(delay)
+                if delay is not None:
+                    sleeper(delay)
+                    continue
+                if running:
+                    continue
+                paused = True
+                break
     except KeyboardInterrupt:
         interrupted = True
         stop.set()
@@ -261,7 +281,9 @@ def run_campaign(
             for future in running:
                 future.cancel()
         executor.shutdown(wait=False, cancel_futures=True)
-    return CampaignResult(completed, failed, tuple(pending), len(running), breaker.pause_reason)
+    if interrupted and running:
+        raise CampaignShutdownError(f"{len(running)} campaign worker(s) ignored shutdown")
+    return CampaignResult(completed, failed, tuple(pending), len(running), breaker.pause_reason, paused, interrupted)
 
 
 def run_job(
@@ -289,7 +311,7 @@ def run_job(
         state = store.read_optional()
         if state is None:
             store.write(JobState("planned"))
-        elif state.phase != "planned":
+        elif redo or (retry_infra and state.phase == "failed") or (resume and state.phase == "interrupted"):
             job_lease.reset_for_rerun()
         if stop.is_set() or breaker.stop_active:
             _terminalize(store, "interrupted", "campaign_interrupted")
@@ -356,6 +378,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--retry-infra", action="store_true")
     parser.add_argument("--redo", action="store_true")
+    parser.add_argument("--acknowledge", choices=("cache", "auth", "soft", "all"))
     parser.add_argument("--all", action="store_true")
     parser.add_argument("--evaluate", action="store_true", help="reserved for Task10; evaluation is not implemented")
     parser.add_argument("--dry-run", action="store_true")
@@ -371,6 +394,12 @@ def parse_args(arguments: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--evaluate is reserved until Task10")
     if args.all and any(value == "--limit" or value.startswith("--limit=") for value in supplied):
         parser.error("--limit and --all conflict")
+    if args.workers > MAX_ACTIVE_JOBS:
+        parser.error(f"--workers must not exceed {MAX_ACTIVE_JOBS}")
+    if args.redo and args.retry_infra:
+        parser.error("--redo and --retry-infra conflict")
+    if args.acknowledge and not args.resume:
+        parser.error("--acknowledge requires --resume")
     if args.output is None:
         if not args.dry_run:
             parser.error("--output is required unless --dry-run is used")
@@ -391,6 +420,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
         all_instances=args.all,
         dry_run=args.dry_run,
         resume=args.resume,
+        acknowledge=args.acknowledge,
     )
     if plan.dry_run:
         return 0
@@ -409,7 +439,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
             plan, candidate, breaker=breaker, resume=args.resume, redo=args.redo, retry_infra=args.retry_infra, stop_event=stop
         ),
     )
-    return 0 if not result.failed else 1
+    return 0 if not (result.failed or result.paused or result.interrupted or result.pending) else 1
 
 
 def _plan_from_manifest(config: CampaignConfig, root: Path, manifest_path: Path, raw: Mapping[str, object], dry_run: bool) -> CampaignPlan:
