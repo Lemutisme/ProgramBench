@@ -12,6 +12,7 @@ import stat
 import subprocess
 import tempfile
 import time
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from decimal import Decimal, localcontext
@@ -44,6 +45,7 @@ EVAL_ARTIFACT_HASH_TIMEOUT_SECONDS = 30
 MAX_PRESERVED_EVAL_FILE_BYTES = 256 * 1024 * 1024
 MAX_PRESERVED_EVAL_TOTAL_BYTES = 512 * 1024 * 1024
 PRESERVED_EVAL_COPY_TIMEOUT_SECONDS = 30
+MAX_EVALUATOR_ATTEMPTS = 16
 MAX_HF_BLOB_FILE_BYTES = 8 * 1024 * 1024 * 1024
 MAX_HF_BLOB_TOTAL_BYTES = 64 * 1024 * 1024 * 1024
 HF_BLOB_COPY_TIMEOUT_SECONDS = 1800
@@ -279,16 +281,17 @@ def evaluate_campaign(
             command_runner is None,
         )
         image_identities = _resolve_evaluator_images(scoring_metadata, command_runner is None)
-        image_plan = _prepare_campaign_image_tags(root, image_identities, command_runner is None)
-        if retry_evaluator and not any(
-            (state := _read_optional_json(root / "evaluation-state" / f"{arm}.json")) is not None
-            and state.get("status") == "interrupted"
-            for arm in ARMS
-        ):
-            raise CampaignEvaluationError("--retry-evaluator requires an explicit interrupted state")
-        evidence = _prepare_evidence(root, jobs)
-        _preflight_foreign_eval_artifacts(root, jobs)
+        image_plan: Mapping[str, object] | None = None
         try:
+            image_plan = _prepare_campaign_image_tags(root, image_identities, command_runner is None)
+            if retry_evaluator and not any(
+                (state := _read_optional_json(root / "evaluation-state" / f"{arm}.json")) is not None
+                and state.get("status") == "interrupted"
+                for arm in ARMS
+            ):
+                raise CampaignEvaluationError("--retry-evaluator requires an explicit interrupted state")
+            evidence = _prepare_evidence(root, jobs)
+            _preflight_foreign_eval_artifacts(root, jobs)
             arm_states = {
                 arm: _evaluate_arm(
                     root,
@@ -318,7 +321,8 @@ def evaluate_campaign(
             report = _comparison(root, manifest_path, manifest, jobs, evidence, lookup, arm_states)
             comparison_path = _publish_comparison_bundle(root, report)
         finally:
-            _cleanup_campaign_image_tags(image_plan, command_runner is None)
+            if image_plan is not None:
+                _cleanup_campaign_image_tags(image_plan, command_runner is None)
     aggregate = report["aggregate"]
     return CampaignEvaluationResult(
         str(report["status"]),
@@ -461,35 +465,54 @@ def _prepare_campaign_image_tags(
     tag = "campaign-" + hashlib.sha256(
         str(root).encode() + b"\0" + _canonical_bytes(identities)
     ).hexdigest()[:16]
+    journal_path = root / "evaluation-image-tags.json"
+    prior_owned: set[str] = set()
+    if journal_path.exists():
+        journal = _read_json(journal_path, "evaluator image ownership journal")
+        if journal.get("tag") != tag or not isinstance(journal.get("owned_tags"), list):
+            raise CampaignEvaluationError("evaluator image ownership journal conflicts")
+        prior_owned = {value for value in journal["owned_tags"] if isinstance(value, str)}
     images: dict[str, object] = {}
-    for instance_id, identity in identities.items():
-        reference = identity.get("reference")
-        digest = identity.get("digest")
-        if not isinstance(reference, str):
-            raise CampaignEvaluationError(f"evaluator image reference unavailable: {instance_id}")
-        repository = reference.rsplit(":", 1)[0]
-        target = f"{repository}:{tag}"
-        owned = False
-        if manage:
-            if not isinstance(digest, str):
-                raise CampaignEvaluationError(f"evaluator image digest unavailable: {instance_id}")
-            current = _docker_image_id(target)
-            if current is not None and current != digest:
-                raise CampaignEvaluationError(f"campaign evaluator tag conflicts: {target}")
-            if current is None:
-                tagged = _run_docker_evidence(("docker", "tag", digest, target), 60, 128 * 1024)
-                if tagged.returncode != 0:
-                    raise CampaignEvaluationError(f"campaign evaluator tag creation failed: {target}")
-                owned = True
-            if _docker_image_id(target) != digest:
-                raise CampaignEvaluationError(f"campaign evaluator tag digest conflicts: {target}")
-        images[instance_id] = {
-            "source_reference": reference,
-            "target_reference": target,
-            "digest": digest,
-            "owned": owned,
-        }
-    return {"version": 1, "tag": tag, "images": images}
+    owned = set(prior_owned)
+    try:
+        for instance_id, identity in identities.items():
+            reference = identity.get("reference")
+            digest = identity.get("digest")
+            if not isinstance(reference, str):
+                raise CampaignEvaluationError(f"evaluator image reference unavailable: {instance_id}")
+            repository = reference.rsplit(":", 1)[0]
+            target = f"{repository}:{tag}"
+            images[instance_id] = {
+                "source_reference": reference,
+                "target_reference": target,
+                "digest": digest,
+            }
+            if manage:
+                if not isinstance(digest, str):
+                    raise CampaignEvaluationError(f"evaluator image digest unavailable: {instance_id}")
+                current = _docker_image_id(target)
+                if current is not None and current != digest:
+                    raise CampaignEvaluationError(f"campaign evaluator tag conflicts: {target}")
+                if current is None:
+                    tagged = _run_docker_evidence(("docker", "tag", digest, target), 60, 128 * 1024)
+                    if tagged.returncode != 0:
+                        raise CampaignEvaluationError(f"campaign evaluator tag creation failed: {target}")
+                    owned.add(target)
+                    _atomic_json(journal_path, {"version": 1, "tag": tag, "owned_tags": sorted(owned)})
+                if _docker_image_id(target) != digest:
+                    raise CampaignEvaluationError(f"campaign evaluator tag digest conflicts: {target}")
+    except BaseException:
+        _cleanup_owned_image_tags(owned, images)
+        journal_path.unlink(missing_ok=True)
+        _sync_directory(root)
+        raise
+    return {
+        "version": 1,
+        "tag": tag,
+        "images": images,
+        "owned_tags": sorted(owned),
+        "journal_path": str(journal_path),
+    }
 
 
 def _verify_campaign_image_tags(plan: Mapping[str, object], verify: bool) -> None:
@@ -511,14 +534,25 @@ def _cleanup_campaign_image_tags(plan: Mapping[str, object], cleanup: bool) -> N
     if not cleanup:
         return
     images = plan.get("images")
-    if not isinstance(images, Mapping):
+    owned = plan.get("owned_tags")
+    if not isinstance(images, Mapping) or not isinstance(owned, list):
         return
-    for raw in images.values():
-        if not isinstance(raw, Mapping) or raw.get("owned") is not True:
-            continue
-        target = raw.get("target_reference")
-        if not isinstance(target, str):
-            continue
+    _cleanup_owned_image_tags({value for value in owned if isinstance(value, str)}, images)
+    journal = plan.get("journal_path")
+    if isinstance(journal, str):
+        Path(journal).unlink(missing_ok=True)
+        _sync_directory(Path(journal).parent)
+
+
+def _cleanup_owned_image_tags(owned: set[str], images: Mapping[str, object]) -> None:
+    expected = {
+        raw.get("target_reference"): raw.get("digest")
+        for raw in images.values()
+        if isinstance(raw, Mapping)
+    }
+    for target in sorted(owned):
+        if _docker_image_id(target) != expected.get(target):
+            raise CampaignEvaluationError(f"owned campaign evaluator tag mutated: {target}")
         removed = _run_docker_evidence(("docker", "rmi", target), 60, 256 * 1024)
         if removed.returncode != 0:
             raise CampaignEvaluationError(f"campaign evaluator tag cleanup failed: {target}")
@@ -568,34 +602,40 @@ def _load_or_plan_hf_inputs(
         blob_root = planned.get("blob_root")
         expected = planned.get("blob_sha256")
         if isinstance(blob_root, str):
+            _verify_owned_blob_tree(root, Path(blob_root), planned)
             actual = _blob_hashes(Path(blob_root), instance_ids)
             if not isinstance(expected, Mapping) or actual != dict(expected):
                 raise CampaignEvaluationError("evaluation input blob hashes conflict")
         return planned
 
-    configured = os.environ.get("PROGRAMBENCH_BLOB_DIR")
-    if configured:
-        blob_root = _materialize_hf_blobs(
-            Path(configured).resolve(), root / "evaluation-blobs", instance_ids
-        )
-        hashes = _blob_hashes(blob_root, instance_ids)
-        commit = "local-" + hashlib.sha256(_canonical_bytes(hashes)).hexdigest()
-    elif resolver is not None or resolve_remote:
-        commit = (resolver or _resolve_hf_main)(HF_REPO_ID, "main")
-        if not isinstance(commit, str) or not commit or commit == "main":
-            raise CampaignEvaluationError("HuggingFace main did not resolve to an immutable commit")
-        blob_root = _materialize_hf_blobs(
-            (syncer or _sync_hf_blobs)(commit, instance_ids),
-            root / "evaluation-blobs",
-            instance_ids,
-        )
-        hashes = _blob_hashes(blob_root, instance_ids)
-        if not hashes:
-            raise CampaignEvaluationError("selected HuggingFace test blobs are unavailable")
-    else:
-        commit = "test-fixture"
-        blob_root = None
-        hashes = {}
+    try:
+        configured = os.environ.get("PROGRAMBENCH_BLOB_DIR")
+        if configured:
+            blob_root = _materialize_hf_blobs(
+                Path(configured).resolve(), root / "evaluation-blobs", instance_ids
+            )
+            hashes = _blob_hashes(blob_root, instance_ids)
+            commit = "local-" + hashlib.sha256(_canonical_bytes(hashes)).hexdigest()
+        elif resolver is not None or resolve_remote:
+            commit = (resolver or _resolve_hf_main)(HF_REPO_ID, "main")
+            if not isinstance(commit, str) or not commit or commit == "main":
+                raise CampaignEvaluationError("HuggingFace main did not resolve to an immutable commit")
+            blob_root = _materialize_hf_blobs(
+                (syncer or _sync_hf_blobs)(commit, instance_ids),
+                root / "evaluation-blobs",
+                instance_ids,
+            )
+            hashes = _blob_hashes(blob_root, instance_ids)
+            if not hashes:
+                raise CampaignEvaluationError("selected HuggingFace test blobs are unavailable")
+        else:
+            commit = "test-fixture"
+            blob_root = None
+            hashes = {}
+    except CampaignEvaluationError:
+        raise
+    except BaseException as error:
+        raise CampaignEvaluationError(f"HuggingFace input planning failed: {type(error).__name__}") from None
     planned = {
         "version": 1,
         "repository": HF_REPO_ID,
@@ -604,6 +644,8 @@ def _load_or_plan_hf_inputs(
         "blob_root": str(blob_root) if blob_root is not None else None,
         "blob_sha256": hashes,
     }
+    if blob_root is not None:
+        _write_blob_owner_marker(root, blob_root, planned)
     _atomic_json(path, planned)
     return planned
 
@@ -632,27 +674,115 @@ def _sync_hf_blobs(commit: str, instance_ids: tuple[str, ...]) -> Path:
 
 def _materialize_hf_blobs(source: Path, target: Path, instance_ids: tuple[str, ...]) -> Path:
     source = source.resolve()
-    _mkdir_contained(target, target.parent)
+    if target.exists() or target.is_symlink():
+        raise CampaignEvaluationError(f"foreign HuggingFace blob target exists: {target}")
+    _require_owned_directory(target.parent, target.parent, "HuggingFace blob target parent")
+    staging = target.parent / f".{target.name}.{uuid.uuid4().hex}.staging"
+    staging.mkdir(mode=0o700)
+    staging_stat = staging.lstat()
+    _atomic_json(
+        target.parent / f"{target.name}.owner.json",
+        {
+            "version": 1,
+            "status": "copying",
+            "staging": str(staging),
+            "device": staging_stat.st_dev,
+            "inode": staging_stat.st_ino,
+        },
+    )
     total = 0
     deadline = time.monotonic() + HF_BLOB_COPY_TIMEOUT_SECONDS
     cache_root = source.parent.parent if source.parent.name == "snapshots" else source
-    for instance_id in instance_ids:
-        current_root = source / instance_id
-        if not current_root.is_dir():
-            continue
-        for current in sorted(current_root.rglob("*")):
-            if not current.is_file():
+    try:
+        for instance_id in instance_ids:
+            current_root = source / instance_id
+            if not current_root.is_dir():
                 continue
-            resolved = current.resolve(strict=True)
-            if current.is_symlink() and not resolved.is_relative_to(cache_root):
-                raise CampaignEvaluationError(f"HuggingFace blob symlink escapes cache: {current}")
-            size = resolved.stat().st_size
-            if size > MAX_HF_BLOB_FILE_BYTES or total + size > MAX_HF_BLOB_TOTAL_BYTES:
-                raise CampaignEvaluationError(f"HuggingFace blob materialization limit exceeded: {current}")
-            destination = target / current.relative_to(source)
-            total += _atomic_copy_bounded(resolved, destination, MAX_HF_BLOB_FILE_BYTES, deadline)
-    _sync_directory(target)
+            for current in sorted(current_root.rglob("*")):
+                if not current.is_file():
+                    continue
+                resolved = current.resolve(strict=True)
+                if current.is_symlink() and not resolved.is_relative_to(cache_root):
+                    raise CampaignEvaluationError(f"HuggingFace blob symlink escapes cache: {current}")
+                metadata = resolved.stat()
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                    raise CampaignEvaluationError(f"HuggingFace blob is not an owned regular file: {current}")
+                if metadata.st_size > MAX_HF_BLOB_FILE_BYTES or total + metadata.st_size > MAX_HF_BLOB_TOTAL_BYTES:
+                    raise CampaignEvaluationError(f"HuggingFace blob materialization limit exceeded: {current}")
+                destination = staging / current.relative_to(source)
+                destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                total += _copy_blob_exclusive(resolved, destination, deadline)
+        for path in sorted(staging.rglob("*"), reverse=True):
+            path.chmod(0o444 if path.is_file() else 0o555)
+        staging.chmod(0o555)
+        _rename_owned_entry(staging, target, target.parent, staging_stat.st_dev, staging_stat.st_ino)
+    except BaseException:
+        if staging.exists() and staging.lstat().st_ino == staging_stat.st_ino:
+            for path in (staging, *staging.rglob("*")):
+                try:
+                    path.chmod(0o700 if path.is_dir() else 0o600)
+                except OSError:
+                    pass
+            shutil.rmtree(staging)
+        raise
+    _sync_directory(target.parent)
     return target
+
+
+def _write_blob_owner_marker(root: Path, blob_root: Path, plan: Mapping[str, object]) -> None:
+    metadata = blob_root.lstat()
+    _atomic_json(
+        root / "evaluation-blobs.owner.json",
+        {
+            "version": 1,
+            "status": "complete",
+            "blob_root": str(blob_root),
+            "device": metadata.st_dev,
+            "inode": metadata.st_ino,
+            "repository": plan.get("repository"),
+            "commit": plan.get("commit"),
+            "blob_sha256": plan.get("blob_sha256"),
+        },
+    )
+
+
+def _verify_owned_blob_tree(root: Path, blob_root: Path, plan: Mapping[str, object]) -> None:
+    expected_root = root / "evaluation-blobs"
+    if blob_root != expected_root or blob_root.is_symlink():
+        raise CampaignEvaluationError("evaluation blob root is not the owned canonical path")
+    _require_owned_directory(blob_root, root, "evaluation blob root")
+    marker = _read_json(root / "evaluation-blobs.owner.json", "evaluation blob owner marker")
+    metadata = blob_root.lstat()
+    if (
+        marker.get("status") != "complete"
+        or marker.get("blob_root") != str(blob_root)
+        or marker.get("device") != metadata.st_dev
+        or marker.get("inode") != metadata.st_ino
+        or marker.get("repository") != plan.get("repository")
+        or marker.get("commit") != plan.get("commit")
+        or marker.get("blob_sha256") != plan.get("blob_sha256")
+    ):
+        raise CampaignEvaluationError("evaluation blob ownership marker conflicts")
+    for path in (blob_root, *sorted(blob_root.rglob("*"))):
+        current = path.lstat()
+        if stat.S_ISLNK(current.st_mode) or current.st_mode & 0o222:
+            raise CampaignEvaluationError(f"evaluation blob tree is mutable or symlinked: {path}")
+        if path.is_file() and (not stat.S_ISREG(current.st_mode) or current.st_nlink != 1):
+            raise CampaignEvaluationError(f"evaluation blob is not an owned regular file: {path}")
+
+
+def _verify_hf_inputs(plan: Mapping[str, object]) -> None:
+    blob_root = plan.get("blob_root")
+    selected = plan.get("selected_ids")
+    expected = plan.get("blob_sha256")
+    if blob_root is None:
+        return
+    if not isinstance(blob_root, str) or not isinstance(selected, list) or not isinstance(expected, Mapping):
+        raise CampaignEvaluationError("evaluation blob plan is malformed")
+    root = Path(blob_root).parent
+    _verify_owned_blob_tree(root, Path(blob_root), plan)
+    if _blob_hashes(Path(blob_root), tuple(str(value) for value in selected)) != dict(expected):
+        raise CampaignEvaluationError("evaluation blob hashes changed during evaluator run")
 
 
 def _cleanup_evaluator_containers(prefix: str) -> tuple[str, ...]:
@@ -834,8 +964,18 @@ def _quarantine_partial_eval_outputs(
     retained_hashes = dict(hashes)
     retained_sizes = dict(sizes)
     quarantined: list[str] = []
-    quarantine = root / "evaluation-state" / f"{arm}.partial"
+    attempt = state.get("attempt")
+    invocation_hash = state.get("invocation_hash")
+    if type(attempt) is not int or not isinstance(invocation_hash, str):
+        raise CampaignEvaluationError("partial evaluator attempt state is malformed")
+    quarantine = (
+        root
+        / "evaluation-state"
+        / f"{arm}.partial"
+        / f"attempt-{attempt:03d}-{invocation_hash[:12]}"
+    )
     _mkdir_contained(quarantine, root)
+    total = 0
     for instance_id in submitted:
         path = arm_root / instance_id / f"{instance_id}.eval.json"
         if not path.exists():
@@ -846,15 +986,20 @@ def _quarantine_partial_eval_outputs(
         if (
             payload.get("state") != "partial"
             or payload.get("invocation_hash") != state.get("invocation_hash")
+            or payload.get("attempt") != attempt
             or identity.sha256 is None
             or payload.get("eval_sha256") != identity.sha256
             or retained_hashes.get(path.name) != identity.sha256
             or retained_hashes.get(sidecar.name) != _sha256(sidecar)
         ):
             raise CampaignEvaluationError(f"partial eval provenance conflicts: {instance_id}")
+        total += path.stat().st_size + sidecar.stat().st_size
+        if total > MAX_PRESERVED_EVAL_TOTAL_BYTES:
+            raise CampaignEvaluationError("partial evaluator quarantine size limit exceeded")
         for current in (path, sidecar):
             metadata = current.lstat()
-            _rename_owned_entry(current, quarantine / current.name, root, metadata.st_dev, metadata.st_ino)
+            target = quarantine / f"{identity.sha256}.{current.name}"
+            _rename_owned_entry(current, target, root, metadata.st_dev, metadata.st_ino)
             retained_hashes.pop(current.name, None)
             retained_sizes.pop(current.name, None)
         quarantined.append(instance_id)
@@ -1123,10 +1268,14 @@ def _evaluate_arm(
         else {}
     )
     prestate = _capture_eval_prestate(arm_root, submitted, invocation_hash, existing)
+    attempt = int(existing.get("attempt", 0)) + 1 if existing is not None else 1
+    if attempt > MAX_EVALUATOR_ATTEMPTS:
+        raise CampaignEvaluationError("evaluator attempt limit exceeded")
     started_at = time.time()
     started_at_ns = time.time_ns()
     base = {
         "version": 1,
+        "attempt": attempt,
         "status": "planned",
         "invocation_hash": invocation_hash,
         "argv": list(argv),
@@ -1193,6 +1342,7 @@ def _evaluate_arm(
         }
         _atomic_json(state_path, done)
         return done
+    _verify_hf_inputs(hf_inputs)
     _verify_campaign_image_tags(image_plan, command_runner is campaign_process.run_checked)
     if completion_path.is_symlink():
         raise CampaignEvaluationError(f"completion marker path is a symlink: {completion_path}")
@@ -1354,6 +1504,12 @@ def _evaluate_arm(
         "evaluator_container_ids": list(containers),
     }
     _atomic_json(state_path, final)
+    try:
+        _verify_hf_inputs(hf_inputs)
+    except CampaignEvaluationError:
+        failed = {**final, "status": "failed", "error": "evaluation_blob_mutation"}
+        _atomic_json(state_path, failed)
+        raise
     if deferred is not None:
         raise deferred
     return final
@@ -1560,6 +1716,10 @@ def _comparison(
                     "evaluator_images": state.get("evaluator_images"),
                     "expected_executable_sha256": state.get("expected_executable_sha256"),
                     "scoring_metadata": state.get("scoring_metadata"),
+                    "hf_repository": state.get("hf_repository"),
+                    "hf_commit": state.get("hf_commit"),
+                    "blob_root": state.get("blob_root"),
+                    "blob_sha256": state.get("blob_sha256"),
                 }
                 for arm, state in arm_states.items()
             },
@@ -1950,6 +2110,15 @@ def _verify_published_bundle(root: Path, bundle: Mapping[str, object]) -> None:
 
 def _result_markdown(report: Mapping[str, object], comparison_sha256: str) -> str:
     aggregate = report["aggregate"]
+    evaluator = report.get("coordinates", {}).get("evaluator", {})
+    arms = evaluator.get("arms", {}) if isinstance(evaluator, Mapping) else {}
+    first_arm = next(iter(arms.values()), {}) if isinstance(arms, Mapping) else {}
+    image_map = first_arm.get("evaluator_images", {}) if isinstance(first_arm, Mapping) else {}
+    image_summary = ", ".join(
+        f"{instance_id}={value.get('digest')}"
+        for instance_id, value in image_map.items()
+        if isinstance(value, Mapping)
+    )
     rows = [
         "| Instance | Arm | Valid | Utility | Resolved | Turns | Actions | Wall | Cost | Cache | Completion | "
         "Package | Preflight | Contract | Quiet | Errors | Delta |",
@@ -1965,6 +2134,9 @@ def _result_markdown(report: Mapping[str, object], comparison_sha256: str) -> st
             f"Valid pairs: {aggregate['valid_pairs']}",
             f"Invalid pairs: {aggregate['invalid_pairs']}",
             f"Comparison SHA-256: {comparison_sha256}",
+            f"HF repository: {first_arm.get('hf_repository') if isinstance(first_arm, Mapping) else None}",
+            f"HF commit: {first_arm.get('hf_commit') if isinstance(first_arm, Mapping) else None}",
+            f"Evaluator images: {image_summary}",
             "",
             *rows,
             "",
@@ -2169,6 +2341,7 @@ def _bind_partial_eval_outputs(
                 "inode": metadata.st_ino,
                 "mtime_ns": metadata.st_mtime_ns,
                 "error": error,
+                "attempt": state.get("attempt"),
             },
         )
         result[f"{instance_id}.eval.partial.provenance.json"] = _sha256(sidecar)
@@ -2289,6 +2462,35 @@ def _atomic_copy_bounded(source: Path, target: Path, limit: int, deadline: float
     finally:
         if os.path.exists(temporary_name):
             os.unlink(temporary_name)
+
+
+def _copy_blob_exclusive(source: Path, target: Path, deadline: float) -> int:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    parent_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    source_descriptor = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    parent_descriptor = os.open(target.parent, parent_flags)
+    target_descriptor = os.open(target.name, flags, 0o600, dir_fd=parent_descriptor)
+    total = 0
+    try:
+        with os.fdopen(source_descriptor, "rb") as current, os.fdopen(target_descriptor, "wb") as output:
+            while chunk := current.read(1024 * 1024):
+                total += len(chunk)
+                if total > MAX_HF_BLOB_FILE_BYTES or time.monotonic() > deadline:
+                    raise CampaignEvaluationError(f"HuggingFace blob copy limit exceeded: {source.name}")
+                output.write(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+            os.fchmod(output.fileno(), 0o444)
+        os.fsync(parent_descriptor)
+        return total
+    except BaseException:
+        try:
+            os.unlink(target.name, dir_fd=parent_descriptor)
+        except OSError:
+            pass
+        raise
+    finally:
+        os.close(parent_descriptor)
 
 
 def _sync_directory(path: Path) -> None:

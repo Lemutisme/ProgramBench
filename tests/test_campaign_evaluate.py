@@ -111,7 +111,9 @@ def _campaign(
             "cache_read": 6,
             "cache_write": 2,
             "exit_class": "discharged" if arm == "procontract" else "idle",
-            "executable_hash": (executable_hashes or {}).get((instance_id, arm), "e" * 64),
+            "executable_hash": executable_hashes.get((instance_id, arm))
+            if executable_hashes is not None
+            else "e" * 64,
         }
         if arm == "procontract":
             result.update(
@@ -1275,8 +1277,8 @@ def test_explicit_retry_quarantines_exception_partial_eval_and_sidecar(tmp_path:
 
     assert outcome.status == "completed"
     quarantine = root / "evaluation-state/procontract.partial"
-    assert (quarantine / "one.eval.json").is_file()
-    assert (quarantine / "one.eval.partial.provenance.json").is_file()
+    assert len(list(quarantine.glob("attempt-*/*.one.eval.json"))) == 1
+    assert len(list(quarantine.glob("attempt-*/*.one.eval.partial.provenance.json"))) == 1
 
 
 def test_keyboard_interrupt_with_eval_file_persists_interrupted_then_reraises(tmp_path: Path) -> None:
@@ -1499,7 +1501,7 @@ def test_done_state_rejects_submission_content_change(tmp_path: Path) -> None:
     with (root / "procontract/one/one/submission.tar.gz").open("ab") as archive:
         archive.write(b"changed")
 
-    with pytest.raises(CampaignEvaluationError, match="conflict"):
+    with pytest.raises(CampaignEvaluationError, match="conflict|mutable"):
         evaluate_campaign(root, instances=instances, command_runner=lambda *_a, **_k: pytest.fail("must not run"))
 
 
@@ -1513,7 +1515,7 @@ def test_done_state_rejects_frozen_manifest_coordinate_change(tmp_path: Path) ->
     manifest["installs"]["procontract"]["revision"] = "changed-revision"
     _write_json(manifest_path, manifest)
 
-    with pytest.raises(CampaignEvaluationError, match="conflict"):
+    with pytest.raises(CampaignEvaluationError, match="conflict|mutable"):
         evaluate_campaign(root, instances=instances, command_runner=lambda *_a, **_k: pytest.fail("must not run"))
 
 
@@ -1625,9 +1627,10 @@ def test_done_state_rejects_local_test_blob_content_change(
     evaluate_campaign(root, instances=instances, command_runner=_runner([]))
     planned = json.loads((root / "evaluation-inputs.json").read_text())
     materialized = Path(planned["blob_root"]) / "one/tests/b1.tar.gz"
+    materialized.chmod(0o644)
     materialized.write_bytes(b"changed-tests")
 
-    with pytest.raises(CampaignEvaluationError, match="conflict"):
+    with pytest.raises(CampaignEvaluationError, match="conflict|mutable"):
         evaluate_campaign(root, instances=instances, command_runner=lambda *_a, **_k: pytest.fail("must not run"))
 
 
@@ -1669,12 +1672,64 @@ def test_hf_main_is_resolved_once_to_immutable_commit_and_mutation_conflicts(tmp
     plan["commit"] = "b" * 40
     _write_json(plan_path, plan)
 
-    with pytest.raises(CampaignEvaluationError, match="invocation conflicts"):
+    with pytest.raises(CampaignEvaluationError, match="conflict"):
         evaluate_campaign(
             root,
             instances=instances,
             command_runner=lambda *_a, **_k: pytest.fail("mutated pin must not run"),
         )
+
+
+def test_blob_mutation_by_first_arm_stops_before_second_arm(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from scripts.campaign_evaluate import CampaignEvaluationError, evaluate_campaign
+
+    source = tmp_path / "source-blobs/one/tests/b1.tar.gz"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"tests")
+    monkeypatch.setenv("PROGRAMBENCH_BLOB_DIR", str(tmp_path / "source-blobs"))
+    root, instances = _campaign(tmp_path / "campaign")
+    calls = []
+
+    def mutate(command, _cwd, _timeout, _grace, _limit, environment, *, on_start):
+        calls.append(Path(command[4]).name)
+        on_start(os.getpid(), os.getpid(), "mutate")
+        blob = Path(environment["PROGRAMBENCH_BLOB_DIR"]) / "one/tests/b1.tar.gz"
+        blob.chmod(0o644)
+        blob.write_bytes(b"mutated")
+        for submission in Path(command[4]).glob("*/submission.tar.gz"):
+            _write_eval(
+                submission.parent / f"{submission.parent.name}.eval.json",
+                statuses=("passed", "failure", "failure"),
+            )
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    with pytest.raises(CampaignEvaluationError, match="blob"):
+        evaluate_campaign(root, instances=instances, command_runner=mutate)
+
+    assert calls == ["procontract"]
+
+
+def test_preexisting_blob_target_symlink_rejects_without_external_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts.campaign_evaluate import CampaignEvaluationError, evaluate_campaign
+
+    source = tmp_path / "source-blobs/one/tests/b1.tar.gz"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"tests")
+    monkeypatch.setenv("PROGRAMBENCH_BLOB_DIR", str(tmp_path / "source-blobs"))
+    root, instances = _campaign(tmp_path / "campaign")
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    marker = victim / "keep"
+    marker.write_bytes(b"safe")
+    (root / "evaluation-blobs").symlink_to(victim, target_is_directory=True)
+
+    with pytest.raises(CampaignEvaluationError, match="foreign HuggingFace blob target"):
+        evaluate_campaign(root, instances=instances, command_runner=lambda *_a, **_k: pytest.fail("must not run"))
+
+    assert marker.read_bytes() == b"safe"
 
 
 def test_done_state_rejects_invocation_configuration_conflict(tmp_path: Path) -> None:
@@ -2140,7 +2195,7 @@ def test_real_calculator_evaluator_scores_two_tiny_submissions_when_docker_avail
                         info.size = len(payload)
                         info.mode = member.external_attr >> 16
                         tar.addfile(info, io.BytesIO(payload))
-                        if member.filename == "calculator.sh":
+                        if member.filename == "calculator.sh" and arm == "procontract":
                             executable_hashes[(instance_id, arm)] = hashlib.sha256(payload).hexdigest()
             submissions[(instance_id, arm)] = archive.getvalue()
 
