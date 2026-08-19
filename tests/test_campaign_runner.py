@@ -43,6 +43,37 @@ def test_scheduler_never_runs_more_than_worker_active_jobs():
     assert len(completed) == 16
 
 
+def test_daemon_worker_pool_joins_all_workers_after_normal_completion():
+    from scripts.campaign_runner import _DaemonWorkerPool
+
+    pool = _DaemonWorkerPool(2)
+    futures = [pool.submit(lambda value=value: value) for value in range(4)]
+    pool.shutdown(wait=True, cancel_futures=False)
+
+    assert [future.result() for future in futures] == list(range(4))
+    assert not any(thread.is_alive() for thread in pool.threads)
+
+
+def test_daemon_worker_pool_cancels_queued_future_without_joining_active_job():
+    from scripts.campaign_runner import _DaemonWorkerPool
+
+    pool = _DaemonWorkerPool(1)
+    started = threading.Event()
+    release = threading.Event()
+    active = pool.submit(lambda: (started.set(), release.wait(1)))
+    assert started.wait(1)
+    queued = pool.submit(lambda: pytest.fail("queued job must be cancelled"))
+
+    pool.shutdown(wait=False, cancel_futures=True)
+    release.set()
+    for thread in pool.threads:
+        thread.join(1)
+
+    assert active.result() == (None, True)
+    assert queued.cancelled()
+    assert not any(thread.is_alive() for thread in pool.threads)
+
+
 def test_stop_token_is_thread_safe_and_keeps_first_sanitized_reason():
     from scripts.campaign_stop import StopToken
 
@@ -233,6 +264,52 @@ def test_scheduler_waits_for_rate_limit_backoff_before_admitting_next_job():
     assert started == ["task-0/procontract", "task-1/vanilla"]
 
 
+def test_scheduler_interrupts_3600_second_admission_backoff_within_bound():
+    from scripts.campaign_runner import run_campaign
+
+    breaker = CircuitBreaker(retry_after_default=3600, retry_after_max=3600)
+    breaker.observe_error(429, retry_after="3600")
+    stop = threading.Event()
+    results = []
+    thread = threading.Thread(
+        target=lambda: results.append(run_campaign((job(0),), breaker=breaker, stop_event=stop)),
+        daemon=True,
+    )
+    started = time.monotonic()
+    thread.start()
+    time.sleep(0.02)
+    stop.set()
+    thread.join(0.2)
+
+    assert not thread.is_alive()
+    assert time.monotonic() - started < 0.2
+    assert results[0].interrupted
+    assert results[0].pending == ()
+
+
+def test_scheduler_rechecks_extended_backoff_and_auth_between_one_second_slices():
+    from scripts.campaign_runner import run_campaign
+
+    now = [0.0]
+    breaker = CircuitBreaker(clock=lambda: now[0], retry_after_default=2, retry_after_max=10)
+    breaker.observe_error(429, retry_after="2", now=0)
+    sleeps = []
+
+    def sleep(delay):
+        sleeps.append(delay)
+        now[0] += delay
+        if len(sleeps) == 1:
+            breaker.observe_error(429, retry_after="4", now=now[0])
+        if len(sleeps) == 2:
+            breaker.observe_error(401)
+
+    result = run_campaign((job(0),), breaker=breaker, sleeper=sleep, clock=lambda: now[0])
+
+    assert sleeps == [1, 1]
+    assert result.paused
+    assert result.pending == (job(0),)
+
+
 def test_scheduler_persists_sanitized_bounded_campaign_log(tmp_path: Path):
     from scripts.campaign_runner import run_campaign
 
@@ -341,6 +418,87 @@ def test_keyboard_interrupt_force_stops_exact_registered_active_job_after_grace(
     assert terminalized == [job(1)]
     assert result.running == 0
     assert result.pending == ()
+
+
+@pytest.mark.parametrize("mode", ["blocking_callback", "noncooperative_worker"])
+def test_fatal_shutdown_exits_real_subprocess_with_only_daemon_threads(tmp_path: Path, mode: str):
+    root = Path(__file__).parents[1]
+    script = r"""
+import sys
+import threading
+import time
+from pathlib import Path
+from scripts.campaign_runner import CampaignJob, CampaignShutdownError, run_campaign
+from scripts.campaign_state import JobState, StateStore
+
+state = StateStore(Path(sys.argv[1]) / "state.json")
+state.write(JobState("planned"))
+ready = threading.Event()
+released = threading.Event()
+mode = sys.argv[2]
+
+def terminalize():
+    current = state.read()
+    if current.phase != "interrupted":
+        state.transition(
+            "interrupted",
+            command_identity="shutdown",
+            expected_generation=current.generation,
+            exit_class="campaign_stop",
+        )
+    released.set()
+    return True
+
+def execute(candidate, stop):
+    if candidate.instance_id == "interrupt":
+        assert ready.wait(1)
+        raise KeyboardInterrupt
+    def force_stop():
+        if mode == "blocking_callback":
+            while True:
+                time.sleep(1)
+    handle = stop.registry.register(candidate, force_stop=force_stop, terminalize=terminalize)
+    ready.set()
+    try:
+        if mode == "noncooperative_worker":
+            while True:
+                time.sleep(1)
+        assert released.wait(1)
+    finally:
+        stop.registry.unregister(handle)
+
+try:
+    started = time.monotonic()
+    run_campaign(
+        (
+            CampaignJob("interrupt", "vanilla", "image"),
+            CampaignJob("active", "procontract", "image"),
+        ),
+        workers=2,
+        execute=execute,
+        interrupt_timeout=0.02,
+    )
+except CampaignShutdownError:
+    print(state.read().phase, time.monotonic() - started, flush=True)
+    raise SystemExit(9)
+raise SystemExit(0)
+"""
+    started = time.monotonic()
+
+    result = subprocess.run(
+        (sys.executable, "-c", script, str(tmp_path), mode),
+        cwd=root,
+        capture_output=True,
+        text=True,
+        timeout=2,
+    )
+
+    assert result.returncode == 9
+    phase, elapsed = result.stdout.split()
+    assert phase == "interrupted"
+    assert float(elapsed) < 0.1
+    assert json.loads(tmp_path.joinpath("state.json").read_text())["phase"] == "interrupted"
+    assert time.monotonic() - started < 2
 
 
 def test_force_stop_or_terminal_cas_failure_is_fatal_even_when_worker_then_exits():

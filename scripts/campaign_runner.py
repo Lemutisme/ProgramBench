@@ -17,9 +17,10 @@ import threading
 import time
 import traceback
 from collections import deque
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, Future, wait
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
+from queue import Empty, Queue
 from typing import Callable, Mapping, Sequence
 
 if __package__ in (None, ""):
@@ -92,6 +93,75 @@ class JobRunResult:
     job: CampaignJob
     status: str
     result: object | None = None
+
+
+@dataclass(frozen=True)
+class _DaemonTask:
+    future: Future[object]
+    operation: Callable[..., object]
+    args: tuple[object, ...]
+
+
+class _DaemonWorkerPool:
+    """Future-compatible daemon workers for bounded fatal campaign shutdown.
+
+    The scheduler keeps mini-swe's one-completion/one-admission pattern, but a
+    permanent job must not enter concurrent.futures' interpreter-exit join set.
+    """
+
+    def __init__(self, workers: int) -> None:
+        self._queue: Queue[_DaemonTask | None] = Queue()
+        self._lock = threading.Lock()
+        self._closed = False
+        self.threads = tuple(
+            threading.Thread(target=self._work, name=f"campaign-worker-{index}", daemon=True)
+            for index in range(workers)
+        )
+        for thread in self.threads:
+            thread.start()
+
+    def submit(self, operation: Callable[..., object], *args: object) -> Future[object]:
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("campaign worker pool is closed")
+            future: Future[object] = Future()
+            self._queue.put(_DaemonTask(future, operation, args))
+            return future
+
+    def shutdown(self, *, wait: bool, cancel_futures: bool) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        if cancel_futures:
+            while True:
+                try:
+                    task = self._queue.get_nowait()
+                except Empty:
+                    break
+                if task is not None:
+                    task.future.cancel()
+                self._queue.task_done()
+        for _ in self.threads:
+            self._queue.put(None)
+        if wait:
+            for thread in self.threads:
+                thread.join()
+
+    def _work(self) -> None:
+        while True:
+            task = self._queue.get()
+            try:
+                if task is None:
+                    return
+                if not task.future.set_running_or_notify_cancel():
+                    continue
+                try:
+                    task.future.set_result(task.operation(*task.args))
+                except BaseException as error:
+                    task.future.set_exception(error)
+            finally:
+                self._queue.task_done()
 
 
 def expand_campaign_jobs(
@@ -212,7 +282,7 @@ def run_campaign(
     running: dict[Future[object], CampaignJob] = {}
     completed = 0
     failed = 0
-    executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="campaign")
+    executor = _DaemonWorkerPool(workers)
     interrupted = stop.is_set()
     if interrupted:
         pending.clear()
@@ -222,11 +292,14 @@ def run_campaign(
     try:
         while pending or running:
             if pending and not running and not stop.is_set() and not breaker.admission_allowed:
-                delay = _backoff_delay(breaker, clock)
-                if delay is None:
+                admission = _wait_for_admission(breaker, stop, clock, sleeper)
+                if admission == "interrupted":
+                    interrupted = True
+                    pending.clear()
+                    break
+                if admission == "paused":
                     paused = True
                     break
-                sleeper(delay)
                 continue
             while pending and len(running) < workers and not stop.is_set() and breaker.admission_allowed:
                 candidate = pending.popleft()
@@ -263,14 +336,9 @@ def run_campaign(
                 pending.clear()
                 break
             if not breaker.admission_allowed:
-                delay = _backoff_delay(breaker, clock)
-                if delay is not None:
-                    sleeper(delay)
-                    continue
                 if running:
                     continue
-                paused = True
-                break
+                continue
     except KeyboardInterrupt:
         interrupted = True
         stop.set("keyboard_interrupt")
@@ -295,7 +363,7 @@ def run_campaign(
                         _append_log(state_path, candidate, "interrupted")
                     _persist_breaker(state_path, breaker)
             if running:
-                force_failures = stop.registry.force_stop_all()
+                force_failures = stop.registry.force_stop_all(deadline=time.monotonic() + interrupt_timeout)
                 deadline = time.monotonic() + interrupt_timeout
                 while running and time.monotonic() < deadline:
                     done, _ = wait(
@@ -318,15 +386,7 @@ def run_campaign(
             shutdown_failed = bool(running) or bool(force_failures)
             for future in running:
                 future.cancel()
-        if running:
-            threading.Thread(
-                target=executor.shutdown,
-                kwargs={"wait": True, "cancel_futures": True},
-                name="campaign-shutdown-reaper",
-                daemon=True,
-            ).start()
-        else:
-            executor.shutdown(wait=True, cancel_futures=True)
+        executor.shutdown(wait=not running, cancel_futures=True)
     if shutdown_failed:
         raise CampaignShutdownError(f"campaign shutdown failed for {len(running) + len(force_failures)} active job(s)")
     return CampaignResult(completed, failed, tuple(pending), len(running), breaker.pause_reason, paused, interrupted)
@@ -668,6 +728,36 @@ def _backoff_delay(breaker: CircuitBreaker, clock: Callable[[], float]) -> float
     if deadline is None:
         return None
     return max(0.0, deadline - clock())
+
+
+def _wait_for_admission(
+    breaker: CircuitBreaker,
+    stop: StopToken,
+    clock: Callable[[], float],
+    sleeper: Callable[[float], None],
+) -> str:
+    while not breaker.admission_allowed:
+        if stop.is_set():
+            return "interrupted"
+        reason = breaker.active_stop_reason
+        if reason == "campaign hard cost cap reached":
+            stop.set("campaign_hard_stop")
+            return "interrupted"
+        if reason == "provider authentication failure":
+            return "paused"
+        deadline = breaker.backoff_until
+        if deadline is None:
+            return "paused"
+        now = clock()
+        if now >= deadline:
+            continue
+        delay = min(1.0, deadline - now)
+        if sleeper is time.sleep:
+            if stop.wait(delay):
+                return "interrupted"
+        else:
+            sleeper(delay)
+    return "ready"
 
 
 def _append_log(state_path: Path | None, candidate: CampaignJob, status: str) -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -50,6 +51,19 @@ class _ActiveJob:
         with self._lock:
             self._active = False
 
+    def begin_bounded_force(self) -> tuple[Callable[[], object], Callable[[], object]] | bool | None:
+        with self._lock:
+            if not self._active:
+                return None
+            if self._forced:
+                return self._succeeded is True
+            self._forced = True
+            return self.force_stop, self.terminalize
+
+    def finish_bounded_force(self, succeeded: bool) -> None:
+        with self._lock:
+            self._succeeded = succeeded
+
 
 class ActiveJobRegistry:
     def __init__(self) -> None:
@@ -80,12 +94,52 @@ class ActiveJobRegistry:
         with self._lock:
             return tuple(entry.job for entry in self._active.values())
 
-    def force_stop_all(self) -> tuple[object, ...]:
+    def force_stop_all(self, *, deadline: float | None = None) -> tuple[object, ...]:
         with self._lock:
             active = tuple(self._active.values())
+        if deadline is not None:
+            return self._force_stop_all_bounded(active, deadline)
         failures = []
         for entry in active:
             if entry.force() is False:
+                failures.append(entry.job)
+        return tuple(failures)
+
+    def _force_stop_all_bounded(self, active: tuple[_ActiveJob, ...], deadline: float) -> tuple[object, ...]:
+        callbacks: list[tuple[_ActiveJob, list[tuple[threading.Thread, list[bool]]]]] = []
+        failures = []
+        for entry in active:
+            claimed = entry.begin_bounded_force()
+            if claimed is False:
+                failures.append(entry.job)
+                continue
+            if not isinstance(claimed, tuple):
+                continue
+            helpers = []
+            for name, callback in zip(("force", "terminal"), claimed, strict=True):
+                result: list[bool] = []
+
+                def run(operation: Callable[[], object] = callback, outcome: list[bool] = result) -> None:
+                    try:
+                        outcome.append(operation() is not False)
+                    except BaseException:
+                        outcome.append(False)
+
+                thread = threading.Thread(
+                    target=run,
+                    name=f"campaign-{name}-callback",
+                    daemon=True,
+                )
+                helpers.append((thread, result))
+                thread.start()
+            callbacks.append((entry, helpers))
+        for _, helpers in callbacks:
+            for thread, _ in helpers:
+                thread.join(max(0.0, deadline - time.monotonic()))
+        for entry, helpers in callbacks:
+            succeeded = all(not thread.is_alive() and result == [True] for thread, result in helpers)
+            entry.finish_bounded_force(succeeded)
+            if not succeeded:
                 failures.append(entry.job)
         return tuple(failures)
 
