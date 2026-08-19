@@ -597,7 +597,11 @@ def _load_or_plan_hf_inputs(
 ) -> Mapping[str, object]:
     path = root / "evaluation-inputs.json"
     if path.exists():
-        planned = _read_json(path, "evaluation input plan")
+        try:
+            planned = _read_json(path, "evaluation input plan")
+        except CampaignEvaluationError:
+            planned = _recover_hf_plan_from_complete_marker(root, instance_ids)
+            _atomic_json(path, planned)
         if planned.get("selected_ids") != list(instance_ids):
             raise CampaignEvaluationError("evaluation input plan selection conflicts")
         blob_root = planned.get("blob_root")
@@ -608,6 +612,13 @@ def _load_or_plan_hf_inputs(
             if not isinstance(expected, Mapping) or actual != dict(expected):
                 raise CampaignEvaluationError("evaluation input blob hashes conflict")
         return planned
+    marker = root / "evaluation-blobs.owner.json"
+    if marker.exists():
+        marker_state = _read_json(marker, "evaluation blob owner marker")
+        if marker_state.get("status") == "complete":
+            recovered = _recover_hf_plan_from_complete_marker(root, instance_ids)
+            _atomic_json(path, recovered)
+            return recovered
 
     try:
         configured = os.environ.get("PROGRAMBENCH_BLOB_DIR")
@@ -679,6 +690,17 @@ def _materialize_hf_blobs(source: Path, target: Path, instance_ids: tuple[str, .
     _require_owned_directory(target.parent, target.parent, "HuggingFace blob target parent")
     journal_path = target.parent / f"{target.name}.owner.json"
     journal = _read_optional_json(journal_path)
+    referenced_staging = journal.get("staging") if isinstance(journal, Mapping) else None
+    for candidate in target.parent.glob(f".{target.name}.*.staging"):
+        if str(candidate) == referenced_staging:
+            continue
+        metadata = candidate.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise CampaignEvaluationError(f"foreign HuggingFace staging entry exists: {candidate}")
+        if any(candidate.iterdir()):
+            raise CampaignEvaluationError(f"nonempty foreign HuggingFace staging directory exists: {candidate}")
+        candidate.rmdir()
+        _sync_directory(candidate.parent)
     if target.exists() or target.is_symlink():
         if journal is None or journal.get("status") not in {"ready_to_publish", "published"}:
             raise CampaignEvaluationError(f"foreign HuggingFace blob target exists: {target}")
@@ -894,9 +916,31 @@ def _write_blob_owner_marker(root: Path, blob_root: Path, plan: Mapping[str, obj
             "inode": metadata.st_ino,
             "repository": plan.get("repository"),
             "commit": plan.get("commit"),
+            "selected_ids": plan.get("selected_ids"),
             "blob_sha256": plan.get("blob_sha256"),
         },
     )
+
+
+def _recover_hf_plan_from_complete_marker(root: Path, instance_ids: tuple[str, ...]) -> Mapping[str, object]:
+    marker = _read_json(root / "evaluation-blobs.owner.json", "evaluation blob owner marker")
+    if marker.get("status") != "complete" or marker.get("selected_ids") != list(instance_ids):
+        raise CampaignEvaluationError("complete evaluation blob marker conflicts")
+    plan = {
+        "version": 1,
+        "repository": marker.get("repository"),
+        "commit": marker.get("commit"),
+        "selected_ids": list(instance_ids),
+        "blob_root": marker.get("blob_root"),
+        "blob_sha256": marker.get("blob_sha256"),
+    }
+    blob_root = plan.get("blob_root")
+    if not isinstance(blob_root, str):
+        raise CampaignEvaluationError("complete evaluation blob marker has no root")
+    _verify_owned_blob_tree(root, Path(blob_root), plan)
+    if _blob_hashes(Path(blob_root), instance_ids) != dict(plan["blob_sha256"]):
+        raise CampaignEvaluationError("complete evaluation blob marker hashes conflict")
+    return plan
 
 
 def _verify_owned_blob_tree(root: Path, blob_root: Path, plan: Mapping[str, object]) -> None:
@@ -1127,13 +1171,9 @@ def _quarantine_partial_eval_outputs(
         / f"{arm}.partial"
         / f"attempt-{attempt:03d}-{invocation_hash[:12]}"
     )
-    quarantine_root = root / "evaluation-state" / f"{arm}.partial"
-    retained = [path for path in quarantine_root.rglob("*") if path.is_file()] if quarantine_root.exists() else []
-    retained_bytes = sum(path.stat().st_size for path in retained)
-    if len(retained) + 2 > MAX_PARTIAL_QUARANTINE_FILES:
-        raise CampaignEvaluationError("partial quarantine file cap reached; archive or clean retained evidence")
     _mkdir_contained(quarantine, root)
     total = 0
+    artifact_records: list[dict[str, object]] = []
     for instance_id in submitted:
         path = arm_root / instance_id / f"{instance_id}.eval.json"
         if not path.exists():
@@ -1151,11 +1191,18 @@ def _quarantine_partial_eval_outputs(
             or retained_hashes.get(sidecar.name) != _sha256(sidecar)
         ):
             raise CampaignEvaluationError(f"partial eval provenance conflicts: {instance_id}")
-        if len(retained) + len(quarantined) * 2 + 2 > MAX_PARTIAL_QUARANTINE_FILES:
-            raise CampaignEvaluationError("partial quarantine file cap reached; archive or clean retained evidence")
         total += path.stat().st_size + sidecar.stat().st_size
-        if retained_bytes + total > MAX_PARTIAL_QUARANTINE_BYTES:
-            raise CampaignEvaluationError("partial quarantine byte cap reached; archive or clean retained evidence")
+        artifact_records.append(
+            {
+                "instance_id": instance_id,
+                "eval_path": str(path),
+                "eval_sha256": identity.sha256,
+                "eval_size": path.stat().st_size,
+                "provenance_sha256": _sha256(sidecar),
+                "provenance_size": sidecar.stat().st_size,
+                "error": payload.get("error"),
+            }
+        )
         for current in (path, sidecar):
             metadata = current.lstat()
             target = quarantine / f"{identity.sha256}.{current.name}"
@@ -1163,6 +1210,18 @@ def _quarantine_partial_eval_outputs(
             retained_hashes.pop(current.name, None)
             retained_sizes.pop(current.name, None)
         quarantined.append(instance_id)
+    index_path = root / "evaluation-state" / f"{arm}.partial-attempts.json"
+    records = _append_partial_attempt_record(
+        index_path,
+        {
+            "attempt": attempt,
+            "invocation_hash": invocation_hash,
+            "artifacts": artifact_records,
+            "quarantine_path": str(quarantine),
+            "raw_retained": True,
+        },
+    )
+    records = _prune_partial_attempts(root, arm, index_path, records)
     updated = {
         **state,
         "artifact_hashes": retained_hashes,
@@ -1170,10 +1229,99 @@ def _quarantine_partial_eval_outputs(
         "eval_artifact_sizes": {},
         "eval_hash_unavailable": {},
         "partial_quarantine": quarantined,
+        "partial_attempt_records": records,
         "completion_disposition": "partial_quarantined",
     }
     _atomic_json(state_path, updated)
     return updated
+
+
+def _append_partial_attempt_record(path: Path, record: Mapping[str, object]) -> list[dict[str, object]]:
+    if path.exists():
+        raw = _read_json(path, "partial attempt index")
+        records = raw.get("records")
+        retention = raw.get("retention", {})
+        if raw.get("version") != 1 or not isinstance(records, list):
+            raise CampaignEvaluationError("partial attempt index is malformed")
+        if not isinstance(retention, Mapping):
+            raise CampaignEvaluationError("partial attempt retention is malformed")
+        result = [dict(value) for value in records if isinstance(value, Mapping)]
+        if len(result) != len(records):
+            raise CampaignEvaluationError("partial attempt records are malformed")
+    else:
+        result = []
+        retention = {}
+    value = dict(record)
+    value["previous_record_hash"] = result[-1]["record_hash"] if result else None
+    value["record_hash"] = hashlib.sha256(_canonical_bytes(value)).hexdigest()
+    result.append(value)
+    _atomic_json(path, {"version": 1, "records": result, "retention": dict(retention)})
+    return result
+
+
+def _prune_partial_attempts(
+    root: Path,
+    arm: str,
+    path: Path,
+    records: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    index = _read_json(path, "partial attempt index")
+    retention = dict(index.get("retention", {})) if isinstance(index.get("retention"), Mapping) else {}
+
+    def is_retained(record: Mapping[str, object]) -> bool:
+        return retention.get(str(record.get("record_hash")), record.get("raw_retained")) is True
+
+    def persist() -> None:
+        _atomic_json(path, {"version": 1, "records": records, "retention": retention})
+
+    signatures: set[tuple[str, ...]] = set()
+    for record in records:
+        artifacts = record.get("artifacts")
+        signature = tuple(
+            sorted(
+                str(value.get("eval_sha256"))
+                for value in artifacts
+                if isinstance(value, Mapping)
+            )
+        ) if isinstance(artifacts, list) else ()
+        if is_retained(record) and signature in signatures:
+            retention[str(record["record_hash"])] = False
+            persist()
+        elif is_retained(record):
+            signatures.add(signature)
+
+    def retained_usage() -> tuple[int, int]:
+        files = 0
+        size = 0
+        for record in records:
+            if not is_retained(record):
+                continue
+            raw = Path(str(record.get("quarantine_path")))
+            if raw.is_dir():
+                entries = [entry for entry in raw.rglob("*") if entry.is_file()]
+                files += len(entries)
+                size += sum(entry.stat().st_size for entry in entries)
+        return files, size
+
+    files, size = retained_usage()
+    while files > MAX_PARTIAL_QUARANTINE_FILES or size > MAX_PARTIAL_QUARANTINE_BYTES:
+        candidate = next((value for value in records if is_retained(value)), None)
+        if candidate is None:
+            break
+        retention[str(candidate["record_hash"])] = False
+        persist()
+        files, size = retained_usage()
+
+    for record in records:
+        if not is_retained(record):
+            raw = Path(str(record.get("quarantine_path")))
+            if raw.exists():
+                expected_parent = root / "evaluation-state" / f"{arm}.partial"
+                if raw.parent != expected_parent or raw.is_symlink():
+                    raise CampaignEvaluationError("partial quarantine tombstone path conflicts")
+                shutil.rmtree(raw)
+                _sync_directory(expected_parent)
+    return [{**record, "raw_retained": is_retained(record)} for record in records]
 
 
 def _evaluate_arm(
@@ -1479,6 +1627,9 @@ def _evaluate_arm(
         "completion_disposition": "running",
         "recovered_container_ids": list(existing.get("recovered_container_ids", []))
         if existing is not None and isinstance(existing.get("recovered_container_ids"), list)
+        else [],
+        "partial_attempt_records": list(existing.get("partial_attempt_records", []))
+        if existing is not None and isinstance(existing.get("partial_attempt_records"), list)
         else [],
     }
     if not submitted:
@@ -1955,6 +2106,7 @@ def _arm_report(
         "errors": report_errors,
         "eval_artifact_size_bytes": eval_size,
         "eval_hash_unavailable_reason": hash_unavailable,
+        "partial_attempt_records": evaluator_state.get("partial_attempt_records", []),
         "turns": result.get("provider_turns", state.provider_turns),
         "actions": result.get("actions", state.actions),
         "wall_time_seconds": str(result.get("elapsed_seconds")) if "elapsed_seconds" in result else None,

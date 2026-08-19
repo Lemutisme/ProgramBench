@@ -1306,7 +1306,9 @@ def test_more_than_sixteen_explicit_retries_are_allowed_while_quarantine_is_with
 
     state = json.loads((root / "evaluation-state/procontract.json").read_text())
     assert state["attempt"] == 17
-    assert len(list((root / "evaluation-state/procontract.partial").glob("attempt-*"))) == 16
+    assert [record["attempt"] for record in state["partial_attempt_records"]] == list(range(1, 17))
+    assert all(len(record["record_hash"]) == 64 for record in state["partial_attempt_records"])
+    assert sum(record["raw_retained"] for record in state["partial_attempt_records"]) <= 1
 
 
 def test_keyboard_interrupt_with_eval_file_persists_interrupted_then_reraises(tmp_path: Path) -> None:
@@ -1795,6 +1797,56 @@ def test_blob_publish_recovers_crash_after_rename_before_plan(
 
     assert outcome.status == "completed"
     assert json.loads((root / "evaluation-blobs.owner.json").read_text())["status"] == "complete"
+
+
+def test_complete_blob_marker_recovers_missing_input_plan(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from scripts import campaign_evaluate
+
+    source = tmp_path / "source-blobs/one/tests/b1.tar.gz"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"tests")
+    monkeypatch.setenv("PROGRAMBENCH_BLOB_DIR", str(tmp_path / "source-blobs"))
+    root, instances = _campaign(tmp_path / "campaign")
+    atomic = campaign_evaluate._atomic_json
+    crashed = False
+
+    def crash_plan(path, value):
+        nonlocal crashed
+        if path.name == "evaluation-inputs.json" and not crashed:
+            crashed = True
+            raise OSError("after complete marker")
+        return atomic(path, value)
+
+    monkeypatch.setattr(campaign_evaluate, "_atomic_json", crash_plan)
+    with pytest.raises(OSError, match="after complete marker"):
+        campaign_evaluate.evaluate_campaign(root, instances=instances, command_runner=_runner([]))
+    assert json.loads((root / "evaluation-blobs.owner.json").read_text())["status"] == "complete"
+    assert not (root / "evaluation-inputs.json").exists()
+
+    monkeypatch.setattr(campaign_evaluate, "_atomic_json", atomic)
+    outcome = campaign_evaluate.evaluate_campaign(root, instances=instances, command_runner=_runner([]))
+
+    assert outcome.status == "completed"
+    assert json.loads((root / "evaluation-inputs.json").read_text())["commit"].startswith("local-")
+
+
+def test_unjournaled_empty_blob_staging_is_recovered_but_nonempty_is_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import campaign_evaluate
+
+    source = tmp_path / "source-blobs/one/tests/b1.tar.gz"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"tests")
+    monkeypatch.setenv("PROGRAMBENCH_BLOB_DIR", str(tmp_path / "source-blobs"))
+    root, instances = _campaign(tmp_path / "campaign")
+    empty = root / ".evaluation-blobs.crashed.staging"
+    empty.mkdir()
+
+    outcome = campaign_evaluate.evaluate_campaign(root, instances=instances, command_runner=_runner([]))
+    assert outcome.status == "completed"
+    assert not empty.exists()
 
 
 def test_hf_keyboard_interrupt_propagates_without_wrapping(tmp_path: Path) -> None:
