@@ -75,6 +75,7 @@ from scripts.campaign_vanilla import (
     VanillaCompletion,
     VanillaError,
     VanillaHttpError,
+    VanillaPromptRequest,
     VanillaResult,
     run_vanilla,
 )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import copy
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -23,6 +24,7 @@ from scripts.campaign_vanilla import (
     VanillaCompletion,
     VanillaError,
     VanillaHttpError,
+    VanillaPromptRequest,
     run_vanilla,
 )
 from scripts.campaign_workspace import WorkspaceLease
@@ -126,7 +128,7 @@ class FakeOpenCodeApi:
         self.polls = polls
         self.current = polls[0] if polls else ([], "idle")
         self.sessions: dict[str, dict[str, object]] = {}
-        self.prompts: dict[str, str] = {}
+        self.prompts: dict[str, dict[str, object]] = {}
         self.create_requests: list[dict[str, object]] = []
         self.prompt_requests: list[dict[str, object]] = []
         self.permissions = 0
@@ -135,7 +137,9 @@ class FakeOpenCodeApi:
     def get_session(self, session_id: str) -> dict[str, object] | None:
         return self.sessions.get(session_id)
 
-    def create_session(self, session_id: str, *, model: str, variant: str, directory: str) -> dict[str, object]:
+    def create_session(
+        self, session_id: str, *, model: str, variant: str, directory: str, agent: str | None
+    ) -> dict[str, object]:
         self.create_requests.append({"id": session_id, "model": model, "variant": variant, "directory": directory})
         return self.sessions.setdefault(
             session_id,
@@ -143,6 +147,7 @@ class FakeOpenCodeApi:
                 "id": session_id,
                 "location": {"directory": directory},
                 "model": {"providerID": model.split("/", 1)[0], "id": model.split("/", 1)[1], "variant": variant},
+                **({"agent": agent} if agent is not None else {}),
             },
         )
 
@@ -154,11 +159,23 @@ class FakeOpenCodeApi:
     def get_message(self, session_id: str, message_id: str) -> dict[str, object] | None:
         if message_id not in self.prompts:
             return None
-        return {"id": message_id, "type": "user", "text": self.prompts[message_id]}
+        return {"id": message_id, "type": "user", "text": self.prompts[message_id]["text"]}
 
-    def prompt(self, session_id: str, message_id: str, *, text: str) -> None:
-        self.prompt_requests.append({"session": session_id, "id": message_id, "text": text})
-        self.prompts.setdefault(message_id, text)
+    def prompt(self, request: VanillaPromptRequest, *, resume: bool = True) -> None:
+        value = request.to_dict()
+        self.prompt_requests.append(
+            {
+                "session": request.session_id,
+                "id": request.message_id,
+                "text": request.text,
+                "request": value,
+                "resume": resume,
+            }
+        )
+        existing = self.prompts.get(request.message_id)
+        if existing is not None and existing != value:
+            raise VanillaHttpError("prompt conflict", status_code=409)
+        self.prompts.setdefault(request.message_id, value)
 
     def messages(self, session_id: str) -> dict[str, object]:
         self.current = self.polls.pop(0) if self.polls else self.current
@@ -181,15 +198,17 @@ class CrashApi(FakeOpenCodeApi):
         self.stage = stage
         self.crashed = False
 
-    def create_session(self, session_id: str, *, model: str, variant: str, directory: str) -> dict[str, object]:
-        result = super().create_session(session_id, model=model, variant=variant, directory=directory)
+    def create_session(
+        self, session_id: str, *, model: str, variant: str, directory: str, agent: str | None
+    ) -> dict[str, object]:
+        result = super().create_session(session_id, model=model, variant=variant, directory=directory, agent=agent)
         if self.stage == "create" and not self.crashed:
             self.crashed = True
             raise InjectedCrash("after create")
         return result
 
-    def prompt(self, session_id: str, message_id: str, *, text: str) -> None:
-        super().prompt(session_id, message_id, text=text)
+    def prompt(self, request: VanillaPromptRequest, *, resume: bool = True) -> None:
+        super().prompt(request, resume=resume)
         if self.stage == "prompt" and not self.crashed:
             self.crashed = True
             raise InjectedCrash("after prompt")
@@ -200,11 +219,13 @@ class BeforeCreateCrashApi(FakeOpenCodeApi):
         super().__init__([([user(), assistant()], "idle")])
         self.crashed = False
 
-    def create_session(self, session_id: str, *, model: str, variant: str, directory: str) -> dict[str, object]:
+    def create_session(
+        self, session_id: str, *, model: str, variant: str, directory: str, agent: str | None
+    ) -> dict[str, object]:
         if not self.crashed:
             self.crashed = True
             raise InjectedCrash("before create side effect")
-        return super().create_session(session_id, model=model, variant=variant, directory=directory)
+        return super().create_session(session_id, model=model, variant=variant, directory=directory, agent=agent)
 
 
 class SafetyApi(FakeOpenCodeApi):
@@ -233,22 +254,26 @@ class SetupErrorApi(FakeOpenCodeApi):
         super().__init__([([], "busy")])
         self.stage = stage
 
-    def create_session(self, session_id: str, *, model: str, variant: str, directory: str) -> dict[str, object]:
+    def create_session(
+        self, session_id: str, *, model: str, variant: str, directory: str, agent: str | None
+    ) -> dict[str, object]:
         if self.stage == "create":
             raise VanillaHttpError("network unavailable", transient=True)
-        return super().create_session(session_id, model=model, variant=variant, directory=directory)
+        return super().create_session(session_id, model=model, variant=variant, directory=directory, agent=agent)
 
-    def prompt(self, session_id: str, message_id: str, *, text: str) -> None:
+    def prompt(self, request: VanillaPromptRequest, *, resume: bool = True) -> None:
         if self.stage == "prompt":
             raise VanillaHttpError("network unavailable", transient=True)
-        super().prompt(session_id, message_id, text=text)
+        super().prompt(request, resume=resume)
 
 
 class SetupRateApi(FakeOpenCodeApi):
     def __init__(self) -> None:
         super().__init__([])
 
-    def create_session(self, session_id: str, *, model: str, variant: str, directory: str) -> dict[str, object]:
+    def create_session(
+        self, session_id: str, *, model: str, variant: str, directory: str, agent: str | None
+    ) -> dict[str, object]:
         raise VanillaHttpError("rate limited", status_code=429, retry_after="10")
 
 
@@ -257,15 +282,17 @@ class AuthSetupApi(SafetyApi):
         super().__init__([([], "busy")])
         self.stage = stage
 
-    def create_session(self, session_id: str, *, model: str, variant: str, directory: str) -> dict[str, object]:
+    def create_session(
+        self, session_id: str, *, model: str, variant: str, directory: str, agent: str | None
+    ) -> dict[str, object]:
         if self.stage == "create":
             raise VanillaHttpError("bad credential", status_code=401)
-        return super().create_session(session_id, model=model, variant=variant, directory=directory)
+        return super().create_session(session_id, model=model, variant=variant, directory=directory, agent=agent)
 
-    def prompt(self, session_id: str, message_id: str, *, text: str) -> None:
+    def prompt(self, request: VanillaPromptRequest, *, resume: bool = True) -> None:
         if self.stage == "prompt":
             raise VanillaHttpError("bad credential", status_code=403)
-        super().prompt(session_id, message_id, text=text)
+        super().prompt(request, resume=resume)
 
 
 class InterruptFailureApi(FakeOpenCodeApi):
@@ -283,6 +310,20 @@ class StatusErrorApi(FakeOpenCodeApi):
         if not self.failed:
             self.failed = True
             raise VanillaHttpError("status transport failed", transient=True)
+        return "idle"
+
+
+class MutatingTerminalApi(FakeOpenCodeApi):
+    def __init__(self, workspace: FakeWorkspace, failed: dict[str, object]) -> None:
+        super().__init__([([user(), failed], "busy")])
+        self.workspace = workspace
+        self.writes = 0
+
+    def status(self, session_id: str) -> str:
+        if self.workspace.stops == 0:
+            self.workspace.candidate.joinpath("live.log").write_text(str(self.writes))
+            self.writes += 1
+            return "busy"
         return "idle"
 
 
@@ -482,6 +523,37 @@ def test_vanilla_runs_exactly_one_ordinary_session_and_freezes_on_idle(tmp_path:
     assert result.workspace_frozen
     assert paths.root.joinpath("subject/source.py").read_text() == "print('candidate')\n"
     assert StateStore(paths.state).read().phase == "frozen"
+    execution = json.loads(paths.root.joinpath("vanilla-execution.json").read_text())
+    assert (
+        execution["prompt_request"]
+        == VanillaPromptRequest(
+            session_id=result.session_id,
+            message_id=result.message_id,
+            text=ORIGINAL_TASK,
+            delivery="steer",
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            directory="/candidate",
+            agent=None,
+            files=(),
+            permission=(("*", "*", "allow"),),
+        ).to_dict()
+    )
+    assert (
+        execution["prompt_request_sha256"]
+        == VanillaPromptRequest(
+            session_id=result.session_id,
+            message_id=result.message_id,
+            text=ORIGINAL_TASK,
+            delivery="steer",
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            directory="/candidate",
+            agent=None,
+            files=(),
+            permission=(("*", "*", "allow"),),
+        ).sha256
+    )
 
 
 def test_freeze_excludes_only_trusted_root_markers_not_candidate_files_with_same_name(tmp_path: Path) -> None:
@@ -588,6 +660,62 @@ def test_crash_after_prompt_resumes_the_same_admission_without_a_second_prompt(t
     _assert_crash_resume(tmp_path, "prompt")
 
 
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"delivery": "queue"},
+        {"files": ({"uri": "file:///candidate/input", "mime": "text/plain"},)},
+        {"agent": "different-agent"},
+        {"model": "openai/different-model"},
+        {"variant": "different-variant"},
+    ],
+)
+def test_same_prompt_id_rejects_conflicting_durable_request_fields(changes: dict[str, object]) -> None:
+    request = VanillaPromptRequest(
+        session_id="ses_owned",
+        message_id="msg_owned",
+        text=ORIGINAL_TASK,
+        delivery="steer",
+        model="openai/gpt-5.6-luna",
+        variant="max",
+        directory="/candidate",
+        agent=None,
+        files=(),
+        permission=(("*", "*", "allow"),),
+    )
+    api = FakeOpenCodeApi([])
+    api.prompt(request)
+    with pytest.raises(VanillaHttpError) as raised:
+        api.prompt(replace(request, **changes))
+    assert raised.value.status_code == 409
+    assert len(api.prompts) == 1
+
+
+def test_resume_with_changed_delivery_fails_before_reissuing_durable_prompt(tmp_path: Path) -> None:
+    paths, record, request, workspace = prepared(tmp_path)
+    api = CrashApi("prompt", [([user(), assistant()], "idle")])
+    clock = FakeClock()
+    kwargs = {
+        "model": "openai/gpt-5.6-luna",
+        "variant": "max",
+        "limits": limits(),
+        "breaker": CircuitBreaker(clock=clock),
+        "api": api,
+        "clock": clock,
+        "sleeper": clock.sleep,
+    }
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease.claim_handle(request)
+        with pytest.raises(InjectedCrash):
+            run_vanilla(job, StateStore(paths.state), workspace, record, **kwargs)
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease.claim_handle(request)
+        with pytest.raises(VanillaError, match="identity"):
+            run_vanilla(job, StateStore(paths.state), workspace, record, delivery="queue", **kwargs)
+    assert len(api.prompt_requests) == 1
+    assert len(api.prompts) == 1
+
+
 def test_resume_transport_failure_preserves_prior_provider_progress(tmp_path: Path) -> None:
     paths, record, request, workspace = prepared(tmp_path)
     api = CrashThenTransientApi()
@@ -679,7 +807,7 @@ def _assert_crash_resume(tmp_path: Path, stage: str) -> None:
     assert len(api.sessions) == 1
     assert len(api.prompts) == 1
     assert len(api.create_requests) == 1
-    assert len(api.prompt_requests) == 1
+    assert len(api.prompt_requests) == (2 if stage == "prompt" else 1)
 
 
 @pytest.mark.parametrize(
@@ -966,6 +1094,220 @@ def test_401_trips_campaign_auth_breaker_interrupts_and_sanitizes(
     assert "credential-value" not in paths.root.joinpath("trajectory.json").read_text()
 
 
+def test_one_character_credential_is_absent_from_artifact_bytes_paths_and_symlink_targets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths, record, request, workspace = prepared(tmp_path)
+    monkeypatch.setenv("OPENAI_API_KEY", "Q")
+    secret_dir = workspace.candidate / "nested-Q"
+    secret_dir.mkdir()
+    secret_dir.joinpath("Q.txt").write_text("candidate credential Q")
+    secret_dir.joinpath("link").symlink_to("/tmp/Q-target")
+    failed = assistant()
+    failed["info"]["error"] = {
+        "name": "APIError",
+        "data": {"message": "provider error Q", "statusCode": 500, "isRetryable": False},
+    }
+    failed["parts"] = [{"type": "text", "text": "message Q"}]
+    api = FakeOpenCodeApi([([user("task Q"), failed], "idle")])
+    clock = FakeClock()
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease.claim_handle(request)
+        run_vanilla(
+            job,
+            StateStore(paths.state),
+            workspace,
+            record,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=limits(),
+            breaker=CircuitBreaker(clock=clock),
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+        )
+    for path in paths.root.rglob("*"):
+        assert "Q" not in path.relative_to(paths.root).as_posix()
+        if path.is_symlink():
+            assert "Q" not in path.readlink().as_posix()
+        elif path.is_file():
+            assert b"Q" not in path.read_bytes()
+
+
+def test_credential_that_collides_with_fixed_request_schema_fails_before_adapter_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths, record, request, workspace = prepared(tmp_path)
+    monkeypatch.setenv("OPENAI_API_KEY", "a")
+    api = FakeOpenCodeApi([])
+    clock = FakeClock()
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease.claim_handle(request)
+        with pytest.raises(VanillaError, match="contains a provider credential"):
+            run_vanilla(
+                job,
+                StateStore(paths.state),
+                workspace,
+                record,
+                model="openai/gpt-5.6-luna",
+                variant="max",
+                limits=limits(),
+                breaker=CircuitBreaker(clock=clock),
+                api=api,
+                clock=clock,
+                sleeper=clock.sleep,
+            )
+    assert StateStore(paths.state).read().phase == "planned"
+    assert not paths.root.joinpath("vanilla-execution.json").exists()
+    assert not api.sessions
+
+
+def test_multisegment_credential_is_removed_from_full_snapshot_relative_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths, record, request, workspace = prepared(tmp_path)
+    monkeypatch.setenv("OPENAI_API_KEY", "foo/bar")
+    workspace.candidate.joinpath("foo").mkdir()
+    workspace.candidate.joinpath("foo/bar").write_text("safe")
+    api = FakeOpenCodeApi([([user(), assistant()], "idle")])
+    clock = FakeClock()
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease.claim_handle(request)
+        run_vanilla(
+            job,
+            StateStore(paths.state),
+            workspace,
+            record,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=limits(),
+            breaker=CircuitBreaker(clock=clock),
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+        )
+    assert all("foo/bar" not in path.relative_to(paths.root).as_posix() for path in paths.root.rglob("*"))
+
+
+def test_json_escaped_credential_in_prompt_files_is_rejected_logically_before_encoding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths, record, request, workspace = prepared(tmp_path)
+    monkeypatch.setenv("OPENAI_API_KEY", 'a"b')
+    clock = FakeClock()
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease.claim_handle(request)
+        with pytest.raises(VanillaError, match="contains a provider credential"):
+            run_vanilla(
+                job,
+                StateStore(paths.state),
+                workspace,
+                record,
+                model="openai/gpt-5.6-luna",
+                variant="max",
+                limits=limits(),
+                breaker=CircuitBreaker(clock=clock),
+                api=FakeOpenCodeApi([]),
+                clock=clock,
+                sleeper=clock.sleep,
+                files=({"uri": "data:text/plain,a%22b", "mime": "text/plain", "name": 'a"b'},),
+            )
+
+
+def test_inventory_stops_scandir_before_enumerating_past_file_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "tree"
+    root.mkdir()
+    for index in range(20):
+        root.joinpath(f"file-{index}").write_text("x")
+    real_scandir = vanilla_module.os.scandir
+    calls = 0
+
+    class SentinelScandir:
+        def __init__(self, path: Path) -> None:
+            self.iterator = real_scandir(path)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            self.iterator.close()
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            nonlocal calls
+            calls += 1
+            if calls > 4:
+                raise AssertionError("inventory enumerated beyond its bound")
+            return next(self.iterator)
+
+    monkeypatch.setattr(vanilla_module, "MAX_FREEZE_FILES", 3)
+    monkeypatch.setattr(vanilla_module.os, "scandir", SentinelScandir)
+    with pytest.raises(VanillaError, match="file count"):
+        vanilla_module._inventory(root)
+    assert 0 < calls <= 4
+
+
+def test_inventory_does_not_follow_symlink_cycles(tmp_path: Path) -> None:
+    root = tmp_path / "tree"
+    root.mkdir()
+    root.joinpath("child").mkdir()
+    root.joinpath("child/cycle").symlink_to(root, target_is_directory=True)
+    inventory = vanilla_module._inventory(root)
+    assert len(inventory) == 3
+    assert sum(item["kind"] == "symlink" for item in inventory) == 1
+
+
+def test_inventory_enforces_per_directory_entry_bound(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "tree"
+    root.mkdir()
+    root.joinpath("one").write_text("1")
+    root.joinpath("two").write_text("2")
+    monkeypatch.setattr(vanilla_module, "MAX_DIRECTORY_ENTRIES", 1)
+    with pytest.raises(VanillaError, match="directory entry count"):
+        vanilla_module._inventory(root)
+
+
+def test_inventory_rejects_file_swapped_to_symlink_before_open(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "tree"
+    root.mkdir()
+    victim = root / "victim"
+    victim.write_text("inside")
+    external = tmp_path / "outside"
+    external.write_text("must not be read")
+    real_open = vanilla_module.os.open
+    swapped = False
+
+    def swap_open(path, flags: int, mode: int = 0o777, *, dir_fd: int | None = None):
+        nonlocal swapped
+        if path == "victim" and dir_fd is not None and not swapped:
+            swapped = True
+            victim.unlink()
+            victim.symlink_to(external)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(vanilla_module.os, "open", swap_open)
+    with pytest.raises(VanillaError, match="identity changed"):
+        vanilla_module._inventory(root)
+    assert swapped
+
+
+def test_inventory_checks_deadline_during_directory_enumeration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "tree"
+    root.mkdir()
+    root.joinpath("one").write_text("1")
+    root.joinpath("two").write_text("2")
+    ticks = iter([0.0, 0.0, 301.0])
+    monkeypatch.setattr(vanilla_module.time, "monotonic", lambda: next(ticks, 301.0))
+    with pytest.raises(VanillaError, match="enumeration exceeded time"):
+        vanilla_module._inventory(root)
+
+
 def test_terminal_model_error_is_frozen_without_a_new_trajectory(tmp_path: Path) -> None:
     paths, record, request, workspace = prepared(tmp_path)
     failed = assistant()
@@ -994,8 +1336,45 @@ def test_terminal_model_error_is_frozen_without_a_new_trajectory(tmp_path: Path)
 
     assert result.completion is VanillaCompletion.PROVIDER_ERROR
     assert result.error == "provider error"
-    assert api.interrupts == 0
+    assert result.interrupt_attempted
+    assert not result.forced_stop
+    assert api.interrupts == 1
     assert StateStore(paths.state).read().phase == "frozen"
+
+
+def test_active_terminal_provider_error_stops_container_before_freeze_and_prevents_late_writes(tmp_path: Path) -> None:
+    paths, record, request, workspace = prepared(tmp_path)
+    failed = assistant()
+    failed["info"]["error"] = {
+        "name": "APIError",
+        "data": {"message": "provider exploded", "statusCode": 500, "isRetryable": False},
+    }
+    api = MutatingTerminalApi(workspace, failed)
+    clock = FakeClock()
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease.claim_handle(request)
+        result = run_vanilla(
+            job,
+            StateStore(paths.state),
+            workspace,
+            record,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=limits(),
+            breaker=CircuitBreaker(clock=clock),
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+        )
+    assert result.completion is VanillaCompletion.PROVIDER_ERROR
+    assert result.interrupt_attempted
+    assert result.forced_stop
+    assert api.interrupts == 1
+    assert workspace.stops == 1
+    frozen = paths.root.joinpath("subject/live.log").read_text()
+    api.status(result.session_id)
+    assert paths.root.joinpath("subject/live.log").read_text() == frozen
+    assert workspace.candidate.joinpath("live.log").read_text() == frozen
 
 
 @pytest.mark.parametrize(("turns_before", "expected_phase", "frozen"), [(0, "failed", False), (1, "frozen", True)])
@@ -1220,6 +1599,77 @@ def test_streaming_usage_changes_advance_breaker_generation_without_rewriting_tr
     assert state.phase_timestamps.keys() == {"planned", "preparing", "executing", "frozen"}
 
 
+@pytest.mark.parametrize(
+    "field",
+    [
+        "provider_turns",
+        "actions",
+        "action_identity",
+        "input",
+        "output",
+        "reasoning",
+        "cache_read",
+        "cache_write",
+        "prompt_total",
+        "max_prompt_total",
+        "cost",
+        "messages",
+    ],
+)
+def test_live_poll_regression_interrupts_and_freezes_without_decreasing_breaker_or_cas(
+    tmp_path: Path, field: str
+) -> None:
+    paths, record, request, workspace = prepared(tmp_path)
+    first = assistant(parts=[{"type": "tool", "callID": "call", "state": {"status": "completed"}}])
+    second = copy.deepcopy(first)
+    first_data = [user(), first]
+    second_data = [user(), second]
+    if field == "provider_turns":
+        first_data.append(assistant("msg_second"))
+    elif field == "actions":
+        second["parts"] = []
+    elif field == "action_identity":
+        second["parts"][0]["callID"] = "different-call"
+    elif field in {"input", "output", "reasoning"}:
+        first["info"]["tokens"][field] += 1
+    elif field in {"cache_read", "cache_write"}:
+        first["info"]["tokens"]["cache"][field.removeprefix("cache_")] = 1
+    elif field in {"prompt_total", "max_prompt_total"}:
+        first["info"]["tokens"]["input"] += 1
+    elif field == "cost":
+        first["info"]["cost"] = 0.26
+    else:
+        second["info"]["id"] = "msg_replaced"
+    api = SafetyApi([(first_data, "busy"), (second_data, "busy")])
+    clock = FakeClock()
+    breaker = CircuitBreaker(clock=clock)
+
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease.claim_handle(request)
+        with pytest.raises(VanillaError, match="non-monotonic"):
+            run_vanilla(
+                job,
+                StateStore(paths.state),
+                workspace,
+                record,
+                model="openai/gpt-5.6-luna",
+                variant="max",
+                limits=limits(),
+                breaker=breaker,
+                api=api,
+                clock=clock,
+                sleeper=clock.sleep,
+            )
+    state = StateStore(paths.state).read()
+    assert state.phase == "frozen"
+    assert state.exit_class == "invalid_usage_regression"
+    assert api.interrupts == 1
+    observed = breaker.snapshot()["jobs"][workspace.manifest.job_id]["usage"]
+    assert observed["provider_turns"] == len(first_data) - 1
+    assert state.provider_turns == len(first_data) - 1
+    assert state.generation == 4
+
+
 def test_hard_cost_cap_interrupts_active_session(tmp_path: Path) -> None:
     paths, record, request, workspace = prepared(tmp_path)
     api = SafetyApi([([user(), assistant(cost=0.25)], "busy")])
@@ -1299,6 +1749,8 @@ def test_resumed_confirmed_session_is_interrupted_by_preexisting_global_stop(tmp
         result = run_vanilla(job, StateStore(paths.state), workspace, record, **kwargs)
     assert result.completion is VanillaCompletion.AUTH
     assert api.interrupts == 1
+    assert len(api.prompt_requests) == 2
+    assert api.prompt_requests[-1]["resume"] is False
 
 
 def test_frozen_invocation_returns_persisted_result_without_api_or_second_freeze(tmp_path: Path) -> None:
