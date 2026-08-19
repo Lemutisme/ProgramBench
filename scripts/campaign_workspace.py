@@ -11,7 +11,7 @@ import tempfile
 import threading
 import time
 import uuid
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, field, fields, replace
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Callable, Mapping
@@ -466,6 +466,36 @@ class WorkspaceLease:
             self._owner = None
 
 
+class StopCoordinator:
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._state = "ready"
+
+    def run(self, operation: Callable[[], None], *, timeout: float = 45.0) -> None:
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            while self._state == "stopping":
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise WorkspaceError("concurrent workspace stop timed out")
+                self._condition.wait(remaining)
+            if self._state == "stopped":
+                return
+            if self._state == "failed":
+                raise WorkspaceError("concurrent workspace stop failed")
+            self._state = "stopping"
+        try:
+            operation()
+        except BaseException:
+            with self._condition:
+                self._state = "ready"
+                self._condition.notify_all()
+            raise
+        with self._condition:
+            self._state = "stopped"
+            self._condition.notify_all()
+
+
 @dataclass(frozen=True)
 class DockerWorkspace:
     """Adapter handoff token backed by a durably running workspace manifest.
@@ -483,6 +513,7 @@ class DockerWorkspace:
     lease: WorkspaceLease
     request: WorkspaceRequest
     adopted: bool = False
+    stop_coordinator: StopCoordinator = field(default_factory=StopCoordinator, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.manifest.phase != "running" or not self.manifest.candidate_mutable:
@@ -561,7 +592,7 @@ class DockerWorkspace:
             self.manifest.instance_id,
             self.manifest.arm,
         )
-        self._stop(active)
+        self.stop_coordinator.run(lambda: self._stop_owned(active))
 
     def force_stop(self) -> None:
         self.lease.require_process_identity(
@@ -570,9 +601,9 @@ class DockerWorkspace:
             self.manifest.instance_id,
             self.manifest.arm,
         )
-        self._stop(self.lease)
+        self.stop_coordinator.run(lambda: self._stop_owned(self.lease))
 
-    def _stop(self, active: WorkspaceLease) -> None:
+    def _stop_owned(self, active: WorkspaceLease) -> None:
         current = _load_manifest(self.manifest_path)
         if _static_identity(current) != _static_identity(self.manifest) or current.container_id != self.container_id:
             raise ContainerConflictError("persisted workspace changed before stop")
@@ -616,6 +647,38 @@ def ensure_workspace(request: WorkspaceRequest, lease: WorkspaceLease | None = N
     lease.claim_handle(request)
     try:
         return _ensure_workspace(replace(request, workspace_lease=lease))
+    except BaseException:
+        lease.release_handle()
+        raise
+
+
+def reconcile_workspace_for_cleanup(request: WorkspaceRequest, lease: WorkspaceLease) -> DockerWorkspace:
+    """Adopt only an exact persisted running workspace; never create or start one."""
+    lease.claim_handle(request)
+    try:
+        manifest = _load_manifest(request.state_root / "workspace.json")
+        if (
+            manifest.job_root != request.job.root
+            or manifest.campaign != request.campaign
+            or manifest.instance_id != request.instance_id
+            or manifest.arm != request.arm
+            or manifest.phase != "running"
+        ):
+            raise ContainerConflictError("cleanup workspace does not match an exact persisted running job")
+        _require_safe_manifest_paths(manifest)
+        _require_path_identities(manifest)
+        _require_binary(manifest)
+        return DockerWorkspace(
+            manifest,
+            manifest.manifest_path,
+            request.docker,
+            request.docker_runner or _run_docker,
+            request.health_probe or _probe_health,
+            request.health_timeout,
+            lease,
+            request,
+            adopted=True,
+        )
     except BaseException:
         lease.release_handle()
         raise

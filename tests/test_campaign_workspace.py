@@ -8,6 +8,7 @@ import stat
 import subprocess
 import sys
 import threading
+import time
 import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -491,6 +492,49 @@ def test_owned_workspace_force_stop_is_safe_from_scheduler_thread(tmp_path: Path
     assert errors == []
     assert json.loads(workspace.manifest_path.read_text())["phase"] == "stopped"
     assert sum(command[1] == "stop" for command in docker.commands) == 1
+
+
+def test_normal_stop_and_force_stop_share_one_serialized_docker_stop(tmp_path: Path) -> None:
+    class OverlappingStopDocker(RecordingDocker):
+        def __init__(self):
+            super().__init__()
+            self.stop_entered = threading.Event()
+            self.release_stop = threading.Event()
+
+        def __call__(self, command: tuple[str, ...], timeout: float):
+            if command[1] == "stop":
+                self.stop_entered.set()
+                assert self.release_stop.wait(1)
+            return super().__call__(command, timeout)
+
+    docker = OverlappingStopDocker()
+    value = request(tmp_path, docker)
+    value.job.root.mkdir(parents=True)
+    errors = []
+
+    with JobLease(value.job, resume=True, redo=False, retry_infra=False), WorkspaceLease(value) as lease:
+        workspace = ensure_workspace_impl(value, lease)
+
+        def force_stop():
+            try:
+                workspace.force_stop()
+            except BaseException as error:
+                errors.append(error)
+
+        force = threading.Thread(target=force_stop)
+        force.start()
+        assert docker.stop_entered.wait(1)
+        release = threading.Thread(target=lambda: (time.sleep(0.05), docker.release_stop.set()))
+        release.start()
+        workspace.stop()
+        force.join(1)
+        release.join(1)
+
+    manifest = json.loads(workspace.manifest_path.read_text())
+    assert errors == []
+    assert sum(command[1] == "stop" for command in docker.commands) == 1
+    assert manifest["phase"] == "stopped"
+    assert manifest["container_id"] == "a" * 64
 
 
 def test_workspace_lease_is_cross_process_and_preserves_journal(tmp_path: Path) -> None:

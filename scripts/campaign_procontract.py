@@ -770,7 +770,9 @@ def run_procontract(
     state = state_store.read()
     guarded_api = StopAwareApi(api, stop)
     if stop.is_set() and state.phase not in {"done", "failed", "interrupted"}:
-        if job.job.root.joinpath("procontract-issue-response.json").is_file():
+        if job.job.root.joinpath("procontract-issue-response.json").is_file() or _issue_may_be_active(
+            job.job.root / "procontract-issue-active.json"
+        ):
             return _finish_active_campaign_stop(
                 job,
                 state_store,
@@ -925,24 +927,25 @@ def _finish_active_campaign_stop(
         raise ProContractError("persisted Contract issue is invalid")
     payload = issue["payload"]
     response_path = job.job.root / "procontract-issue-response.json"
+    marker_path = job.job.root / "procontract-issue-active.json"
     if not response_path.is_file():
         try:
-            accepted = (
-                _reconcile_ambiguous_issue(
-                    api,
-                    payload,
-                    response_path,
-                    _all_credential_names(workspace.manifest.credential_env),
-                )
-                if guarded_api.attempted("issue")
-                else None
+            accepted = _reconcile_ambiguous_issue(
+                api,
+                payload,
+                response_path,
+                _all_credential_names(workspace.manifest.credential_env),
             )
-        except ProContractError:
-            return _finish_unadmitted_campaign_stop(job, state_store, state, workspace, clock)
+        except ProContractHttpError:
+            return _finish_ambiguous_issue_stop(job, state_store, state, workspace, issue, clock)
         if accepted is None:
+            if _issue_may_be_active(marker_path):
+                state = _set_issue_marker(marker_path, state_store, state, str(issue["payloadHash"]), False, "absent")
             return _finish_unadmitted_campaign_stop(job, state_store, state, workspace, clock)
     else:
         accepted = _validate_issue_response(_read_json(response_path), payload)
+    if _issue_may_be_active(marker_path):
+        state = _set_issue_marker(marker_path, state_store, state, str(issue["payloadHash"]), False, "reconciled")
     contract = guarded_api.observed("get_contract")
     if not isinstance(contract, Mapping):
         contract = accepted["data"]
@@ -999,6 +1002,65 @@ def _finish_active_campaign_stop(
         poll_interval,
         quiet,
     )
+
+
+def _finish_ambiguous_issue_stop(
+    job: JobLease,
+    state_store: StateStore,
+    state: JobState,
+    workspace: DockerWorkspace,
+    issue: Mapping[str, object],
+    clock: Callable[[], float],
+) -> ProContractResult:
+    payload = issue["payload"]
+    if not isinstance(payload, Mapping):
+        raise ProContractError("persisted Contract issue payload is invalid")
+    if workspace.lease._handle_active:
+        workspace.stop_for_freeze()
+    result = ProContractResult(
+        contract_id=str(payload["id"]),
+        session_id="ses_unconfirmed",
+        prompt_id="msg_unconfirmed",
+        revision=1,
+        spec_hash=_hash_json(_expected_spec(payload)),
+        status="dormant",
+        completion=ProContractCompletion.LOST_SERVER,
+        provider_turns=state.provider_turns,
+        actions=state.actions,
+        cost=Decimal(str(state.cost)),
+        elapsed_seconds=max(0, clock() - float(issue["startedAt"])),
+        acceptance_hash=str(issue["acceptanceHash"]),
+        subject_hash=None,
+        replay_evidence_hash=None,
+        report_hash=None,
+        package_hash=None,
+        executable_hash=None,
+        attestation_id=None,
+        interrupt_attempted=False,
+        forced_stop=True,
+        workspace_frozen=False,
+        container_stopped_for_freeze=True,
+        quiet=False,
+        outstanding=(str(payload["id"]),),
+        exit_class="lost_server",
+        error="ambiguous Contract issue could not be reconciled",
+        usage_incomplete=True,
+    )
+    result_path = job.job.root / "procontract-result.json"
+    _write_json(result_path, result.to_dict())
+    marker_path = job.job.root / "procontract-issue-active.json"
+    state_store.transition(
+        "failed",
+        command_identity=state.command_identity or "campaign_stop",
+        expected_generation=state.generation,
+        exit_class="lost_server",
+        artifact_hashes={
+            "procontract-issue.json": _sha256(job.job.root / "procontract-issue.json"),
+            **({marker_path.name: _sha256(marker_path)} if marker_path.is_file() else {}),
+            result_path.name: _sha256(result_path),
+        },
+    )
+    return result
 
 
 def _run_procontract(
@@ -1075,8 +1137,45 @@ def _run_procontract(
         raise ProContractError("persisted Contract start time is invalid")
     deadline = float(started_at) + MAX_WALL_TIME_SECONDS
     accepted_path = job.job.root / "procontract-issue-response.json"
+    marker_path = job.job.root / "procontract-issue-active.json"
     issue_attempts = 0
-    while True:
+    accepted: Mapping[str, object] | None = None
+    if accepted_path.is_file():
+        accepted = _issue_or_reconcile(
+            api,
+            payload,
+            accepted_path,
+            _all_credential_names(workspace.manifest.credential_env),
+        )
+        if _issue_may_be_active(marker_path):
+            state = _set_issue_marker(marker_path, state_store, state, str(issue["payloadHash"]), False, "response")
+    elif _issue_may_be_active(marker_path):
+        try:
+            accepted = _reconcile_ambiguous_issue(
+                api,
+                payload,
+                accepted_path,
+                _all_credential_names(workspace.manifest.credential_env),
+            )
+        except ProContractHttpError:
+            return _finish_ambiguous_issue_stop(job, state_store, state, workspace, issue, clock)
+        state = _set_issue_marker(
+            marker_path,
+            state_store,
+            state,
+            str(issue["payloadHash"]),
+            False,
+            "reconciled" if accepted is not None else "absent",
+        )
+    while accepted is None:
+        state = _set_issue_marker(
+            marker_path,
+            state_store,
+            state,
+            str(issue["payloadHash"]),
+            True,
+            None,
+        )
         try:
             issue_attempts += 1
             accepted = _issue_or_reconcile(
@@ -1084,6 +1183,14 @@ def _run_procontract(
                 payload,
                 accepted_path,
                 _all_credential_names(workspace.manifest.credential_env),
+            )
+            state = _set_issue_marker(
+                marker_path,
+                state_store,
+                state,
+                str(issue["payloadHash"]),
+                False,
+                "response",
             )
             break
         except ProContractError as error:
@@ -1098,10 +1205,28 @@ def _run_procontract(
                 )
             except ProContractConflictError:
                 raise
+            except ProContractHttpError:
+                return _finish_ambiguous_issue_stop(job, state_store, state, workspace, issue, clock)
             except ProContractError:
-                accepted = None
+                raise
             if accepted is not None:
+                state = _set_issue_marker(
+                    marker_path,
+                    state_store,
+                    state,
+                    str(issue["payloadHash"]),
+                    False,
+                    "reconciled",
+                )
                 break
+            state = _set_issue_marker(
+                marker_path,
+                state_store,
+                state,
+                str(issue["payloadHash"]),
+                False,
+                "absent",
+            )
             if status_code == 409:
                 raise ProContractConflictError("existing Contract conflicts with frozen issue") from None
             if status_code == 429:
@@ -2517,6 +2642,46 @@ def _load_or_create_issue(path: Path, workspace: DockerWorkspace, clock: Callabl
     return record
 
 
+def _issue_may_be_active(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    raw = _read_json(path)
+    if (
+        not isinstance(raw, Mapping)
+        or set(raw) != {"version", "payloadHash", "issue_may_be_active", "resolution"}
+        or raw["version"] != 1
+        or not isinstance(raw["payloadHash"], str)
+        or type(raw["issue_may_be_active"]) is not bool
+        or raw["resolution"] is not None
+        and not isinstance(raw["resolution"], str)
+    ):
+        raise ProContractError("persisted Contract issue activity marker is invalid")
+    return raw["issue_may_be_active"]
+
+
+def _set_issue_marker(
+    path: Path,
+    state_store: StateStore,
+    state: JobState,
+    payload_hash: str,
+    active: bool,
+    resolution: str | None,
+) -> JobState:
+    _write_json(
+        path,
+        {
+            "version": 1,
+            "payloadHash": payload_hash,
+            "issue_may_be_active": active,
+            "resolution": resolution,
+        },
+    )
+    return state_store.update(
+        expected_generation=state.generation,
+        artifact_hashes={**dict(state.artifact_hashes or {}), path.name: _sha256(path)},
+    )
+
+
 def _validate_issue_record(raw: Mapping[str, object], workspace: DockerWorkspace) -> None:
     if (
         set(raw)
@@ -2575,7 +2740,11 @@ def _reconcile_ambiguous_issue(
         return None
     if contract is not None and execution is None:
         _validate_contract(contract, payload)
-        return None
+        raise ProContractHttpError(
+            "existing Contract execution binding is unavailable",
+            status_code=503,
+            transient=True,
+        )
     if contract is None:
         raise ProContractConflictError("ambiguous issue left an incomplete native Contract binding")
     contract = _validate_contract(contract, payload)

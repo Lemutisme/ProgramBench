@@ -34,11 +34,18 @@ from scripts.campaign_state import JobLease, JobPaths, JobState, StateStore
 from scripts.campaign_stop import StopToken
 from scripts.campaign_usage import CircuitBreaker
 from scripts.campaign_vanilla import HttpOpenCodeApi, run_vanilla
-from scripts.campaign_workspace import WorkspaceLease, WorkspaceRequest, ensure_workspace
+from scripts.campaign_workspace import (
+    WorkspaceLease,
+    WorkspaceRequest,
+    ensure_workspace,
+    reconcile_workspace_for_cleanup,
+)
 from scripts.run_opencode import CampaignConfig, ConfigError, expand_jobs, load_config, select_instances
 
 
 MAX_ACTIVE_JOBS = 8
+JOB_CLEANUP_MAX_ATTEMPTS = 3
+JOB_CLEANUP_TIMEOUT_SECONDS = 0.25
 DRY_RUN_OUTPUT = Path("campaign-dry-run")
 _CREDENTIAL_ENV = ("OPENAI_API_KEY", "OPENCODE_SERVER_PASSWORD")
 
@@ -91,6 +98,7 @@ class CampaignPlan:
     jobs: tuple[CampaignJob, ...]
     installs: Mapping[str, object]
     dry_run: bool
+    cleanup_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -217,6 +225,7 @@ def plan_campaign(
         if not resume:
             raise CampaignError(f"campaign already exists: {manifest_path}; use --resume")
         breaker_path = root / "breaker.json"
+        cleanup_only = False
         if breaker_path.exists():
             breaker = CircuitBreaker.from_snapshot(_read_json(breaker_path))
             if acknowledge is not None:
@@ -226,9 +235,12 @@ def plan_campaign(
                     breaker.acknowledge(acknowledge)
                 _persist_breaker_required(breaker_path, breaker, None)
             if breaker.paused:
-                raise CampaignPausedError(
-                    f"campaign is paused ({breaker.pause_reason}); acknowledge it through the persisted breaker state before --resume"
-                )
+                if breaker.hard_stopped:
+                    cleanup_only = True
+                else:
+                    raise CampaignPausedError(
+                        f"campaign is paused ({breaker.pause_reason}); acknowledge it through the persisted breaker state before --resume"
+                    )
         expected_selection = {
             "limit": limit,
             "seed": seed,
@@ -237,7 +249,7 @@ def plan_campaign(
         }
         if frozen.get("selection") != expected_selection:
             raise CampaignError("campaign manifest conflicts with requested selection")
-        return _plan_from_manifest(config, root, manifest_path, frozen, dry_run)
+        return _plan_from_manifest(config, root, manifest_path, frozen, dry_run, cleanup_only)
 
     filtered = tuple(filter_instances([dict(instance) for instance in instances], filter_spec=instance_filter or ""))
     eligible = tuple(instance for instance in filtered if str(instance.get("instance_id", "")) not in config.excluded)
@@ -298,6 +310,7 @@ def run_campaign(
     running: dict[Future[object], CampaignJob] = {}
     completed = 0
     failed = 0
+    cleanup_failures = 0
     executor = _DaemonWorkerPool(workers)
     interrupted = stop.is_set()
     if interrupted:
@@ -353,7 +366,12 @@ def run_campaign(
                 candidate = running.pop(future)
                 try:
                     outcome = future.result()
-                    if isinstance(outcome, JobRunResult) and outcome.status in {"failed", "interrupted"}:
+                    if isinstance(outcome, JobRunResult) and outcome.status == "cleanup_failed":
+                        cleanup_failures += 1
+                        failed += 1
+                        stop.set("workspace_cleanup_failed")
+                        _append_log(state_path, candidate, "failed")
+                    elif isinstance(outcome, JobRunResult) and outcome.status in {"failed", "interrupted"}:
                         failed += 1
                         _append_log(state_path, candidate, "failed")
                     else:
@@ -402,7 +420,10 @@ def run_campaign(
                     candidate = running.pop(future)
                     try:
                         outcome = future.result()
-                        if isinstance(outcome, JobRunResult) and outcome.status in {"failed", "interrupted"}:
+                        if isinstance(outcome, JobRunResult) and outcome.status == "cleanup_failed":
+                            cleanup_failures += 1
+                            failed += 1
+                        elif isinstance(outcome, JobRunResult) and outcome.status in {"failed", "interrupted"}:
                             failed += 1
                         else:
                             completed += 1
@@ -424,7 +445,10 @@ def run_campaign(
                         candidate = running.pop(future)
                         try:
                             outcome = future.result()
-                            if isinstance(outcome, JobRunResult) and outcome.status in {"failed", "interrupted"}:
+                            if isinstance(outcome, JobRunResult) and outcome.status == "cleanup_failed":
+                                cleanup_failures += 1
+                                failed += 1
+                            elif isinstance(outcome, JobRunResult) and outcome.status in {"failed", "interrupted"}:
                                 failed += 1
                             else:
                                 completed += 1
@@ -432,15 +456,57 @@ def run_campaign(
                             failed += 1
                         _append_log(state_path, candidate, "interrupted")
                         persist_breaker()
-            shutdown_failed = bool(running) or bool(force_failures)
+            shutdown_failed = bool(running) or bool(force_failures) or cleanup_failures > 0
             for future in running:
                 future.cancel()
         executor.shutdown(wait=not running, cancel_futures=True)
     if durability_error is not None:
         raise durability_error
     if shutdown_failed:
-        raise CampaignShutdownError(f"campaign shutdown failed for {len(running) + len(force_failures)} active job(s)")
+        raise CampaignShutdownError(
+            f"campaign shutdown failed for {len(running) + len(force_failures) + cleanup_failures} active job(s)"
+        )
     return CampaignResult(completed, failed, tuple(pending), len(running), breaker.pause_reason, paused, interrupted)
+
+
+def run_cleanup_campaign(
+    plan: CampaignPlan,
+    breaker: CircuitBreaker,
+    *,
+    workspace_factory: Callable[[WorkspaceRequest, WorkspaceLease], object] = reconcile_workspace_for_cleanup,
+    vanilla_runner: Callable[..., object] = run_vanilla,
+    procontract_runner: Callable[..., object] = run_procontract,
+    vanilla_api_factory: Callable[[object], object] | None = None,
+    procontract_api_factory: Callable[[object], object] | None = None,
+) -> CampaignResult:
+    stop = StopToken()
+    stop.set("campaign_hard_stop")
+    outcomes = tuple(
+        run_job(
+            plan,
+            candidate,
+            breaker=breaker,
+            resume=True,
+            cleanup_only=True,
+            stop_token=stop,
+            workspace_factory=workspace_factory,
+            vanilla_runner=vanilla_runner,
+            procontract_runner=procontract_runner,
+            vanilla_api_factory=vanilla_api_factory,
+            procontract_api_factory=procontract_api_factory,
+        )
+        for candidate in plan.jobs
+    )
+    failed = sum(outcome.status in {"failed", "cleanup_failed"} for outcome in outcomes)
+    return CampaignResult(
+        completed=len(outcomes) - failed,
+        failed=failed,
+        pending=(),
+        running=0,
+        pause_reason=breaker.pause_reason,
+        paused=True,
+        interrupted=True,
+    )
 
 
 def run_job(
@@ -451,6 +517,7 @@ def run_job(
     resume: bool = False,
     redo: bool = False,
     retry_infra: bool = False,
+    cleanup_only: bool = False,
     stop_event: threading.Event | None = None,
     stop_token: StopToken | None = None,
     workspace_factory: Callable[[WorkspaceRequest, WorkspaceLease], object] = ensure_workspace,
@@ -465,15 +532,28 @@ def run_job(
     stop = stop_token or StopToken(stop_event)
     paths = JobPaths(plan.output / candidate.arm / candidate.instance_id)
     store = StateStore(paths.state)
-    with JobLease(paths, resume=resume, redo=redo, retry_infra=retry_infra) as job_lease:
+    with JobLease(
+        paths,
+        resume=resume,
+        redo=redo,
+        retry_infra=retry_infra,
+        cleanup_only=cleanup_only,
+    ) as job_lease:
         if not job_lease.should_run:
             return JobRunResult(candidate, "skipped")
         state = store.read_optional()
+        if (
+            cleanup_only
+            and state is not None
+            and state.phase in {"done", "failed", "interrupted"}
+            and state.exit_class != "cleanup_failed"
+        ):
+            return JobRunResult(candidate, "skipped")
         if state is None:
             store.write(JobState("planned"))
         elif redo or (retry_infra and state.phase == "failed") or (resume and state.phase == "interrupted"):
             job_lease.reset_for_rerun()
-        if stop.is_set() or breaker.stop_active:
+        if (stop.is_set() or breaker.stop_active) and not cleanup_only:
             _terminalize(store, "interrupted", "campaign_stop")
             return JobRunResult(candidate, "interrupted")
         install = _install_for(plan, candidate.arm)
@@ -499,7 +579,14 @@ def run_job(
                     terminalize=lambda: _terminalize(store, "interrupted", "campaign_stop"),
                 )
                 try:
-                    if stop.is_set() or breaker.stop_active:
+                    if cleanup_only and state is not None and state.exit_class == "cleanup_failed":
+                        return JobRunResult(
+                            candidate,
+                            "completed"
+                            if _bounded_cleanup_stop(workspace.stop_for_freeze, JOB_CLEANUP_TIMEOUT_SECONDS)
+                            else "cleanup_failed",
+                        )
+                    if (stop.is_set() or breaker.stop_active) and not cleanup_only:
                         workspace.stop_for_freeze()
                         _terminalize(store, "interrupted", "campaign_stop")
                         return JobRunResult(candidate, "interrupted")
@@ -552,18 +639,47 @@ def run_job(
                 except BaseException as error:
                     exit_class, traceback_hash = _exception_metadata(store, error)
                     interrupted = stop.is_set()
+                    cleanup_deadline = time.monotonic() + JOB_CLEANUP_TIMEOUT_SECONDS
+                    attempts = 0
+                    while (
+                        workspace_lease._handle_active
+                        and attempts < JOB_CLEANUP_MAX_ATTEMPTS
+                        and time.monotonic() < cleanup_deadline
+                    ):
+                        attempts += 1
+                        if not _bounded_cleanup_stop(
+                            workspace.stop_for_freeze,
+                            max(0.0, cleanup_deadline - time.monotonic()),
+                        ):
+                            stop.set("workspace_cleanup_failed")
+                            time.sleep(0.01)
+                    if workspace_lease._handle_active:
+                        evidence_path = paths.root / "cleanup-failure.json"
+                        container_id = getattr(workspace, "container_id", None)
+                        _atomic_json(
+                            evidence_path,
+                            {
+                                "version": 1,
+                                "attempts": attempts,
+                                "container_ids": [container_id] if isinstance(container_id, str) else [],
+                                "status": "cleanup_failed",
+                            },
+                        )
+                        _terminalize(
+                            store,
+                            "failed",
+                            "cleanup_failed",
+                            artifact_hashes={
+                                evidence_path.name: hashlib.sha256(evidence_path.read_bytes()).hexdigest()
+                            },
+                        )
+                        return JobRunResult(candidate, "cleanup_failed")
                     _terminalize(
                         store,
                         "interrupted" if interrupted else "failed",
                         "campaign_stop" if interrupted else exit_class,
                         traceback_hash=traceback_hash,
                     )
-                    while workspace_lease._handle_active:
-                        try:
-                            workspace.stop_for_freeze()
-                        except BaseException:
-                            stop.set("workspace_cleanup_failed")
-                            time.sleep(0.01)
                     return JobRunResult(candidate, "interrupted" if stop.is_set() else "failed")
                 finally:
                     stop.registry.unregister(active)
@@ -647,6 +763,10 @@ def main(arguments: Sequence[str] | None = None) -> int:
         if breaker_path.exists()
         else CircuitBreaker.from_campaign_config(config)
     )
+    if plan.cleanup_only:
+        run_cleanup_campaign(plan, breaker)
+        print(f"campaign remains paused after cleanup: {breaker.pause_reason}", file=sys.stderr, flush=True)
+        return 1
     try:
         result = run_campaign(
             plan.jobs,
@@ -668,13 +788,19 @@ def main(arguments: Sequence[str] | None = None) -> int:
         if error.recovery_path is None:
             print(json.dumps(error.recovery_snapshot, allow_nan=False, sort_keys=True), file=sys.stderr, flush=True)
         return 1
-    except CampaignShutdownError:
+    except CampaignShutdownError as error:
+        print(f"campaign shutdown failed: {_sanitize_shutdown_error(error)}", file=sys.stderr, flush=True)
         return 1
     return 0 if not (result.failed or result.paused or result.interrupted or result.pending) else 1
 
 
 def _plan_from_manifest(
-    config: CampaignConfig, root: Path, manifest_path: Path, raw: Mapping[str, object], dry_run: bool
+    config: CampaignConfig,
+    root: Path,
+    manifest_path: Path,
+    raw: Mapping[str, object],
+    dry_run: bool,
+    cleanup_only: bool = False,
 ) -> CampaignPlan:
     selected = raw.get("selected_ids")
     jobs = raw.get("jobs")
@@ -691,7 +817,9 @@ def _plan_from_manifest(
         raise CampaignError("campaign manifest has malformed job") from error
     if len(frozen_jobs) != len(jobs):
         raise CampaignError("campaign manifest has malformed jobs")
-    return CampaignPlan(root, manifest_path, config, tuple(selected), frozen_jobs, dict(installs), dry_run)
+    return CampaignPlan(
+        root, manifest_path, config, tuple(selected), frozen_jobs, dict(installs), dry_run, cleanup_only
+    )
 
 
 def _selection_instance(instance: Mapping[str, object]) -> Mapping[str, str]:
@@ -913,7 +1041,39 @@ def _campaign_name(root: Path) -> str:
     return name[:128]
 
 
-def _terminalize(store: StateStore, phase: str, exit_class: str, *, traceback_hash: str | None = None) -> bool:
+def _bounded_cleanup_stop(operation: Callable[[], object], timeout: float) -> bool:
+    result: list[bool] = []
+
+    def run() -> None:
+        try:
+            operation()
+            result.append(True)
+        except BaseException:
+            result.append(False)
+
+    thread = threading.Thread(target=run, name="campaign-job-cleanup", daemon=True)
+    thread.start()
+    thread.join(timeout)
+    return not thread.is_alive() and result == [True]
+
+
+def _sanitize_shutdown_error(error: CampaignShutdownError) -> str:
+    message = " ".join(str(error).split())[:512]
+    for name in _CREDENTIAL_ENV:
+        value = os.environ.get(name)
+        if value:
+            message = message.replace(value, "[REDACTED]")
+    return message
+
+
+def _terminalize(
+    store: StateStore,
+    phase: str,
+    exit_class: str,
+    *,
+    traceback_hash: str | None = None,
+    artifact_hashes: Mapping[str, str] | None = None,
+) -> bool:
     try:
         state = store.read_optional()
         if state is None:
@@ -934,7 +1094,11 @@ def _terminalize(store: StateStore, phase: str, exit_class: str, *, traceback_ha
             command_identity=state.command_identity or "campaign",
             expected_generation=state.generation,
             exit_class=exit_class,
-            artifact_hashes={} if traceback_hash is None else {"traceback": traceback_hash},
+            artifact_hashes=artifact_hashes
+            if artifact_hashes is not None
+            else {}
+            if traceback_hash is None
+            else {"traceback": traceback_hash},
         )
         return True
     except BaseException:

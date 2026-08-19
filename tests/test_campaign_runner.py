@@ -989,7 +989,7 @@ def test_resume_rejects_changed_frozen_selection_options(tmp_path: Path):
 
 
 def test_resume_acknowledges_recoverable_breaker_pause_but_not_hard_stop(tmp_path: Path):
-    from scripts.campaign_runner import CampaignPausedError, plan_campaign
+    from scripts.campaign_runner import plan_campaign
     from scripts.campaign_usage import TurnUsage, UsageSummary
     from scripts.run_opencode import load_config
 
@@ -1038,17 +1038,138 @@ def test_resume_acknowledges_recoverable_breaker_pause_but_not_hard_stop(tmp_pat
     )
     (tmp_path / "hard/breaker.json").write_text(json.dumps(hard.snapshot()))
 
-    with pytest.raises(CampaignPausedError, match="hard cost"):
-        plan_campaign(
-            config,
-            instances,
-            output=tmp_path / "hard",
-            limit=1,
-            dry_run=True,
-            resume=True,
-            acknowledge="all",
-        )
+    cleanup = plan_campaign(
+        config,
+        instances,
+        output=tmp_path / "hard",
+        limit=1,
+        dry_run=True,
+        resume=True,
+        acknowledge="all",
+    )
+    assert cleanup.cleanup_only
     assert CircuitBreaker.from_snapshot(json.loads((tmp_path / "hard/breaker.json").read_text())).hard_stopped
+
+
+def test_persisted_hard_stop_resume_runs_cleanup_only_without_admission(tmp_path: Path, monkeypatch):
+    from scripts import campaign_runner
+    from scripts.campaign_usage import TurnUsage, UsageSummary
+    from scripts.run_opencode import load_config
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config_path = tmp_path / "campaign.yaml"
+    config_path.write_text(_config(repo))
+    config = load_config(config_path)
+    instances = [{"instance_id": "one", "difficulty": "easy", "language": "python", "image_name": "one"}]
+    plan = campaign_runner.plan_campaign(
+        config,
+        instances,
+        output=tmp_path / "out",
+        limit=1,
+        prepare_install_fn=lambda arm, _: {"arm": arm.name},
+    )
+    breaker = CircuitBreaker(hard_cost_cap="1")
+    turn = TurnUsage(input=1, prompt_total=1, cost=Decimal("1"))
+    breaker.observe(
+        "hard",
+        0,
+        UsageSummary(
+            provider_turns=1,
+            input=1,
+            prompt_total=1,
+            turns_without_cache=1,
+            max_prompt_total=1,
+            cost=Decimal("1"),
+            turns=(turn,),
+        ),
+    )
+    (plan.output / "breaker.json").write_text(json.dumps(breaker.snapshot()))
+    terminal = plan.jobs[0]
+    for candidate in plan.jobs:
+        paths = campaign_runner.JobPaths(plan.output / candidate.arm / candidate.instance_id)
+        store = campaign_runner.StateStore(paths.state)
+        state = store.write(campaign_runner.JobState("planned"))
+        if candidate == terminal:
+            store.transition(
+                "failed",
+                command_identity="prior-cleanup",
+                expected_generation=state.generation,
+                exit_class="cleanup_failed",
+            )
+        paths.root.joinpath("cleanup-failure.json").write_text('{"status":"prior_force_failed"}\n')
+
+    resumed = campaign_runner.plan_campaign(
+        config,
+        instances,
+        output=plan.output,
+        limit=1,
+        resume=True,
+        prepare_install_fn=lambda *_: pytest.fail("cleanup resume cannot resolve moving refs"),
+    )
+    monkeypatch.setattr(campaign_runner, "_install_for", lambda frozen, arm: frozen.installs[arm])
+    calls = []
+    workspaces = []
+
+    class Workspace:
+        base_url = "http://127.0.0.1:9999"
+        port = 9999
+
+        def __init__(self, request, lease):
+            self.request = request
+            self.lease = lease
+            self.stops = 0
+            self.blocking = request.arm == terminal.arm
+            lease.claim_handle(request)
+
+        def stop_for_freeze(self):
+            if self.blocking:
+                time.sleep(1)
+                raise RuntimeError("prior cleanup remains blocked")
+            self.stops += 1
+            self.lease.release_handle()
+
+    def workspace_factory(request, lease):
+        workspace = Workspace(request, lease)
+        workspaces.append(workspace)
+        return workspace
+
+    def adapter(_job, store, workspace, *_args, **kwargs):
+        assert kwargs["stop_token"].is_set()
+        calls.append((workspace.request.instance_id, workspace.request.arm))
+        state = store.read()
+        store.transition(
+            "interrupted",
+            command_identity=state.command_identity or "cleanup",
+            expected_generation=state.generation,
+            exit_class="hard_stop_cleanup",
+        )
+        workspace.stop_for_freeze()
+
+    started = time.monotonic()
+    result = campaign_runner.run_cleanup_campaign(
+        resumed,
+        breaker,
+        workspace_factory=workspace_factory,
+        vanilla_runner=adapter,
+        procontract_runner=adapter,
+        vanilla_api_factory=lambda _: object(),
+        procontract_api_factory=lambda _: object(),
+    )
+
+    assert resumed.cleanup_only
+    assert time.monotonic() - started < 0.5
+    assert result.paused
+    assert result.interrupted
+    assert result.failed == 1
+    assert set(calls) == {(candidate.instance_id, candidate.arm) for candidate in resumed.jobs if candidate != terminal}
+    assert len(workspaces) == 2
+    assert sum(workspace.stops for workspace in workspaces) == 1
+    assert breaker.hard_stopped
+    for candidate in resumed.jobs:
+        state = campaign_runner.StateStore(resumed.output / candidate.arm / candidate.instance_id / "state.json").read()
+        assert state.phase == ("failed" if candidate == terminal else "interrupted")
+        assert state.exit_class == ("cleanup_failed" if candidate == terminal else "hard_stop_cleanup")
 
 
 @pytest.mark.parametrize("phase", ["planned", "preparing", "executing", "frozen", "packaged", "preflighted"])
@@ -1503,6 +1624,122 @@ def test_run_job_retains_registered_cleanup_until_scheduler_retries_failed_stop(
     assert not workspaces[0].lease._handle_active
 
 
+def test_persistent_workspace_cleanup_failure_is_bounded_and_durable(tmp_path: Path, monkeypatch):
+    from scripts import campaign_runner
+    from scripts.run_opencode import load_config
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config_path = tmp_path / "campaign.yaml"
+    config_path.write_text(_config(repo))
+    plan = campaign_runner.CampaignPlan(
+        tmp_path / "out", tmp_path / "out/campaign.json", load_config(config_path), ("one",), (), {}, False
+    )
+    candidate = campaign_runner.CampaignJob("one", "vanilla", "one-image")
+    workspaces = []
+
+    class Workspace:
+        base_url = "http://127.0.0.1:9999"
+        port = 9999
+
+        def __init__(self, request, lease):
+            self.lease = lease
+            self.attempts = 0
+            self.container_id = "a" * 64
+            lease.claim_handle(request)
+
+        def stop_for_freeze(self):
+            self.attempts += 1
+            raise RuntimeError("cleanup-secret")
+
+    def workspace_factory(request, lease):
+        workspace = Workspace(request, lease)
+        workspaces.append(workspace)
+        return workspace
+
+    monkeypatch.setattr(campaign_runner, "_install_for", lambda *_: object())
+    started = time.monotonic()
+    with pytest.raises(campaign_runner.CampaignShutdownError):
+        campaign_runner.run_campaign(
+            (candidate,),
+            workers=1,
+            interrupt_timeout=0.02,
+            execute=lambda current, stop: campaign_runner.run_job(
+                plan,
+                current,
+                breaker=CircuitBreaker(),
+                stop_token=stop,
+                workspace_factory=workspace_factory,
+                vanilla_runner=lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("adapter-secret")),
+                vanilla_api_factory=lambda _: object(),
+            ),
+        )
+
+    evidence = json.loads((plan.output / "vanilla/one/cleanup-failure.json").read_text())
+    state = campaign_runner.StateStore(plan.output / "vanilla/one/state.json").read()
+    assert time.monotonic() - started < 0.5
+    assert workspaces[0].attempts == campaign_runner.JOB_CLEANUP_MAX_ATTEMPTS
+    assert evidence == {
+        "version": 1,
+        "attempts": campaign_runner.JOB_CLEANUP_MAX_ATTEMPTS,
+        "container_ids": ["a" * 64],
+        "status": "cleanup_failed",
+    }
+    assert state.phase == "failed"
+    assert state.exit_class == "cleanup_failed"
+    assert "secret" not in (plan.output / "vanilla/one/cleanup-failure.json").read_text()
+
+
+def test_blocking_workspace_stop_hits_cleanup_deadline_without_worker_spin(tmp_path: Path, monkeypatch):
+    from scripts import campaign_runner
+    from scripts.run_opencode import load_config
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config_path = tmp_path / "campaign.yaml"
+    config_path.write_text(_config(repo))
+    plan = campaign_runner.CampaignPlan(
+        tmp_path / "out", tmp_path / "out/campaign.json", load_config(config_path), ("one",), (), {}, False
+    )
+    candidate = campaign_runner.CampaignJob("one", "vanilla", "one-image")
+
+    class Workspace:
+        base_url = "http://127.0.0.1:9999"
+        port = 9999
+        container_id = "a" * 64
+
+        def __init__(self, request, lease):
+            self.lease = lease
+            lease.claim_handle(request)
+
+        def stop_for_freeze(self):
+            time.sleep(1)
+            raise RuntimeError("blocked stop failed")
+
+    monkeypatch.setattr(campaign_runner, "_install_for", lambda *_: object())
+    started = time.monotonic()
+    with pytest.raises(campaign_runner.CampaignShutdownError):
+        campaign_runner.run_campaign(
+            (candidate,),
+            workers=1,
+            interrupt_timeout=0.02,
+            execute=lambda current, stop: campaign_runner.run_job(
+                plan,
+                current,
+                breaker=CircuitBreaker(),
+                stop_token=stop,
+                workspace_factory=lambda request, lease: Workspace(request, lease),
+                vanilla_runner=lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("adapter failed")),
+                vanilla_api_factory=lambda _: object(),
+            ),
+        )
+
+    assert time.monotonic() - started < 0.5
+    evidence = json.loads((plan.output / "vanilla/one/cleanup-failure.json").read_text())
+    assert evidence["attempts"] == 1
+    assert campaign_runner.StateStore(plan.output / "vanilla/one/state.json").read().exit_class == "cleanup_failed"
+
+
 def test_retry_infra_restarts_a_normalized_pre_provider_failure(tmp_path: Path, monkeypatch):
     from scripts import campaign_runner
     from scripts.run_opencode import load_config
@@ -1799,7 +2036,9 @@ def test_cli_returns_nonzero_for_paused_interrupted_and_fatal_campaigns(
 
     def run(*_args, **_kwargs):
         if outcome == "fatal":
-            raise campaign_runner.CampaignShutdownError("noncooperative worker")
+            raise campaign_runner.CampaignShutdownError(
+                f"noncooperative worker {campaign_runner.os.environ['OPENCODE_SERVER_PASSWORD']}"
+            )
         if outcome == "durability":
             recovery = tmp_path / "breaker-recovery.json"
             recovery.write_text("{}")
@@ -1823,6 +2062,10 @@ def test_cli_returns_nonzero_for_paused_interrupted_and_fatal_campaigns(
     assert campaign_runner.main(["--config", str(config_path), "--output", str(plan.output)]) == 1
     if outcome == "durability":
         assert str(tmp_path / "breaker-recovery.json") in capsys.readouterr().err
+    if outcome == "fatal":
+        stderr = capsys.readouterr().err
+        assert "noncooperative worker" in stderr
+        assert "test-password" not in stderr
 
 
 def _config(repo: Path) -> str:

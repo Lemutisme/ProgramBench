@@ -686,7 +686,7 @@ class CrashAfterStateCommitStore(StateStore):
 
     def update(self, *, expected_generation: int, **changes: object) -> JobState:
         state = super().update(expected_generation=expected_generation, **changes)
-        if not self.crashed:
+        if not self.crashed and {"provider_turns", "actions", "cost"} & changes.keys():
             self.crashed = True
             raise InjectedCrash("after state commit")
         return state
@@ -971,7 +971,7 @@ def test_campaign_stop_after_issue_intent_but_before_api_issue_terminalizes_with
     assert result.exit_class == "campaign_stop"
     assert store.read().phase == "interrupted"
     assert api.issues == []
-    assert not paths.root.joinpath("procontract-issue-response.json").exists()
+    assert paths.root.joinpath("procontract-issue-response.json").is_file()
     assert workspace.stops == 1
 
 
@@ -1067,10 +1067,10 @@ def test_campaign_stop_freezes_when_ambiguous_issue_reconciliation_is_unavailabl
             stop_token=token,
         )
 
-    assert result.completion is ProContractCompletion.INTERRUPTED
-    assert result.exit_class == "campaign_stop"
+    assert result.completion is ProContractCompletion.LOST_SERVER
+    assert result.exit_class == "lost_server"
     assert len(api.issues) == 1
-    assert store.read().phase == "interrupted"
+    assert store.read().phase == "failed"
     assert workspace.stops == 1
     assert not workspace.lease._handle_active
 
@@ -1173,6 +1173,158 @@ def test_preexisting_campaign_stop_settles_admitted_contract_resume(tmp_path: Pa
     assert len(api.issues) == 1
     assert api.interrupts == ["ses_contract"]
     assert store.read().phase == "interrupted"
+
+
+def test_fresh_adapter_uses_durable_issue_active_marker_to_reconcile_before_stop(tmp_path: Path) -> None:
+    from scripts.campaign_procontract import ProContractCompletion, build_issue_payload, run_procontract
+    from scripts.campaign_stop import StopToken
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    store = _state(paths)
+    request, workspace = _workspace(tmp_path, paths)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock())
+    contract = _contract(payload)
+    execution = _execution(payload)
+
+    class AcceptedThenCrashApi(FakeApi):
+        def issue(self, issue):
+            super().issue(issue)
+            raise InjectedCrash("accepted issue response lost at process boundary")
+
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease._handle_active = True
+        with pytest.raises(InjectedCrash):
+            run_procontract(
+                job,
+                store,
+                workspace,
+                model="openai/gpt-5.6-luna",
+                variant="max",
+                limits=_limits(),
+                breaker=CircuitBreaker(),
+                api=AcceptedThenCrashApi(contract, execution),
+                clock=clock,
+                sleeper=clock.sleep,
+            )
+
+    marker_path = paths.root / "procontract-issue-active.json"
+    marker = json.loads(marker_path.read_text())
+    assert marker["issue_may_be_active"] is True
+    assert store.read().artifact_hashes[marker_path.name] == _file_hash(marker_path)
+
+    class ReconcileOnlyApi(SafetyApi):
+        def __init__(self):
+            super().__init__(contract, execution)
+            self.contract_gets = 0
+            self.execution_gets = 0
+
+        def issue(self, issue):
+            pytest.fail("durable ambiguous issue must never POST again during cleanup")
+
+        def get_contract(self, contract_id: str):
+            self.contract_gets += 1
+            return super().get_contract(contract_id)
+
+        def get_execution(self, contract_id: str):
+            self.execution_gets += 1
+            return super().get_execution(contract_id)
+
+    api = ReconcileOnlyApi()
+    token = StopToken()
+    token.set("campaign_hard_stop")
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease._handle_active = True
+        result = run_procontract(
+            job,
+            store,
+            workspace,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=_limits(),
+            breaker=CircuitBreaker(),
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+            stop_token=token,
+        )
+
+    assert result.completion is ProContractCompletion.INTERRUPTED
+    assert result.session_id == "ses_contract"
+    assert api.contract_gets >= 1
+    assert api.execution_gets >= 1
+    assert api.issues == []
+    assert api.interrupts == ["ses_contract"]
+    assert json.loads(marker_path.read_text())["issue_may_be_active"] is False
+    assert store.read().phase == "interrupted"
+
+
+def test_durable_issue_marker_with_contract_but_missing_execution_never_reposts(tmp_path: Path) -> None:
+    from scripts.campaign_procontract import ProContractCompletion, build_issue_payload, run_procontract
+    from scripts.campaign_stop import StopToken
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    store = _state(paths)
+    request, workspace = _workspace(tmp_path, paths)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock())
+    contract = _contract(payload)
+    execution = _execution(payload)
+
+    class AcceptedThenCrashApi(FakeApi):
+        def issue(self, issue):
+            super().issue(issue)
+            raise InjectedCrash("accepted issue response lost")
+
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease._handle_active = True
+        with pytest.raises(InjectedCrash):
+            run_procontract(
+                job,
+                store,
+                workspace,
+                model="openai/gpt-5.6-luna",
+                variant="max",
+                limits=_limits(),
+                breaker=CircuitBreaker(),
+                api=AcceptedThenCrashApi(contract, execution),
+                clock=clock,
+                sleeper=clock.sleep,
+            )
+
+    class MissingExecutionApi(FakeApi):
+        def issue(self, issue):
+            pytest.fail("known Contract evidence must not be reposted")
+
+        def get_execution(self, contract_id: str):
+            return None
+
+    api = MissingExecutionApi(contract, execution)
+    token = StopToken()
+    token.set("campaign_hard_stop")
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease._handle_active = True
+        result = run_procontract(
+            job,
+            store,
+            workspace,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=_limits(),
+            breaker=CircuitBreaker(),
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+            stop_token=token,
+        )
+
+    assert result.completion is ProContractCompletion.LOST_SERVER
+    assert result.exit_class == "lost_server"
+    assert api.issues == []
+    assert workspace.stops == 1
+    assert store.read().phase == "failed"
 
 
 def test_campaign_stop_does_not_replace_observed_native_contract_terminal_status(tmp_path: Path) -> None:
@@ -1338,7 +1490,7 @@ def test_requires_active_job_and_workspace_leases_before_issue(tmp_path: Path) -
     assert api.issues == []
 
 
-def test_issue_response_loss_retries_the_identical_persisted_request(tmp_path: Path) -> None:
+def test_issue_response_loss_reconciles_without_reposting_persisted_request(tmp_path: Path) -> None:
     from scripts.campaign_procontract import build_issue_payload, run_procontract
 
     paths = JobPaths(tmp_path / "job")
@@ -1383,8 +1535,7 @@ def test_issue_response_loss_retries_the_identical_persisted_request(tmp_path: P
         )
 
     assert result.completion.value == "discharged"
-    assert len(api.issues) == 2
-    assert api.issues[0] == api.issues[1]
+    assert len(api.issues) == 1
     persisted = __import__("json").loads((paths.root / "procontract-issue.json").read_text())
     assert persisted["payload"] == api.issues[0]
 

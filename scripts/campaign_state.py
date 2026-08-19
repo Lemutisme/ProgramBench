@@ -665,8 +665,21 @@ def _read_backup(path: Path) -> RecoveryState:
         raise StateError(f"invalid recovery backup: {path}") from error
 
 
-def should_run(job: JobPaths, *, resume: bool, redo: bool, retry_infra: bool = False) -> bool:
+def should_run(
+    job: JobPaths,
+    *,
+    resume: bool,
+    redo: bool,
+    retry_infra: bool = False,
+    cleanup_only: bool = False,
+) -> bool:
     state = StateStore(job.state).read_optional()
+    if cleanup_only:
+        return (
+            state is None
+            or state.phase not in {"done", "failed", "interrupted"}
+            or state.exit_class == "cleanup_failed"
+        )
     if redo:
         return True
     if state is not None and state.phase == "failed":
@@ -685,8 +698,22 @@ def should_run(job: JobPaths, *, resume: bool, redo: bool, retry_infra: bool = F
 class JobLease:
     """Hold a job lock while checking admission and performing explicit reset."""
 
-    def __init__(self, job: JobPaths, *, resume: bool, redo: bool, retry_infra: bool) -> None:
-        self.job, self.resume, self.redo, self.retry_infra = job, resume, redo, retry_infra
+    def __init__(
+        self,
+        job: JobPaths,
+        *,
+        resume: bool,
+        redo: bool,
+        retry_infra: bool,
+        cleanup_only: bool = False,
+    ) -> None:
+        self.job, self.resume, self.redo, self.retry_infra, self.cleanup_only = (
+            job,
+            resume,
+            redo,
+            retry_infra,
+            cleanup_only,
+        )
         self.should_run = False
         self._lock_context = None
 
@@ -696,7 +723,13 @@ class JobLease:
         self._lock_context = job_lock(self.job.lock)
         self._lock_context.__enter__()
         try:
-            self.should_run = should_run(self.job, resume=self.resume, redo=self.redo, retry_infra=self.retry_infra)
+            self.should_run = should_run(
+                self.job,
+                resume=self.resume,
+                redo=self.redo,
+                retry_infra=self.retry_infra,
+                cleanup_only=self.cleanup_only,
+            )
         except BaseException as error:
             self._lock_context.__exit__(type(error), error, error.__traceback__)
             self._lock_context = None
