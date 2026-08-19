@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import os
+import selectors
 import signal
 import subprocess
-import threading
 import time
 from pathlib import Path
 
@@ -37,43 +37,53 @@ def run_docker(command: tuple[str, ...], timeout: float) -> str:
     except OSError as error:
         raise DockerProcessError(f"docker command failed to start ({type(error).__name__})") from None
     output = bytearray()
-    exceeded = threading.Event()
-    drain_error: list[str] = []
-
-    def drain() -> None:
-        if process.stdout is None:
-            return
-        try:
-            while chunk := process.stdout.read(16 * 1024):
-                remaining = max(0, _OUTPUT_LIMIT - len(output))
-                output.extend(chunk[:remaining])
-                if len(chunk) > remaining:
-                    exceeded.set()
-        except (OSError, ValueError) as error:
-            drain_error.append(type(error).__name__)
-
-    reader = threading.Thread(target=drain, daemon=True)
-    reader.start()
+    exceeded = False
+    if process.stdout is None:
+        _terminate(process)
+        raise DockerProcessError("docker output pipe is unavailable")
+    stream = process.stdout.detach()
+    process.stdout = None
+    descriptor = stream.fileno()
+    os.set_blocking(descriptor, False)
+    selector = selectors.DefaultSelector()
+    selector.register(descriptor, selectors.EVENT_READ)
     deadline = time.monotonic() + timeout
     timed_out = False
-    while process.poll() is None and not exceeded.is_set():
-        if time.monotonic() >= deadline:
+    eof = False
+    while not eof and not exceeded:
+        remaining_time = deadline - time.monotonic()
+        if process.poll() is None and remaining_time <= 0:
             timed_out = True
             break
-        time.sleep(0.01)
-    if timed_out or exceeded.is_set():
+        events = selector.select(max(0, min(0.05, remaining_time)) if process.poll() is None else 0)
+        for key, _mask in events:
+            try:
+                chunk = os.read(key.fd, 16 * 1024)
+            except BlockingIOError:
+                continue
+            if not chunk:
+                eof = True
+                break
+            remaining = max(0, _OUTPUT_LIMIT - len(output))
+            output.extend(chunk[:remaining])
+            if len(chunk) > remaining:
+                exceeded = True
+                break
+        if process.poll() is not None and not events:
+            break
+    if not timed_out and not exceeded and process.poll() is None:
+        try:
+            process.wait(timeout=max(0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            timed_out = True
+    if timed_out or exceeded:
         _terminate(process)
-    reader.join(_TERMINATION_GRACE)
-    if reader.is_alive():
-        _signal_process_group(process.pid, signal.SIGKILL)
-        if process.stdout:
-            process.stdout.close()
-        reader.join(_TERMINATION_GRACE)
-    if reader.is_alive() or drain_error:
-        raise DockerProcessError("docker output cleanup failed")
+    selector.unregister(descriptor)
+    selector.close()
+    stream.close()
     if timed_out:
         raise DockerProcessError("docker command timed out")
-    if exceeded.is_set():
+    if exceeded:
         raise DockerProcessError(f"docker command output limit exceeded: {_OUTPUT_LIMIT} bytes")
     decoded = output.decode(errors="replace")
     if process.returncode != 0 and any(
@@ -90,7 +100,7 @@ def _run_contained(command: tuple[str, ...], timeout: float) -> str | None:
 
     try:
         cgroup = campaign_process.create_command_cgroup()
-    except campaign_process.ProcessError:
+    except campaign_process.ProcessContainmentError:
         return None
     try:
         result = campaign_process.run_checked(
@@ -106,6 +116,8 @@ def _run_contained(command: tuple[str, ...], timeout: float) -> str | None:
         raise DockerProcessError("docker command timed out") from None
     except campaign_process.ProcessOutputLimitError as error:
         raise DockerProcessError(str(error).replace("command", "docker command", 1)) from None
+    except campaign_process.ProcessCleanupError:
+        raise
     except campaign_process.ProcessError as error:
         raise DockerProcessError(f"docker contained cleanup failed ({type(error).__name__})") from None
     output = result.stdout + result.stderr

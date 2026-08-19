@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import subprocess
+import os
+import signal
+import threading
 import time
 from pathlib import Path
 
 import pytest
 
 from scripts.campaign_workspace import DockerCommandError, _run_docker
+from scripts import campaign_docker
 
 
 def test_docker_runner_bounds_noisy_combined_output(tmp_path: Path) -> None:
@@ -65,6 +69,32 @@ def test_docker_runner_timeout_kills_detached_pipe_holder(tmp_path: Path) -> Non
         ["ps", "-o", "stat=", "-p", str(detached)], capture_output=True, text=True, timeout=2
     ).stdout.strip()
     assert not status or status.startswith("Z")
+
+
+def test_fallback_timeout_never_waits_on_undiscoverable_detached_pipe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pid_file = tmp_path / "detached.pid"
+    command = tmp_path / "docker"
+    command.write_text(f"#!/bin/sh\nsetsid sh -c 'echo $$ > {pid_file}; sleep 30' &\nwait\n")
+    command.chmod(0o755)
+    monkeypatch.setattr(campaign_docker, "_run_contained", lambda _command, _timeout: None)
+    monkeypatch.setattr(campaign_docker, "_best_effort_descendants", lambda _pid: set())
+    threads = threading.active_count()
+    started = time.monotonic()
+
+    try:
+        with pytest.raises(DockerCommandError, match="timed out") as error:
+            _run_docker((str(command),), 0.1)
+        assert time.monotonic() - started < 2
+        assert len(str(error.value)) < 200
+        assert threading.active_count() == threads
+    finally:
+        if pid_file.exists():
+            try:
+                os.kill(int(pid_file.read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
 
 def test_docker_runner_never_reports_secret_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
