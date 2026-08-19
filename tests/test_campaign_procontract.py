@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import subprocess
 import threading
 from urllib.parse import urlparse
 
@@ -12,7 +13,7 @@ import pytest
 
 from scripts.campaign_state import JobLease, JobPaths, JobState, StateConflictError, StateStore
 from scripts.campaign_usage import CircuitBreaker
-from scripts.campaign_workspace import WorkspaceLease
+from scripts.campaign_workspace import WorkspaceError, WorkspaceLease
 from scripts.run_opencode import Limits
 
 
@@ -42,6 +43,18 @@ class StaticHttpClient:
         from scripts.campaign_procontract import HttpResponse
 
         return HttpResponse(200, {}, json.dumps(self.value, separators=(",", ":")).encode())
+
+
+class SequenceHttpClient:
+    def __init__(self, values: list[object]) -> None:
+        self.values = values
+        self.urls: list[str] = []
+
+    def request(self, method: str, url: str, **kwargs: object) -> object:
+        from scripts.campaign_procontract import HttpResponse
+
+        self.urls.append(url)
+        return HttpResponse(200, {}, json.dumps(self.values.pop(0), separators=(",", ":")).encode())
 
 
 class WallClock(FakeClock):
@@ -137,6 +150,35 @@ class CrashApi(FakeApi):
             self.crashed = True
             raise InjectedCrash("after attest")
         return response
+
+
+class ExactExportDropApi(FakeApi):
+    def __init__(self, contract: dict[str, object], execution: dict[str, object], subject_hash: str) -> None:
+        super().__init__(contract, execution)
+        self.subject_hash = subject_hash
+        self.export_calls = 0
+
+    def export(self, workspace: object, contract_id: str, destination: Path) -> dict[str, object]:
+        self.export_calls += 1
+        assert _write_git_export(destination) == self.subject_hash
+        raise WorkspaceError("export response lost")
+
+
+class PartialExportDropApi(FakeApi):
+    def __init__(self, contract: dict[str, object], execution: dict[str, object]) -> None:
+        super().__init__(contract, execution)
+        self.export_calls = 0
+
+    def export(self, workspace: object, contract_id: str, destination: Path) -> dict[str, object]:
+        self.export_calls += 1
+        destination.mkdir()
+        destination.joinpath("compile.sh").write_text("partial")
+        raise WorkspaceError("export response lost")
+
+
+class MissingExportDropApi(FakeApi):
+    def export(self, workspace: object, contract_id: str, destination: Path) -> dict[str, object]:
+        raise WorkspaceError("export command failed before materialization")
 
 
 class SafetyApi(FakeApi):
@@ -627,7 +669,12 @@ def _workspace(
     return request, FakeWorkspace(manifest, lease)
 
 
-def _contract(payload: dict[str, object], *, status: str = "verification") -> dict[str, object]:
+def _contract(
+    payload: dict[str, object],
+    *,
+    status: str = "verification",
+    subject_hash: str = "snapshot",
+) -> dict[str, object]:
     replay = payload["evidence"]["replay"]  # type: ignore[index]
     spec = {
         key: payload[key]
@@ -646,12 +693,12 @@ def _contract(payload: dict[str, object], *, status: str = "verification") -> di
         "handoff": {
             "summary": "ready",
             "uncertainties": [],
-            "subjectHash": "snapshot",
+            "subjectHash": subject_hash,
             "replay": {
                 "policyHash": __import__("hashlib")
                 .sha256(__import__("json").dumps(replay, separators=(",", ":")).encode())
                 .hexdigest(),
-                "subjectHash": "snapshot",
+                "subjectHash": subject_hash,
                 "evidenceHash": "native-replay",
                 "passed": True,
                 "summary": "Replay verification passed",
@@ -1246,7 +1293,7 @@ def test_post_attestation_native_challenge_is_preserved(tmp_path: Path) -> None:
     assert len(api.attestations) == 1
 
 
-@pytest.mark.parametrize("stage", ["export", "attest"])
+@pytest.mark.parametrize("stage", ["attest"])
 def test_resume_after_delivery_response_loss_does_not_repeat_native_mutation(tmp_path: Path, stage: str) -> None:
     from scripts.campaign_procontract import build_issue_payload, run_procontract
 
@@ -1284,6 +1331,128 @@ def test_resume_after_delivery_response_loss_does_not_repeat_native_mutation(tmp
     assert len(api.exports) == 1
     assert len(api.attestations) == 1
     assert (paths.root / "procontract-attestation.json").is_file()
+
+
+def test_ambiguous_cli_export_exact_tree_reconciles_without_second_export(tmp_path: Path) -> None:
+    from scripts.campaign_procontract import build_issue_payload, run_procontract
+
+    subject_hash = _write_git_export(tmp_path / "prototype")
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    store = _state(paths)
+    _, workspace = _workspace(tmp_path, paths, contained=True)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock())
+    api = ExactExportDropApi(
+        _contract(payload, subject_hash=subject_hash),
+        _execution(payload),
+        subject_hash,
+    )
+    packages = 0
+
+    def package(subject: Path, run_dir: Path, iid: str) -> Path:
+        nonlocal packages
+        packages += 1
+        return _package(run_dir, iid)
+
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease._handle_active = True
+        result = run_procontract(
+            job,
+            store,
+            workspace,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=_limits(),
+            breaker=CircuitBreaker(),
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+            package=package,
+            preflight=lambda archive, iid: SimpleNamespace(executable_hash="e" * 64, output="ok"),
+        )
+
+    assert result.completion.value == "discharged"
+    assert api.export_calls == 1
+    assert packages == 1
+    assert len(api.attestations) == 1
+    assert (paths.root / "procontract-export-complete.json").is_file()
+
+
+def test_ambiguous_cli_export_partial_tree_is_preserved_without_delivery(tmp_path: Path) -> None:
+    from scripts.campaign_procontract import build_issue_payload, run_procontract
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    store = _state(paths)
+    _, workspace = _workspace(tmp_path, paths, contained=True)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock())
+    api = PartialExportDropApi(_contract(payload), _execution(payload))
+    packages = 0
+
+    def package(subject: Path, run_dir: Path, iid: str) -> Path:
+        nonlocal packages
+        packages += 1
+        return _package(run_dir, iid)
+
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease._handle_active = True
+        result = run_procontract(
+            job,
+            store,
+            workspace,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=_limits(),
+            breaker=CircuitBreaker(),
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+            package=package,
+            preflight=lambda archive, iid: SimpleNamespace(executable_hash="e" * 64, output="ok"),
+        )
+
+    export = next(workspace.manifest.state_dir.glob("contract-export-*"))
+    assert result.completion.value == "lost_server"
+    assert result.error == "export_ambiguous"
+    assert api.export_calls == 1
+    assert packages == 0
+    assert api.attestations == []
+    assert export.joinpath("compile.sh").read_text() == "partial"
+    assert (paths.root / "procontract-export-ambiguous.json").is_file()
+
+
+def test_ambiguous_cli_export_missing_destination_preserves_native_loss(tmp_path: Path) -> None:
+    from scripts.campaign_procontract import build_issue_payload, run_procontract
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    store = _state(paths)
+    _, workspace = _workspace(tmp_path, paths, contained=True)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock())
+    api = MissingExportDropApi(_contract(payload), _execution(payload))
+
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease._handle_active = True
+        result = run_procontract(
+            job,
+            store,
+            workspace,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=_limits(),
+            breaker=CircuitBreaker(),
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+        )
+
+    assert result.completion.value == "lost_server"
+    assert result.error == "export_ambiguous"
+    assert api.attestations == []
+    assert (paths.root / "procontract-export-ambiguous.json").is_file()
 
 
 def test_conflicting_existing_contract_fails_closed_before_export(tmp_path: Path) -> None:
@@ -2820,7 +2989,7 @@ def test_real_public_http_adapter_uses_only_contract_and_read_only_session_endpo
                     }
                 )
             if path.path == "/api/session/ses_contract/message":
-                return self.respond({"data": [], "cursor": {"next": None}})
+                return self.respond({"data": [], "cursor": {}})
             if path.path == "/api/session/active":
                 return self.respond({"data": {}})
             self.send_error(404)
@@ -2887,7 +3056,6 @@ def test_real_public_http_adapter_uses_only_contract_and_read_only_session_endpo
     "active",
     [
         {"": {"type": "running"}},
-        {"ses_": {"type": "running"}},
         {"bad": {"type": "running"}},
         {"ses_other": "running"},
         {"ses_other": {"type": "running", "extra": True}},
@@ -2916,11 +3084,86 @@ def test_active_session_record_accepts_multiple_exact_running_sessions() -> None
         "http://127.0.0.1:4096",
         expected_port=4096,
         password="secret",
-        http_client=StaticHttpClient({"data": {"ses_other": {"type": "running"}, "ses_contract": {"type": "running"}}}),
+        http_client=StaticHttpClient(
+            {
+                "data": {
+                    "ses": {"type": "running"},
+                    "session-custom": {"type": "running"},
+                    "ses_contract": {"type": "running"},
+                }
+            }
+        ),
     )
 
     assert api.status("ses_contract") == "busy"
     assert api.status("ses_missing") == "idle"
+
+
+@pytest.mark.parametrize("session_id", ["bad", "", 1])
+def test_active_session_record_rejects_invalid_target_id(session_id: object) -> None:
+    from scripts.campaign_procontract import HttpProContractApi, ProContractError
+
+    api = HttpProContractApi(
+        "http://127.0.0.1:4096",
+        expected_port=4096,
+        password="secret",
+        http_client=StaticHttpClient({"data": {}}),
+    )
+
+    with pytest.raises(ProContractError):
+        api.status(session_id)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"data": [], "cursor": {"previous": 1}},
+        {"data": [], "cursor": {"extra": "cursor"}},
+        {"data": [], "cursor": {"next": "not-allowed-on-empty"}},
+        {"data": [], "cursor": {}, "extra": True},
+        {"data": [{"id": "msg"}], "cursor": {"previous": "same", "next": "same"}},
+    ],
+)
+def test_message_pagination_rejects_malformed_cursor_response(response: object) -> None:
+    from scripts.campaign_procontract import HttpProContractApi, ProContractError
+
+    api = HttpProContractApi(
+        "http://127.0.0.1:4096",
+        expected_port=4096,
+        password="secret",
+        http_client=SequenceHttpClient([response]),
+    )
+
+    with pytest.raises(ProContractError, match="messages"):
+        api.messages("ses")
+
+
+def test_message_pagination_accepts_valid_pages_and_empty_cursor() -> None:
+    from scripts.campaign_procontract import HttpProContractApi
+
+    client = SequenceHttpClient(
+        [
+            {"data": [{"id": "first"}], "cursor": {"previous": "p1", "next": "n1"}},
+            {"data": [{"id": "second"}], "cursor": {"previous": "p2"}},
+        ]
+    )
+    api = HttpProContractApi(
+        "http://127.0.0.1:4096",
+        expected_port=4096,
+        password="secret",
+        http_client=client,
+    )
+
+    assert api.messages("ses") == {"data": [{"id": "first"}, {"id": "second"}]}
+    assert "cursor=n1" in client.urls[1]
+
+    empty = HttpProContractApi(
+        "http://127.0.0.1:4096",
+        expected_port=4096,
+        password="secret",
+        http_client=SequenceHttpClient([{"data": [], "cursor": {}}]),
+    )
+    assert empty.messages("session-custom") == {"data": []}
 
 
 def test_run_opencode_reexports_native_contract_surface() -> None:
@@ -2936,7 +3179,7 @@ def test_run_opencode_reexports_native_contract_surface() -> None:
 def test_result_v1_without_quiet_unconfirmed_remains_readable() -> None:
     from decimal import Decimal
 
-    from scripts.campaign_procontract import ProContractCompletion, ProContractResult
+    from scripts.campaign_procontract import ProContractCompletion, ProContractError, ProContractResult
 
     raw = ProContractResult(
         contract_id="pct_existing",
@@ -2968,6 +3211,10 @@ def test_result_v1_without_quiet_unconfirmed_remains_readable() -> None:
     raw.pop("quiet_unconfirmed")
 
     assert ProContractResult.from_dict(raw).quiet_unconfirmed is False
+
+    raw["session_id"] = 1
+    with pytest.raises(ProContractError):
+        ProContractResult.from_dict(raw)
 
 
 def test_done_result_is_idempotent_and_makes_no_public_api_mutation(tmp_path: Path) -> None:
@@ -3079,3 +3326,29 @@ def _tree_identity(root: Path) -> list[tuple[str, int, int, str]]:
         )
         for path in sorted(root.rglob("*"))
     ]
+
+
+def _write_git_export(root: Path) -> str:
+    root.mkdir()
+    root.joinpath("compile.sh").write_text("#!/bin/sh\n")
+    root.joinpath("compile.sh").chmod(0o755)
+    root.joinpath("executable").write_text("binary")
+    root.joinpath("executable").chmod(0o755)
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    subprocess.run(["git", "-C", str(root), "add", "compile.sh", "executable"], check=True)
+    environment = {
+        **__import__("os").environ,
+        "GIT_AUTHOR_NAME": "test",
+        "GIT_AUTHOR_EMAIL": "test@example.com",
+        "GIT_COMMITTER_NAME": "test",
+        "GIT_COMMITTER_EMAIL": "test@example.com",
+        "GIT_AUTHOR_DATE": "2000-01-01T00:00:00Z",
+        "GIT_COMMITTER_DATE": "2000-01-01T00:00:00Z",
+    }
+    subprocess.run(["git", "-C", str(root), "commit", "-qm", "snapshot"], check=True, env=environment)
+    return subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD^{tree}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()

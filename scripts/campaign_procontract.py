@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import os
+import subprocess
 import tempfile
 import time
 from dataclasses import dataclass
@@ -87,6 +88,8 @@ CONTROL_ARTIFACT_NAMES = (
     "procontract-progress.json",
     "procontract-verification.json",
     "procontract-export.json",
+    "procontract-export-complete.json",
+    "procontract-export-ambiguous.json",
     "procontract-subject.json",
     "procontract-package-request.json",
     "procontract-package.json",
@@ -166,11 +169,12 @@ class ProContractNativeOutcome(ProContractError):
         completion: "ProContractCompletion",
         contract: Mapping[str, object],
         execution: Mapping[str, object],
+        reason: str | None = None,
     ) -> None:
         self.completion = completion
         self.contract = contract
         self.execution = execution
-        super().__init__(f"native Contract status preserved: {completion.value}")
+        super().__init__(reason or f"native Contract status preserved: {completion.value}")
 
 
 class ProContractCompletion(str, Enum):
@@ -317,8 +321,11 @@ class ProContractResult:
             raise ProContractError("persisted ProContract result is invalid") from error
         if (
             raw["version"] != 1
+            or not isinstance(result.contract_id, str)
             or not result.contract_id.startswith("pct_")
-            or not result.session_id.startswith("ses_")
+            or not isinstance(result.session_id, str)
+            or not result.session_id.startswith("ses")
+            or not isinstance(result.prompt_id, str)
             or not result.prompt_id.startswith("msg_")
             or type(result.revision) is not int
             or result.revision <= 0
@@ -484,12 +491,20 @@ class HttpProContractApi:
         while True:
             query = {"limit": 200, **({"order": "asc"} if cursor is None else {"cursor": cursor})}
             raw = self._mapping(
-                self._request("GET", f"/api/session/{_id(session_id, 'ses_')}/message?{urlencode(query)}")
+                self._request("GET", f"/api/session/{_session_id(session_id)}/message?{urlencode(query)}")
             )
             if (
                 set(raw) != {"data", "cursor"}
                 or not isinstance(raw["data"], list)
                 or not isinstance(raw["cursor"], Mapping)
+                or set(raw["cursor"]) - {"previous", "next"}
+                or any(not isinstance(raw["cursor"][key], str) or not raw["cursor"][key] for key in raw["cursor"])
+                or not raw["data"]
+                and bool(raw["cursor"])
+                or raw["cursor"].get("previous") is not None
+                and raw["cursor"].get("previous") == raw["cursor"].get("next")
+                or cursor is not None
+                and cursor in {raw["cursor"].get("previous"), raw["cursor"].get("next")}
             ):
                 raise ProContractError("OpenCode projected messages response is invalid")
             messages.extend(raw["data"])
@@ -503,15 +518,14 @@ class HttpProContractApi:
             cursor = next_cursor
 
     def status(self, session_id: str) -> str:
+        _session_id(session_id)
         raw = self._mapping(self._request("GET", "/api/session/active"))
         if set(raw) != {"data"} or not isinstance(raw["data"], Mapping):
             raise ProContractError("OpenCode Session status response is invalid")
         active = raw["data"]
         if any(
             not isinstance(key, str)
-            or not key.startswith("ses_")
-            or len(key) <= len("ses_")
-            or len(key) > 256
+            or not key.startswith("ses")
             or not isinstance(value, Mapping)
             or set(value) != {"type"}
             or value["type"] != "running"
@@ -524,7 +538,7 @@ class HttpProContractApi:
         return self._mapping(self._request("GET", f"/api/contract/quiet?{urlencode({'scope': scope})}"))
 
     def interrupt(self, session_id: str) -> None:
-        self._request("POST", f"/api/session/{_id(session_id, 'ses_')}/interrupt", expected=(204,))
+        self._request("POST", f"/api/session/{_session_id(session_id)}/interrupt", expected=(204,))
 
     def export(self, workspace: DockerWorkspace, contract_id: str, destination: Path) -> Mapping[str, object]:
         try:
@@ -1228,24 +1242,55 @@ def _deliver(
     handoff, replay = _verification(contract, payload)
     export_dir = Path(workspace.manifest.state_dir) / f"contract-export-{payload['id']}"
     export_path = job.job.root / "procontract-export.json"
+    complete_path = job.job.root / "procontract-export-complete.json"
+    ambiguous_path = job.job.root / "procontract-export-ambiguous.json"
+    ambiguous_invocation = False
+    reconciled_complete = False
     if export_path.exists():
         exported = _read_json(export_path)
+        if complete_path.exists():
+            _validate_export_complete(complete_path, export_dir, str(payload["id"]), str(handoff["subjectHash"]))
+        else:
+            ambiguous_invocation = True
+            reconciled_complete = _git_snapshot_identity(export_dir) == handoff["subjectHash"]
     elif export_dir.exists():
+        ambiguous_invocation = True
+        reconciled_complete = (
+            _validate_export_complete(complete_path, export_dir, str(payload["id"]), str(handoff["subjectHash"]))
+            if complete_path.exists()
+            else _git_snapshot_identity(export_dir) == handoff["subjectHash"]
+        )
         exported = {
             "contractID": payload["id"],
             "subjectHash": handoff["subjectHash"],
             "directory": str(export_dir),
         }
-        _validate_export(exported, payload, handoff, export_dir, workspace)
-        _write_json(export_path, exported)
     else:
-        exported = api.export(workspace, str(payload["id"]), export_dir)
+        try:
+            exported = api.export(workspace, str(payload["id"]), export_dir)
+        except WorkspaceError:
+            ambiguous_invocation = True
+            reconciled_complete = _git_snapshot_identity(export_dir) == handoff["subjectHash"]
+            exported = {
+                "contractID": payload["id"],
+                "subjectHash": handoff["subjectHash"],
+                "directory": str(export_dir),
+            }
+        else:
+            _validate_export(exported, payload, handoff, export_dir, workspace)
+            _write_export_complete(
+                complete_path,
+                export_dir,
+                str(payload["id"]),
+                str(handoff["subjectHash"]),
+                str(handoff["subjectHash"]),
+            )
+            _write_json(
+                export_path,
+                _sanitize_control(exported, _all_credential_names(workspace.manifest.credential_env)),
+            )
+    if not ambiguous_invocation or reconciled_complete:
         _validate_export(exported, payload, handoff, export_dir, workspace)
-        _write_json(
-            export_path,
-            _sanitize_control(exported, _all_credential_names(workspace.manifest.credential_env)),
-        )
-    _validate_export(exported, payload, handoff, export_dir, workspace)
     try:
         exported_contract, exported_execution = _stage_contract_observation(
             api,
@@ -1282,6 +1327,35 @@ def _deliver(
             or exported_replay != replay
         ):
             raise ProContractConflictError("Contract handoff changed while its exact subject was exported")
+        if ambiguous_invocation:
+            if reconciled_complete:
+                _write_export_complete(
+                    complete_path,
+                    export_dir,
+                    str(payload["id"]),
+                    str(handoff["subjectHash"]),
+                    str(handoff["subjectHash"]),
+                )
+                _write_or_verify_json(export_path, exported, "reconciled Contract export response")
+            else:
+                _write_or_verify_json(
+                    ambiguous_path,
+                    {
+                        "version": 1,
+                        "contractID": payload["id"],
+                        "subjectHash": handoff["subjectHash"],
+                        "directory": str(export_dir),
+                        "treeHash": _tree_hash(_semantic_inventory(export_dir)) if export_dir.is_dir() else None,
+                        "complete": False,
+                    },
+                    "ambiguous Contract export evidence",
+                )
+                raise ProContractNativeOutcome(
+                    ProContractCompletion.LOST_SERVER,
+                    exported_contract,
+                    exported_execution,
+                    "export_ambiguous",
+                )
     except ProContractNativeOutcome:
         raise
     except ProContractConflictError:
@@ -1680,6 +1754,7 @@ def _deliver(
                 "procontract-progress.json",
                 "procontract-verification.json",
                 "procontract-export.json",
+                "procontract-export-complete.json",
                 "procontract-subject.json",
                 "procontract-package-request.json",
                 "procontract-package.json",
@@ -2205,7 +2280,7 @@ def _validate_execution(raw: object, payload: Mapping[str, object], revision: in
         or raw["location"] != payload["location"]
         or raw["model"] != payload["model"]
         or not isinstance(raw["sessionID"], str)
-        or not raw["sessionID"].startswith("ses_")
+        or not raw["sessionID"].startswith("ses")
         or not isinstance(raw["promptID"], str)
         or not raw["promptID"].startswith("msg_")
         or type(raw["dispatched"]) is not bool
@@ -2311,6 +2386,79 @@ def _validate_export(
         or not destination.is_dir()
     ):
         raise ProContractConflictError("Contract export does not match the current native handoff")
+
+
+def _write_export_complete(
+    path: Path,
+    export: Path,
+    contract_id: str,
+    subject_hash: str,
+    git_identity: str,
+) -> None:
+    _write_or_verify_json(
+        path,
+        {
+            "version": 1,
+            "contractID": contract_id,
+            "subjectHash": subject_hash,
+            "directory": str(export),
+            "treeHash": _tree_hash(_semantic_inventory(export)),
+            "gitSnapshotIdentity": git_identity,
+        },
+        "complete Contract export evidence",
+    )
+
+
+def _validate_export_complete(path: Path, export: Path, contract_id: str, subject_hash: str) -> bool:
+    raw = _read_json(path)
+    if raw != {
+        "version": 1,
+        "contractID": contract_id,
+        "subjectHash": subject_hash,
+        "directory": str(export),
+        "treeHash": _tree_hash(_semantic_inventory(export)),
+        "gitSnapshotIdentity": subject_hash,
+    }:
+        raise ProContractConflictError("persisted complete Contract export evidence is invalid")
+    return True
+
+
+def _git_snapshot_identity(export: Path) -> str | None:
+    if not export.is_dir():
+        return None
+    git_dir = export / ".git" if export.joinpath(".git").is_dir() else Path(str(export) + ".git")
+    if not git_dir.is_dir():
+        return None
+    command = ["git", f"--git-dir={git_dir}", f"--work-tree={export}"]
+    try:
+        tree = subprocess.run(
+            [*command, "rev-parse", "HEAD^{tree}"],
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        tracked = subprocess.run([*command, "diff", "--quiet", "HEAD", "--"], timeout=10, check=False)
+        untracked = subprocess.run(
+            [*command, "ls-files", "--others", "--exclude-standard"],
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if (
+        tree.returncode != 0
+        or tracked.returncode != 0
+        or untracked.returncode != 0
+        or len(tree.stdout) > 256
+        or len(untracked.stdout) > 64 * 1024
+        or untracked.stdout.strip()
+    ):
+        return None
+    identity = tree.stdout.decode(errors="strict").strip()
+    if len(identity) not in {40, 64} or any(character not in "0123456789abcdef" for character in identity):
+        return None
+    return identity
 
 
 def _materialize_subject(export: Path, subject: Path, job_root: Path, credential_names: tuple[str, ...]) -> None:
@@ -3152,4 +3300,10 @@ def _reject_constant(value: str) -> object:
 def _id(value: str, prefix: str) -> str:
     if not isinstance(value, str) or not value.startswith(prefix) or len(value) > 256:
         raise ProContractError("OpenCode ID is invalid")
+    return quote(value, safe="_-.")
+
+
+def _session_id(value: object) -> str:
+    if not isinstance(value, str) or not value.startswith("ses"):
+        raise ProContractError("OpenCode Session ID is invalid")
     return quote(value, safe="_-.")
