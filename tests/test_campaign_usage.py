@@ -313,12 +313,10 @@ def test_persistence_rejects_corrupt_cache_failures_and_job_turn_aggregates() ->
 
 def test_exact_decimal_sum_spans_exponents_and_cost_cap() -> None:
     result = summarize_usage(
-        b'{"data":[{"type":"assistant","cost":1e100,"tokens":{"input":1,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"content":"ok"},{"type":"assistant","cost":0.1,"tokens":{"input":1,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"content":"ok"}]}'
+        b'{"data":[{"type":"assistant","cost":1e20,"tokens":{"input":1,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"content":"ok"},{"type":"assistant","cost":0.1,"tokens":{"input":1,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"content":"ok"}]}'
     )
-    assert result.cost == Decimal(
-        "10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000.1"
-    )
-    breaker = CircuitBreaker(hard_cost_cap=Decimal("1e100"))
+    assert result.cost == Decimal("100000000000000000000.1")
+    breaker = CircuitBreaker(hard_cost_cap=Decimal("1e20"))
     breaker.observe("job", 1, result)
     assert breaker.hard_stopped
 
@@ -733,6 +731,34 @@ def test_past_retry_after_date_is_immediate_on_fresh_breaker() -> None:
     breaker = CircuitBreaker(clock=lambda: 100.0, retry_after_default=7)
     breaker.observe_error(429, retry_after="Thu, 01 Jan 1970 00:01:39 GMT")
     assert breaker.backoff_until == 100.0
+
+
+def test_decimal_bounds_allow_realistic_extremes_and_reject_absurd_exponents() -> None:
+    allowed = summarize_usage(
+        b'{"data":[{"type":"assistant","cost":1e20,"tokens":{"input":1,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"content":"ok"},{"type":"assistant","cost":1e-20,"tokens":{"input":1,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"content":"ok"}]}'
+    )
+    assert allowed.cost > 0
+    with pytest.raises(UsageParseError):
+        summarize_usage(
+            b'{"data":[{"type":"assistant","cost":1e4096,"tokens":{"input":1,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"content":"ok"}]}'
+        )
+    with pytest.raises(UsageParseError):
+        TurnUsage(cost=Decimal("1e999999999"))
+
+
+def test_combined_cost_failure_leaves_observation_snapshot_atomic() -> None:
+    breaker = CircuitBreaker()
+    first = summarize_usage(
+        b'{"data":[{"type":"assistant","cost":1e20,"tokens":{"input":1,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"content":"ok"}]}'
+    )
+    second = summarize_usage(
+        b'{"data":[{"type":"assistant","cost":9.999999999999999999999999999999999999999999999999999999999999999e20,"tokens":{"input":1,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"content":"ok"}]}'
+    )
+    breaker.observe("first", 1, first)
+    before = breaker.snapshot()
+    with pytest.raises(UsageParseError):
+        breaker.observe("second", 1, second)
+    assert breaker.snapshot() == before
 
 
 def test_acknowledged_recoverable_pause_round_trips_without_derived_drift() -> None:

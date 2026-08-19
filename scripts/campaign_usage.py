@@ -23,8 +23,9 @@ MAX_SNAPSHOT_BYTES = 64 * 1024 * 1024
 MAX_MESSAGES_PER_JOB = 1001
 MAX_PROVIDER_TURNS = 1000
 MAX_TOKEN_COUNT = 10**12
-MAX_DECIMAL_DIGITS = 256
-MAX_DECIMAL_EXPONENT_SPAN = 4096
+MAX_DECIMAL_DIGITS = 64
+MAX_DECIMAL_EXPONENT_SPAN = 128
+MAX_COMBINED_EXPONENT_SPAN = 256
 
 
 class StaleObservationError(UsageParseError):
@@ -282,6 +283,22 @@ class _CampaignTotals:
     max_prompts: Counter[int] = field(default_factory=Counter)
     telemetry_gaps: int = 0
 
+    def copy(self) -> _CampaignTotals:
+        return _CampaignTotals(
+            self.provider_turns,
+            self.input,
+            self.output,
+            self.reasoning,
+            self.cache_read,
+            self.cache_write,
+            self.prompt_total,
+            self.turns_with_cache,
+            self.turns_without_cache,
+            self.cost,
+            self.max_prompts.copy(),
+            self.telemetry_gaps,
+        )
+
     def add(self, summary: UsageSummary, sign: int) -> None:
         for name in (
             "provider_turns",
@@ -420,8 +437,10 @@ class CircuitBreaker:
     @property
     def campaign_usage(self) -> UsageSummary:
         with self._lock:
-            self._materialize_usage()
-            return self._campaign_usage
+            jobs = tuple(self._jobs[job][1] for job in sorted(self._jobs))
+            totals = self._totals.copy()
+        turns = tuple(turn for summary in jobs for turn in summary.turns)
+        return totals.summary(turns)
 
     @property
     def total_usage(self) -> UsageSummary:
@@ -517,24 +536,63 @@ class CircuitBreaker:
                 if resolved_usage != previous[1]:
                     raise StaleObservationError("usage changed without a newer generation")
                 if effective_terminal != previous[2]:
-                    self._jobs[resolved_job] = (previous[0], previous[1], effective_terminal)
-                    self._terminal_sequence.append(resolved_job)
+                    candidate_jobs = dict(self._jobs)
+                    candidate_jobs[resolved_job] = (previous[0], previous[1], effective_terminal)
+                    candidate_sequence = list(self._terminal_sequence)
+                    candidate_sequence.append(resolved_job)
+                    candidate_failures = self._cache_failures_for(candidate_jobs, candidate_sequence)
+                    candidate_causes = set(self._pause_causes)
+                    if candidate_failures >= self.consecutive_failures and not self._cache_acknowledged:
+                        candidate_causes.add("cache")
+                    self._jobs = candidate_jobs
+                    self._terminal_sequence = candidate_sequence
+                    self._cache_failures = candidate_failures
+                    self._pause_causes = candidate_causes
                     self._state_version += 1
-                    self._recompute_cache()
                 return
             was_terminal = previous[2] if previous is not None else False
             is_terminal = was_terminal or terminal
-            self._jobs[resolved_job] = (resolved_generation, resolved_usage, is_terminal)
+            candidate_jobs = dict(self._jobs)
+            candidate_jobs[resolved_job] = (resolved_generation, resolved_usage, is_terminal)
+            candidate_totals = self._totals.copy()
             if previous is not None:
-                self._totals.add(previous[1], -1)
-            self._totals.add(resolved_usage, 1)
+                candidate_totals.add(previous[1], -1)
+            candidate_totals.add(resolved_usage, 1)
+            candidate_sequence = list(self._terminal_sequence)
+            candidate_cache_acknowledged = self._cache_acknowledged
+            if is_terminal and not was_terminal:
+                candidate_sequence.append(resolved_job)
+                candidate_cache_acknowledged = False
+            candidate_failures = (
+                self._cache_failures
+                if not is_terminal and not was_terminal
+                else self._cache_failures_for(candidate_jobs, candidate_sequence)
+            )
+            candidate_causes = set(self._pause_causes)
+            if candidate_failures >= self.consecutive_failures and not candidate_cache_acknowledged:
+                candidate_causes.add("cache")
+            cost = candidate_totals.cost
+            candidate_soft_acknowledged = self._soft_acknowledged
+            if "hard" in candidate_causes or self.hard_cost_cap is not None and cost >= self.hard_cost_cap:
+                candidate_causes.add("hard")
+                candidate_causes.discard("soft")
+                candidate_soft_acknowledged = False
+            elif self.soft_cost_cap is None or cost < self.soft_cost_cap:
+                candidate_causes.discard("soft")
+                candidate_soft_acknowledged = False
+            elif candidate_soft_acknowledged:
+                candidate_causes.discard("soft")
+            else:
+                candidate_causes.add("soft")
+            self._jobs = candidate_jobs
+            self._totals = candidate_totals
+            self._terminal_sequence = candidate_sequence
+            self._cache_acknowledged = candidate_cache_acknowledged
+            self._cache_failures = candidate_failures
+            self._pause_causes = candidate_causes
+            self._soft_acknowledged = candidate_soft_acknowledged
             self._usage_version += 1
             self._state_version += 1
-            if is_terminal and not was_terminal:
-                self._terminal_sequence.append(resolved_job)
-                self._cache_acknowledged = False
-            self._apply_cost_caps()
-            self._recompute_cache()
 
     def _recompute_usage(self) -> None:
         self._totals = _CampaignTotals()
@@ -551,18 +609,22 @@ class CircuitBreaker:
         self._materialized_version = self._usage_version
 
     def _recompute_cache(self) -> None:
+        failures = self._cache_failures_for(self._jobs, self._terminal_sequence)
+        self._cache_failures = failures
+        if failures >= self.consecutive_failures and not self._cache_acknowledged:
+            self._pause_causes.add("cache")
+
+    def _cache_failures_for(self, jobs: Mapping[str, tuple[int, UsageSummary, bool]], sequence: list[str]) -> int:
         failures = 0
-        for job in self._terminal_sequence:
-            summary = self._jobs[job][1]
+        for job in sequence:
+            summary = jobs[job][1]
             if summary.provider_turns < self.cache_warmup_turns:
                 continue
             if not _ratio_at_least(summary.cache_read, summary.prompt_total, self.minimum_cache_ratio):
                 failures += 1
             else:
                 failures = 0
-        self._cache_failures = failures
-        if failures >= self.consecutive_failures and not self._cache_acknowledged:
-            self._pause_causes.add("cache")
+        return failures
 
     def observe_error(
         self,
@@ -950,6 +1012,8 @@ def _validate_decimal_bounds(value: Decimal) -> None:
         raise UsageParseError("decimal exceeds size limit")
     if abs(value.as_tuple().exponent) > MAX_DECIMAL_EXPONENT_SPAN:
         raise UsageParseError("decimal exponent exceeds size limit")
+    if not value.is_zero() and abs(value.adjusted()) > MAX_DECIMAL_EXPONENT_SPAN:
+        raise UsageParseError("decimal adjusted exponent exceeds size limit")
 
 
 def _usage_cost(value: object) -> Decimal:
@@ -977,6 +1041,9 @@ def _sum_decimals(values: object) -> Decimal:
             raise UsageParseError("internal cost must be Decimal")
         _validate_decimal_bounds(value)
     minimum_exponent = min(value.as_tuple().exponent for value in decimals)
+    maximum_exponent = max(value.as_tuple().exponent for value in decimals)
+    if maximum_exponent - minimum_exponent > MAX_COMBINED_EXPONENT_SPAN:
+        raise UsageParseError("combined decimal exponent span exceeds limit")
     total = sum(
         (-1 if value.as_tuple().sign else 1)
         * int("".join(str(digit) for digit in value.as_tuple().digits) or "0")
@@ -987,7 +1054,9 @@ def _sum_decimals(values: object) -> Decimal:
         return Decimal(0)
     sign = 1 if total < 0 else 0
     digits = str(abs(total))
-    return Decimal((sign, tuple(int(digit) for digit in digits), minimum_exponent))
+    result = Decimal((sign, tuple(int(digit) for digit in digits), minimum_exponent))
+    _validate_decimal_bounds(result)
+    return result
 
 
 def _summary_fields(turns: tuple[TurnUsage, ...]) -> tuple[object, ...]:
