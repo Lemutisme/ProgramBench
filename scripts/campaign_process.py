@@ -6,6 +6,7 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -128,18 +129,51 @@ def run_bounded(
     grace: float,
     output_limit: int,
     environment: Mapping[str, str] | None = None,
+    *,
+    on_start: Callable[[int, int, str], None] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a non-provider evidence reader with bounded output, time, and descendants."""
     executable = shutil.which(command[0])
     invocation = (executable, *command[1:]) if executable else command
-    process = subprocess.Popen(
-        invocation,
-        cwd=cwd,
-        env=dict(environment) if environment is not None else {"PATH": os.defpath, "LANG": "C", "LC_ALL": "C"},
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=True,
-    )
+    read_descriptor, write_descriptor = os.pipe()
+    try:
+        process = subprocess.Popen(
+            (
+                sys.executable,
+                "-c",
+                "import os,sys; fd=int(sys.argv[1]); token=os.read(fd,4); os.close(fd); "
+                "token == b'run\\n' or sys.exit(125); os.execvp(sys.argv[2], sys.argv[2:])",
+                str(read_descriptor),
+                *invocation,
+            ),
+            cwd=cwd,
+            env=dict(environment)
+            if environment is not None
+            else {"PATH": os.defpath, "LANG": "C", "LC_ALL": "C"},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+            pass_fds=(read_descriptor,),
+        )
+    except BaseException:
+        os.close(read_descriptor)
+        os.close(write_descriptor)
+        raise
+    os.close(read_descriptor)
+    if on_start is not None:
+        try:
+            on_start(process.pid, process.pid, _process_start_identity(process.pid))
+        except BaseException:
+            os.close(write_descriptor)
+            _terminate_bounded(process, grace)
+            raise
+    try:
+        os.write(write_descriptor, b"run\n")
+    except BaseException:
+        _terminate_bounded(process, grace)
+        raise
+    finally:
+        os.close(write_descriptor)
     output = _BoundedOutput(output_limit)
     readers = (
         threading.Thread(target=_drain_bounded, args=(process.stdout, output, output.stdout, process.pid), daemon=True),
@@ -167,6 +201,15 @@ def run_bounded(
         output.stdout.decode(errors="replace"),
         output.stderr.decode(errors="replace"),
     )
+
+
+def _process_start_identity(pid: int) -> str:
+    """Return Linux procfs start ticks, which disambiguate PID reuse."""
+    try:
+        suffix = Path(f"/proc/{pid}/stat").read_text().rpartition(")")[2].split()
+        return suffix[19]
+    except (IndexError, OSError) as error:
+        raise ProcessError("bounded process start identity is unavailable") from error
 
 
 def _drain_bounded(stream: object, output: _BoundedOutput, target: bytearray, process_group: int) -> None:

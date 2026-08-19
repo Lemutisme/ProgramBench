@@ -828,7 +828,7 @@ def test_expand_campaign_pairs_every_selected_instance_in_seeded_order():
     assert first == expand_campaign_jobs(("one", "two"), {"one": "one-image", "two": "two-image"}, seed=42)
 
 
-def test_cli_parser_has_bounded_campaign_defaults_and_rejects_evaluator():
+def test_cli_parser_has_bounded_campaign_defaults_and_evaluator_flags():
     from scripts.campaign_runner import build_parser, parse_args
 
     parser = build_parser()
@@ -836,8 +836,9 @@ def test_cli_parser_has_bounded_campaign_defaults_and_rejects_evaluator():
     assert args.workers == 8
     assert args.limit == 8
     assert "8 active trajectories" in parser.format_help()
-    with pytest.raises(SystemExit, match="2"):
-        parse_args(["--config", "campaign.yaml", "--evaluate"])
+    evaluator = parse_args(["--config", "campaign.yaml", "--output", "out", "--evaluate"])
+    assert evaluator.evaluate
+    assert not evaluator.retry_evaluator
 
 
 def test_cli_limit_and_all_conflict_and_non_dry_requires_output():

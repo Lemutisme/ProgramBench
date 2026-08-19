@@ -718,7 +718,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--redo", action="store_true")
     parser.add_argument("--acknowledge", choices=("cache", "auth", "soft", "all"))
     parser.add_argument("--all", action="store_true")
-    parser.add_argument("--evaluate", action="store_true", help="reserved for Task10; evaluation is not implemented")
+    parser.add_argument("--evaluate", action="store_true", help="evaluate both arms and write the paired report")
+    parser.add_argument(
+        "--retry-evaluator",
+        action="store_true",
+        help="explicitly retry an interrupted evaluator without forcing completed results",
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
@@ -728,8 +733,8 @@ def parse_args(arguments: Sequence[str] | None = None) -> argparse.Namespace:
     values = list(arguments) if arguments is not None else None
     args = parser.parse_args(values)
     supplied = values if values is not None else os.sys.argv[1:]
-    if args.evaluate:
-        parser.error("--evaluate is reserved until Task10")
+    if args.retry_evaluator and not args.evaluate:
+        parser.error("--retry-evaluator requires --evaluate")
     if args.all and any(value == "--limit" or value.startswith("--limit=") for value in supplied):
         parser.error("--limit and --all conflict")
     if args.workers > MAX_ACTIVE_JOBS:
@@ -772,25 +777,30 @@ def main(arguments: Sequence[str] | None = None) -> int:
         run_cleanup_campaign(plan, breaker)
         print(f"campaign remains paused after cleanup: {breaker.pause_reason}", file=sys.stderr, flush=True)
         return 1
+    terminal_evaluation = args.evaluate and not (args.redo or args.retry_infra) and _selected_jobs_terminal(plan)
     required = ("OPENAI_API_KEY", "OPENCODE_SERVER_PASSWORD")
     missing = tuple(name for name in required if not os.environ.get(name))
-    if missing:
+    if missing and not terminal_evaluation:
         raise CampaignError(f"required credential environment variable(s) are missing: {', '.join(missing)}")
     try:
-        result = run_campaign(
-            plan.jobs,
-            workers=args.workers,
-            breaker=breaker,
-            state_path=breaker_path,
-            execute=lambda candidate, stop: run_job(
-                plan,
-                candidate,
+        result = (
+            CampaignResult(len(plan.jobs), 0, (), 0, breaker.pause_reason)
+            if terminal_evaluation
+            else run_campaign(
+                plan.jobs,
+                workers=args.workers,
                 breaker=breaker,
-                resume=args.resume,
-                redo=args.redo,
-                retry_infra=args.retry_infra,
-                stop_token=stop,
-            ),
+                state_path=breaker_path,
+                execute=lambda candidate, stop: run_job(
+                    plan,
+                    candidate,
+                    breaker=breaker,
+                    resume=args.resume,
+                    redo=args.redo,
+                    retry_infra=args.retry_infra,
+                    stop_token=stop,
+                ),
+            )
         )
     except CampaignDurabilityError as error:
         print(str(error), file=sys.stderr, flush=True)
@@ -800,7 +810,18 @@ def main(arguments: Sequence[str] | None = None) -> int:
     except CampaignShutdownError as error:
         print(f"campaign shutdown failed: {_sanitize_shutdown_error(error)}", file=sys.stderr, flush=True)
         return 1
-    return 0 if not (result.failed or result.paused or result.interrupted or result.pending) else 1
+    incomplete = bool(result.paused or result.interrupted or result.pending or result.running)
+    evaluation_failed = False
+    if args.evaluate and not incomplete:
+        from scripts.campaign_evaluate import CampaignEvaluationError, evaluate_campaign
+
+        try:
+            evaluation = evaluate_campaign(plan.output, retry_evaluator=args.retry_evaluator)
+            evaluation_failed = evaluation.status != "completed"
+        except CampaignEvaluationError as error:
+            print(f"campaign evaluation refused: {_sanitize_evaluation_error(error)}", file=sys.stderr, flush=True)
+            evaluation_failed = True
+    return 0 if not (result.failed or incomplete or evaluation_failed) else 1
 
 
 def _plan_from_manifest(
@@ -829,6 +850,17 @@ def _plan_from_manifest(
     return CampaignPlan(
         root, manifest_path, config, tuple(selected), frozen_jobs, dict(installs), dry_run, cleanup_only
     )
+
+
+def _selected_jobs_terminal(plan: CampaignPlan) -> bool:
+    try:
+        return all(
+            (state := StateStore(plan.output / job.arm / job.instance_id / "state.json").read_optional()) is not None
+            and state.phase in {"frozen", "packaged", "preflighted", "done", "failed", "interrupted"}
+            for job in plan.jobs
+        )
+    except (OSError, ValueError):
+        return False
 
 
 def _selection_instance(instance: Mapping[str, object]) -> Mapping[str, str]:
@@ -1141,6 +1173,15 @@ def _cleanup_recovery_evidence(paths: JobPaths, workspace: object) -> Mapping[st
 
 
 def _sanitize_shutdown_error(error: CampaignShutdownError) -> str:
+    message = " ".join(str(error).split())[:512]
+    for name in _CREDENTIAL_ENV:
+        value = os.environ.get(name)
+        if value:
+            message = message.replace(value, "[REDACTED]")
+    return message
+
+
+def _sanitize_evaluation_error(error: BaseException) -> str:
     message = " ".join(str(error).split())[:512]
     for name in _CREDENTIAL_ENV:
         value = os.environ.get(name)
