@@ -208,6 +208,11 @@ class LostApi(FakeApi):
         return None
 
 
+class NoExecutionApi(FakeApi):
+    def get_execution(self, contract_id: str) -> dict[str, object] | None:
+        return None
+
+
 class DelayedDispatchApi(FakeApi):
     def __init__(self, contract: dict[str, object], execution: dict[str, object]) -> None:
         pending = {**execution, "dispatched": False, "attempts": 0, "turnsUsed": 0, "actionsUsed": 0}
@@ -1974,6 +1979,112 @@ def test_pending_revision_precedes_safety_and_delivery(tmp_path: Path, status: s
         )
     assert result.completion.value == "pending_revision"
     assert api.exports == [] and api.attestations == []
+
+
+@pytest.mark.parametrize("binding", ["rotated", "missing"])
+def test_pending_revision_precedes_rotated_or_missing_execution_binding(tmp_path: Path, binding: str) -> None:
+    from scripts.campaign_procontract import build_issue_payload, run_procontract
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    store = _state(paths)
+    _, workspace = _workspace(tmp_path, paths)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock())
+    contract = _contract(payload, status="active")
+    contract["pendingRevision"] = {"spec": contract["spec"], "specHash": "pending", "reason": "requested"}
+    execution = {**_execution(payload), "promptID": "msg_rotated", "dispatched": False}
+    api = (
+        FakeApi(contract, execution)
+        if binding == "rotated"
+        else NoExecutionApi(contract, {**_execution(payload), "dispatched": False})
+    )
+
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease._handle_active = True
+        result = run_procontract(
+            job,
+            store,
+            workspace,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=_limits(),
+            breaker=CircuitBreaker(),
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+        )
+
+    assert result.completion.value == "pending_revision"
+    assert result.prompt_id == ("msg_rotated" if binding == "rotated" else _execution(payload)["promptID"])
+    assert api.exports == [] and api.attestations == []
+
+
+@pytest.mark.parametrize("native", ["released", "escalated", "challenged"])
+def test_native_terminal_state_precedes_missing_execution_binding(tmp_path: Path, native: str) -> None:
+    from scripts.campaign_procontract import build_issue_payload, run_procontract
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    store = _state(paths)
+    _, workspace = _workspace(tmp_path, paths)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock())
+    contract = _contract(payload, status="released" if native == "released" else "escalated")
+    if native == "challenged":
+        contract = _challenged(_contract(payload))
+    api = NoExecutionApi(contract, _execution(payload))
+
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease._handle_active = True
+        result = run_procontract(
+            job,
+            store,
+            workspace,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=_limits(),
+            breaker=CircuitBreaker(),
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+        )
+
+    assert result.completion.value == ("challenged" if native == "challenged" else native)
+    assert api.exports == [] and api.attestations == []
+
+
+def test_unexplained_active_binding_rotation_is_rejected(tmp_path: Path) -> None:
+    from scripts.campaign_procontract import ProContractConflictError, build_issue_payload, run_procontract
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    store = _state(paths)
+    _, workspace = _workspace(tmp_path, paths)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock())
+    execution = _execution(payload)
+
+    class RotatedApi(FakeApi):
+        def get_execution(self, contract_id: str) -> dict[str, object] | None:
+            return {**execution, "promptID": "msg_unexplained"}
+
+    api = RotatedApi(_contract(payload, status="active"), execution)
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease._handle_active = True
+        with pytest.raises(ProContractConflictError, match="binding"):
+            run_procontract(
+                job,
+                store,
+                workspace,
+                model="openai/gpt-5.6-luna",
+                variant="max",
+                limits=_limits(),
+                breaker=CircuitBreaker(),
+                api=api,
+                clock=clock,
+                sleeper=clock.sleep,
+            )
 
 
 @pytest.mark.parametrize("bad", ["/abs", "../x", "a/../b", r"C:\\root", r"a\\..\\b", ""])
@@ -3975,6 +4086,42 @@ def test_done_result_is_idempotent_and_makes_no_public_api_mutation(tmp_path: Pa
         invoke()
     assert (len(api.issues), len(api.exports), len(api.attestations)) == mutations
     assert workspace.stops == 4
+
+
+def test_done_result_revalidates_retained_export_git_identity(tmp_path: Path) -> None:
+    from scripts.campaign_procontract import ProContractConflictError, build_issue_payload, run_procontract
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    store = _state(paths)
+    _, workspace = _workspace(tmp_path, paths)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock())
+    api = FakeApi(_contract(payload), _execution(payload))
+
+    def invoke() -> object:
+        with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+            workspace.lease._handle_active = True
+            return run_procontract(
+                job,
+                store,
+                workspace,
+                model="openai/gpt-5.6-luna",
+                variant="max",
+                limits=_limits(),
+                breaker=CircuitBreaker(),
+                api=api,
+                clock=clock,
+                sleeper=clock.sleep,
+                package=lambda subject, run_dir, iid: _package(run_dir, iid),
+                preflight=lambda archive, iid: SimpleNamespace(executable_hash="e" * 64, output="ok"),
+            )
+
+    invoke()
+    api.exports[0][1].joinpath(".git/HEAD").write_text("corrupt\n")
+
+    with pytest.raises(ProContractConflictError, match="export"):
+        invoke()
 
 
 def test_interrupted_result_is_idempotently_adopted_without_api_calls(tmp_path: Path) -> None:

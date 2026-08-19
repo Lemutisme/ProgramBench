@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
 import textwrap
 import time
 import uuid
@@ -374,8 +375,9 @@ def test_real_delivery_restart_rebinds_procontract_api_and_preserves_attestation
 
 
 @pytest.mark.slow
+@pytest.mark.parametrize("expected_completion", ["discharged", "pending_revision"])
 def test_pinned_real_binary_completes_native_procontract_lifecycle(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, expected_completion: str
 ) -> None:
     from scripts.run_opencode import (
         CircuitBreaker,
@@ -396,6 +398,15 @@ def test_pinned_real_binary_completes_native_procontract_lifecycle(
     )
     if not binary.is_file() or not os.access(binary, os.X_OK):
         pytest.skip(f"Pinned ProContract binary unavailable: {binary}")
+    fixture_metadata = json.loads(Path(__file__).with_name("fixtures").joinpath("procontract-binary.json").read_text())
+    fixture_metadata["sha256"] = os.environ.get("PROGRAMBENCH_PROCONTRACT_SHA256", fixture_metadata["sha256"])
+    fixture_metadata["version"] = os.environ.get("PROGRAMBENCH_PROCONTRACT_VERSION", fixture_metadata["version"])
+    tmp_path.joinpath("procontract-binary.json").write_text(json.dumps(fixture_metadata, sort_keys=True))
+    assert hashlib.sha256(binary.read_bytes()).hexdigest() == fixture_metadata["sha256"]
+    assert (
+        subprocess.run([str(binary), "--version"], check=True, capture_output=True, text=True).stdout.strip()
+        == fixture_metadata["version"]
+    )
     try:
         _run_docker(("docker", "info", "--format", "{{.ServerVersion}}"), 30)
     except DockerCommandError as error:
@@ -434,9 +445,8 @@ def test_pinned_real_binary_completes_native_procontract_lifecycle(
         _run_docker(("docker", "tag", tag, preflight_image), 30)
         preflight_tagged = True
         provider_script = tmp_path / "provider.py"
-        provider_script.write_text(
-            textwrap.dedent(
-                """\
+        provider_source = textwrap.dedent(
+            """\
                 import json
                 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -489,9 +499,14 @@ def test_pinned_real_binary_completes_native_procontract_lifecycle(
                         return
 
                 ThreadingHTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
-                """
-            )
+            """
         )
+        if expected_completion == "pending_revision":
+            provider_source = provider_source.replace("contract_report_ready", "contract_propose_revision").replace(
+                '{"summary":"Candidate and replay are ready.","uncertainties":[]}',
+                '{"goal":"Revised fixture goal","brief":"Await principal revision decision.","reason":"Need revised scope."}',
+            )
+        provider_script.write_text(provider_source)
         provider_name = f"programbench-provider-{uuid.uuid4().hex}"
         provider_container = _run_docker(
             (
@@ -677,12 +692,20 @@ def test_pinned_real_binary_completes_native_procontract_lifecycle(
                 poll_interval=0.1,
             )
 
-            assert result.completion.value == "discharged"
-            assert result.quiet is True
-            assert result.report_hash is not None
-            assert result.attestation_id is not None
+            assert result.completion.value == expected_completion
+            if expected_completion == "discharged":
+                assert result.quiet is True
+                assert result.report_hash is not None
+                assert result.attestation_id is not None
+            else:
+                assert result.pending_revision is not None
+                assert result.attestation_id is None
+                assert not paths.root.joinpath("procontract-attestation-request.json").exists()
+                native = json.loads(paths.root.joinpath("procontract-native-result.json").read_text())
+                assert native["contract"]["pendingRevision"] == result.pending_revision
+                assert native["execution"]["contractID"] == result.contract_id
             assert tmp_path.joinpath("provider-hits.jsonl").is_file()
-            assert workspace.manifest.binary_sha256 == hashlib.sha256(binary.read_bytes()).hexdigest()
+            assert workspace.manifest.binary_sha256 == fixture_metadata["sha256"]
             if workspace.lease._handle_active:
                 workspace.stop_for_freeze()
     finally:

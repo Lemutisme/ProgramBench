@@ -781,7 +781,7 @@ def _run_procontract(
         if workspace.lease._handle_active:
             workspace.stop_for_freeze()
         _scan_terminal_credentials(job.job.root, workspace, result.contract_id)
-        _verify_terminal_artifacts(job.job.root, state, result)
+        _verify_terminal_artifacts(job.job.root, state, result, workspace)
         return result
 
     issue_path = job.job.root / "procontract-issue.json"
@@ -909,7 +909,7 @@ def _run_procontract(
             try:
                 found = api.get_contract(str(payload["id"]))
                 found_execution = api.get_execution(str(payload["id"]))
-                if found is None or found_execution is None:
+                if found is None:
                     return _finish_without_delivery(
                         job,
                         state_store,
@@ -927,7 +927,82 @@ def _run_procontract(
                         clock,
                     )
                 contract = _validate_contract(found, payload)
-                current_execution = _validate_execution(found_execution, payload, int(contract["revision"]))
+                current_execution = (
+                    _validate_execution(found_execution, payload, int(contract["revision"]))
+                    if found_execution is not None
+                    else None
+                )
+                native_execution = current_execution or execution
+                if contract.get("pendingRevision") is not None:
+                    return _finish_pending_revision(
+                        job,
+                        state_store,
+                        state,
+                        workspace,
+                        command_identity,
+                        payload,
+                        contract,
+                        native_execution,
+                        usage,
+                        actions,
+                        issue,
+                        clock,
+                    )
+                native = _native_outcome_completion(contract)
+                if native in {
+                    ProContractCompletion.CHALLENGED,
+                    ProContractCompletion.ESCALATED,
+                    ProContractCompletion.RELEASED,
+                }:
+                    return _finish_native_state(
+                        job,
+                        state_store,
+                        state,
+                        workspace,
+                        command_identity,
+                        payload,
+                        contract,
+                        native_execution,
+                        usage,
+                        actions,
+                        issue,
+                        native,
+                        clock,
+                        quiet,
+                    )
+                if contract["status"] == "discharged":
+                    return _resume_discharged(
+                        job,
+                        state_store,
+                        state,
+                        workspace,
+                        command_identity,
+                        payload,
+                        contract,
+                        native_execution,
+                        usage,
+                        actions,
+                        issue,
+                        quiet,
+                        clock,
+                    )
+                if current_execution is None:
+                    return _finish_without_delivery(
+                        job,
+                        state_store,
+                        state,
+                        workspace,
+                        command_identity,
+                        payload,
+                        contract,
+                        execution,
+                        usage,
+                        actions,
+                        issue,
+                        ProContractCompletion.LOST_SERVER,
+                        "native Contract execution binding is unavailable",
+                        clock,
+                    )
                 if _binding_identity(current_execution) != _binding_identity(bound_execution):
                     raise ProContractConflictError("native Contract execution binding changed after issue")
                 execution = current_execution
@@ -3416,6 +3491,49 @@ def _finish_pending_revision(
     )
 
 
+def _finish_native_state(
+    job: JobLease,
+    state_store: StateStore,
+    state: JobState,
+    workspace: DockerWorkspace,
+    command_identity: str,
+    payload: Mapping[str, object],
+    contract: Mapping[str, object],
+    execution: Mapping[str, object],
+    usage: UsageSummary,
+    actions: int,
+    issue: Mapping[str, object],
+    completion: ProContractCompletion,
+    clock: Callable[[], float],
+    quiet: Mapping[str, object],
+) -> ProContractResult:
+    _write_or_verify_json(
+        job.job.root / "procontract-native-result.json",
+        _sanitize_control(
+            {"version": 1, "contract": contract, "execution": execution, "quiet": quiet},
+            _all_credential_names(workspace.manifest.credential_env),
+        ),
+        "native Contract terminal observation",
+    )
+    return _finish_without_delivery(
+        job,
+        state_store,
+        state,
+        workspace,
+        command_identity,
+        payload,
+        contract,
+        execution,
+        usage,
+        actions,
+        issue,
+        completion,
+        f"native Contract status preserved: {completion.value}",
+        clock,
+        quiet=quiet,
+    )
+
+
 def _finish_without_delivery(
     job: JobLease,
     state_store: StateStore,
@@ -3641,7 +3759,12 @@ def _result(
     )
 
 
-def _verify_terminal_artifacts(job_root: Path, state: JobState, result: ProContractResult) -> None:
+def _verify_terminal_artifacts(
+    job_root: Path,
+    state: JobState,
+    result: ProContractResult,
+    workspace: DockerWorkspace,
+) -> None:
     hashes = dict(state.artifact_hashes or {})
     if not hashes or any(
         not job_root.joinpath(name).is_file() or _sha256(job_root / name) != digest for name, digest in hashes.items()
@@ -3655,7 +3778,7 @@ def _verify_terminal_artifacts(job_root: Path, state: JobState, result: ProContr
     ):
         raise ProContractConflictError("terminal ProContract result is not discharged and quiet")
     if state.phase == "done":
-        _verify_done_delivery(job_root, result)
+        _verify_done_delivery(job_root, result, workspace)
     if (
         result.exit_class != state.exit_class
         or result.provider_turns != state.provider_turns
@@ -3665,8 +3788,21 @@ def _verify_terminal_artifacts(job_root: Path, state: JobState, result: ProContr
         raise ProContractConflictError("terminal ProContract result conflicts with job state")
 
 
-def _verify_done_delivery(job_root: Path, result: ProContractResult) -> None:
+def _verify_done_delivery(job_root: Path, result: ProContractResult, workspace: DockerWorkspace) -> None:
     try:
+        if not isinstance(result.subject_hash, str):
+            raise ProContractConflictError("terminal result has no subject identity")
+        export = Path(workspace.manifest.state_dir) / f"contract-export-{result.contract_id}"
+        identity = _git_snapshot_identity(export, _owned_writable_roots(workspace))
+        if identity != result.subject_hash:
+            raise ProContractConflictError("terminal export Git identity conflicts with result")
+        _validate_export_complete(
+            job_root / "procontract-export-complete.json",
+            export,
+            result.contract_id,
+            result.subject_hash,
+            identity,
+        )
         archive = _require_package_record(_read_json(job_root / "procontract-package.json"), job_root)
         if result.package_hash != _sha256(archive):
             raise ProContractConflictError("terminal package hash conflicts with result")
