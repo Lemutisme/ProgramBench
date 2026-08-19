@@ -485,6 +485,25 @@ def test_active_soft_acknowledgement_sets_marker_and_roundtrips() -> None:
     assert restored.snapshot() == breaker.snapshot()
 
 
+def test_inactive_cache_ack_cannot_pre_authorize_later_two_failure_sequence() -> None:
+    breaker = CircuitBreaker()
+    breaker.acknowledge("cache")
+    assert breaker.snapshot()["cache_acknowledged"] is False
+    breaker.observe("unhealthy", 1, usage(turns=20, read=0))
+    breaker.observe("healthy", 1, usage(turns=20, read=2000))
+    breaker.observe("healthy", 2, usage(turns=20, read=0))
+    assert breaker.consecutive_cache_failures == 2
+    assert breaker.paused
+
+
+def test_inactive_auth_ack_cannot_pre_authorize_future_auth_failure() -> None:
+    breaker = CircuitBreaker()
+    breaker.acknowledge("auth")
+    assert breaker.admission_allowed
+    breaker.observe_error(401)
+    assert breaker.paused
+
+
 def test_acknowledged_recoverable_pause_round_trips_without_derived_drift() -> None:
     breaker = CircuitBreaker(soft_cost_cap="1")
     breaker.observe("job", 1, usage(turns=1, cost="1"))

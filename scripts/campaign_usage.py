@@ -472,10 +472,14 @@ class CircuitBreaker:
                 self._soft_acknowledged = True
                 return
             if reason == "cache":
+                if "cache" not in self._pause_causes:
+                    return
                 self._pause_causes.discard("cache")
                 self._cache_acknowledged = True
                 return
             if reason == "auth":
+                if "auth" not in self._pause_causes:
+                    return
                 self._pause_causes.discard("auth")
                 return
             if reason == "hard":
