@@ -10,12 +10,14 @@ import argparse
 import hashlib
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import traceback
+import warnings
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED, Future, wait
 from dataclasses import asdict, dataclass, is_dataclass
@@ -580,12 +582,17 @@ def run_job(
                 )
                 try:
                     if cleanup_only and state is not None and state.exit_class == "cleanup_failed":
-                        return JobRunResult(
-                            candidate,
-                            "completed"
-                            if _bounded_cleanup_stop(workspace.stop_for_freeze, JOB_CLEANUP_TIMEOUT_SECONDS)
-                            else "cleanup_failed",
+                        if not _bounded_cleanup_stop(
+                            _workspace_cleanup_operation(workspace), JOB_CLEANUP_TIMEOUT_SECONDS
+                        ):
+                            return JobRunResult(candidate, "cleanup_failed")
+                        workspace_lease.release_handle()
+                        job_lease.mark_cleanup_recovered(
+                            expected_generation=state.generation,
+                            command_identity="campaign-cleanup-recovery",
+                            artifact_hashes=_cleanup_recovery_evidence(paths, workspace),
                         )
+                        return JobRunResult(candidate, "completed")
                     if (stop.is_set() or breaker.stop_active) and not cleanup_only:
                         workspace.stop_for_freeze()
                         _terminalize(store, "interrupted", "campaign_stop")
@@ -648,11 +655,13 @@ def run_job(
                     ):
                         attempts += 1
                         if not _bounded_cleanup_stop(
-                            workspace.stop_for_freeze,
+                            _workspace_cleanup_operation(workspace),
                             max(0.0, cleanup_deadline - time.monotonic()),
                         ):
                             stop.set("workspace_cleanup_failed")
                             time.sleep(0.01)
+                        else:
+                            workspace_lease.release_handle()
                     if workspace_lease._handle_active:
                         evidence_path = paths.root / "cleanup-failure.json"
                         container_id = getattr(workspace, "container_id", None)
@@ -753,10 +762,6 @@ def main(arguments: Sequence[str] | None = None) -> int:
     )
     if plan.dry_run:
         return 0
-    required = ("OPENAI_API_KEY", "OPENCODE_SERVER_PASSWORD")
-    missing = tuple(name for name in required if not os.environ.get(name))
-    if missing:
-        raise CampaignError(f"required credential environment variable(s) are missing: {', '.join(missing)}")
     breaker_path = plan.output / "breaker.json"
     breaker = (
         CircuitBreaker.from_snapshot(_read_json(breaker_path))
@@ -767,6 +772,10 @@ def main(arguments: Sequence[str] | None = None) -> int:
         run_cleanup_campaign(plan, breaker)
         print(f"campaign remains paused after cleanup: {breaker.pause_reason}", file=sys.stderr, flush=True)
         return 1
+    required = ("OPENAI_API_KEY", "OPENCODE_SERVER_PASSWORD")
+    missing = tuple(name for name in required if not os.environ.get(name))
+    if missing:
+        raise CampaignError(f"required credential environment variable(s) are missing: {', '.join(missing)}")
     try:
         result = run_campaign(
             plan.jobs,
@@ -1042,19 +1051,93 @@ def _campaign_name(root: Path) -> str:
 
 
 def _bounded_cleanup_stop(operation: Callable[[], object], timeout: float) -> bool:
-    result: list[bool] = []
-
-    def run() -> None:
+    read_descriptor, write_descriptor = os.pipe()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        pid = os.fork()
+    if pid == 0:
+        os.close(read_descriptor)
         try:
+            os.setsid()
+            owner = getattr(operation, "__self__", None)
+            lease = getattr(owner, "lease", None)
+            if isinstance(lease, WorkspaceLease):
+                lease.authorize_fork_cleanup(os.getppid())
             operation()
-            result.append(True)
+            os.write(write_descriptor, b"1")
+            os._exit(0)
         except BaseException:
-            result.append(False)
+            try:
+                os.write(write_descriptor, b"0")
+            finally:
+                os._exit(1)
+    os.close(write_descriptor)
+    deadline = time.monotonic() + timeout
+    status: int | None = None
+    while time.monotonic() < deadline:
+        observed, observed_status = os.waitpid(pid, os.WNOHANG)
+        if observed == pid:
+            status = observed_status
+            break
+        time.sleep(min(0.005, max(0.0, deadline - time.monotonic())))
+    if status is None:
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except (PermissionError, ProcessLookupError):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        grace = time.monotonic() + 0.05
+        while time.monotonic() < grace:
+            observed, observed_status = os.waitpid(pid, os.WNOHANG)
+            if observed == pid:
+                status = observed_status
+                break
+            time.sleep(0.005)
+    if status is None:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except (PermissionError, ProcessLookupError):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        _, status = os.waitpid(pid, 0)
+    try:
+        result = os.read(read_descriptor, 1)
+    finally:
+        os.close(read_descriptor)
+    return os.waitstatus_to_exitcode(status) == 0 and result == b"1"
 
-    thread = threading.Thread(target=run, name="campaign-job-cleanup", daemon=True)
-    thread.start()
-    thread.join(timeout)
-    return not thread.is_alive() and result == [True]
+
+def _workspace_cleanup_operation(workspace: object) -> Callable[[], object]:
+    force_stop = getattr(workspace, "force_stop", None)
+    return force_stop if callable(force_stop) else getattr(workspace, "stop_for_freeze")
+
+
+def _cleanup_recovery_evidence(paths: JobPaths, workspace: object) -> Mapping[str, str]:
+    manifest_path = getattr(workspace, "manifest_path", None)
+    manifest_hash = (
+        hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        if isinstance(manifest_path, Path) and manifest_path.is_file()
+        else None
+    )
+    container_id = getattr(workspace, "container_id", None)
+    evidence_path = paths.root / "cleanup-recovered.json"
+    _atomic_json(
+        evidence_path,
+        {
+            "version": 1,
+            "container_ids": [container_id] if isinstance(container_id, str) else [],
+            "manifest_sha256": manifest_hash,
+            "status": "cleanup_recovered",
+        },
+    )
+    return {
+        evidence_path.name: hashlib.sha256(evidence_path.read_bytes()).hexdigest(),
+        **({"workspace.json": manifest_hash} if manifest_hash is not None else {}),
+    }
 
 
 def _sanitize_shutdown_error(error: CampaignShutdownError) -> str:

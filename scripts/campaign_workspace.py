@@ -416,6 +416,7 @@ class WorkspaceLease:
         self._lock_context = None
         self._owner: tuple[int, int] | None = None
         self._handle_active = False
+        self._cleanup_child_pid: int | None = None
 
     def __enter__(self) -> "WorkspaceLease":
         if self._lock_context is not None:
@@ -444,7 +445,9 @@ class WorkspaceLease:
 
     def require_process_identity(self, job_root: Path, campaign: str, instance_id: str, arm: str) -> None:
         expected = (str(Path(job_root).absolute()), campaign, instance_id, arm)
-        if self._lock_context is None or self._owner is None or self._owner[0] != os.getpid():
+        owner = self._owner[0] == os.getpid() if self._owner is not None else False
+        cleanup_child = self._cleanup_child_pid == os.getpid() if self._cleanup_child_pid is not None else False
+        if self._lock_context is None or not (owner or cleanup_child):
             raise WorkspaceError("workspace lease is not active in this process")
         if self.identity != expected:
             raise WorkspaceError("workspace lease does not match this job")
@@ -458,12 +461,18 @@ class WorkspaceLease:
     def release_handle(self) -> None:
         self._handle_active = False
 
+    def authorize_fork_cleanup(self, parent_pid: int) -> None:
+        if self._owner is None or self._owner[0] != parent_pid or os.getppid() != parent_pid:
+            raise WorkspaceError("forked cleanup does not descend from the workspace lease owner")
+        self._cleanup_child_pid = os.getpid()
+
     def __exit__(self, exception_type, exception, traceback) -> None:
         self._handle_active = False
         if self._lock_context is not None:
             self._lock_context.__exit__(exception_type, exception, traceback)
             self._lock_context = None
             self._owner = None
+            self._cleanup_child_pid = None
 
 
 class StopCoordinator:
@@ -494,6 +503,40 @@ class StopCoordinator:
         with self._condition:
             self._state = "stopped"
             self._condition.notify_all()
+
+
+@dataclass(frozen=True)
+class CleanupWorkspace:
+    manifest: WorkspaceManifest
+    manifest_path: Path
+    lease: WorkspaceLease
+    request: WorkspaceRequest
+
+    @property
+    def container_id(self) -> str:
+        if self.manifest.container_id is None:
+            raise WorkspaceError("cleanup workspace has no container identity")
+        return self.manifest.container_id
+
+    @property
+    def port(self) -> int:
+        if self.manifest.port is None:
+            raise WorkspaceError("cleanup workspace has no persisted port")
+        return self.manifest.port
+
+    @property
+    def base_url(self) -> str:
+        return f"http://127.0.0.1:{self.port}"
+
+    @property
+    def candidate(self) -> Path:
+        return self.manifest.candidate
+
+    def stop_for_freeze(self) -> None:
+        self.lease.release_handle()
+
+    def force_stop(self) -> None:
+        self.lease.release_handle()
 
 
 @dataclass(frozen=True)
@@ -652,7 +695,10 @@ def ensure_workspace(request: WorkspaceRequest, lease: WorkspaceLease | None = N
         raise
 
 
-def reconcile_workspace_for_cleanup(request: WorkspaceRequest, lease: WorkspaceLease) -> DockerWorkspace:
+def reconcile_workspace_for_cleanup(
+    request: WorkspaceRequest,
+    lease: WorkspaceLease,
+) -> DockerWorkspace | CleanupWorkspace:
     """Adopt only an exact persisted running workspace; never create or start one."""
     lease.claim_handle(request)
     try:
@@ -662,12 +708,14 @@ def reconcile_workspace_for_cleanup(request: WorkspaceRequest, lease: WorkspaceL
             or manifest.campaign != request.campaign
             or manifest.instance_id != request.instance_id
             or manifest.arm != request.arm
-            or manifest.phase != "running"
+            or manifest.phase not in {"running", "stopped"}
         ):
             raise ContainerConflictError("cleanup workspace does not match an exact persisted running job")
         _require_safe_manifest_paths(manifest)
         _require_path_identities(manifest)
         _require_binary(manifest)
+        if manifest.phase == "stopped":
+            return CleanupWorkspace(manifest, manifest.manifest_path, lease, request)
         return DockerWorkspace(
             manifest,
             manifest.manifest_path,

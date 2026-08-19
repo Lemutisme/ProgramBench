@@ -546,6 +546,39 @@ class StateStore:
                 )
             )
 
+    def mark_cleanup_recovered(
+        self,
+        *,
+        expected_generation: int,
+        command_identity: str,
+        artifact_hashes: Mapping[str, str],
+    ) -> JobState:
+        if not isinstance(command_identity, str) or not command_identity:
+            raise StateError("cleanup recovery command identity must be nonempty")
+        if not isinstance(artifact_hashes, Mapping) or any(
+            not isinstance(name, str) or not isinstance(digest, str) for name, digest in artifact_hashes.items()
+        ):
+            raise StateError("cleanup recovery artifact hashes are invalid")
+        with self._state_lock():
+            current = self._read_unlocked()
+            self._check_generation(current, expected_generation)
+            if current.phase != "failed" or current.exit_class != "cleanup_failed":
+                raise StateError("cleanup recovery requires failed cleanup_failed state")
+            recovered_at = time.time()
+            return self._commit_locked(
+                replace(
+                    current,
+                    phase="interrupted",
+                    phase_timestamps={**dict(current.phase_timestamps or {}), "interrupted": recovered_at},
+                    exit_class="cleanup_recovered",
+                    artifact_hashes={**dict(current.artifact_hashes or {}), **dict(artifact_hashes)},
+                    command_identity=command_identity,
+                    reset_reason="cleanup_recovered_from:cleanup_failed",
+                    reset_at=recovered_at,
+                    generation=current.generation + 1,
+                )
+            )
+
     def next_phase(self, state: JobState | Phase | None = None) -> Phase:
         current_phase = self.read().phase if state is None else state.phase if isinstance(state, JobState) else state
         if not isinstance(current_phase, str) or current_phase not in _PHASES:
@@ -742,6 +775,21 @@ class JobLease:
         current = StateStore(self.job.state).read()
         return StateStore(self.job.state).reset_for_rerun(
             redo=self.redo, retry_infra=self.retry_infra, resume=self.resume, expected_generation=current.generation
+        )
+
+    def mark_cleanup_recovered(
+        self,
+        *,
+        expected_generation: int,
+        command_identity: str,
+        artifact_hashes: Mapping[str, str],
+    ) -> JobState:
+        if self._lock_context is None or not self.cleanup_only:
+            raise StateError("cleanup recovery requires an active cleanup-only JobLease")
+        return StateStore(self.job.state).mark_cleanup_recovered(
+            expected_generation=expected_generation,
+            command_identity=command_identity,
+            artifact_hashes=artifact_hashes,
         )
 
     def __exit__(self, exception_type, exception, traceback) -> None:

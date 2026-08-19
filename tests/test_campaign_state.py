@@ -890,6 +890,44 @@ def test_failed_terminal_redo_can_reset_and_continue(tmp_path: Path):
     assert store.read().phase == "preparing"
 
 
+def test_cleanup_only_job_lease_marks_failed_cleanup_recovered_once(tmp_path: Path):
+    paths = JobPaths(tmp_path / "job")
+    store = StateStore(paths.state)
+    state = store.write(JobState("planned"))
+    state = store.transition(
+        "failed",
+        command_identity="cleanup-attempt",
+        expected_generation=state.generation,
+        exit_class="cleanup_failed",
+        artifact_hashes={"cleanup-failure.json": "a" * 64},
+    )
+
+    with JobLease(paths, resume=True, redo=False, retry_infra=False, cleanup_only=True) as lease:
+        recovered = lease.mark_cleanup_recovered(
+            expected_generation=state.generation,
+            command_identity="cleanup-recovery",
+            artifact_hashes={"workspace.json": "b" * 64},
+        )
+
+    assert recovered.phase == "interrupted"
+    assert recovered.exit_class == "cleanup_recovered"
+    assert recovered.command_identity == "cleanup-recovery"
+    assert recovered.reset_reason == "cleanup_recovered_from:cleanup_failed"
+    assert recovered.reset_at is not None
+    assert recovered.artifact_hashes == {
+        "cleanup-failure.json": "a" * 64,
+        "workspace.json": "b" * 64,
+    }
+    with JobLease(paths, resume=True, redo=False, retry_infra=False, cleanup_only=True) as lease:
+        assert not lease.should_run
+        with pytest.raises(StateError, match="cleanup recovery"):
+            lease.mark_cleanup_recovered(
+                expected_generation=recovered.generation,
+                command_identity="duplicate",
+                artifact_hashes={},
+            )
+
+
 @pytest.mark.parametrize(
     ("phase", "submission", "resume", "redo", "retry_infra", "expected"),
     [

@@ -537,6 +537,40 @@ def test_normal_stop_and_force_stop_share_one_serialized_docker_stop(tmp_path: P
     assert manifest["container_id"] == "a" * 64
 
 
+def test_forked_cleanup_is_authorized_by_parent_held_workspace_lease(tmp_path: Path) -> None:
+    from scripts.campaign_runner import _bounded_cleanup_stop, _workspace_cleanup_operation
+
+    docker = RecordingDocker()
+    value = request(tmp_path, docker)
+    value.job.root.mkdir(parents=True)
+
+    with JobLease(value.job, resume=True, redo=False, retry_infra=False), WorkspaceLease(value) as lease:
+        workspace = ensure_workspace_impl(value, lease)
+        assert _bounded_cleanup_stop(_workspace_cleanup_operation(workspace), 1)
+        lease.release_handle()
+
+    assert json.loads(workspace.manifest_path.read_text())["phase"] == "stopped"
+
+
+def test_cleanup_reconcile_adopts_already_stopped_manifest_without_restart(tmp_path: Path) -> None:
+    from scripts.campaign_workspace import reconcile_workspace_for_cleanup
+
+    docker = RecordingDocker()
+    value = request(tmp_path, docker)
+    value.job.root.mkdir(parents=True)
+    with JobLease(value.job, resume=True, redo=False, retry_infra=False), WorkspaceLease(value) as lease:
+        workspace = ensure_workspace_impl(value, lease)
+        workspace.stop()
+    commands = len(docker.commands)
+
+    with JobLease(value.job, resume=True, redo=False, retry_infra=False), WorkspaceLease(value) as lease:
+        cleanup = reconcile_workspace_for_cleanup(value, lease)
+        cleanup.force_stop()
+
+    assert len(docker.commands) == commands
+    assert json.loads(workspace.manifest_path.read_text())["phase"] == "stopped"
+
+
 def test_workspace_lease_is_cross_process_and_preserves_journal(tmp_path: Path) -> None:
     value = request(tmp_path, RecordingDocker())
     command = (

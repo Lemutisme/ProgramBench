@@ -3,6 +3,7 @@ import threading
 import time
 import subprocess
 import sys
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 
@@ -1118,16 +1119,10 @@ def test_persisted_hard_stop_resume_runs_cleanup_only_without_admission(tmp_path
         def __init__(self, request, lease):
             self.request = request
             self.lease = lease
-            self.stops = 0
-            self.blocking = request.arm == terminal.arm
             lease.claim_handle(request)
 
         def stop_for_freeze(self):
-            if self.blocking:
-                time.sleep(1)
-                raise RuntimeError("prior cleanup remains blocked")
-            self.stops += 1
-            self.lease.release_handle()
+            self.request.job.root.joinpath("child-stop-observed").write_text("stopped")
 
     def workspace_factory(request, lease):
         workspace = Workspace(request, lease)
@@ -1146,7 +1141,6 @@ def test_persisted_hard_stop_resume_runs_cleanup_only_without_admission(tmp_path
         )
         workspace.stop_for_freeze()
 
-    started = time.monotonic()
     result = campaign_runner.run_cleanup_campaign(
         resumed,
         breaker,
@@ -1158,18 +1152,28 @@ def test_persisted_hard_stop_resume_runs_cleanup_only_without_admission(tmp_path
     )
 
     assert resumed.cleanup_only
-    assert time.monotonic() - started < 0.5
     assert result.paused
     assert result.interrupted
-    assert result.failed == 1
+    assert result.failed == 0
     assert set(calls) == {(candidate.instance_id, candidate.arm) for candidate in resumed.jobs if candidate != terminal}
     assert len(workspaces) == 2
-    assert sum(workspace.stops for workspace in workspaces) == 1
+    assert all(workspace.request.job.root.joinpath("child-stop-observed").is_file() for workspace in workspaces)
     assert breaker.hard_stopped
     for candidate in resumed.jobs:
         state = campaign_runner.StateStore(resumed.output / candidate.arm / candidate.instance_id / "state.json").read()
-        assert state.phase == ("failed" if candidate == terminal else "interrupted")
-        assert state.exit_class == ("cleanup_failed" if candidate == terminal else "hard_stop_cleanup")
+        assert state.phase == "interrupted"
+        assert state.exit_class == ("cleanup_recovered" if candidate == terminal else "hard_stop_cleanup")
+
+    before = len(workspaces)
+    second = campaign_runner.run_cleanup_campaign(
+        resumed,
+        breaker,
+        workspace_factory=lambda *_: pytest.fail("cleanup_recovered job cannot reacquire workspace"),
+        vanilla_runner=lambda *_args, **_kwargs: pytest.fail("cleanup_recovered job cannot rerun adapter"),
+        procontract_runner=lambda *_args, **_kwargs: pytest.fail("cleanup_recovered job cannot rerun adapter"),
+    )
+    assert second.failed == 0
+    assert len(workspaces) == before
 
 
 @pytest.mark.parametrize("phase", ["planned", "preparing", "executing", "frozen", "packaged", "preflighted"])
@@ -1530,8 +1534,7 @@ def test_run_job_force_stops_before_unregistering_unexpected_adapter_failure(tmp
             assert self.lease._lock_context is not None
             assert self.lease._handle_active
             assert token.registry.active_jobs() == (candidate,)
-            self.stops += 1
-            self.lease.release_handle()
+            self.request.job.root.joinpath("child-stop-observed").write_text("stopped")
 
     def workspace_factory(request, lease):
         workspace = Workspace(request, lease)
@@ -1561,7 +1564,7 @@ def test_run_job_force_stops_before_unregistering_unexpected_adapter_failure(tmp
     assert state.phase == "failed"
     assert state.exit_class == "execution_failed"
     assert "adapter-secret" not in (state.exit_class or "")
-    assert workspaces[0].stops == 1
+    assert workspaces[0].request.job.root.joinpath("child-stop-observed").is_file()
     assert not workspaces[0].lease._handle_active
     assert token.registry.active_jobs() == ()
 
@@ -1585,15 +1588,16 @@ def test_run_job_retains_registered_cleanup_until_scheduler_retries_failed_stop(
         port = 9999
 
         def __init__(self, request, lease):
+            self.request = request
             self.lease = lease
-            self.attempts = 0
             lease.claim_handle(request)
 
         def stop_for_freeze(self):
-            self.attempts += 1
-            if self.attempts == 1:
+            path = self.request.job.root / "cleanup-attempts"
+            attempts = int(path.read_text()) + 1 if path.is_file() else 1
+            path.write_text(str(attempts))
+            if attempts == 1:
                 raise RuntimeError("transient stop failure")
-            self.lease.release_handle()
 
     def workspace_factory(request, lease):
         workspace = Workspace(request, lease)
@@ -1620,7 +1624,7 @@ def test_run_job_retains_registered_cleanup_until_scheduler_retries_failed_stop(
     assert result.interrupted
     assert result.failed == 1
     assert state.phase == "failed"
-    assert workspaces[0].attempts == 2
+    assert workspaces[0].request.job.root.joinpath("cleanup-attempts").read_text() == "2"
     assert not workspaces[0].lease._handle_active
 
 
@@ -1643,13 +1647,15 @@ def test_persistent_workspace_cleanup_failure_is_bounded_and_durable(tmp_path: P
         port = 9999
 
         def __init__(self, request, lease):
+            self.request = request
             self.lease = lease
-            self.attempts = 0
             self.container_id = "a" * 64
             lease.claim_handle(request)
 
         def stop_for_freeze(self):
-            self.attempts += 1
+            path = self.request.job.root / "cleanup-attempts"
+            attempts = int(path.read_text()) + 1 if path.is_file() else 1
+            path.write_text(str(attempts))
             raise RuntimeError("cleanup-secret")
 
     def workspace_factory(request, lease):
@@ -1678,7 +1684,9 @@ def test_persistent_workspace_cleanup_failure_is_bounded_and_durable(tmp_path: P
     evidence = json.loads((plan.output / "vanilla/one/cleanup-failure.json").read_text())
     state = campaign_runner.StateStore(plan.output / "vanilla/one/state.json").read()
     assert time.monotonic() - started < 0.5
-    assert workspaces[0].attempts == campaign_runner.JOB_CLEANUP_MAX_ATTEMPTS
+    assert int(workspaces[0].request.job.root.joinpath("cleanup-attempts").read_text()) == (
+        campaign_runner.JOB_CLEANUP_MAX_ATTEMPTS
+    )
     assert evidence == {
         "version": 1,
         "attempts": campaign_runner.JOB_CLEANUP_MAX_ATTEMPTS,
@@ -1709,11 +1717,14 @@ def test_blocking_workspace_stop_hits_cleanup_deadline_without_worker_spin(tmp_p
         container_id = "a" * 64
 
         def __init__(self, request, lease):
+            self.request = request
             self.lease = lease
             lease.claim_handle(request)
 
         def stop_for_freeze(self):
-            time.sleep(1)
+            self.request.job.root.joinpath("cleanup-child-pid").write_text(str(campaign_runner.os.getpid()))
+            time.sleep(0.5)
+            self.request.job.root.joinpath("late-cleanup-write").write_text("unsafe")
             raise RuntimeError("blocked stop failed")
 
     monkeypatch.setattr(campaign_runner, "_install_for", lambda *_: object())
@@ -1734,10 +1745,15 @@ def test_blocking_workspace_stop_hits_cleanup_deadline_without_worker_spin(tmp_p
             ),
         )
 
-    assert time.monotonic() - started < 0.5
+    assert time.monotonic() - started < 0.8
     evidence = json.loads((plan.output / "vanilla/one/cleanup-failure.json").read_text())
     assert evidence["attempts"] == 1
     assert campaign_runner.StateStore(plan.output / "vanilla/one/state.json").read().exit_class == "cleanup_failed"
+    child_pid = int((plan.output / "vanilla/one/cleanup-child-pid").read_text())
+    with pytest.raises(ProcessLookupError):
+        campaign_runner.os.kill(child_pid, 0)
+    time.sleep(0.3)
+    assert not (plan.output / "vanilla/one/late-cleanup-write").exists()
 
 
 def test_retry_infra_restarts_a_normalized_pre_provider_failure(tmp_path: Path, monkeypatch):
@@ -2066,6 +2082,45 @@ def test_cli_returns_nonzero_for_paused_interrupted_and_fatal_campaigns(
         stderr = capsys.readouterr().err
         assert "noncooperative worker" in stderr
         assert "test-password" not in stderr
+
+
+def test_cli_dispatches_cleanup_only_before_provider_credential_preflight(tmp_path: Path, monkeypatch):
+    from scripts import campaign_runner
+    from scripts.run_opencode import load_config
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config_path = tmp_path / "campaign.yaml"
+    config_path.write_text(_config(repo))
+    config = load_config(config_path)
+    plan = campaign_runner.CampaignPlan(
+        tmp_path / "out",
+        tmp_path / "out/campaign.json",
+        config,
+        (),
+        (),
+        {},
+        False,
+        cleanup_only=True,
+    )
+    called = []
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENCODE_SERVER_PASSWORD", raising=False)
+    monkeypatch.setattr(campaign_runner, "load_config", lambda _: config)
+    monkeypatch.setattr(campaign_runner, "load_all_instances", lambda **_: [])
+    monkeypatch.setattr(campaign_runner, "plan_campaign", lambda *_args, **_kwargs: plan)
+    monkeypatch.setattr(
+        campaign_runner,
+        "run_cleanup_campaign",
+        lambda *_args, **_kwargs: called.append("cleanup"),
+    )
+
+    assert campaign_runner.main(["--config", str(config_path), "--output", str(plan.output), "--resume"]) == 1
+    assert called == ["cleanup"]
+
+    monkeypatch.setattr(campaign_runner, "plan_campaign", lambda *_args, **_kwargs: replace(plan, cleanup_only=False))
+    with pytest.raises(campaign_runner.CampaignError, match="credential"):
+        campaign_runner.main(["--config", str(config_path), "--output", str(plan.output)])
 
 
 def _config(repo: Path) -> str:
