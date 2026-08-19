@@ -11,7 +11,7 @@ import subprocess
 import stat
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from enum import Enum
 from pathlib import Path, PurePosixPath
@@ -20,6 +20,8 @@ from urllib.parse import quote, urlencode, urlparse
 
 from programbench.candidate import CandidateError, PreflightResult, package_workspace, preflight_candidate
 from scripts.campaign_freeze import (
+    MAX_FREEZE_BYTES,
+    MAX_INVENTORY_SECONDS,
     CredentialLeakError,
     _inventory,
     _make_read_only,
@@ -1289,20 +1291,12 @@ def _deliver(
     ambiguous_path = job.job.root / "procontract-export-ambiguous.json"
     ambiguous_invocation = False
     reconciled_complete = False
+    direct_success = False
     if export_path.exists():
         exported = _read_json(export_path)
-        if complete_path.exists():
-            _validate_export_complete(complete_path, export_dir, str(payload["id"]), str(handoff["subjectHash"]))
-        else:
-            ambiguous_invocation = True
-            reconciled_complete = _git_snapshot_identity(export_dir) == handoff["subjectHash"]
+        ambiguous_invocation = not complete_path.exists()
     elif export_dir.exists():
         ambiguous_invocation = True
-        reconciled_complete = (
-            _validate_export_complete(complete_path, export_dir, str(payload["id"]), str(handoff["subjectHash"]))
-            if complete_path.exists()
-            else _git_snapshot_identity(export_dir) == handoff["subjectHash"]
-        )
         exported = {
             "contractID": payload["id"],
             "subjectHash": handoff["subjectHash"],
@@ -1313,26 +1307,19 @@ def _deliver(
             exported = api.export(workspace, str(payload["id"]), export_dir)
         except WorkspaceError:
             ambiguous_invocation = True
-            reconciled_complete = _git_snapshot_identity(export_dir) == handoff["subjectHash"]
             exported = {
                 "contractID": payload["id"],
                 "subjectHash": handoff["subjectHash"],
                 "directory": str(export_dir),
             }
         else:
+            direct_success = True
             _validate_export(exported, payload, handoff, export_dir, workspace)
-            _write_export_complete(
-                complete_path,
-                export_dir,
-                str(payload["id"]),
-                str(handoff["subjectHash"]),
-                str(handoff["subjectHash"]),
-            )
             _write_json(
                 export_path,
                 _sanitize_control(exported, _all_credential_names(workspace.manifest.credential_env)),
             )
-    if not ambiguous_invocation or reconciled_complete:
+    if direct_success:
         _validate_export(exported, payload, handoff, export_dir, workspace)
     try:
         exported_contract, exported_execution = _stage_contract_observation(
@@ -1371,6 +1358,20 @@ def _deliver(
             or exported_replay != replay
         ):
             raise ProContractConflictError("Contract handoff changed while its exact subject was exported")
+        if workspace.lease._handle_active:
+            workspace.stop()
+        if direct_success:
+            _write_export_complete(
+                complete_path,
+                export_dir,
+                str(payload["id"]),
+                str(handoff["subjectHash"]),
+                str(handoff["subjectHash"]),
+            )
+        elif complete_path.exists():
+            _validate_export_complete(complete_path, export_dir, str(payload["id"]), str(handoff["subjectHash"]))
+        elif ambiguous_invocation:
+            reconciled_complete = _git_snapshot_identity(export_dir) == handoff["subjectHash"]
         if ambiguous_invocation:
             if reconciled_complete:
                 _write_export_complete(
@@ -2500,20 +2501,33 @@ def _git_snapshot_identity(export: Path) -> str | None:
         listed = subprocess.run(
             [*command, "ls-tree", "-rz", "-r", "HEAD"], capture_output=True, timeout=10, check=False
         )
+        status_result = subprocess.run(
+            [*command, "status", "--porcelain=v1", "--ignored", "--untracked-files=all"],
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        index_diff = subprocess.run([*command, "diff-index", "--quiet", "--cached", "HEAD", "--"], timeout=10)
+        file_diff = subprocess.run([*command, "diff-files", "--quiet", "--"], timeout=10)
     except (OSError, subprocess.SubprocessError):
         return None
     if (
         tree.returncode != 0
         or listed.returncode != 0
+        or status_result.returncode != 0
+        or index_diff.returncode != 0
+        or file_diff.returncode != 0
         or len(tree.stdout) > 256
         or len(listed.stdout) > MAX_CREDENTIAL_SCAN_BYTES
+        or len(status_result.stdout) > 64 * 1024
+        or status_result.stdout.strip()
     ):
         return None
     identity = tree.stdout.decode(errors="strict").strip()
     if len(identity) not in {40, 64} or any(character not in "0123456789abcdef" for character in identity):
         return None
     try:
-        matches = _worktree_matches_git_tree(export, git_dir, listed.stdout)
+        matches = _worktree_matches_git_tree(export, listed.stdout)
     except VanillaError:
         return None
     if not matches:
@@ -2521,7 +2535,7 @@ def _git_snapshot_identity(export: Path) -> str | None:
     return identity
 
 
-def _worktree_matches_git_tree(export: Path, git_dir: Path, listing: bytes) -> bool:
+def _worktree_matches_git_tree(export: Path, listing: bytes) -> bool:
     expected: dict[str, tuple[str, str]] = {}
     for record in listing.split(b"\0"):
         if not record:
@@ -2543,7 +2557,7 @@ def _worktree_matches_git_tree(export: Path, git_dir: Path, listing: bytes) -> b
     if {str(item["path_sha256"]) for item in inventory} != expected_hashes:
         return False
     observed = {str(item["path_sha256"]): item for item in inventory}
-    command = ["git", f"--git-dir={git_dir}", f"--work-tree={export}", "hash-object"]
+    deadline = time.monotonic() + MAX_INVENTORY_SECONDS
     for relative, (mode, digest) in expected.items():
         path = export / relative
         info = path.lstat()
@@ -2551,9 +2565,8 @@ def _worktree_matches_git_tree(export: Path, git_dir: Path, listing: bytes) -> b
         if mode == "120000":
             if not stat.S_ISLNK(info.st_mode) or item.get("kind") != "symlink":
                 return False
-            result = subprocess.run(
-                command + ["--stdin"], input=os.readlink(path).encode(), capture_output=True, check=False
-            )
+            content = os.readlink(path).encode()
+            actual_digest = _git_blob_digest(content, len(digest))
         else:
             if (
                 not stat.S_ISREG(info.st_mode)
@@ -2561,10 +2574,26 @@ def _worktree_matches_git_tree(export: Path, git_dir: Path, listing: bytes) -> b
                 or bool(info.st_mode & 0o111) != (mode == "100755")
             ):
                 return False
-            result = subprocess.run(command + [str(path)], capture_output=True, check=False)
-        if result.returncode != 0 or result.stdout.decode().strip() != digest:
+            if info.st_size > MAX_FREEZE_BYTES or time.monotonic() > deadline:
+                return False
+            algorithm = hashlib.sha1() if len(digest) == 40 else hashlib.sha256()
+            algorithm.update(f"blob {info.st_size}\0".encode())
+            with path.open("rb") as source:
+                while chunk := source.read(1024 * 1024):
+                    if time.monotonic() > deadline:
+                        return False
+                    algorithm.update(chunk)
+            actual_digest = algorithm.hexdigest()
+        if actual_digest != digest:
             return False
     return True
+
+
+def _git_blob_digest(content: bytes, length: int) -> str:
+    algorithm = hashlib.sha1() if length == 40 else hashlib.sha256()
+    algorithm.update(f"blob {len(content)}\0".encode())
+    algorithm.update(content)
+    return algorithm.hexdigest()
 
 
 def _materialize_subject(export: Path, subject: Path, job_root: Path, credential_names: tuple[str, ...]) -> None:
@@ -3059,7 +3088,7 @@ def _finish_without_delivery(
     discharge_path = job.job.root / "procontract-discharge.json"
     effective_contract = contract
     effective_execution = execution
-    if discharge_path.is_file():
+    if discharge_path.is_file() and completion is not ProContractCompletion.PENDING_REVISION:
         discharge = _read_json(discharge_path)
         if (
             not isinstance(discharge, Mapping)
@@ -3099,6 +3128,14 @@ def _finish_without_delivery(
         error=error,
         interrupt_attempted=interrupt_attempted,
     )
+    if result.pending_revision is not None:
+        sanitized_pending = _sanitize_control(
+            result.pending_revision,
+            _all_credential_names(workspace.manifest.credential_env),
+        )
+        if not isinstance(sanitized_pending, Mapping):
+            raise ProContractError("sanitized pending revision is invalid")
+        result = replace(result, pending_revision=dict(sanitized_pending))
     _write_json(job.job.root / "procontract-result.json", result.to_dict())
     hashes = {
         path.name: _sha256(path)
