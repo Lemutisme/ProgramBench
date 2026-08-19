@@ -52,6 +52,18 @@ from scripts.campaign_usage import (
     UsageSummary,
     summarize_usage,
 )
+from scripts.campaign_workspace import (
+    ContainerConflictError,
+    DockerCommandError,
+    DockerNotFoundError,
+    DockerWorkspace,
+    WorkspaceError,
+    WorkspaceHealthError,
+    WorkspaceManifest,
+    WorkspaceRequest,
+    ensure_workspace,
+    prepare_workspace,
+)
 
 # Public compatibility re-exports for callers that historically imported state helpers here.
 import yaml
