@@ -254,24 +254,15 @@ def test_validate_evaluation_rejects_nonstandard_json_numeric(tmp_path: Path, co
     assert validate_evaluation(path, _instance()).reasons == ("malformed_eval_json",)
 
 
-def test_validate_evaluation_rejects_oversize_json_before_hash_or_parse(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_validate_evaluation_hashes_parse_oversize_json_before_rejecting_it(tmp_path: Path) -> None:
     from scripts import campaign_evaluate
 
     path = tmp_path / "one.eval.json"
     path.write_bytes(b" " * (campaign_evaluate.MAX_EVAL_JSON_BYTES + 1))
-    monkeypatch.setattr(
-        campaign_evaluate,
-        "_sha256",
-        lambda _path: pytest.fail("oversize eval must be rejected before full hashing"),
-    )
-
     result = campaign_evaluate.validate_evaluation(path, _instance())
 
     assert result.reasons == ("oversize_eval_json",)
-    assert result.eval_sha256 is None
+    assert result.eval_sha256 == hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def test_validate_evaluation_rejects_deeply_nested_json_without_crashing(tmp_path: Path) -> None:
@@ -478,6 +469,84 @@ def test_outputs_are_atomic_deterministic_and_sanitized(tmp_path: Path, monkeypa
     assert second.result_path.read_bytes() == result_md
     assert not list(root.rglob("*.tmp"))
     assert secret.encode() not in b"".join(path.read_bytes() for path in root.rglob("*") if path.is_file())
+
+
+def test_malformed_and_parse_oversize_eval_hashes_survive_state_and_report(tmp_path: Path) -> None:
+    from scripts import campaign_evaluate
+
+    root, instances = _campaign(tmp_path / "campaign")
+
+    def invalid_results(command, _cwd, _timeout, _grace, _limit, _environment, *, on_start):
+        on_start(os.getpid(), os.getpid(), "invalid-results")
+        arm_root = Path(command[4])
+        path = arm_root / "one/one.eval.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(
+            b"{malformed"
+            if arm_root.name == "procontract"
+            else b" " * (campaign_evaluate.MAX_EVAL_JSON_BYTES + 1)
+        )
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    first = campaign_evaluate.evaluate_campaign(root, instances=instances, command_runner=invalid_results)
+    comparison = first.comparison_path.read_bytes()
+    report = json.loads(comparison)
+
+    assert first.status == "invalid_protocol"
+    for arm, reason in (("procontract", "malformed_eval_json"), ("vanilla", "oversize_eval_json")):
+        path = root / f"evaluation/{arm}/one/one.eval.json"
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        state = json.loads((root / f"evaluation-state/{arm}.json").read_text())
+        assert state["artifact_hashes"]["one.eval.json"] == digest
+        assert report["pairs"][0][arm]["artifact_hashes"]["one.eval.json"] == digest
+        assert reason in report["pairs"][0][arm]["errors"]
+
+    second = campaign_evaluate.evaluate_campaign(
+        root,
+        instances=instances,
+        command_runner=lambda *_args, **_kwargs: pytest.fail("done invalid results must be reused"),
+    )
+
+    assert second.comparison_path.read_bytes() == comparison
+
+
+def test_eval_beyond_artifact_hash_cap_records_size_reason_and_reuses_deterministically(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import campaign_evaluate
+
+    monkeypatch.setattr(campaign_evaluate, "MAX_EVAL_JSON_BYTES", 32)
+    monkeypatch.setattr(campaign_evaluate, "MAX_EVAL_ARTIFACT_HASH_BYTES", 64)
+    root, instances = _campaign(tmp_path / "campaign")
+
+    def too_large(command, _cwd, _timeout, _grace, _limit, _environment, *, on_start):
+        on_start(os.getpid(), os.getpid(), "oversize-artifact")
+        path = Path(command[4]) / "one/one.eval.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b" " * 65)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    first = campaign_evaluate.evaluate_campaign(root, instances=instances, command_runner=too_large)
+    comparison = first.comparison_path.read_bytes()
+    report = json.loads(comparison)
+
+    for arm in ("procontract", "vanilla"):
+        state = json.loads((root / f"evaluation-state/{arm}.json").read_text())
+        pair = report["pairs"][0][arm]
+        assert state["eval_artifact_sizes"] == {"one": 65}
+        assert state["eval_hash_unavailable"] == {"one": "artifact_size_limit"}
+        assert "one.eval.json" not in state["artifact_hashes"]
+        assert pair["eval_artifact_size_bytes"] == 65
+        assert pair["eval_hash_unavailable_reason"] == "artifact_size_limit"
+        assert "hash_unavailable:artifact_size_limit" in pair["errors"]
+
+    second = campaign_evaluate.evaluate_campaign(
+        root,
+        instances=instances,
+        command_runner=lambda *_args, **_kwargs: pytest.fail("unhashable done result must be reused"),
+    )
+    assert second.comparison_path.read_bytes() == comparison
 
 
 def test_interrupted_evaluator_requires_explicit_retry_and_skips_done_arm(tmp_path: Path) -> None:

@@ -35,6 +35,8 @@ EVALUATOR_TIMEOUT_SECONDS = 12 * 60 * 60
 EVALUATOR_GRACE_SECONDS = 30
 EVALUATOR_OUTPUT_LIMIT = 4 * 1024 * 1024
 MAX_EVAL_JSON_BYTES = 32 * 1024 * 1024
+MAX_EVAL_ARTIFACT_HASH_BYTES = 256 * 1024 * 1024
+EVAL_ARTIFACT_HASH_TIMEOUT_SECONDS = 30
 _CREDENTIAL_ENV = ("OPENAI_API_KEY", "OPENCODE_SERVER_PASSWORD")
 
 
@@ -50,6 +52,15 @@ class EvaluatedInstance:
     total: int
     reasons: tuple[str, ...]
     eval_sha256: str | None
+    eval_size_bytes: int | None = None
+    hash_unavailable_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class _EvalArtifactIdentity:
+    sha256: str | None
+    size_bytes: int | None
+    unavailable_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -65,17 +76,47 @@ def validate_evaluation(path: Path, instance: Mapping[str, object]) -> Evaluated
     """Strictly validate one evaluator result and compute its canonical utility."""
     if not path.is_file():
         return EvaluatedInstance(False, None, 0, 0, ("missing_eval_json",), None)
+    artifact = _eval_artifact_identity(path)
+    hash_reason = (
+        (f"hash_unavailable:{artifact.unavailable_reason}",) if artifact.unavailable_reason is not None else ()
+    )
     try:
         if path.stat().st_size > MAX_EVAL_JSON_BYTES:
-            return EvaluatedInstance(False, None, 0, 0, ("oversize_eval_json",), None)
+            return EvaluatedInstance(
+                False,
+                None,
+                0,
+                0,
+                ("oversize_eval_json", *hash_reason),
+                artifact.sha256,
+                artifact.size_bytes,
+                artifact.unavailable_reason,
+            )
         with path.open("rb") as source_file:
             encoded = source_file.read(MAX_EVAL_JSON_BYTES + 1)
         if len(encoded) > MAX_EVAL_JSON_BYTES:
-            return EvaluatedInstance(False, None, 0, 0, ("oversize_eval_json",), None)
+            return EvaluatedInstance(
+                False,
+                None,
+                0,
+                0,
+                ("oversize_eval_json", *hash_reason),
+                artifact.sha256,
+                artifact.size_bytes,
+                artifact.unavailable_reason,
+            )
         source = encoded.decode()
     except (OSError, UnicodeError):
-        return EvaluatedInstance(False, None, 0, 0, ("malformed_eval_json",), None)
-    digest = hashlib.sha256(encoded).hexdigest()
+        return EvaluatedInstance(
+            False,
+            None,
+            0,
+            0,
+            ("malformed_eval_json", *hash_reason),
+            artifact.sha256,
+            artifact.size_bytes,
+            artifact.unavailable_reason,
+        )
     try:
         raw = json.loads(
             source,
@@ -85,12 +126,21 @@ def validate_evaluation(path: Path, instance: Mapping[str, object]) -> Evaluated
         _reject_nonfinite_numbers(raw)
         result = EvaluationResult.model_validate(raw)
     except (OSError, RecursionError, UnicodeError, ValidationError, ValueError):
-        return EvaluatedInstance(False, None, 0, 0, ("malformed_eval_json",), digest)
+        return EvaluatedInstance(
+            False,
+            None,
+            0,
+            0,
+            ("malformed_eval_json", *hash_reason),
+            artifact.sha256,
+            artifact.size_bytes,
+            artifact.unavailable_reason,
+        )
 
     active = get_active_branches(dict(instance))
     ignored = get_ignored_tests(dict(instance))
     filtered = result.for_branches(active).without_ignored(ignored)
-    reasons: list[str] = []
+    reasons = list(hash_reason)
     if result.solution_branch != "submission":
         reasons.append(f"unexpected_solution_branch:{result.solution_branch or '<missing>'}")
     if result.error_code is not None:
@@ -125,13 +175,31 @@ def validate_evaluation(path: Path, instance: Mapping[str, object]) -> Evaluated
         canonical = score_instance(path, dict(instance))
     except (OSError, UnicodeError, ValidationError, ValueError):
         reasons.append("official_score_failed")
-        return EvaluatedInstance(False, None, 0, 0, tuple(reasons), digest)
+        return EvaluatedInstance(
+            False,
+            None,
+            0,
+            0,
+            tuple(reasons),
+            artifact.sha256,
+            artifact.size_bytes,
+            artifact.unavailable_reason,
+        )
     resolved = sum(tests.values())
     total = len(tests)
     utility = Fraction(resolved, total) if total else Fraction(0)
     if canonical != float(utility):
         reasons.append("official_score_mismatch")
-    return EvaluatedInstance(not reasons, utility, resolved, total, tuple(reasons), digest)
+    return EvaluatedInstance(
+        not reasons,
+        utility,
+        resolved,
+        total,
+        tuple(reasons),
+        artifact.sha256,
+        artifact.size_bytes,
+        artifact.unavailable_reason,
+    )
 
 
 def evaluate_campaign(
@@ -457,6 +525,11 @@ def _evaluate_arm(
                 f"evaluator for {arm} was interrupted{detail}; use --retry-evaluator"
             )
 
+    retained_artifacts = (
+        dict(existing.get("artifact_hashes", {}))
+        if existing is not None and isinstance(existing.get("artifact_hashes"), Mapping)
+        else {}
+    )
     preserved = (
         _preserve_eval_results(state_root, arm_root, arm, submitted, existing)
         if retry_evaluator and existing is not None
@@ -484,7 +557,7 @@ def _evaluate_arm(
         "blob_root": blob_root,
         "blob_sha256": blob_hashes,
         "preserved_eval_hashes": preserved,
-        "artifact_hashes": {},
+        "artifact_hashes": retained_artifacts,
         "exit_code": None,
         "error": None,
     }
@@ -497,6 +570,8 @@ def _evaluate_arm(
             "status": "done",
             "exit_code": 0,
             "missing_eval_ids": [],
+            "eval_artifact_sizes": {},
+            "eval_hash_unavailable": {},
             "artifact_hashes": {
                 stdout_path.name: _sha256(stdout_path),
                 stderr_path.name: _sha256(stderr_path),
@@ -567,13 +642,21 @@ def _evaluate_arm(
         for path in (stdout_path, stderr_path)
         if path.is_file()
     }
-    hashes.update(
-        {
-            f"{instance_id}.eval.json": _sha256(arm_root / instance_id / f"{instance_id}.eval.json")
-            for instance_id in submitted
-            if (arm_root / instance_id / f"{instance_id}.eval.json").is_file()
-        }
-    )
+    eval_sizes: dict[str, int] = {}
+    unavailable_hashes: dict[str, str] = {}
+    for instance_id in submitted:
+        path = arm_root / instance_id / f"{instance_id}.eval.json"
+        if not path.is_file():
+            continue
+        identity = _eval_artifact_identity(path)
+        if identity.size_bytes is not None:
+            eval_sizes[instance_id] = identity.size_bytes
+        if identity.sha256 is not None:
+            hashes[f"{instance_id}.eval.json"] = identity.sha256
+        elif retained := retained_artifacts.get(f"{instance_id}.eval.json"):
+            hashes[f"{instance_id}.eval.json"] = retained
+        if identity.unavailable_reason is not None:
+            unavailable_hashes[instance_id] = identity.unavailable_reason
     missing = sorted(
         instance_id
         for instance_id in submitted
@@ -588,6 +671,8 @@ def _evaluate_arm(
         "exit_code": exit_code,
         "error": error,
         "missing_eval_ids": missing,
+        "eval_artifact_sizes": eval_sizes,
+        "eval_hash_unavailable": unavailable_hashes,
         "artifact_hashes": hashes,
     }
     _atomic_json(state_path, final)
@@ -609,20 +694,28 @@ def _reconcile_complete(
         _atomic_bytes(stdout_path, b"")
     if not stderr_path.is_file():
         _atomic_bytes(stderr_path, b"evaluator output unavailable after controller loss\n")
-    artifacts = {
-        stdout_path.name: _sha256(stdout_path),
-        stderr_path.name: _sha256(stderr_path),
-        **{
-            f"{instance_id}.eval.json": _sha256(arm_root / instance_id / f"{instance_id}.eval.json")
-            for instance_id in submitted
-        },
-    }
+    artifacts = {stdout_path.name: _sha256(stdout_path), stderr_path.name: _sha256(stderr_path)}
+    retained = state.get("artifact_hashes") if isinstance(state.get("artifact_hashes"), Mapping) else {}
+    sizes: dict[str, int] = {}
+    unavailable: dict[str, str] = {}
+    for instance_id in submitted:
+        identity = _eval_artifact_identity(arm_root / instance_id / f"{instance_id}.eval.json")
+        if identity.size_bytes is not None:
+            sizes[instance_id] = identity.size_bytes
+        if identity.sha256 is not None:
+            artifacts[f"{instance_id}.eval.json"] = identity.sha256
+        elif previous := retained.get(f"{instance_id}.eval.json"):
+            artifacts[f"{instance_id}.eval.json"] = previous
+        if identity.unavailable_reason is not None:
+            unavailable[instance_id] = identity.unavailable_reason
     done = {
         **state,
         "status": "done",
         "artifact_hashes": artifacts,
         "error": state.get("error"),
         "missing_eval_ids": [],
+        "eval_artifact_sizes": sizes,
+        "eval_hash_unavailable": unavailable,
     }
     _atomic_json(state_path, done)
     return done
@@ -759,11 +852,30 @@ def _arm_report(
     state = evidence["state"]
     valid = not errors and evaluated.valid
     utility = evaluated.utility
+    evaluator_hashes = evaluator_state.get("artifact_hashes")
+    retained_eval_hash = (
+        evaluator_hashes.get(f"{instance_id}.eval.json") if isinstance(evaluator_hashes, Mapping) else None
+    )
+    evaluator_sizes = evaluator_state.get("eval_artifact_sizes")
+    evaluator_unavailable = evaluator_state.get("eval_hash_unavailable")
+    eval_size = (
+        evaluated.eval_size_bytes
+        if evaluated.eval_size_bytes is not None
+        else evaluator_sizes.get(instance_id)
+        if isinstance(evaluator_sizes, Mapping)
+        else None
+    )
+    hash_unavailable = (
+        evaluated.hash_unavailable_reason
+        or evaluator_unavailable.get(instance_id)
+        if isinstance(evaluator_unavailable, Mapping)
+        else evaluated.hash_unavailable_reason
+    )
     artifacts = {
         **dict(state.artifact_hashes or {}),
         "submission.tar.gz": evidence["submission_sha256"],
         f"{arm}-result.json": evidence["result_sha256"],
-        f"{instance_id}.eval.json": evaluated.eval_sha256,
+        f"{instance_id}.eval.json": evaluated.eval_sha256 or retained_eval_hash,
     }
     cache = _cache_report(result)
     timestamps = state.phase_timestamps or {}
@@ -774,6 +886,8 @@ def _arm_report(
         "total": evaluated.total if utility is not None else None,
         "resolution": _resolution(utility if valid else None),
         "errors": errors,
+        "eval_artifact_size_bytes": eval_size,
+        "eval_hash_unavailable_reason": hash_unavailable,
         "turns": result.get("provider_turns", state.provider_turns),
         "actions": result.get("actions", state.actions),
         "wall_time_seconds": str(result.get("elapsed_seconds")) if "elapsed_seconds" in result else None,
@@ -877,18 +991,34 @@ def _verify_done_artifacts(
     submitted: Sequence[str],
     arm: str,
 ) -> None:
-    expected = {
-        stdout_path.name: stdout_path,
-        stderr_path.name: stderr_path,
-        **{
-            f"{instance_id}.eval.json": arm_root / instance_id / f"{instance_id}.eval.json"
-            for instance_id in submitted
-        },
-    }
     hashes = state.get("artifact_hashes")
-    if not isinstance(hashes, Mapping) or set(hashes) != set(expected) or any(
-        not path.is_file() or hashes.get(name) != _sha256(path) for name, path in expected.items()
+    sizes = state.get("eval_artifact_sizes")
+    unavailable = state.get("eval_hash_unavailable")
+    if (
+        not isinstance(hashes, Mapping)
+        or hashes.get(stdout_path.name) != _sha256(stdout_path)
+        or hashes.get(stderr_path.name) != _sha256(stderr_path)
+        or not isinstance(sizes, Mapping)
+        or not isinstance(unavailable, Mapping)
     ):
+        raise CampaignEvaluationError(f"evaluator artifact conflict for {arm}")
+    allowed = {stdout_path.name, stderr_path.name}
+    for instance_id in submitted:
+        name = f"{instance_id}.eval.json"
+        allowed.add(name)
+        path = arm_root / instance_id / name
+        if not path.is_file():
+            raise CampaignEvaluationError(f"evaluator artifact conflict for {arm}")
+        identity = _eval_artifact_identity(path)
+        if sizes.get(instance_id) != identity.size_bytes:
+            raise CampaignEvaluationError(f"evaluator artifact conflict for {arm}")
+        if identity.sha256 is not None and hashes.get(name) != identity.sha256:
+            raise CampaignEvaluationError(f"evaluator artifact conflict for {arm}")
+        if identity.sha256 is None and unavailable.get(instance_id) != identity.unavailable_reason:
+            raise CampaignEvaluationError(f"evaluator artifact conflict for {arm}")
+        if identity.sha256 is None and name in hashes and not isinstance(hashes.get(name), str):
+            raise CampaignEvaluationError(f"evaluator artifact conflict for {arm}")
+    if set(hashes) - allowed:
         raise CampaignEvaluationError(f"evaluator artifact conflict for {arm}")
 
 
@@ -1094,6 +1224,30 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _eval_artifact_identity(path: Path) -> _EvalArtifactIdentity:
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return _EvalArtifactIdentity(None, None, "stat_failed")
+    if size > MAX_EVAL_ARTIFACT_HASH_BYTES:
+        return _EvalArtifactIdentity(None, size, "artifact_size_limit")
+    started = time.monotonic()
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        with path.open("rb") as source:
+            while chunk := source.read(1024 * 1024):
+                total += len(chunk)
+                if total > MAX_EVAL_ARTIFACT_HASH_BYTES:
+                    return _EvalArtifactIdentity(None, total, "artifact_size_limit")
+                if time.monotonic() - started > EVAL_ARTIFACT_HASH_TIMEOUT_SECONDS:
+                    return _EvalArtifactIdentity(None, total, "hash_timeout")
+                digest.update(chunk)
+    except OSError:
+        return _EvalArtifactIdentity(None, total, "read_failed")
+    return _EvalArtifactIdentity(digest.hexdigest(), total)
 
 
 def _evaluator_identity(root: Path) -> dict[str, object]:
