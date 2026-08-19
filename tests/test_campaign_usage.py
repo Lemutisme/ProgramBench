@@ -582,6 +582,30 @@ def test_valid_direct_summary_roundtrips_through_breaker_snapshot() -> None:
     assert CircuitBreaker.from_snapshot(breaker.snapshot()).campaign_usage == summary
 
 
+def test_campaign_usage_turn_order_is_sorted_by_job_id_not_observation_order() -> None:
+    breaker = CircuitBreaker()
+    first = usage(turns=1, cost="0.1")
+    second = usage(turns=1, cost="0.2")
+    breaker.observe("b-job", 1, second)
+    breaker.observe("a-job", 1, first)
+    assert breaker.campaign_usage.turns == first.turns + second.turns
+    restored = CircuitBreaker.from_snapshot(breaker.snapshot())
+    assert restored.snapshot() == breaker.snapshot()
+
+
+def test_concurrent_multi_job_snapshots_have_deterministic_aggregate_order() -> None:
+    breaker = CircuitBreaker()
+    values = {
+        "job-c": usage(turns=1, cost="0.3"),
+        "job-a": usage(turns=1, cost="0.1"),
+        "job-b": usage(turns=1, cost="0.2"),
+    }
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        list(pool.map(lambda item: breaker.observe(item[0], 1, item[1]), values.items()))
+    assert breaker.campaign_usage.turns == values["job-a"].turns + values["job-b"].turns + values["job-c"].turns
+    assert CircuitBreaker.from_snapshot(breaker.snapshot()).snapshot() == breaker.snapshot()
+
+
 def test_acknowledged_recoverable_pause_round_trips_without_derived_drift() -> None:
     breaker = CircuitBreaker(soft_cost_cap="1")
     breaker.observe("job", 1, usage(turns=1, cost="1"))

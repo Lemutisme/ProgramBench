@@ -432,7 +432,8 @@ class CircuitBreaker:
 
     def _recompute_usage(self) -> None:
         total = UsageSummary()
-        for _, summary, _ in self._jobs.values():
+        for job in sorted(self._jobs):
+            summary = self._jobs[job][1]
             total = _add(total, summary)
         self._campaign_usage = total
 
