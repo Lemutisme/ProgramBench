@@ -181,6 +181,14 @@ class MissingExportDropApi(FakeApi):
         raise WorkspaceError("export command failed before materialization")
 
 
+class IgnoredExportDropApi(ExactExportDropApi):
+    def export(self, workspace: object, contract_id: str, destination: Path) -> dict[str, object]:
+        self.export_calls += 1
+        assert _write_git_export(destination, ignored=True) == self.subject_hash
+        destination.joinpath("ignored.bin").write_text("ignored residue")
+        raise WorkspaceError("export response lost")
+
+
 class SafetyApi(FakeApi):
     def status(self, session_id: str) -> str:
         return "idle" if self.interrupts else "busy"
@@ -1455,6 +1463,35 @@ def test_ambiguous_cli_export_missing_destination_preserves_native_loss(tmp_path
     assert (paths.root / "procontract-export-ambiguous.json").is_file()
 
 
+def test_ambiguous_cli_export_rejects_ignored_untracked_residue(tmp_path: Path) -> None:
+    from scripts.campaign_procontract import build_issue_payload, run_procontract
+
+    subject_hash = _write_git_export(tmp_path / "prototype", ignored=True)
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    store = _state(paths)
+    _, workspace = _workspace(tmp_path, paths, contained=True)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock())
+    api = IgnoredExportDropApi(_contract(payload, subject_hash=subject_hash), _execution(payload), subject_hash)
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease._handle_active = True
+        result = run_procontract(
+            job,
+            store,
+            workspace,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=_limits(),
+            breaker=CircuitBreaker(),
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+        )
+    assert result.completion.value == "lost_server"
+    assert api.attestations == []
+
+
 def test_conflicting_existing_contract_fails_closed_before_export(tmp_path: Path) -> None:
     from scripts.campaign_procontract import ProContractConflictError, build_issue_payload, run_procontract
 
@@ -1617,6 +1654,71 @@ def test_native_negative_outcomes_are_preserved_without_attestation(tmp_path: Pa
     assert api.attestations == []
     preserved = json.loads((paths.root / "procontract-native-result.json").read_text())
     assert preserved["contract"] == contract
+
+
+@pytest.mark.parametrize("status", ["active", "verification", "discharged"])
+def test_pending_revision_precedes_safety_and_delivery(tmp_path: Path, status: str) -> None:
+    from scripts.campaign_procontract import build_issue_payload, run_procontract
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    store = _state(paths)
+    _, workspace = _workspace(tmp_path, paths)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock())
+    contract = _contract(payload, status=status)
+    contract["pendingRevision"] = {"spec": contract["spec"], "specHash": "pending", "reason": "requested"}
+    execution = _execution(payload)
+    execution["actionsUsed"] = 4000
+    api = FakeApi(contract, execution)
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease._handle_active = True
+        result = run_procontract(
+            job,
+            store,
+            workspace,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=_limits(),
+            breaker=CircuitBreaker(),
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+        )
+    assert result.completion.value == "pending_revision"
+    assert api.exports == [] and api.attestations == []
+
+
+@pytest.mark.parametrize("bad", ["/abs", "../x", "a/../b", r"C:\\root", r"a\\..\\b", ""])
+def test_pending_revision_rejects_invalid_candidate_paths(tmp_path: Path, bad: str) -> None:
+    from scripts.campaign_procontract import ProContractError, build_issue_payload, run_procontract
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    store = _state(paths)
+    _, workspace = _workspace(tmp_path, paths)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock())
+    contract = _contract(payload)
+    pending = copy.deepcopy(contract["spec"])
+    pending["evidence"]["replay"]["artifacts"] = [bad]
+    contract["pendingRevision"] = {"spec": pending, "specHash": "pending", "reason": "bad"}
+    api = FakeApi(contract, _execution(payload))
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease._handle_active = True
+        with pytest.raises(ProContractError):
+            run_procontract(
+                job,
+                store,
+                workspace,
+                model="openai/gpt-5.6-luna",
+                variant="max",
+                limits=_limits(),
+                breaker=CircuitBreaker(),
+                api=api,
+                clock=clock,
+                sleeper=clock.sleep,
+            )
 
 
 @pytest.mark.parametrize("failure", ["replay", "package", "preflight"])
@@ -3328,14 +3430,18 @@ def _tree_identity(root: Path) -> list[tuple[str, int, int, str]]:
     ]
 
 
-def _write_git_export(root: Path) -> str:
+def _write_git_export(root: Path, *, ignored: bool = False) -> str:
     root.mkdir()
     root.joinpath("compile.sh").write_text("#!/bin/sh\n")
     root.joinpath("compile.sh").chmod(0o755)
     root.joinpath("executable").write_text("binary")
     root.joinpath("executable").chmod(0o755)
+    if ignored:
+        root.joinpath(".gitignore").write_text("ignored.bin\n")
     subprocess.run(["git", "init", "-q", str(root)], check=True)
-    subprocess.run(["git", "-C", str(root), "add", "compile.sh", "executable"], check=True)
+    subprocess.run(
+        ["git", "-C", str(root), "add", "compile.sh", "executable", *([".gitignore"] if ignored else [])], check=True
+    )
     environment = {
         **__import__("os").environ,
         "GIT_AUTHOR_NAME": "test",

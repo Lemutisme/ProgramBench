@@ -8,12 +8,13 @@ import json
 import math
 import os
 import subprocess
+import stat
 import tempfile
 import time
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import Enum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Callable, Mapping, Protocol
 from urllib.parse import quote, urlencode, urlparse
 
@@ -182,6 +183,7 @@ class ProContractCompletion(str, Enum):
     ESCALATED = "escalated"
     CHALLENGED = "challenged"
     OUTSTANDING = "outstanding"
+    PENDING_REVISION = "pending_revision"
     RELEASED = "released"
     WALL_TIME = "wall_time"
     PROVIDER_TURNS = "provider_turns"
@@ -886,6 +888,21 @@ def _run_procontract(
                 if _binding_identity(current_execution) != _binding_identity(bound_execution):
                     raise ProContractConflictError("native Contract execution binding changed after issue")
                 execution = current_execution
+                if contract.get("pendingRevision") is not None:
+                    return _finish_pending_revision(
+                        job,
+                        state_store,
+                        state,
+                        workspace,
+                        command_identity,
+                        payload,
+                        contract,
+                        execution,
+                        usage,
+                        actions,
+                        issue,
+                        clock,
+                    )
                 previous_usage, previous_actions, previous_messages = usage, actions, messages
                 sanitized = _sanitize_control(
                     api.messages(str(execution["sessionID"])),
@@ -1165,6 +1182,9 @@ def _run_procontract(
             deadline,
         )
     except ProContractNativeOutcome as outcome:
+        outcome_quiet = (
+            _pending_revision_quiet(payload) if outcome.completion is ProContractCompletion.PENDING_REVISION else quiet
+        )
         _write_or_verify_json(
             job.job.root / "procontract-native-result.json",
             _sanitize_control(
@@ -1172,7 +1192,7 @@ def _run_procontract(
                     "version": 1,
                     "contract": outcome.contract,
                     "execution": outcome.execution,
-                    "quiet": quiet,
+                    "quiet": outcome_quiet,
                 },
                 _all_credential_names(workspace.manifest.credential_env),
             ),
@@ -1193,7 +1213,7 @@ def _run_procontract(
             outcome.completion,
             str(outcome),
             clock,
-            quiet=quiet,
+            quiet=outcome_quiet,
         )
     except (CandidateError, CredentialLeakError, ProContractDeliveryError, ProContractHttpError, WorkspaceError):
         return _finish_without_delivery(
@@ -1309,6 +1329,7 @@ def _deliver(
             raise ProContractConflictError("Contract execution binding changed while its subject was exported")
         if (
             exported_contract["status"] == "discharged"
+            and exported_contract.get("pendingRevision") is None
             and job.job.root.joinpath("procontract-attestation-request.json").is_file()
             and job.job.root.joinpath("verifier-report.json").is_file()
             and isinstance(exported_contract.get("handoff"), Mapping)
@@ -1533,7 +1554,7 @@ def _deliver(
         and job.job.root.joinpath("procontract-attestation-request.json").is_file()
         and job.job.root.joinpath("verifier-report.json").is_file()
     )
-    if native is not None and not reconcilable_discharge:
+    if native is not None and (native is not ProContractCompletion.DISCHARGED or not reconcilable_discharge):
         raise ProContractNativeOutcome(native, current, current_execution)
     if _attestation_coordinates(current) != _attestation_coordinates(contract):
         raise ProContractConflictError("Contract coordinates changed before attestation")
@@ -1581,7 +1602,7 @@ def _deliver(
                 if _binding_identity(observed_execution) != _binding_identity(execution):
                     raise ProContractConflictError("Contract coordinates changed after ambiguous attestation") from None
                 native = _native_outcome_completion(observed)
-                if native is not None and observed["status"] != "discharged":
+                if native is not None and native is not ProContractCompletion.DISCHARGED:
                     raise ProContractNativeOutcome(native, observed, observed_execution)
                 if _attestation_coordinates(observed) != _attestation_coordinates(contract):
                     raise ProContractConflictError("Contract coordinates changed after ambiguous attestation") from None
@@ -2238,7 +2259,7 @@ def _valid_replay_schema(value: object) -> bool:
             and set(check) in ({"argv", "timeout", "exit"}, {"argv", "cwd", "timeout", "exit"})
             and isinstance(check["argv"], list)
             and all(isinstance(item, str) and item for item in check["argv"])
-            and ("cwd" not in check or isinstance(check["cwd"], str) and bool(check["cwd"]))
+            and ("cwd" not in check or _valid_candidate_path(check["cwd"]))
             and type(check["timeout"]) is int
             and 1_000 <= check["timeout"] <= 600_000
             and type(check["exit"]) is int
@@ -2249,12 +2270,28 @@ def _valid_replay_schema(value: object) -> bool:
         and all(
             isinstance(item, Mapping)
             and set(item) == {"path", "hash"}
-            and all(isinstance(item[key], str) and item[key] for key in ("path", "hash"))
+            and _valid_candidate_path(item["path"])
+            and isinstance(item["hash"], str)
+            and bool(item["hash"])
             for item in value["protected"]
         )
         and isinstance(value["artifacts"], list)
-        and all(isinstance(item, str) and item for item in value["artifacts"])
+        and all(_valid_candidate_path(item) for item in value["artifacts"])
     )
+
+
+def _valid_candidate_path(value: object) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    normalized = value.replace("\\", "/")
+    if normalized.startswith("/") or (
+        len(normalized) >= 3
+        and normalized[0] in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        and normalized[1] == ":"
+        and normalized[2] == "/"
+    ):
+        return False
+    return ".." not in normalized.split("/")
 
 
 def _validate_execution(raw: object, payload: Mapping[str, object], revision: int) -> Mapping[str, object]:
@@ -2437,28 +2474,72 @@ def _git_snapshot_identity(export: Path) -> str | None:
             timeout=10,
             check=False,
         )
-        tracked = subprocess.run([*command, "diff", "--quiet", "HEAD", "--"], timeout=10, check=False)
-        untracked = subprocess.run(
-            [*command, "ls-files", "--others", "--exclude-standard"],
-            capture_output=True,
-            timeout=10,
-            check=False,
+        listed = subprocess.run(
+            [*command, "ls-tree", "-rz", "-r", "HEAD"], capture_output=True, timeout=10, check=False
         )
     except (OSError, subprocess.SubprocessError):
         return None
     if (
         tree.returncode != 0
-        or tracked.returncode != 0
-        or untracked.returncode != 0
+        or listed.returncode != 0
         or len(tree.stdout) > 256
-        or len(untracked.stdout) > 64 * 1024
-        or untracked.stdout.strip()
+        or len(listed.stdout) > MAX_CREDENTIAL_SCAN_BYTES
     ):
         return None
     identity = tree.stdout.decode(errors="strict").strip()
     if len(identity) not in {40, 64} or any(character not in "0123456789abcdef" for character in identity):
         return None
+    if not _worktree_matches_git_tree(export, git_dir, listed.stdout):
+        return None
     return identity
+
+
+def _worktree_matches_git_tree(export: Path, git_dir: Path, listing: bytes) -> bool:
+    expected: dict[str, tuple[str, str]] = {}
+    for record in listing.split(b"\0"):
+        if not record:
+            continue
+        try:
+            metadata, encoded = record.split(b"\t", 1)
+            mode, kind, digest = metadata.decode().split(" ")
+            relative = encoded.decode()
+        except (UnicodeError, ValueError):
+            return False
+        if kind != "blob" or mode not in {"100644", "100755", "120000"} or not _valid_candidate_path(relative):
+            return False
+        expected[relative] = (mode, digest)
+    expected_dirs = {
+        parent.as_posix() for name in expected for parent in PurePosixPath(name).parents if str(parent) != "."
+    }
+    actual: set[str] = set()
+    for root, directories, files in os.walk(export, followlinks=False):
+        base = Path(root)
+        if base == export and ".git" in directories:
+            directories.remove(".git")
+        for name in [*directories, *files]:
+            relative = (base / name).relative_to(export).as_posix()
+            if relative == ".git":
+                continue
+            actual.add(relative)
+    if actual != set(expected) | expected_dirs:
+        return False
+    command = ["git", f"--git-dir={git_dir}", f"--work-tree={export}", "hash-object"]
+    for relative, (mode, digest) in expected.items():
+        path = export / relative
+        info = path.lstat()
+        if mode == "120000":
+            if not stat.S_ISLNK(info.st_mode):
+                return False
+            result = subprocess.run(
+                command + ["--stdin"], input=os.readlink(path).encode(), capture_output=True, check=False
+            )
+        else:
+            if not stat.S_ISREG(info.st_mode) or bool(info.st_mode & 0o111) != (mode == "100755"):
+                return False
+            result = subprocess.run(command + [str(path)], capture_output=True, check=False)
+        if result.returncode != 0 or result.stdout.decode().strip() != digest:
+            return False
+    return True
 
 
 def _materialize_subject(export: Path, subject: Path, job_root: Path, credential_names: tuple[str, ...]) -> None:
@@ -2648,7 +2729,7 @@ def _observe_after_attestation(
                 if _binding_identity(execution) != _binding_identity(current_execution):
                     raise ProContractConflictError("Contract execution binding changed after attestation")
                 native = _native_outcome_completion(contract)
-                if native is not None and contract["status"] != "discharged":
+                if native is not None and native is not ProContractCompletion.DISCHARGED:
                     raise ProContractNativeOutcome(native, contract, execution)
                 if _attestation_coordinates(contract) != _attestation_coordinates(current):
                     raise ProContractConflictError("Contract coordinates changed after attestation")
@@ -2755,6 +2836,8 @@ def _attestation_coordinates(contract: Mapping[str, object]) -> tuple[object, ..
 
 
 def _native_outcome_completion(contract: Mapping[str, object]) -> ProContractCompletion | None:
+    if contract.get("pendingRevision") is not None:
+        return ProContractCompletion.PENDING_REVISION
     if contract.get("challenge") is not None:
         return ProContractCompletion.CHALLENGED
     status = contract.get("status")
@@ -2873,6 +2956,59 @@ def _stop_and_finish(
     )
 
 
+def _pending_revision_quiet(payload: Mapping[str, object]) -> Mapping[str, object]:
+    return {
+        "scope": payload["scope"],
+        "quiet": False,
+        "frontier": -1,
+        "ledgerHash": "",
+        "stateHash": "",
+        "outstanding": [payload["id"]],
+    }
+
+
+def _finish_pending_revision(
+    job: JobLease,
+    state_store: StateStore,
+    state: JobState,
+    workspace: DockerWorkspace,
+    command_identity: str,
+    payload: Mapping[str, object],
+    contract: Mapping[str, object],
+    execution: Mapping[str, object],
+    usage: UsageSummary,
+    actions: int,
+    issue: Mapping[str, object],
+    clock: Callable[[], float],
+) -> ProContractResult:
+    quiet = _pending_revision_quiet(payload)
+    _write_or_verify_json(
+        job.job.root / "procontract-native-result.json",
+        _sanitize_control(
+            {"version": 1, "contract": contract, "execution": execution, "quiet": quiet},
+            _all_credential_names(workspace.manifest.credential_env),
+        ),
+        "native pending revision observation",
+    )
+    return _finish_without_delivery(
+        job,
+        state_store,
+        state,
+        workspace,
+        command_identity,
+        payload,
+        contract,
+        execution,
+        usage,
+        actions,
+        issue,
+        ProContractCompletion.PENDING_REVISION,
+        "native pending revision preserved",
+        clock,
+        quiet=quiet,
+    )
+
+
 def _finish_without_delivery(
     job: JobLease,
     state_store: StateStore,
@@ -2954,6 +3090,7 @@ def _finish_without_delivery(
             ProContractCompletion.AUTH,
             ProContractCompletion.HARD_COST,
             ProContractCompletion.OUTSTANDING,
+            ProContractCompletion.PENDING_REVISION,
         }
         else "failed",
         command_identity=command_identity,
