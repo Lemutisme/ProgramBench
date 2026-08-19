@@ -30,6 +30,7 @@ from scripts.campaign_freeze import (
     _verify_no_credentials,
 )
 from scripts.campaign_state import JobLease, JobState, StateError, StateStore
+from scripts.campaign_stop import CampaignStopped, StopAwareApi, StopToken, stop_aware_sleeper
 from scripts.campaign_usage import CircuitBreaker, UsageParseError, UsageSummary
 from scripts.campaign_vanilla import (
     MAX_ARTIFACT_BYTES,
@@ -203,6 +204,7 @@ class ProContractCompletion(str, Enum):
     HARD_COST = "hard_cost"
     LOST_SERVER = "lost_server"
     DELIVERY_FAILED = "delivery_failed"
+    INTERRUPTED = "interrupted"
 
 
 @dataclass(frozen=True)
@@ -761,8 +763,35 @@ def run_procontract(
     poll_interval: float = 1,
     package: Callable[[Path, Path, str], Path] = package_workspace,
     preflight: Callable[[Path, str], PreflightResult] = preflight_candidate,
+    stop_token: StopToken | None = None,
 ) -> ProContractResult:
     """Fail closed around the durable native Contract orchestration."""
+    stop = stop_token or StopToken()
+    state = state_store.read()
+    guarded_api = StopAwareApi(api, stop)
+    if stop.is_set() and state.phase not in {"done", "failed", "interrupted"}:
+        if job.job.root.joinpath("procontract-issue-response.json").is_file():
+            return _finish_active_campaign_stop(
+                job,
+                state_store,
+                workspace,
+                breaker,
+                api,
+                guarded_api,
+                clock,
+                sleeper,
+                poll_interval,
+            )
+        return _finish_unadmitted_campaign_stop(job, state_store, state, workspace, clock)
+
+    def guarded_package(subject: Path, run_dir: Path, instance_id: str) -> Path:
+        stop.checkpoint()
+        return package(subject, run_dir, instance_id)
+
+    def guarded_preflight(archive: Path, instance_id: str) -> PreflightResult:
+        stop.checkpoint()
+        return preflight(archive, instance_id)
+
     try:
         result = _run_procontract(
             job,
@@ -772,12 +801,12 @@ def run_procontract(
             variant=variant,
             limits=limits,
             breaker=breaker,
-            api=api,
+            api=guarded_api,  # type: ignore[arg-type]
             clock=clock,
-            sleeper=sleeper,
+            sleeper=stop_aware_sleeper(stop, sleeper),
             poll_interval=poll_interval,
-            package=package,
-            preflight=preflight,
+            package=guarded_package,
+            preflight=guarded_preflight,
         )
         state = state_store.read()
         if state.phase in {"done", "failed", "interrupted"}:
@@ -788,10 +817,188 @@ def run_procontract(
                 _terminal_usage(job.job.root),
             )
         return result
+    except CampaignStopped:
+        return _finish_active_campaign_stop(
+            job,
+            state_store,
+            workspace,
+            breaker,
+            api,
+            guarded_api,
+            clock,
+            sleeper,
+            poll_interval,
+        )
     except (VanillaError, UsageParseError, StateError):
         if workspace.lease._handle_active:
             workspace.stop_for_freeze()
         raise
+
+
+def _finish_unadmitted_campaign_stop(
+    job: JobLease,
+    state_store: StateStore,
+    state: JobState,
+    workspace: DockerWorkspace,
+    clock: Callable[[], float],
+) -> ProContractResult:
+    issue = _load_or_create_issue(job.job.root / "procontract-issue.json", workspace, clock)
+    payload = issue["payload"]
+    if not isinstance(payload, Mapping):
+        raise ProContractError("persisted Contract issue payload is invalid")
+    if workspace.lease._handle_active:
+        workspace.stop_for_freeze()
+    result = ProContractResult(
+        contract_id=str(payload["id"]),
+        session_id="ses_unadmitted",
+        prompt_id="msg_unadmitted",
+        revision=1,
+        spec_hash=_hash_json(
+            {
+                key: payload[key]
+                for key in (
+                    "trigger",
+                    "goal",
+                    "policy",
+                    "brief",
+                    "requires",
+                    "authority",
+                    "budget",
+                    "evidence",
+                    "resolution",
+                )
+            }
+        ),
+        status="dormant",
+        completion=ProContractCompletion.INTERRUPTED,
+        provider_turns=state.provider_turns,
+        actions=state.actions,
+        cost=Decimal(str(state.cost)),
+        elapsed_seconds=max(0, clock() - float(issue["startedAt"])),
+        acceptance_hash=str(issue["acceptanceHash"]),
+        subject_hash=None,
+        replay_evidence_hash=None,
+        report_hash=None,
+        package_hash=None,
+        executable_hash=None,
+        attestation_id=None,
+        interrupt_attempted=False,
+        forced_stop=True,
+        workspace_frozen=False,
+        container_stopped_for_freeze=True,
+        quiet=False,
+        outstanding=(str(payload["id"]),),
+        exit_class="campaign_stop",
+        error="campaign_stop",
+    )
+    result_path = job.job.root / "procontract-result.json"
+    _write_json(result_path, result.to_dict())
+    state_store.transition(
+        "interrupted",
+        command_identity=state.command_identity or "campaign_stop",
+        expected_generation=state.generation,
+        exit_class="campaign_stop",
+        artifact_hashes={
+            "procontract-issue.json": _sha256(job.job.root / "procontract-issue.json"),
+            "procontract-result.json": _sha256(result_path),
+        },
+    )
+    return result
+
+
+def _finish_active_campaign_stop(
+    job: JobLease,
+    state_store: StateStore,
+    workspace: DockerWorkspace,
+    breaker: CircuitBreaker,
+    api: ProContractApi,
+    guarded_api: StopAwareApi,
+    clock: Callable[[], float],
+    sleeper: Callable[[float], None],
+    poll_interval: float,
+) -> ProContractResult:
+    state = state_store.read()
+    if state.phase in {"done", "failed", "interrupted"}:
+        return ProContractResult.from_dict(_read_json(job.job.root / "procontract-result.json"))
+    issue = _read_json(job.job.root / "procontract-issue.json")
+    if not isinstance(issue, Mapping) or not isinstance(issue.get("payload"), Mapping):
+        raise ProContractError("persisted Contract issue is invalid")
+    payload = issue["payload"]
+    response_path = job.job.root / "procontract-issue-response.json"
+    if not response_path.is_file():
+        try:
+            accepted = (
+                _reconcile_ambiguous_issue(
+                    api,
+                    payload,
+                    response_path,
+                    _all_credential_names(workspace.manifest.credential_env),
+                )
+                if guarded_api.attempted("issue")
+                else None
+            )
+        except ProContractError:
+            return _finish_unadmitted_campaign_stop(job, state_store, state, workspace, clock)
+        if accepted is None:
+            return _finish_unadmitted_campaign_stop(job, state_store, state, workspace, clock)
+    else:
+        accepted = _validate_issue_response(_read_json(response_path), payload)
+    contract = guarded_api.observed("get_contract")
+    if not isinstance(contract, Mapping):
+        contract = accepted["data"]
+    contract = _validate_contract(contract, payload)
+    execution = accepted["execution"]
+    observed_execution = guarded_api.observed("get_execution")
+    if isinstance(observed_execution, Mapping):
+        execution = observed_execution
+    execution = _validate_execution(execution, payload, int(contract["revision"]))
+    usage, actions, messages = _restore_contract_progress(
+        job.job.root / "procontract-progress.json", state, payload, execution
+    )
+    quiet = _pending_revision_quiet(payload)
+    native = _native_outcome_completion(contract)
+    if native is not None and native is not ProContractCompletion.OUTSTANDING:
+        return _finish_native_state(
+            job,
+            state_store,
+            state,
+            workspace,
+            state.command_identity or "campaign_stop",
+            payload,
+            contract,
+            execution,
+            usage,
+            actions,
+            messages,
+            issue,
+            native,
+            api,
+            breaker,
+            clock,
+            quiet,
+            sleeper,
+            poll_interval,
+        )
+    return _stop_and_finish(
+        job,
+        state_store,
+        state,
+        workspace,
+        state.command_identity or "campaign_stop",
+        payload,
+        contract,
+        execution,
+        usage,
+        actions,
+        issue,
+        api,
+        ProContractCompletion.INTERRUPTED,
+        "campaign_stop",
+        clock,
+        sleeper,
+        poll_interval,
+        quiet,
+    )
 
 
 def _run_procontract(
@@ -3896,6 +4103,7 @@ def _finish_without_delivery(
             ProContractCompletion.HARD_COST,
             ProContractCompletion.OUTSTANDING,
             ProContractCompletion.PENDING_REVISION,
+            ProContractCompletion.INTERRUPTED,
         }
         else "failed",
         command_identity=command_identity,
@@ -4023,7 +4231,7 @@ def _result(
         container_stopped_for_freeze=stopped,
         quiet=quiet.get("quiet") is True,
         outstanding=tuple(str(value) for value in quiet.get("outstanding", [])),
-        exit_class=completion.value,
+        exit_class="campaign_stop" if completion is ProContractCompletion.INTERRUPTED else completion.value,
         error=error,
         quiet_unconfirmed=quiet_unconfirmed,
         pending_revision=dict(contract["pendingRevision"])

@@ -889,6 +889,334 @@ def _challenged(contract: dict[str, object]) -> dict[str, object]:
     }
 
 
+def test_campaign_stop_before_contract_admission_freezes_without_issue(tmp_path: Path) -> None:
+    from scripts.campaign_procontract import ProContractCompletion, build_issue_payload, run_procontract
+    from scripts.campaign_stop import StopToken
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    store = _state(paths)
+    request, workspace = _workspace(tmp_path, paths)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock())
+    api = FakeApi(_contract(payload), _execution(payload))
+    token = StopToken()
+    token.set("keyboard_interrupt")
+
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease._handle_active = True
+        result = run_procontract(
+            job,
+            store,
+            workspace,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=_limits(),
+            breaker=CircuitBreaker(),
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+            stop_token=token,
+        )
+
+    state = store.read()
+    assert result.completion is ProContractCompletion.INTERRUPTED
+    assert result.exit_class == "campaign_stop"
+    assert state.phase == "interrupted"
+    assert state.exit_class == "campaign_stop"
+    assert api.issues == []
+    assert api.interrupts == []
+    assert workspace.stops == 1
+
+
+def test_campaign_stop_after_issue_intent_but_before_api_issue_terminalizes_without_response(tmp_path: Path) -> None:
+    from scripts.campaign_procontract import ProContractCompletion, build_issue_payload, run_procontract
+    from scripts.campaign_stop import StopToken
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    token = StopToken()
+
+    class StopBeforeIssueStore(StateStore):
+        def transition(self, next_phase, **kwargs):
+            state = super().transition(next_phase, **kwargs)
+            if next_phase == "executing":
+                token.set("keyboard_interrupt")
+            return state
+
+    store = StopBeforeIssueStore(paths.state)
+    store.write(JobState("planned"))
+    request, workspace = _workspace(tmp_path, paths)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock())
+    api = FakeApi(_contract(payload), _execution(payload))
+
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease._handle_active = True
+        result = run_procontract(
+            job,
+            store,
+            workspace,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=_limits(),
+            breaker=CircuitBreaker(),
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+            stop_token=token,
+        )
+
+    assert result.completion is ProContractCompletion.INTERRUPTED
+    assert result.exit_class == "campaign_stop"
+    assert store.read().phase == "interrupted"
+    assert api.issues == []
+    assert not paths.root.joinpath("procontract-issue-response.json").exists()
+    assert workspace.stops == 1
+
+
+def test_campaign_stop_reconciles_admitted_contract_after_lost_issue_response(tmp_path: Path) -> None:
+    from scripts.campaign_procontract import (
+        ProContractCompletion,
+        ProContractHttpError,
+        build_issue_payload,
+        run_procontract,
+    )
+    from scripts.campaign_stop import StopToken
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    store = _state(paths)
+    request, workspace = _workspace(tmp_path, paths)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock())
+    token = StopToken()
+
+    class AdmitThenLoseResponseApi(SafetyApi):
+        def issue(self, issue):
+            super().issue(issue)
+            token.set("keyboard_interrupt")
+            raise ProContractHttpError("issue response lost", status_code=503, transient=True)
+
+    api = AdmitThenLoseResponseApi(_contract(payload), _execution(payload))
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease._handle_active = True
+        result = run_procontract(
+            job,
+            store,
+            workspace,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=_limits(),
+            breaker=CircuitBreaker(),
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+            stop_token=token,
+        )
+
+    assert result.completion is ProContractCompletion.INTERRUPTED
+    assert result.session_id == "ses_contract"
+    assert result.exit_class == "campaign_stop"
+    assert len(api.issues) == 1
+    assert api.interrupts == ["ses_contract"]
+    assert paths.root.joinpath("procontract-issue-response.json").is_file()
+    assert store.read().phase == "interrupted"
+
+
+def test_campaign_stop_freezes_when_ambiguous_issue_reconciliation_is_unavailable(tmp_path: Path) -> None:
+    from scripts.campaign_procontract import (
+        ProContractCompletion,
+        ProContractHttpError,
+        build_issue_payload,
+        run_procontract,
+    )
+    from scripts.campaign_stop import StopToken
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    store = _state(paths)
+    request, workspace = _workspace(tmp_path, paths)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock())
+    token = StopToken()
+
+    class UnavailableReconciliationApi(SafetyApi):
+        def issue(self, issue):
+            super().issue(issue)
+            token.set("keyboard_interrupt")
+            raise ProContractHttpError("issue response lost", status_code=503, transient=True)
+
+        def get_contract(self, contract_id: str) -> dict[str, object] | None:
+            raise ProContractHttpError("reconciliation unavailable", status_code=503, transient=True)
+
+    api = UnavailableReconciliationApi(_contract(payload), _execution(payload))
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease._handle_active = True
+        result = run_procontract(
+            job,
+            store,
+            workspace,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=_limits(),
+            breaker=CircuitBreaker(),
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+            stop_token=token,
+        )
+
+    assert result.completion is ProContractCompletion.INTERRUPTED
+    assert result.exit_class == "campaign_stop"
+    assert len(api.issues) == 1
+    assert store.read().phase == "interrupted"
+    assert workspace.stops == 1
+
+
+def test_campaign_stop_during_contract_poll_interrupts_and_terminalizes(tmp_path: Path) -> None:
+    from scripts.campaign_procontract import ProContractCompletion, build_issue_payload, run_procontract
+    from scripts.campaign_stop import StopToken
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    store = _state(paths)
+    request, workspace = _workspace(tmp_path, paths)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock())
+    token = StopToken()
+
+    class StopAfterContractApi(SafetyApi):
+        def get_contract(self, contract_id: str) -> dict[str, object] | None:
+            contract = super().get_contract(contract_id)
+            token.set("keyboard_interrupt")
+            return contract
+
+    api = StopAfterContractApi(_contract(payload), _execution(payload))
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease._handle_active = True
+        result = run_procontract(
+            job,
+            store,
+            workspace,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=_limits(),
+            breaker=CircuitBreaker(),
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+            stop_token=token,
+            package=lambda *_: pytest.fail("campaign stop cannot enter delivery"),
+            preflight=lambda *_: pytest.fail("campaign stop cannot enter preflight"),
+        )
+
+    state = store.read()
+    assert result.completion is ProContractCompletion.INTERRUPTED
+    assert result.exit_class == "campaign_stop"
+    assert result.interrupt_attempted
+    assert state.phase == "interrupted"
+    assert state.exit_class == "campaign_stop"
+    assert len(api.issues) == 1
+    assert api.interrupts == ["ses_contract"]
+    assert api.exports == []
+    assert workspace.stops == 1
+
+
+def test_preexisting_campaign_stop_settles_admitted_contract_resume(tmp_path: Path) -> None:
+    from scripts.campaign_procontract import ProContractCompletion, build_issue_payload, run_procontract
+    from scripts.campaign_stop import StopToken
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    store = _state(paths)
+    request, workspace = _workspace(tmp_path, paths)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock())
+
+    class CrashAfterAdmissionApi(SafetyApi):
+        def __init__(self):
+            super().__init__(_contract(payload), _execution(payload))
+            self.crash = True
+
+        def get_contract(self, contract_id: str) -> dict[str, object] | None:
+            if self.crash:
+                self.crash = False
+                raise InjectedCrash("after accepted Contract admission")
+            return super().get_contract(contract_id)
+
+    api = CrashAfterAdmissionApi()
+    kwargs = {
+        "model": "openai/gpt-5.6-luna",
+        "variant": "max",
+        "limits": _limits(),
+        "breaker": CircuitBreaker(),
+        "api": api,
+        "clock": clock,
+        "sleeper": clock.sleep,
+        "package": lambda *_: pytest.fail("campaign stop cannot enter delivery"),
+        "preflight": lambda *_: pytest.fail("campaign stop cannot enter preflight"),
+    }
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease._handle_active = True
+        with pytest.raises(InjectedCrash):
+            run_procontract(job, store, workspace, **kwargs)
+    token = StopToken()
+    token.set("keyboard_interrupt")
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease._handle_active = True
+        result = run_procontract(job, store, workspace, stop_token=token, **kwargs)
+
+    assert result.completion is ProContractCompletion.INTERRUPTED
+    assert result.exit_class == "campaign_stop"
+    assert len(api.issues) == 1
+    assert api.interrupts == ["ses_contract"]
+    assert store.read().phase == "interrupted"
+
+
+def test_campaign_stop_does_not_replace_observed_native_contract_terminal_status(tmp_path: Path) -> None:
+    from scripts.campaign_procontract import ProContractCompletion, build_issue_payload, run_procontract
+    from scripts.campaign_stop import StopToken
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    store = _state(paths)
+    request, workspace = _workspace(tmp_path, paths)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock())
+    token = StopToken()
+
+    class StopAfterContractApi(FakeApi):
+        def get_contract(self, contract_id: str) -> dict[str, object] | None:
+            contract = super().get_contract(contract_id)
+            token.set("keyboard_interrupt")
+            return contract
+
+    api = StopAfterContractApi(_challenged(_contract(payload)), _execution(payload))
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease._handle_active = True
+        result = run_procontract(
+            job,
+            store,
+            workspace,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=_limits(),
+            breaker=CircuitBreaker(),
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+            stop_token=token,
+            package=lambda *_: pytest.fail("native terminal status cannot enter delivery"),
+            preflight=lambda *_: pytest.fail("native terminal status cannot enter preflight"),
+        )
+
+    assert result.completion is ProContractCompletion.CHALLENGED
+    assert result.exit_class == "challenged"
+    assert store.read().exit_class == "challenged"
+    assert workspace.stops == 1
+
+
 def test_happy_lifecycle_uses_native_scheduler_and_exact_delivery(tmp_path: Path) -> None:
     from scripts.campaign_procontract import build_issue_payload, run_procontract
 

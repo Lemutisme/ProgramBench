@@ -442,6 +442,13 @@ class WorkspaceLease:
         if self.identity != expected:
             raise WorkspaceError("workspace lease does not match this job")
 
+    def require_process_identity(self, job_root: Path, campaign: str, instance_id: str, arm: str) -> None:
+        expected = (str(Path(job_root).absolute()), campaign, instance_id, arm)
+        if self._lock_context is None or self._owner is None or self._owner[0] != os.getpid():
+            raise WorkspaceError("workspace lease is not active in this process")
+        if self.identity != expected:
+            raise WorkspaceError("workspace lease does not match this job")
+
     def claim_handle(self, request: WorkspaceRequest) -> None:
         self.require(request)
         if self._handle_active:
@@ -554,6 +561,18 @@ class DockerWorkspace:
             self.manifest.instance_id,
             self.manifest.arm,
         )
+        self._stop(active)
+
+    def force_stop(self) -> None:
+        self.lease.require_process_identity(
+            self.manifest.job_root,
+            self.manifest.campaign,
+            self.manifest.instance_id,
+            self.manifest.arm,
+        )
+        self._stop(self.lease)
+
+    def _stop(self, active: WorkspaceLease) -> None:
         current = _load_manifest(self.manifest_path)
         if _static_identity(current) != _static_identity(self.manifest) or current.container_id != self.container_id:
             raise ContainerConflictError("persisted workspace changed before stop")

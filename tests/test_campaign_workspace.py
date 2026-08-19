@@ -469,6 +469,30 @@ def test_workspace_lease_rejects_reentry_mismatch_and_multiple_handles(tmp_path:
             ensure_workspace_impl(mismatch, lease)
 
 
+def test_owned_workspace_force_stop_is_safe_from_scheduler_thread(tmp_path: Path) -> None:
+    docker = RecordingDocker()
+    value = request(tmp_path, docker)
+    value.job.root.mkdir(parents=True)
+    errors = []
+
+    with JobLease(value.job, resume=True, redo=False, retry_infra=False), WorkspaceLease(value) as lease:
+        workspace = ensure_workspace_impl(value, lease)
+
+        def force_stop():
+            try:
+                workspace.force_stop()
+            except BaseException as error:
+                errors.append(error)
+
+        thread = threading.Thread(target=force_stop)
+        thread.start()
+        thread.join()
+
+    assert errors == []
+    assert json.loads(workspace.manifest_path.read_text())["phase"] == "stopped"
+    assert sum(command[1] == "stop" for command in docker.commands) == 1
+
+
 def test_workspace_lease_is_cross_process_and_preserves_journal(tmp_path: Path) -> None:
     value = request(tmp_path, RecordingDocker())
     command = (

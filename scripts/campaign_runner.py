@@ -30,6 +30,7 @@ from programbench.utils.instance_filters import filter_instances
 from scripts.campaign_install import InstallRecord, prepare_install
 from scripts.campaign_procontract import HttpProContractApi, run_procontract
 from scripts.campaign_state import JobLease, JobPaths, JobState, StateStore
+from scripts.campaign_stop import StopToken
 from scripts.campaign_usage import CircuitBreaker
 from scripts.campaign_vanilla import HttpOpenCodeApi, run_vanilla
 from scripts.campaign_workspace import WorkspaceLease, WorkspaceRequest, ensure_workspace
@@ -93,7 +94,9 @@ class JobRunResult:
     result: object | None = None
 
 
-def expand_campaign_jobs(selected_ids: Sequence[str], images: Mapping[str, str], *, seed: int) -> tuple[CampaignJob, ...]:
+def expand_campaign_jobs(
+    selected_ids: Sequence[str], images: Mapping[str, str], *, seed: int
+) -> tuple[CampaignJob, ...]:
     """Expand selected task IDs to two hash-ordered, image-pinned trajectories."""
     jobs = expand_jobs(tuple(selected_ids), ("procontract", "vanilla"), str(seed))
     try:
@@ -190,7 +193,7 @@ def run_campaign(
     *,
     workers: int = MAX_ACTIVE_JOBS,
     breaker: CircuitBreaker | None = None,
-    execute: Callable[[CampaignJob, threading.Event], object] | None = None,
+    execute: Callable[[CampaignJob, StopToken], object] | None = None,
     state_path: Path | None = None,
     stop_event: threading.Event | None = None,
     interrupt_timeout: float = 20.0,
@@ -204,14 +207,18 @@ def run_campaign(
         raise CampaignError("interrupt timeout must be positive")
     breaker = breaker or CircuitBreaker()
     execute = execute or (lambda _job, _stop: None)
-    stop = stop_event or threading.Event()
+    stop = stop_event if isinstance(stop_event, StopToken) else StopToken(stop_event)
     pending = deque(jobs)
     running: dict[Future[object], CampaignJob] = {}
     completed = 0
     failed = 0
     executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="campaign")
-    interrupted = False
+    interrupted = stop.is_set()
+    if interrupted:
+        pending.clear()
     paused = False
+    shutdown_failed = False
+    force_failures: tuple[object, ...] = ()
     try:
         while pending or running:
             if pending and not running and not stop.is_set() and not breaker.admission_allowed:
@@ -226,7 +233,7 @@ def run_campaign(
                 running[executor.submit(execute, candidate, stop)] = candidate
             if not running:
                 break
-            done, _ = wait(tuple(running), return_when=FIRST_COMPLETED)
+            done, _ = wait(tuple(running), timeout=0.1, return_when=FIRST_COMPLETED)
             for future in done:
                 candidate = running.pop(future)
                 try:
@@ -243,8 +250,17 @@ def run_campaign(
                     failed += 1
                     _append_log(state_path, candidate, "failed")
                 _persist_breaker(state_path, breaker)
-                print(f"completed={completed} running={len(running)} pending={len(pending)} failed={failed}", flush=True)
+                print(
+                    f"completed={completed} running={len(running)} pending={len(pending)} failed={failed}", flush=True
+                )
+            if breaker.active_stop_reason == "campaign hard cost cap reached":
+                interrupted = True
+                stop.set("campaign_hard_stop")
+                pending.clear()
+                break
             if stop.is_set():
+                interrupted = True
+                pending.clear()
                 break
             if not breaker.admission_allowed:
                 delay = _backoff_delay(breaker, clock)
@@ -257,7 +273,7 @@ def run_campaign(
                 break
     except KeyboardInterrupt:
         interrupted = True
-        stop.set()
+        stop.set("keyboard_interrupt")
         pending.clear()
         _persist_breaker(state_path, breaker)
     finally:
@@ -278,11 +294,41 @@ def run_campaign(
                         failed += 1
                         _append_log(state_path, candidate, "interrupted")
                     _persist_breaker(state_path, breaker)
+            if running:
+                force_failures = stop.registry.force_stop_all()
+                deadline = time.monotonic() + interrupt_timeout
+                while running and time.monotonic() < deadline:
+                    done, _ = wait(
+                        tuple(running),
+                        timeout=max(0, deadline - time.monotonic()),
+                        return_when=FIRST_COMPLETED,
+                    )
+                    for future in done:
+                        candidate = running.pop(future)
+                        try:
+                            outcome = future.result()
+                            if isinstance(outcome, JobRunResult) and outcome.status in {"failed", "interrupted"}:
+                                failed += 1
+                            else:
+                                completed += 1
+                        except BaseException:
+                            failed += 1
+                        _append_log(state_path, candidate, "interrupted")
+                        _persist_breaker(state_path, breaker)
+            shutdown_failed = bool(running) or bool(force_failures)
             for future in running:
                 future.cancel()
-        executor.shutdown(wait=False, cancel_futures=True)
-    if interrupted and running:
-        raise CampaignShutdownError(f"{len(running)} campaign worker(s) ignored shutdown")
+        if running:
+            threading.Thread(
+                target=executor.shutdown,
+                kwargs={"wait": True, "cancel_futures": True},
+                name="campaign-shutdown-reaper",
+                daemon=True,
+            ).start()
+        else:
+            executor.shutdown(wait=True, cancel_futures=True)
+    if shutdown_failed:
+        raise CampaignShutdownError(f"campaign shutdown failed for {len(running) + len(force_failures)} active job(s)")
     return CampaignResult(completed, failed, tuple(pending), len(running), breaker.pause_reason, paused, interrupted)
 
 
@@ -295,6 +341,7 @@ def run_job(
     redo: bool = False,
     retry_infra: bool = False,
     stop_event: threading.Event | None = None,
+    stop_token: StopToken | None = None,
     workspace_factory: Callable[[WorkspaceRequest, WorkspaceLease], object] = ensure_workspace,
     vanilla_runner: Callable[..., object] = run_vanilla,
     procontract_runner: Callable[..., object] = run_procontract,
@@ -302,7 +349,9 @@ def run_job(
     procontract_api_factory: Callable[[object], object] | None = None,
 ) -> JobRunResult:
     """Acquire JobLease then WorkspaceLease and delegate to exactly one arm adapter."""
-    stop = stop_event or threading.Event()
+    if stop_event is not None and stop_token is not None:
+        raise CampaignError("pass only one campaign stop signal")
+    stop = stop_token or StopToken(stop_event)
     paths = JobPaths(plan.output / candidate.arm / candidate.instance_id)
     store = StateStore(paths.state)
     with JobLease(paths, resume=resume, redo=redo, retry_infra=retry_infra) as job_lease:
@@ -314,7 +363,7 @@ def run_job(
         elif redo or (retry_infra and state.phase == "failed") or (resume and state.phase == "interrupted"):
             job_lease.reset_for_rerun()
         if stop.is_set() or breaker.stop_active:
-            _terminalize(store, "interrupted", "campaign_interrupted")
+            _terminalize(store, "interrupted", "campaign_stop")
             return JobRunResult(candidate, "interrupted")
         install = _install_for(plan, candidate.arm)
         request = WorkspaceRequest(
@@ -333,27 +382,64 @@ def run_job(
         try:
             with WorkspaceLease(request) as workspace_lease:
                 workspace = workspace_factory(request, workspace_lease)
-                if stop.is_set() or breaker.stop_active:
-                    workspace.stop_for_freeze()
-                    _terminalize(store, "interrupted", "campaign_interrupted")
-                    return JobRunResult(candidate, "interrupted")
-                if candidate.arm == "vanilla":
-                    api = vanilla_api_factory(workspace) if vanilla_api_factory else HttpOpenCodeApi(
-                        workspace.base_url, expected_port=workspace.port
-                    )
-                    result = vanilla_runner(
-                        job_lease, store, workspace, install, model=plan.config.model, variant=plan.config.variant,
-                        limits=plan.config.limits, breaker=breaker, api=api,
-                    )
-                else:
-                    api = procontract_api_factory(workspace) if procontract_api_factory else HttpProContractApi(
-                        workspace.base_url, expected_port=workspace.port
-                    )
-                    result = procontract_runner(
-                        job_lease, store, workspace, model=plan.config.model, variant=plan.config.variant,
-                        limits=plan.config.limits, breaker=breaker, api=api,
-                    )
-                return JobRunResult(candidate, "completed", result)
+                active = stop.registry.register(
+                    candidate,
+                    force_stop=getattr(workspace, "force_stop", workspace.stop_for_freeze),
+                    terminalize=lambda: _terminalize(store, "interrupted", "campaign_stop"),
+                )
+                try:
+                    if stop.is_set() or breaker.stop_active:
+                        workspace.stop_for_freeze()
+                        _terminalize(store, "interrupted", "campaign_stop")
+                        return JobRunResult(candidate, "interrupted")
+                    if candidate.arm == "vanilla":
+                        api = (
+                            vanilla_api_factory(workspace)
+                            if vanilla_api_factory
+                            else HttpOpenCodeApi(workspace.base_url, expected_port=workspace.port)
+                        )
+                        result = vanilla_runner(
+                            job_lease,
+                            store,
+                            workspace,
+                            install,
+                            model=plan.config.model,
+                            variant=plan.config.variant,
+                            limits=plan.config.limits,
+                            breaker=breaker,
+                            api=api,
+                            stop_token=stop,
+                        )
+                    else:
+                        api = (
+                            procontract_api_factory(workspace)
+                            if procontract_api_factory
+                            else HttpProContractApi(workspace.base_url, expected_port=workspace.port)
+                        )
+                        result = procontract_runner(
+                            job_lease,
+                            store,
+                            workspace,
+                            model=plan.config.model,
+                            variant=plan.config.variant,
+                            limits=plan.config.limits,
+                            breaker=breaker,
+                            api=api,
+                            stop_token=stop,
+                        )
+                    state = store.read_optional()
+                    if (
+                        state is not None
+                        and state.phase in {"frozen", "packaged", "preflighted", "done", "failed", "interrupted"}
+                        and state.exit_class not in {None, "campaign_stop"}
+                    ):
+                        return JobRunResult(candidate, "completed", result)
+                    if stop.is_set() or breaker.stop_active:
+                        _terminalize(store, "interrupted", "campaign_stop")
+                        return JobRunResult(candidate, "interrupted")
+                    return JobRunResult(candidate, "completed", result)
+                finally:
+                    stop.registry.unregister(active)
         except BaseException as error:
             exit_class, traceback_hash = _exception_metadata(store, error)
             _terminalize(
@@ -429,20 +515,35 @@ def main(arguments: Sequence[str] | None = None) -> int:
     if missing:
         raise CampaignError(f"required credential environment variable(s) are missing: {', '.join(missing)}")
     breaker_path = plan.output / "breaker.json"
-    breaker = CircuitBreaker.from_snapshot(_read_json(breaker_path)) if breaker_path.exists() else CircuitBreaker.from_campaign_config(config)
-    result = run_campaign(
-        plan.jobs,
-        workers=args.workers,
-        breaker=breaker,
-        state_path=breaker_path,
-        execute=lambda candidate, stop: run_job(
-            plan, candidate, breaker=breaker, resume=args.resume, redo=args.redo, retry_infra=args.retry_infra, stop_event=stop
-        ),
+    breaker = (
+        CircuitBreaker.from_snapshot(_read_json(breaker_path))
+        if breaker_path.exists()
+        else CircuitBreaker.from_campaign_config(config)
     )
+    try:
+        result = run_campaign(
+            plan.jobs,
+            workers=args.workers,
+            breaker=breaker,
+            state_path=breaker_path,
+            execute=lambda candidate, stop: run_job(
+                plan,
+                candidate,
+                breaker=breaker,
+                resume=args.resume,
+                redo=args.redo,
+                retry_infra=args.retry_infra,
+                stop_token=stop,
+            ),
+        )
+    except CampaignShutdownError:
+        return 1
     return 0 if not (result.failed or result.paused or result.interrupted or result.pending) else 1
 
 
-def _plan_from_manifest(config: CampaignConfig, root: Path, manifest_path: Path, raw: Mapping[str, object], dry_run: bool) -> CampaignPlan:
+def _plan_from_manifest(
+    config: CampaignConfig, root: Path, manifest_path: Path, raw: Mapping[str, object], dry_run: bool
+) -> CampaignPlan:
     selected = raw.get("selected_ids")
     jobs = raw.get("jobs")
     installs = raw.get("installs")
@@ -451,7 +552,9 @@ def _plan_from_manifest(config: CampaignConfig, root: Path, manifest_path: Path,
     if not isinstance(jobs, list) or not isinstance(installs, Mapping):
         raise CampaignError("campaign manifest has invalid jobs or installs")
     try:
-        frozen_jobs = tuple(CampaignJob(item["instance_id"], item["arm"], item["image"]) for item in jobs if isinstance(item, Mapping))
+        frozen_jobs = tuple(
+            CampaignJob(item["instance_id"], item["arm"], item["image"]) for item in jobs if isinstance(item, Mapping)
+        )
     except (KeyError, TypeError) as error:
         raise CampaignError("campaign manifest has malformed job") from error
     if len(frozen_jobs) != len(jobs):
@@ -480,7 +583,12 @@ def _config_manifest(config: CampaignConfig) -> dict[str, object]:
         "limits": asdict(config.limits),
         "cache": asdict(config.cache),
         "arms": {
-            arm.name: {"repo": str(arm.repo.resolve()), "revision": arm.revision, "mode": arm.mode, "binary": str(arm.binary) if arm.binary else None}
+            arm.name: {
+                "repo": str(arm.repo.resolve()),
+                "revision": arm.revision,
+                "mode": arm.mode,
+                "binary": str(arm.binary) if arm.binary else None,
+            }
             for arm in config.arms
         },
         "excluded": sorted(config.excluded),
@@ -495,8 +603,14 @@ def _require_manifest_config(raw: Mapping[str, object], config: Mapping[str, obj
 def _programbench_metadata() -> dict[str, object]:
     root = Path(__file__).resolve().parents[1]
     try:
-        sha = subprocess.run(("git", "rev-parse", "HEAD"), cwd=root, check=True, capture_output=True, text=True).stdout.strip()
-        dirty = bool(subprocess.run(("git", "status", "--porcelain"), cwd=root, check=True, capture_output=True, text=True).stdout.strip())
+        sha = subprocess.run(
+            ("git", "rev-parse", "HEAD"), cwd=root, check=True, capture_output=True, text=True
+        ).stdout.strip()
+        dirty = bool(
+            subprocess.run(
+                ("git", "status", "--porcelain"), cwd=root, check=True, capture_output=True, text=True
+            ).stdout.strip()
+        )
         return {"sha": sha, "dirty": dirty}
     except (OSError, subprocess.SubprocessError):
         return {"sha": None, "dirty": None}
@@ -608,11 +722,22 @@ def _campaign_name(root: Path) -> str:
     return name[:128]
 
 
-def _terminalize(store: StateStore, phase: str, exit_class: str, *, traceback_hash: str | None = None) -> None:
+def _terminalize(store: StateStore, phase: str, exit_class: str, *, traceback_hash: str | None = None) -> bool:
     try:
         state = store.read_optional()
-        if state is None or state.phase in {"done", "failed", "interrupted"}:
-            return
+        if state is None:
+            return False
+        if state.phase in {
+            "frozen",
+            "packaged",
+            "preflighted",
+            "done",
+            "failed",
+            "interrupted",
+        } and state.exit_class not in {None, "campaign_stop"}:
+            return True
+        if state.phase in {"done", "failed", "interrupted"}:
+            return True
         store.transition(
             phase,
             command_identity=state.command_identity or "campaign",
@@ -620,8 +745,9 @@ def _terminalize(store: StateStore, phase: str, exit_class: str, *, traceback_ha
             exit_class=exit_class,
             artifact_hashes={} if traceback_hash is None else {"traceback": traceback_hash},
         )
+        return True
     except BaseException:
-        return
+        return False
 
 
 def _exception_metadata(store: StateStore, error: BaseException) -> tuple[str, str]:
@@ -629,8 +755,14 @@ def _exception_metadata(store: StateStore, error: BaseException) -> tuple[str, s
         state = store.read_optional()
     except BaseException:
         state = None
-    digest = hashlib.sha256("".join(traceback.format_exception(type(error), error, error.__traceback__)).encode()).hexdigest()
-    prefix = "infrastructure_failed_before_provider" if state is None or state.phase in {"planned", "preparing"} else "execution_failed"
+    digest = hashlib.sha256(
+        "".join(traceback.format_exception(type(error), error, error.__traceback__)).encode()
+    ).hexdigest()
+    prefix = (
+        "infrastructure_failed_before_provider"
+        if state is None or state.phase in {"planned", "preparing"}
+        else "execution_failed"
+    )
     return prefix, digest
 
 

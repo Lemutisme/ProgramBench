@@ -588,6 +588,198 @@ def tree_snapshot(root: Path) -> dict[str, tuple[object, ...]]:
     return result
 
 
+def test_campaign_stop_before_vanilla_admission_freezes_without_api_mutation(tmp_path: Path) -> None:
+    from scripts.campaign_stop import StopToken
+
+    paths, record, request, workspace = prepared(tmp_path)
+    api = FakeOpenCodeApi([([user(), assistant()], "idle")])
+    clock = FakeClock()
+    token = StopToken()
+    token.set("keyboard_interrupt")
+
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease.claim_handle(request)
+        result = run_vanilla(
+            job,
+            StateStore(paths.state),
+            workspace,
+            record,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=limits(),
+            breaker=CircuitBreaker(clock=clock),
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+            stop_token=token,
+        )
+
+    state = StateStore(paths.state).read()
+    assert result.completion is VanillaCompletion.INTERRUPTED
+    assert result.exit_class == "campaign_stop"
+    assert state.phase == "interrupted"
+    assert state.exit_class == "campaign_stop"
+    assert not api.sessions
+    assert not api.prompt_requests
+    assert api.interrupts == 0
+    assert workspace.stops == 1
+
+
+def test_campaign_stop_during_vanilla_poll_interrupts_and_terminalizes(tmp_path: Path) -> None:
+    from scripts.campaign_stop import StopToken
+
+    paths, record, request, workspace = prepared(tmp_path)
+    clock = FakeClock()
+    token = StopToken()
+
+    class StopAfterMessagesApi(SafetyApi):
+        def messages(self, session_id: str) -> dict[str, object]:
+            messages = super().messages(session_id)
+            token.set("keyboard_interrupt")
+            return messages
+
+    api = StopAfterMessagesApi([([user(), assistant()], "idle")])
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease.claim_handle(request)
+        result = run_vanilla(
+            job,
+            StateStore(paths.state),
+            workspace,
+            record,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=limits(),
+            breaker=CircuitBreaker(clock=clock),
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+            stop_token=token,
+        )
+
+    state = StateStore(paths.state).read()
+    assert result.completion is VanillaCompletion.INTERRUPTED
+    assert result.exit_class == "campaign_stop"
+    assert result.interrupt_attempted
+    assert state.phase == "interrupted"
+    assert state.exit_class == "campaign_stop"
+    assert len(api.prompt_requests) == 1
+    assert api.interrupts == 1
+    assert workspace.stops == 1
+
+
+def test_preexisting_campaign_stop_settles_admitted_vanilla_resume(tmp_path: Path) -> None:
+    from scripts.campaign_stop import StopToken
+
+    paths, record, request, workspace = prepared(tmp_path)
+    api = CrashApi("prompt", [([user(), assistant()], "idle")])
+    clock = FakeClock()
+    kwargs = {
+        "model": "openai/gpt-5.6-luna",
+        "variant": "max",
+        "limits": limits(),
+        "breaker": CircuitBreaker(clock=clock),
+        "api": api,
+        "clock": clock,
+        "sleeper": clock.sleep,
+    }
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease.claim_handle(request)
+        with pytest.raises(InjectedCrash):
+            run_vanilla(job, StateStore(paths.state), workspace, record, **kwargs)
+    token = StopToken()
+    token.set("keyboard_interrupt")
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease.claim_handle(request)
+        result = run_vanilla(job, StateStore(paths.state), workspace, record, stop_token=token, **kwargs)
+
+    assert result.completion is VanillaCompletion.INTERRUPTED
+    assert result.exit_class == "campaign_stop"
+    assert len(api.prompt_requests) == 1
+    assert api.interrupts == 1
+    assert StateStore(paths.state).read().phase == "interrupted"
+
+
+def test_campaign_stop_does_not_replace_observed_idle_terminal_status(tmp_path: Path) -> None:
+    from scripts.campaign_stop import StopToken
+
+    paths, record, request, workspace = prepared(tmp_path)
+    clock = FakeClock()
+    token = StopToken()
+
+    class StopAfterIdleApi(FakeOpenCodeApi):
+        def status(self, session_id: str) -> str:
+            status = super().status(session_id)
+            token.set("keyboard_interrupt")
+            return status
+
+    api = StopAfterIdleApi([([user(), assistant()], "idle")])
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease.claim_handle(request)
+        result = run_vanilla(
+            job,
+            StateStore(paths.state),
+            workspace,
+            record,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=limits(),
+            breaker=CircuitBreaker(clock=clock),
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+            stop_token=token,
+        )
+
+    assert result.completion is VanillaCompletion.IDLE
+    assert result.exit_class == "idle"
+    assert StateStore(paths.state).read().phase == "frozen"
+    assert api.interrupts == 0
+    assert workspace.stops == 1
+
+
+def test_campaign_stop_does_not_replace_observed_provider_terminal_status(tmp_path: Path) -> None:
+    from scripts.campaign_stop import StopToken
+
+    paths, record, request, workspace = prepared(tmp_path)
+    clock = FakeClock()
+    token = StopToken()
+    failed = assistant()
+    failed["info"]["error"] = {
+        "name": "APIError",
+        "data": {"message": "provider exploded", "statusCode": 500, "isRetryable": False},
+    }
+
+    class StopAfterMessagesApi(FakeOpenCodeApi):
+        def messages(self, session_id: str) -> dict[str, object]:
+            messages = super().messages(session_id)
+            token.set("keyboard_interrupt")
+            return messages
+
+    api = StopAfterMessagesApi([([user(), failed], "busy")])
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease.claim_handle(request)
+        result = run_vanilla(
+            job,
+            StateStore(paths.state),
+            workspace,
+            record,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=limits(),
+            breaker=CircuitBreaker(clock=clock),
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+            stop_token=token,
+        )
+
+    assert result.completion is VanillaCompletion.PROVIDER_ERROR
+    assert result.exit_class == "provider_error"
+    assert StateStore(paths.state).read().phase == "frozen"
+    assert api.interrupts == 1
+    assert workspace.stops == 1
+
+
 def test_vanilla_runs_exactly_one_ordinary_session_and_freezes_on_idle(tmp_path: Path) -> None:
     paths = JobPaths(tmp_path / "pilot/vanilla/testorg__calculator.abc1234")
     StateStore(paths.state).write(JobState("planned"))

@@ -3,6 +3,7 @@ import threading
 import time
 import subprocess
 import sys
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -40,6 +41,120 @@ def test_scheduler_never_runs_more_than_worker_active_jobs():
     assert result.completed == 16
     assert result.pending == ()
     assert len(completed) == 16
+
+
+def test_stop_token_is_thread_safe_and_keeps_first_sanitized_reason():
+    from scripts.campaign_stop import StopToken
+
+    token = StopToken()
+    first = threading.Thread(target=lambda: token.set(" keyboard interrupt\nunsafe detail "))
+    second = threading.Thread(target=lambda: (first.join(), token.set("replacement")))
+    first.start()
+    second.start()
+    first.join()
+    second.join()
+
+    assert token.is_set()
+    assert token.wait(0)
+    assert token.reason == "keyboard_interrupt_unsafe_detail"
+
+
+def test_scheduler_passes_one_real_stop_token_to_every_job():
+    from scripts.campaign_runner import run_campaign
+    from scripts.campaign_stop import StopToken
+
+    seen = []
+
+    run_campaign(tuple(job(index) for index in range(2)), workers=1, execute=lambda _job, stop: seen.append(stop))
+
+    assert len(seen) == 2
+    assert seen[0] is seen[1]
+    assert isinstance(seen[0], StopToken)
+    assert not seen[0].is_set()
+
+
+def test_scheduler_treats_preexisting_external_stop_as_interrupted_without_admission():
+    from scripts.campaign_runner import run_campaign
+
+    event = threading.Event()
+    event.set()
+
+    result = run_campaign(
+        tuple(job(index) for index in range(2)),
+        stop_event=event,
+        execute=lambda *_: pytest.fail("pre-stopped campaign cannot admit work"),
+    )
+
+    assert result.interrupted
+    assert result.pending == ()
+
+
+def test_active_job_registry_runs_idempotent_force_callbacks_outside_lock():
+    from scripts.campaign_stop import ActiveJobRegistry
+
+    registry = ActiveJobRegistry()
+    calls = []
+    handle = registry.register(
+        job(0),
+        force_stop=lambda: calls.append(registry.active_jobs()),
+        terminalize=lambda: calls.append("terminalized"),
+    )
+
+    registry.force_stop_all()
+    registry.force_stop_all()
+    registry.unregister(handle)
+
+    assert calls == [((job(0),)), "terminalized"]
+    assert registry.active_jobs() == ()
+
+
+def test_active_job_registry_remembers_idempotent_callback_failure():
+    from scripts.campaign_stop import ActiveJobRegistry
+
+    registry = ActiveJobRegistry()
+    calls = []
+    candidate = job(0)
+
+    def force_stop():
+        calls.append("force")
+        raise RuntimeError("secret")
+
+    handle = registry.register(candidate, force_stop=force_stop, terminalize=lambda: False)
+
+    assert registry.force_stop_all() == (candidate,)
+    assert registry.force_stop_all() == (candidate,)
+    registry.unregister(handle)
+    assert calls == ["force"]
+
+
+def test_active_job_registry_skips_entry_unregistered_after_force_snapshot():
+    from scripts.campaign_stop import ActiveJobRegistry
+
+    registry = ActiveJobRegistry()
+    first_started = threading.Event()
+    release_first = threading.Event()
+    second_calls = []
+    results = []
+    first = registry.register(
+        job(0),
+        force_stop=lambda: (first_started.set(), release_first.wait(1)),
+        terminalize=lambda: None,
+    )
+    second = registry.register(
+        job(1),
+        force_stop=lambda: second_calls.append("stale"),
+        terminalize=lambda: False,
+    )
+    thread = threading.Thread(target=lambda: results.append(registry.force_stop_all()))
+    thread.start()
+    assert first_started.wait(1)
+    registry.unregister(second)
+    release_first.set()
+    thread.join(1)
+    registry.unregister(first)
+
+    assert results == [()]
+    assert second_calls == []
 
 
 def test_scheduler_prints_plain_progress(capsys):
@@ -142,7 +257,9 @@ def test_scheduler_logs_the_future_that_completed_not_last_admitted_job(tmp_path
         if candidate.instance_id == "task-1":
             time.sleep(0.05)
 
-    run_campaign(tuple(job(index) for index in range(2)), workers=2, state_path=tmp_path / "breaker.json", execute=execute)
+    run_campaign(
+        tuple(job(index) for index in range(2)), workers=2, state_path=tmp_path / "breaker.json", execute=execute
+    )
 
     assert "task-0 procontract completed" in (tmp_path / "campaign.log").read_text()
 
@@ -194,11 +311,124 @@ def test_keyboard_interrupt_stops_active_workers_and_cancels_admission():
     assert result.pending == ()
 
 
+def test_keyboard_interrupt_force_stops_exact_registered_active_job_after_grace():
+    from scripts.campaign_runner import run_campaign
+
+    ready = threading.Barrier(2)
+    released = threading.Event()
+    forced = []
+    terminalized = []
+
+    def execute(candidate, stop):
+        if candidate.instance_id == "task-0":
+            ready.wait(1)
+            raise KeyboardInterrupt
+        handle = stop.registry.register(
+            candidate,
+            force_stop=lambda: (forced.append(candidate), released.set()),
+            terminalize=lambda: terminalized.append(candidate),
+        )
+        try:
+            ready.wait(1)
+            assert released.wait(1)
+        finally:
+            stop.registry.unregister(handle)
+
+    result = run_campaign(tuple(job(index) for index in range(3)), workers=2, execute=execute, interrupt_timeout=0.01)
+
+    assert result.interrupted
+    assert forced == [job(1)]
+    assert terminalized == [job(1)]
+    assert result.running == 0
+    assert result.pending == ()
+
+
+def test_force_stop_or_terminal_cas_failure_is_fatal_even_when_worker_then_exits():
+    from scripts.campaign_runner import CampaignShutdownError, run_campaign
+
+    ready = threading.Barrier(2)
+    released = threading.Event()
+    finished = threading.Event()
+    secret = "force-stop-secret"
+
+    def execute(candidate, stop):
+        if candidate.instance_id == "task-0":
+            ready.wait(1)
+            raise KeyboardInterrupt
+
+        def force_stop():
+            raise RuntimeError(secret)
+
+        def terminalize():
+            released.set()
+            return False
+
+        handle = stop.registry.register(candidate, force_stop=force_stop, terminalize=terminalize)
+        try:
+            ready.wait(1)
+            assert released.wait(1)
+            finished.set()
+        finally:
+            stop.registry.unregister(handle)
+
+    with pytest.raises(CampaignShutdownError) as raised:
+        run_campaign(tuple(job(index) for index in range(2)), workers=2, execute=execute, interrupt_timeout=0.01)
+
+    assert finished.is_set()
+    assert secret not in str(raised.value)
+
+
+def test_persistent_hard_cost_stop_forces_registered_active_jobs():
+    from scripts.campaign_runner import run_campaign
+    from scripts.campaign_usage import TurnUsage, UsageSummary
+
+    breaker = CircuitBreaker(hard_cost_cap="1")
+    ready = threading.Barrier(2)
+    released = threading.Event()
+    forced = []
+    turn = TurnUsage(input=1, prompt_total=1, cost=Decimal("1"))
+    summary = UsageSummary(
+        provider_turns=1,
+        input=1,
+        prompt_total=1,
+        turns_without_cache=1,
+        max_prompt_total=1,
+        cost=Decimal("1"),
+        turns=(turn,),
+    )
+
+    def execute(candidate, stop):
+        if candidate.instance_id == "task-0":
+            ready.wait(1)
+            breaker.observe(candidate.key, 0, summary)
+            return
+        handle = stop.registry.register(
+            candidate,
+            force_stop=lambda: (forced.append(candidate), released.set()),
+            terminalize=lambda: None,
+        )
+        try:
+            ready.wait(1)
+            assert released.wait(1)
+        finally:
+            stop.registry.unregister(handle)
+
+    result = run_campaign(
+        tuple(job(index) for index in range(3)), workers=2, breaker=breaker, execute=execute, interrupt_timeout=0.01
+    )
+
+    assert result.interrupted
+    assert result.pause_reason == "campaign hard cost cap reached"
+    assert forced == [job(1)]
+    assert result.pending == ()
+
+
 def test_keyboard_interrupt_raises_when_worker_ignores_stop_until_released():
     from scripts.campaign_runner import CampaignShutdownError, run_campaign
 
     started = threading.Event()
     release = threading.Event()
+    finished = threading.Event()
 
     def execute(candidate, _stop):
         if candidate.instance_id == "task-0":
@@ -206,12 +436,14 @@ def test_keyboard_interrupt_raises_when_worker_ignores_stop_until_released():
             raise KeyboardInterrupt
         started.set()
         release.wait(2)
+        finished.set()
 
     try:
         with pytest.raises(CampaignShutdownError):
             run_campaign(tuple(job(index) for index in range(2)), workers=2, execute=execute, interrupt_timeout=0.01)
     finally:
         release.set()
+        assert finished.wait(1)
 
 
 def test_expand_campaign_pairs_every_selected_instance_in_seeded_order():
@@ -313,7 +545,10 @@ def test_plan_uses_programbench_regex_filter_and_all_after_exclusions(tmp_path: 
             {"instance_id": "keep__two", "difficulty": "hard", "language": "rust", "image_name": "two"},
             {"instance_id": "skip__three", "difficulty": "hard", "language": "rust", "image_name": "three"},
         ],
-        output=tmp_path / "out", instance_filter="keep__.*", all_instances=True, dry_run=True,
+        output=tmp_path / "out",
+        instance_filter="keep__.*",
+        all_instances=True,
+        dry_run=True,
         prepare_install_fn=lambda arm, _root: {"arm": arm.name},
     )
 
@@ -330,12 +565,21 @@ def test_resume_uses_frozen_install_data_without_resolving_moving_refs(tmp_path:
     config_path.write_text(_config(repo))
     instances = [{"instance_id": "one", "difficulty": "easy", "language": "python", "image_name": "one-image"}]
     plan_campaign(
-        load_config(config_path), instances, output=tmp_path / "out", limit=1, dry_run=True,
+        load_config(config_path),
+        instances,
+        output=tmp_path / "out",
+        limit=1,
+        dry_run=True,
         prepare_install_fn=lambda arm, _root: {"arm": arm.name, "revision": arm.revision, "binary_sha256": "a" * 64},
     )
 
     resumed = plan_campaign(
-        load_config(config_path), instances, output=tmp_path / "out", limit=1, dry_run=True, resume=True,
+        load_config(config_path),
+        instances,
+        output=tmp_path / "out",
+        limit=1,
+        dry_run=True,
+        resume=True,
         prepare_install_fn=lambda *_: pytest.fail("resume must not resolve a moving ref"),
     )
 
@@ -355,19 +599,31 @@ def test_resume_rejects_changed_frozen_selection_options(tmp_path: Path):
         {"instance_id": "two", "difficulty": "hard", "language": "rust", "image_name": "two-image"},
     ]
     plan_campaign(
-        load_config(config_path), instances, output=tmp_path / "out", limit=1, seed=42, dry_run=True,
+        load_config(config_path),
+        instances,
+        output=tmp_path / "out",
+        limit=1,
+        seed=42,
+        dry_run=True,
         prepare_install_fn=lambda arm, _root: {"arm": arm.name, "revision": arm.revision, "binary_sha256": "a" * 64},
     )
 
     with pytest.raises(CampaignError, match="selection"):
         plan_campaign(
-            load_config(config_path), instances, output=tmp_path / "out", limit=2, seed=42, dry_run=True, resume=True,
+            load_config(config_path),
+            instances,
+            output=tmp_path / "out",
+            limit=2,
+            seed=42,
+            dry_run=True,
+            resume=True,
             prepare_install_fn=lambda *_: pytest.fail("resume must not resolve installs"),
         )
 
 
 def test_resume_acknowledges_recoverable_breaker_pause_but_not_hard_stop(tmp_path: Path):
-    from scripts.campaign_runner import plan_campaign
+    from scripts.campaign_runner import CampaignPausedError, plan_campaign
+    from scripts.campaign_usage import TurnUsage, UsageSummary
     from scripts.run_opencode import load_config
 
     repo = tmp_path / "repo"
@@ -376,13 +632,56 @@ def test_resume_acknowledges_recoverable_breaker_pause_but_not_hard_stop(tmp_pat
     config_path.write_text(_config(repo))
     instances = [{"instance_id": "one", "difficulty": "easy", "language": "python", "image_name": "one"}]
     config = load_config(config_path)
-    plan_campaign(config, instances, output=tmp_path / "out", limit=1, dry_run=True, prepare_install_fn=lambda arm, _: {"arm": arm.name})
+    plan_campaign(
+        config,
+        instances,
+        output=tmp_path / "out",
+        limit=1,
+        dry_run=True,
+        prepare_install_fn=lambda arm, _: {"arm": arm.name},
+    )
     breaker = CircuitBreaker()
     breaker.observe_error(401)
     (tmp_path / "out/breaker.json").write_text(json.dumps(breaker.snapshot()))
 
     plan_campaign(config, instances, output=tmp_path / "out", limit=1, dry_run=True, resume=True, acknowledge="auth")
 
+    plan_campaign(
+        config,
+        instances,
+        output=tmp_path / "hard",
+        limit=1,
+        dry_run=True,
+        prepare_install_fn=lambda arm, _: {"arm": arm.name},
+    )
+    turn = TurnUsage(input=1, prompt_total=1, cost=Decimal("2"))
+    hard = CircuitBreaker(hard_cost_cap="2")
+    hard.observe(
+        "hard",
+        0,
+        UsageSummary(
+            provider_turns=1,
+            input=1,
+            prompt_total=1,
+            turns_without_cache=1,
+            max_prompt_total=1,
+            cost=Decimal("2"),
+            turns=(turn,),
+        ),
+    )
+    (tmp_path / "hard/breaker.json").write_text(json.dumps(hard.snapshot()))
+
+    with pytest.raises(CampaignPausedError, match="hard cost"):
+        plan_campaign(
+            config,
+            instances,
+            output=tmp_path / "hard",
+            limit=1,
+            dry_run=True,
+            resume=True,
+            acknowledge="all",
+        )
+    assert CircuitBreaker.from_snapshot(json.loads((tmp_path / "hard/breaker.json").read_text())).hard_stopped
 
 
 @pytest.mark.parametrize("phase", ["planned", "preparing", "executing", "frozen", "packaged", "preflighted"])
@@ -394,7 +693,9 @@ def test_resume_preserves_unfinished_state_without_reset(tmp_path: Path, monkeyp
     repo.mkdir()
     config_path = tmp_path / "campaign.yaml"
     config_path.write_text(_config(repo))
-    plan = campaign_runner.CampaignPlan(tmp_path / "out", tmp_path / "manifest", load_config(config_path), ("one",), (), {}, False)
+    plan = campaign_runner.CampaignPlan(
+        tmp_path / "out", tmp_path / "manifest", load_config(config_path), ("one",), (), {}, False
+    )
     candidate = campaign_runner.CampaignJob("one", "vanilla", "one-image")
     paths = campaign_runner.JobPaths(plan.output / candidate.arm / candidate.instance_id)
     store = campaign_runner.StateStore(paths.state)
@@ -408,12 +709,19 @@ def test_resume_preserves_unfinished_state_without_reset(tmp_path: Path, monkeyp
     class Workspace:
         base_url = "http://127.0.0.1:9999"
         port = 9999
-        def stop_for_freeze(self): pass
+
+        def stop_for_freeze(self):
+            pass
 
     seen = []
     campaign_runner.run_job(
-        plan, candidate, breaker=CircuitBreaker(), resume=True, workspace_factory=lambda *_: Workspace(),
-        vanilla_runner=lambda _lease, state, *_args, **_kwargs: seen.append(state.read().generation), vanilla_api_factory=lambda _: object(),
+        plan,
+        candidate,
+        breaker=CircuitBreaker(),
+        resume=True,
+        workspace_factory=lambda *_: Workspace(),
+        vanilla_runner=lambda _lease, state, *_args, **_kwargs: seen.append(state.read().generation),
+        vanilla_api_factory=lambda _: object(),
     )
 
     assert seen == [before]
@@ -467,6 +775,217 @@ def test_run_job_dispatches_vanilla_once_and_skips_a_terminal_retry(tmp_path: Pa
     assert calls == ["vanilla"]
 
 
+@pytest.mark.parametrize("arm", ["vanilla", "procontract"])
+def test_run_job_passes_campaign_stop_token_to_adapter(tmp_path: Path, monkeypatch, arm: str):
+    from scripts import campaign_runner
+    from scripts.campaign_stop import StopToken
+    from scripts.run_opencode import load_config
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config_path = tmp_path / "campaign.yaml"
+    config_path.write_text(_config(repo))
+    plan = campaign_runner.CampaignPlan(
+        tmp_path / "out", tmp_path / "out/campaign.json", load_config(config_path), ("one",), (), {}, False
+    )
+    token = StopToken()
+    seen = []
+
+    class Workspace:
+        base_url = "http://127.0.0.1:9999"
+        port = 9999
+
+        def stop_for_freeze(self):
+            return None
+
+    def adapter(*_args, **kwargs):
+        seen.append(kwargs["stop_token"])
+
+    monkeypatch.setattr(campaign_runner, "_install_for", lambda *_: object())
+    result = campaign_runner.run_job(
+        plan,
+        campaign_runner.CampaignJob("one", arm, "one-image"),
+        breaker=CircuitBreaker(),
+        stop_token=token,
+        workspace_factory=lambda *_: Workspace(),
+        vanilla_runner=adapter,
+        procontract_runner=adapter,
+        vanilla_api_factory=lambda _: object(),
+        procontract_api_factory=lambda _: object(),
+    )
+
+    assert result.status == "completed"
+    assert seen == [token]
+
+
+def test_run_job_with_preexisting_campaign_stop_never_allocates_workspace(tmp_path: Path):
+    from scripts import campaign_runner
+    from scripts.campaign_stop import StopToken
+    from scripts.run_opencode import load_config
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config_path = tmp_path / "campaign.yaml"
+    config_path.write_text(_config(repo))
+    plan = campaign_runner.CampaignPlan(
+        tmp_path / "out", tmp_path / "out/campaign.json", load_config(config_path), ("one",), (), {}, False
+    )
+    token = StopToken()
+    token.set("keyboard_interrupt")
+
+    result = campaign_runner.run_job(
+        plan,
+        campaign_runner.CampaignJob("one", "vanilla", "one-image"),
+        breaker=CircuitBreaker(),
+        stop_token=token,
+        workspace_factory=lambda *_: pytest.fail("stopped campaign cannot allocate a workspace"),
+    )
+
+    state = campaign_runner.StateStore(tmp_path / "out/vanilla/one/state.json").read()
+    assert result.status == "interrupted"
+    assert state.phase == "interrupted"
+    assert state.exit_class == "campaign_stop"
+
+
+def test_run_job_registers_exact_workspace_and_cas_terminalizes_forced_stop(tmp_path: Path, monkeypatch):
+    from scripts import campaign_runner
+    from scripts.campaign_stop import StopToken
+    from scripts.run_opencode import load_config
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config_path = tmp_path / "campaign.yaml"
+    config_path.write_text(_config(repo))
+    plan = campaign_runner.CampaignPlan(
+        tmp_path / "out", tmp_path / "out/campaign.json", load_config(config_path), ("one",), (), {}, False
+    )
+    candidate = campaign_runner.CampaignJob("one", "vanilla", "one-image")
+    token = StopToken()
+    started = threading.Event()
+    released = threading.Event()
+    results = []
+    stops = []
+
+    class Workspace:
+        base_url = "http://127.0.0.1:9999"
+        port = 9999
+
+        def stop_for_freeze(self):
+            stops.append(candidate)
+            released.set()
+
+    def adapter(*_args, **_kwargs):
+        started.set()
+        assert released.wait(1)
+
+    monkeypatch.setattr(campaign_runner, "_install_for", lambda *_: object())
+    thread = threading.Thread(
+        target=lambda: results.append(
+            campaign_runner.run_job(
+                plan,
+                candidate,
+                breaker=CircuitBreaker(),
+                stop_token=token,
+                workspace_factory=lambda *_: Workspace(),
+                vanilla_runner=adapter,
+                vanilla_api_factory=lambda _: object(),
+            )
+        )
+    )
+    thread.start()
+    try:
+        assert started.wait(1)
+        assert token.registry.active_jobs() == (candidate,)
+        token.set("keyboard_interrupt")
+        token.registry.force_stop_all()
+        thread.join(1)
+    finally:
+        released.set()
+        thread.join(1)
+
+    state = campaign_runner.StateStore(tmp_path / "out/vanilla/one/state.json").read()
+    assert results == [campaign_runner.JobRunResult(candidate, "interrupted")]
+    assert stops == [candidate]
+    assert state.phase == "interrupted"
+    assert state.exit_class == "campaign_stop"
+    assert token.registry.active_jobs() == ()
+
+
+def test_run_job_preserves_native_terminal_result_observed_during_campaign_stop(tmp_path: Path, monkeypatch):
+    from scripts import campaign_runner
+    from scripts.campaign_stop import StopToken
+    from scripts.run_opencode import load_config
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config_path = tmp_path / "campaign.yaml"
+    config_path.write_text(_config(repo))
+    plan = campaign_runner.CampaignPlan(
+        tmp_path / "out", tmp_path / "out/campaign.json", load_config(config_path), ("one",), (), {}, False
+    )
+    candidate = campaign_runner.CampaignJob("one", "vanilla", "one-image")
+    token = StopToken()
+
+    class Workspace:
+        base_url = "http://127.0.0.1:9999"
+        port = 9999
+
+        def stop_for_freeze(self):
+            return None
+
+    def adapter(_job_lease, store, *_args, **_kwargs):
+        state = store.read()
+        for phase in ("preparing", "executing"):
+            state = store.transition(phase, command_identity="native", expected_generation=state.generation)
+        store.transition(
+            "frozen",
+            command_identity="native",
+            expected_generation=state.generation,
+            exit_class="idle",
+            artifact_hashes={"native-result.json": "a" * 64},
+        )
+        token.set("keyboard_interrupt")
+        return "native-result"
+
+    monkeypatch.setattr(campaign_runner, "_install_for", lambda *_: object())
+    result = campaign_runner.run_job(
+        plan,
+        candidate,
+        breaker=CircuitBreaker(),
+        stop_token=token,
+        workspace_factory=lambda *_: Workspace(),
+        vanilla_runner=adapter,
+        vanilla_api_factory=lambda _: object(),
+    )
+
+    state = campaign_runner.StateStore(tmp_path / "out/vanilla/one/state.json").read()
+    assert result == campaign_runner.JobRunResult(candidate, "completed", "native-result")
+    assert state.phase == "frozen"
+    assert state.exit_class == "idle"
+    assert state.artifact_hashes == {"native-result.json": "a" * 64}
+
+
+def test_force_terminal_cas_preserves_native_frozen_state_and_artifact_hashes(tmp_path: Path):
+    from scripts import campaign_runner
+
+    store = campaign_runner.StateStore(tmp_path / "state.json")
+    state = store.write(campaign_runner.JobState("planned"))
+    for phase in ("preparing", "executing"):
+        state = store.transition(phase, command_identity="native", expected_generation=state.generation)
+    store.transition(
+        "frozen",
+        command_identity="native",
+        expected_generation=state.generation,
+        exit_class="idle",
+        artifact_hashes={"native-result.json": "a" * 64},
+    )
+
+    assert campaign_runner._terminalize(store, "interrupted", "campaign_stop")
+    assert store.read().phase == "frozen"
+    assert store.read().exit_class == "idle"
+    assert store.read().artifact_hashes == {"native-result.json": "a" * 64}
+
+
 def test_run_job_normalizes_unexpected_error_without_secret(tmp_path: Path, monkeypatch):
     from scripts import campaign_runner
     from scripts.run_opencode import load_config
@@ -507,7 +1026,10 @@ def test_retry_infra_restarts_a_normalized_pre_provider_failure(tmp_path: Path, 
     candidate = campaign_runner.CampaignJob("one", "vanilla", "one-image")
     monkeypatch.setattr(campaign_runner, "_install_for", lambda *_: object())
     campaign_runner.run_job(
-        plan, candidate, breaker=CircuitBreaker(), workspace_factory=lambda *_: (_ for _ in ()).throw(RuntimeError("infra"))
+        plan,
+        candidate,
+        breaker=CircuitBreaker(),
+        workspace_factory=lambda *_: (_ for _ in ()).throw(RuntimeError("infra")),
     )
     retried = []
 
@@ -543,6 +1065,261 @@ def test_resume_refuses_an_install_record_that_differs_from_manifest(tmp_path: P
 
     with pytest.raises(campaign_runner.CampaignError, match="frozen install"):
         campaign_runner._install_for(plan, "vanilla")
+
+
+@pytest.mark.parametrize("workers", [2, 8])
+def test_fake_paired_campaign_runs_real_scheduler_paths_and_resumes_without_adapter_calls(
+    tmp_path: Path, monkeypatch, workers: int
+):
+    from scripts import campaign_runner
+    from scripts.run_opencode import load_config
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config_path = tmp_path / "campaign.yaml"
+    config_path.write_text(_config(repo))
+    config = load_config(config_path)
+    instances = [
+        {"instance_id": "one", "difficulty": "easy", "language": "python", "image_name": "one-image"},
+        {"instance_id": "two", "difficulty": "hard", "language": "rust", "image_name": "two-image"},
+    ]
+    prepared = []
+
+    def prepare(arm, root):
+        prepared.append((arm.name, arm.revision, root))
+        return {"arm": arm.name, "revision": f"frozen-{arm.name}", "binary_sha256": arm.name[0] * 64}
+
+    plan = campaign_runner.plan_campaign(
+        config,
+        instances,
+        output=tmp_path / "out",
+        limit=2,
+        seed=42,
+        prepare_install_fn=prepare,
+    )
+    monkeypatch.setattr(campaign_runner, "_install_for", lambda frozen, arm: frozen.installs[arm])
+    active = 0
+    maximum = 0
+    lock = threading.Lock()
+    calls = []
+    workspaces = []
+
+    class Workspace:
+        def __init__(self, request, lease):
+            self.base_url = "http://127.0.0.1:9999"
+            self.port = 9999
+            self.request = request
+            self.lease = lease
+            self.stops = 0
+            lease.claim_handle(request)
+
+        def stop_for_freeze(self):
+            self.stops += 1
+            self.lease.release_handle()
+
+    def workspace_factory(request, lease):
+        workspace = Workspace(request, lease)
+        workspaces.append(workspace)
+        return workspace
+
+    def adapter(job_lease, store, workspace, *_args, **_kwargs):
+        nonlocal active, maximum
+        with lock:
+            active += 1
+            maximum = max(maximum, active)
+            calls.append((workspace.request.instance_id, workspace.request.arm))
+        try:
+            time.sleep(0.03)
+            state = store.read()
+            for phase in ("preparing", "executing", "frozen", "packaged", "preflighted"):
+                state = store.transition(phase, command_identity="fake-adapter", expected_generation=state.generation)
+            job_lease.job.submission.write_bytes(f"{workspace.request.instance_id}:{workspace.request.arm}".encode())
+            job_lease.job.root.joinpath("usage.json").write_text('{"cost":"0"}\n')
+            job_lease.job.root.joinpath(f"{workspace.request.arm}-result.json").write_text('{"terminal":true}\n')
+            store.transition("done", command_identity="fake-adapter", expected_generation=state.generation)
+            workspace.stop_for_freeze()
+        finally:
+            with lock:
+                active -= 1
+
+    breaker = CircuitBreaker()
+    result = campaign_runner.run_campaign(
+        plan.jobs,
+        workers=workers,
+        breaker=breaker,
+        state_path=plan.output / "breaker.json",
+        execute=lambda candidate, stop: campaign_runner.run_job(
+            plan,
+            candidate,
+            breaker=breaker,
+            stop_token=stop,
+            workspace_factory=workspace_factory,
+            vanilla_runner=adapter,
+            procontract_runner=adapter,
+            vanilla_api_factory=lambda _: object(),
+            procontract_api_factory=lambda _: object(),
+        ),
+    )
+
+    assert result.completed == 4
+    assert result.failed == 0
+    assert maximum == min(workers, 4)
+    assert set(calls) == {(instance, arm) for instance in ("one", "two") for arm in ("vanilla", "procontract")}
+    assert len(prepared) == 2
+    assert len(workspaces) == 4
+    assert all(workspace.stops == 1 for workspace in workspaces)
+    for candidate in plan.jobs:
+        paths = campaign_runner.JobPaths(plan.output / candidate.arm / candidate.instance_id)
+        assert campaign_runner.StateStore(paths.state).read().phase == "done"
+        assert paths.submission.read_bytes() == f"{candidate.instance_id}:{candidate.arm}".encode()
+        assert paths.root.joinpath("usage.json").is_file()
+        assert paths.root.joinpath(f"{candidate.arm}-result.json").is_file()
+        assert not tuple(paths.root.glob("*.eval.json"))
+
+    resumed = campaign_runner.plan_campaign(
+        config,
+        instances,
+        output=plan.output,
+        limit=2,
+        seed=42,
+        resume=True,
+        prepare_install_fn=lambda *_: pytest.fail("resume cannot resolve prepared refs"),
+    )
+    calls.clear()
+    resumed_result = campaign_runner.run_campaign(
+        resumed.jobs,
+        workers=workers,
+        execute=lambda candidate, stop: campaign_runner.run_job(
+            resumed,
+            candidate,
+            breaker=CircuitBreaker(),
+            resume=True,
+            stop_token=stop,
+            workspace_factory=lambda *_: pytest.fail("terminal resume cannot allocate workspace"),
+            vanilla_runner=adapter,
+            procontract_runner=adapter,
+        ),
+    )
+
+    assert resumed_result.completed == 4
+    assert resumed_result.failed == 0
+    assert calls == []
+    assert len(prepared) == 2
+
+
+@pytest.mark.parametrize("mode", ["pause", "interrupt"])
+def test_fake_paired_campaign_pause_and_interrupt_drain_real_active_job_paths(tmp_path: Path, monkeypatch, mode: str):
+    from scripts import campaign_runner
+    from scripts.run_opencode import load_config
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config_path = tmp_path / "campaign.yaml"
+    config_path.write_text(_config(repo))
+    plan = campaign_runner.plan_campaign(
+        load_config(config_path),
+        [
+            {"instance_id": "one", "difficulty": "easy", "language": "python", "image_name": "one-image"},
+            {"instance_id": "two", "difficulty": "hard", "language": "rust", "image_name": "two-image"},
+        ],
+        output=tmp_path / "out",
+        limit=2,
+        prepare_install_fn=lambda arm, _: {"arm": arm.name},
+    )
+    monkeypatch.setattr(campaign_runner, "_install_for", lambda frozen, arm: frozen.installs[arm])
+    breaker = CircuitBreaker()
+    ready = threading.Barrier(2)
+    lock = threading.Lock()
+    triggered = False
+    calls = []
+
+    class Workspace:
+        base_url = "http://127.0.0.1:9999"
+        port = 9999
+
+        def __init__(self, request, lease):
+            self.request = request
+            self.lease = lease
+            lease.claim_handle(request)
+
+        def stop_for_freeze(self):
+            self.lease.release_handle()
+
+    def adapter(_job_lease, _store, workspace, *_args, **kwargs):
+        nonlocal triggered
+        calls.append((workspace.request.instance_id, workspace.request.arm))
+        ready.wait(1)
+        with lock:
+            first = not triggered
+            triggered = True
+        if first:
+            if mode == "pause":
+                breaker.observe_error(401)
+            else:
+                kwargs["stop_token"].set("keyboard_interrupt")
+        workspace.stop_for_freeze()
+
+    result = campaign_runner.run_campaign(
+        plan.jobs,
+        workers=2,
+        breaker=breaker,
+        execute=lambda candidate, stop: campaign_runner.run_job(
+            plan,
+            candidate,
+            breaker=breaker,
+            stop_token=stop,
+            workspace_factory=lambda request, lease: Workspace(request, lease),
+            vanilla_runner=adapter,
+            procontract_runner=adapter,
+            vanilla_api_factory=lambda _: object(),
+            procontract_api_factory=lambda _: object(),
+        ),
+    )
+
+    assert len(calls) == 2
+    assert result.failed == 2
+    assert result.paused is (mode == "pause")
+    assert result.interrupted is (mode == "interrupt")
+    assert len(result.pending) == (2 if mode == "pause" else 0)
+    for instance_id, arm in calls:
+        state = campaign_runner.StateStore(plan.output / arm / instance_id / "state.json").read()
+        assert state.phase == "interrupted"
+        assert state.exit_class == "campaign_stop"
+
+
+@pytest.mark.parametrize("outcome", ["paused", "interrupted", "fatal"])
+def test_cli_returns_nonzero_for_paused_interrupted_and_fatal_campaigns(tmp_path: Path, monkeypatch, outcome: str):
+    from scripts import campaign_runner
+    from scripts.run_opencode import load_config
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config_path = tmp_path / "campaign.yaml"
+    config_path.write_text(_config(repo))
+    config = load_config(config_path)
+    plan = campaign_runner.CampaignPlan(tmp_path / "out", tmp_path / "out/campaign.json", config, (), (), {}, False)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENCODE_SERVER_PASSWORD", "test-password")
+    monkeypatch.setattr(campaign_runner, "load_config", lambda _: config)
+    monkeypatch.setattr(campaign_runner, "load_all_instances", lambda **_: [])
+    monkeypatch.setattr(campaign_runner, "plan_campaign", lambda *_args, **_kwargs: plan)
+
+    def run(*_args, **_kwargs):
+        if outcome == "fatal":
+            raise campaign_runner.CampaignShutdownError("noncooperative worker")
+        return campaign_runner.CampaignResult(
+            0,
+            0,
+            (),
+            0,
+            "paused" if outcome == "paused" else None,
+            paused=outcome == "paused",
+            interrupted=outcome == "interrupted",
+        )
+
+    monkeypatch.setattr(campaign_runner, "run_campaign", run)
+
+    assert campaign_runner.main(["--config", str(config_path), "--output", str(plan.output)]) == 1
 
 
 def _config(repo: Path) -> str:

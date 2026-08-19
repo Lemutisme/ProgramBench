@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Callable, Literal, Mapping
 
 from scripts.campaign_install import InstallRecord
 from scripts.campaign_state import JobLease, JobState, StateStore
+from scripts.campaign_stop import CampaignStopped, StopAwareApi, StopToken, stop_aware_sleeper
 from scripts.campaign_usage import (
     CircuitBreaker,
     TurnUsage,
@@ -229,6 +230,61 @@ def run_vanilla(
     delivery: Literal["steer", "queue"] = "steer",
     agent: str | None = None,
     files: tuple[Mapping[str, object], ...] = (),
+    stop_token: StopToken | None = None,
+) -> VanillaResult:
+    stop = stop_token or StopToken()
+    guarded_api = StopAwareApi(api, stop)
+    try:
+        return _run_vanilla(
+            job,
+            state_store,
+            workspace,
+            install,
+            model=model,
+            variant=variant,
+            limits=limits,
+            breaker=breaker,
+            api=guarded_api,  # type: ignore[arg-type]
+            clock=clock,
+            sleeper=stop_aware_sleeper(stop, sleeper),
+            poll_interval=poll_interval,
+            delivery=delivery,
+            agent=agent,
+            files=files,
+            stop_token=stop,
+        )
+    except CampaignStopped:
+        return _finish_active_campaign_stop(
+            job,
+            state_store,
+            workspace,
+            breaker,
+            api,
+            guarded_api,
+            clock,
+            sleeper,
+            poll_interval,
+        )
+
+
+def _run_vanilla(
+    job: JobLease,
+    state_store: StateStore,
+    workspace: DockerWorkspace,
+    install: InstallRecord,
+    *,
+    model: str,
+    variant: str,
+    limits: Limits,
+    breaker: CircuitBreaker,
+    api: OpenCodeApi,
+    clock: Callable[[], float] = time.time,
+    sleeper: Callable[[float], None] = time.sleep,
+    poll_interval: float = 1.0,
+    delivery: Literal["steer", "queue"] = "steer",
+    agent: str | None = None,
+    files: tuple[Mapping[str, object], ...] = (),
+    stop_token: StopToken | None = None,
 ) -> VanillaResult:
     """Run or adopt one durable vanilla trajectory and freeze its candidate once."""
     _validate_inputs(
@@ -255,6 +311,10 @@ def run_vanilla(
         _verify_no_credentials(job.job.root, workspace.manifest.credential_env)
         workspace.release()
         return result
+
+    stop = stop_token or StopToken()
+    if stop.is_set():
+        stop.checkpoint()
 
     session_id, message_id = _ids(workspace.manifest.campaign, workspace.manifest.job_id)
     prompt_request = VanillaPromptRequest(
@@ -872,6 +932,196 @@ def run_vanilla(
     _verify_no_credentials(job.job.root, workspace.manifest.credential_env)
     if invalid_error is not None:
         raise VanillaError(f"{invalid_error}; invalid trajectory evidence frozen")
+    return result
+
+
+def _finish_unadmitted_campaign_stop(
+    job: JobLease,
+    state_store: StateStore,
+    state: JobState,
+    workspace: DockerWorkspace,
+) -> VanillaResult:
+    session_id, message_id = _ids(workspace.manifest.campaign, workspace.manifest.job_id)
+    if workspace.lease._handle_active:
+        workspace.stop()
+    result = _freeze(
+        job.job.root,
+        workspace,
+        _result(
+            session_id,
+            message_id,
+            VanillaCompletion.INTERRUPTED,
+            _usage_from_state(state),
+            state.actions,
+            0,
+            workspace_frozen=True,
+            container_stopped_for_freeze=True,
+            forced_stop=True,
+            exit_class="campaign_stop",
+            error="campaign_stop",
+        ),
+        {"id": session_id, "status": "unconfirmed"},
+        {"data": []},
+    )
+    state_store.transition(
+        "interrupted",
+        command_identity=state.command_identity or "campaign_stop",
+        expected_generation=state.generation,
+        provider_turns=state.provider_turns,
+        actions=state.actions,
+        cost=state.cost,
+        exit_class="campaign_stop",
+        artifact_hashes={
+            name: _sha256(job.job.root / name)
+            for name in ("trajectory.json", "usage.json", "workspace-inventory.json", "vanilla-result.json")
+        },
+    )
+    return result
+
+
+def _finish_active_campaign_stop(
+    job: JobLease,
+    state_store: StateStore,
+    workspace: DockerWorkspace,
+    breaker: CircuitBreaker,
+    api: OpenCodeApi,
+    guarded_api: StopAwareApi,
+    clock: Callable[[], float],
+    sleeper: Callable[[float], None],
+    poll_interval: float,
+) -> VanillaResult:
+    state = state_store.read()
+    if state.phase in {"frozen", "packaged", "preflighted", "done", "failed", "interrupted"}:
+        return _read_result(job.job.root / "vanilla-result.json")
+    execution_path = job.job.root / "vanilla-execution.json"
+    if not execution_path.is_file():
+        return _finish_unadmitted_campaign_stop(job, state_store, state, workspace)
+    execution = _read_json(execution_path)
+    if not isinstance(execution, Mapping):
+        raise VanillaError("persisted vanilla execution is invalid")
+    session_id = str(execution["session_id"])
+    message_id = str(execution["message_id"])
+    usage, actions, messages, _ = _restore_progress(job.job.root / "vanilla-progress.json", state)
+    session = guarded_api.observed("get_session")
+    if not isinstance(session, Mapping):
+        session = {"id": session_id, "status": "unconfirmed"}
+    if guarded_api.blocked_method == "interrupt" and execution.get("interrupt_attempted") is True:
+        execution = {**execution, "interrupt_attempted": False}
+        _write_json(execution_path, execution)
+    provider_error = _provider_error(messages)
+    if provider_error is not None and provider_error[0] != 429:
+        completion = VanillaCompletion.AUTH if provider_error[0] in {401, 403} else VanillaCompletion.PROVIDER_ERROR
+        if completion is VanillaCompletion.AUTH:
+            breaker.observe_error(provider_error[0], detail=provider_error[2])
+        stopped = _interrupt(api, session_id, workspace, execution_path, execution, clock, sleeper, poll_interval)
+        if workspace.lease._handle_active:
+            workspace.stop()
+        result = _freeze(
+            job.job.root,
+            workspace,
+            _result(
+                session_id,
+                message_id,
+                completion,
+                usage,
+                actions,
+                max(0, clock() - float(execution["started_at"])),
+                workspace_frozen=True,
+                container_stopped_for_freeze=True,
+                interrupt_attempted=_execution_interrupt_attempted(execution_path),
+                forced_stop=stopped,
+                error="provider authentication failure" if completion is VanillaCompletion.AUTH else "provider error",
+            ),
+            session,
+            messages,
+        )
+        _observe_terminal_usage(breaker, workspace.manifest.job_id, state.generation, usage)
+        state_store.transition(
+            "frozen",
+            command_identity=state.command_identity or "campaign_stop",
+            expected_generation=state.generation,
+            provider_turns=state.provider_turns,
+            actions=actions,
+            cost=state.cost,
+            exit_class=completion.value,
+            artifact_hashes={
+                name: _sha256(job.job.root / name)
+                for name in ("trajectory.json", "usage.json", "workspace-inventory.json", "vanilla-result.json")
+            },
+        )
+        return result
+    if guarded_api.observed("status") == "idle" and usage.provider_turns and _messages_settled(messages):
+        if workspace.lease._handle_active:
+            workspace.stop()
+        result = _freeze(
+            job.job.root,
+            workspace,
+            _result(
+                session_id,
+                message_id,
+                VanillaCompletion.IDLE,
+                usage,
+                actions,
+                max(0, clock() - float(execution["started_at"])),
+                workspace_frozen=True,
+                container_stopped_for_freeze=True,
+            ),
+            session,
+            messages,
+        )
+        _observe_terminal_usage(breaker, workspace.manifest.job_id, state.generation, usage)
+        state_store.transition(
+            "frozen",
+            command_identity=state.command_identity or "campaign_stop",
+            expected_generation=state.generation,
+            provider_turns=state.provider_turns,
+            actions=actions,
+            cost=state.cost,
+            exit_class="idle",
+            artifact_hashes={
+                name: _sha256(job.job.root / name)
+                for name in ("trajectory.json", "usage.json", "workspace-inventory.json", "vanilla-result.json")
+            },
+        )
+        return result
+    if execution.get("prompt_may_be_active") is True:
+        _interrupt(api, session_id, workspace, execution_path, execution, clock, sleeper, poll_interval)
+    if workspace.lease._handle_active:
+        workspace.stop()
+    result = _freeze(
+        job.job.root,
+        workspace,
+        _result(
+            session_id,
+            message_id,
+            VanillaCompletion.INTERRUPTED,
+            usage,
+            actions,
+            0,
+            workspace_frozen=True,
+            container_stopped_for_freeze=True,
+            interrupt_attempted=_execution_interrupt_attempted(execution_path),
+            forced_stop=True,
+            exit_class="campaign_stop",
+            error="campaign_stop",
+        ),
+        session,
+        messages,
+    )
+    _observe_terminal_usage(breaker, workspace.manifest.job_id, state.generation, usage)
+    state_store.transition(
+        "interrupted",
+        command_identity=state.command_identity or "campaign_stop",
+        expected_generation=state.generation,
+        provider_turns=state.provider_turns,
+        actions=actions,
+        cost=state.cost,
+        exit_class="campaign_stop",
+        artifact_hashes={
+            name: _sha256(job.job.root / name)
+            for name in ("trajectory.json", "usage.json", "workspace-inventory.json", "vanilla-result.json")
+        },
+    )
     return result
 
 
