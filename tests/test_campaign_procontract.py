@@ -34,6 +34,16 @@ class FakeClock:
         self.now += seconds
 
 
+class StaticHttpClient:
+    def __init__(self, value: object) -> None:
+        self.value = value
+
+    def request(self, *args: object, **kwargs: object) -> object:
+        from scripts.campaign_procontract import HttpResponse
+
+        return HttpResponse(200, {}, json.dumps(self.value, separators=(",", ":")).encode())
+
+
 class WallClock(FakeClock):
     def __init__(self) -> None:
         super().__init__()
@@ -277,6 +287,41 @@ class AttestErrorApi(FakeApi):
         raise self.error
 
 
+class AttestReconcileErrorApi(FakeApi):
+    def __init__(
+        self,
+        contract: dict[str, object],
+        execution: dict[str, object],
+        reconcile_error: Exception,
+        reconcile_failures: int,
+    ) -> None:
+        super().__init__(contract, execution)
+        self.reconcile_error = reconcile_error
+        self.reconcile_failures = reconcile_failures
+        self.reconciling = False
+        self.attest_calls = 0
+        self.reconcile_calls = 0
+
+    def attest(self, contract_id: str, evidence_hash: str) -> dict[str, object]:
+        self.attest_calls += 1
+        if self.attest_calls == 1:
+            self.reconciling = True
+            from scripts.campaign_procontract import ProContractHttpError
+
+            raise ProContractHttpError("attestation response lost", status_code=503, transient=True)
+        return super().attest(contract_id, evidence_hash)
+
+    def get_contract(self, contract_id: str) -> dict[str, object] | None:
+        if self.reconciling:
+            self.reconcile_calls += 1
+            if self.reconcile_failures != 0:
+                if self.reconcile_failures > 0:
+                    self.reconcile_failures -= 1
+                raise self.reconcile_error
+            self.reconciling = False
+        return self.contract
+
+
 class MalformedIssueResponseApi(FakeApi):
     def issue(self, payload: dict[str, object]) -> dict[str, object]:
         response = super().issue(payload)
@@ -441,11 +486,13 @@ class SecretControlBeforeAttestApi(FakeApi):
         self.path = path
         self.secret = secret
         self.gets = 0
+        self.identity: tuple[int, str] | None = None
 
     def get_contract(self, contract_id: str) -> dict[str, object] | None:
         self.gets += 1
         if self.gets == 3:
             self.path.write_text(self.secret)
+            self.identity = (self.path.stat().st_ino, _file_hash(self.path))
         return self.contract
 
 
@@ -459,6 +506,40 @@ class NonQuietApi(FakeApi):
             "stateHash": "state",
             "outstanding": [self.contract["id"]],
         }
+
+
+class StageHttpApi(FakeApi):
+    def __init__(
+        self,
+        contract: dict[str, object],
+        execution: dict[str, object],
+        stage: str,
+        error: Exception,
+        failures: int,
+    ) -> None:
+        super().__init__(contract, execution)
+        self.stage = stage
+        self.error = error
+        self.failures = failures
+        self.gets = 0
+
+    def _fail(self) -> None:
+        if self.failures == 0:
+            return
+        if self.failures > 0:
+            self.failures -= 1
+        raise self.error
+
+    def get_contract(self, contract_id: str) -> dict[str, object] | None:
+        self.gets += 1
+        if self.stage == "export" and self.gets >= 2 or self.stage == "pre_attest" and self.gets >= 3:
+            self._fail()
+        return self.contract
+
+    def quiet(self, scope: str) -> dict[str, object]:
+        if self.stage == "quiet" and self.contract["status"] == "discharged":
+            self._fail()
+        return super().quiet(scope)
 
 
 class CrashAfterStateCommitStore(StateStore):
@@ -511,9 +592,15 @@ def _state(paths: JobPaths) -> StateStore:
     return store
 
 
-def _workspace(tmp_path: Path, paths: JobPaths) -> tuple[SimpleNamespace, FakeWorkspace]:
-    candidate = tmp_path / "candidate"
-    candidate.mkdir()
+def _workspace(
+    tmp_path: Path,
+    paths: JobPaths,
+    *,
+    contained: bool = False,
+) -> tuple[SimpleNamespace, FakeWorkspace]:
+    base = paths.root / "workspace" if contained else tmp_path
+    candidate = base / "candidate"
+    candidate.mkdir(parents=True)
     request = SimpleNamespace(
         job=paths,
         campaign="pilot",
@@ -530,11 +617,13 @@ def _workspace(tmp_path: Path, paths: JobPaths) -> tuple[SimpleNamespace, FakeWo
         arm="procontract",
         job_root=paths.root,
         subject_dir=paths.root / "subject",
-        state_dir=tmp_path / "state",
+        state_dir=base / "state",
+        log_dir=base / "logs",
         candidate=candidate,
         credential_env=(),
     )
     manifest.state_dir.mkdir()
+    manifest.log_dir.mkdir()
     return request, FakeWorkspace(manifest, lease)
 
 
@@ -1007,6 +1096,53 @@ def test_malformed_committed_attestation_response_reconciles_without_retry(tmp_p
 
     assert result.completion.value == "discharged"
     assert len(api.attestations) == 1
+
+
+@pytest.mark.parametrize(("status", "failures", "completion"), [(401, -1, "auth"), (429, 1, "discharged")])
+def test_attestation_reconcile_uses_stage_http_policy(
+    tmp_path: Path, status: int, failures: int, completion: str
+) -> None:
+    from scripts.campaign_procontract import ProContractHttpError, build_issue_payload, run_procontract
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    store = _state(paths)
+    _, workspace = _workspace(tmp_path, paths, contained=True)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock())
+    api = AttestReconcileErrorApi(
+        _contract(payload),
+        _execution(payload),
+        ProContractHttpError(
+            "reconcile failed",
+            status_code=status,
+            retry_after="1" if status == 429 else None,
+        ),
+        failures,
+    )
+
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease._handle_active = True
+        result = run_procontract(
+            job,
+            store,
+            workspace,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=_limits(),
+            breaker=CircuitBreaker(clock=clock),
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+            package=lambda subject, run_dir, iid: _package(run_dir, iid),
+            preflight=lambda archive, iid: SimpleNamespace(executable_hash="e" * 64, output="ok"),
+        )
+
+    assert result.completion.value == completion
+    assert api.attest_calls == (1 if status == 401 else 2)
+    if status == 429:
+        assert api.reconcile_calls == 2
+        assert clock.now >= 101
 
 
 def test_post_attestation_get_loss_retries_observation_without_second_attest(tmp_path: Path) -> None:
@@ -1494,22 +1630,27 @@ def test_state_cas_conflict_stops_native_writer_before_propagating(tmp_path: Pat
 def test_credential_in_export_fails_closed_without_package_or_attestation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from scripts.campaign_freeze import CredentialLeakError
     from scripts.campaign_procontract import build_issue_payload, run_procontract
 
     monkeypatch.setenv("OPENAI_API_KEY", "campaign-secret")
     paths = JobPaths(tmp_path / "job")
     paths.root.mkdir()
     store = _state(paths)
-    _, workspace = _workspace(tmp_path, paths)
+    _, workspace = _workspace(tmp_path, paths, contained=True)
     workspace.manifest.credential_env = ("OPENAI_API_KEY",)
     clock = FakeClock()
     payload = build_issue_payload(workspace, now=clock())
     api = FakeApi(_contract(payload), _execution(payload))
     original = api.export
+    leak_identity: tuple[int, str] | None = None
 
     def export(owner: object, contract_id: str, destination: Path) -> dict[str, object]:
+        nonlocal leak_identity
         result = original(owner, contract_id, destination)
-        destination.joinpath("leak.txt").write_text("campaign-secret")
+        leak = destination / "leak.txt"
+        leak.write_text("campaign-secret")
+        leak_identity = (leak.stat().st_ino, _file_hash(leak))
         return result
 
     api.export = export  # type: ignore[method-assign]
@@ -1522,26 +1663,28 @@ def test_credential_in_export_fails_closed_without_package_or_attestation(
 
     with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
         workspace.lease._handle_active = True
-        result = run_procontract(
-            job,
-            store,
-            workspace,
-            model="openai/gpt-5.6-luna",
-            variant="max",
-            limits=_limits(),
-            breaker=CircuitBreaker(),
-            api=api,
-            package=package,
-            preflight=lambda archive, iid: SimpleNamespace(executable_hash="e" * 64, output="ok"),
-            clock=clock,
-            sleeper=clock.sleep,
-        )
+        with pytest.raises(CredentialLeakError):
+            run_procontract(
+                job,
+                store,
+                workspace,
+                model="openai/gpt-5.6-luna",
+                variant="max",
+                limits=_limits(),
+                breaker=CircuitBreaker(),
+                api=api,
+                package=package,
+                preflight=lambda archive, iid: SimpleNamespace(executable_hash="e" * 64, output="ok"),
+                clock=clock,
+                sleeper=clock.sleep,
+            )
 
-    assert result.completion.value == "delivery_failed"
     assert packages == 0
     assert api.attestations == []
     assert not paths.root.joinpath("subject").exists()
-    assert "campaign-secret" not in (paths.root / "procontract-result.json").read_text()
+    leak = next(workspace.manifest.state_dir.glob("contract-export-*/leak.txt"))
+    assert (leak.stat().st_ino, _file_hash(leak)) == leak_identity
+    assert not paths.root.joinpath("procontract-result.json").exists()
 
 
 def test_issue_response_credential_is_sanitized_before_persistence(
@@ -1578,12 +1721,15 @@ def test_issue_response_credential_is_sanitized_before_persistence(
         )
 
     assert result.completion.value == "discharged"
+    response = json.loads((paths.root / "procontract-issue-response.json").read_text())
+    assert response["receipt"]["hash"] == "[REDACTED]"
     _assert_secret_absent(paths.root, secret)
 
 
 def test_native_failure_scans_candidate_credentials_before_terminal_result(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from scripts.campaign_freeze import CredentialLeakError
     from scripts.campaign_procontract import build_issue_payload, run_procontract
 
     secret = "candidate-secret"
@@ -1591,9 +1737,10 @@ def test_native_failure_scans_candidate_credentials_before_terminal_result(
     paths = JobPaths(tmp_path / "job")
     paths.root.mkdir()
     store = _state(paths)
-    _, workspace = _workspace(tmp_path, paths)
+    _, workspace = _workspace(tmp_path, paths, contained=True)
     workspace.manifest.credential_env = ("CONTROL_SECRET",)
     workspace.candidate.joinpath("private.log").write_text(secret)
+    before = _tree_identity(workspace.candidate)
     clock = FakeClock()
     payload = build_issue_payload(workspace, now=clock())
     contract = _challenged(_contract(payload))
@@ -1601,48 +1748,7 @@ def test_native_failure_scans_candidate_credentials_before_terminal_result(
 
     with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
         workspace.lease._handle_active = True
-        result = run_procontract(
-            job,
-            store,
-            workspace,
-            model="openai/gpt-5.6-luna",
-            variant="max",
-            limits=_limits(),
-            breaker=CircuitBreaker(),
-            api=api,
-            clock=clock,
-            sleeper=clock.sleep,
-        )
-
-    assert result.completion.value == "delivery_failed"
-    assert api.attestations == []
-    assert workspace.candidate.joinpath("private.log").read_text() == secret
-    _assert_secret_absent(paths.root, secret)
-
-
-def test_incomplete_control_scan_refuses_terminal_publication(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from scripts.campaign_procontract import (
-        ProContractCredentialScanError,
-        build_issue_payload,
-        run_procontract,
-    )
-
-    paths = JobPaths(tmp_path / "job")
-    paths.root.mkdir()
-    store = _state(paths)
-    _, workspace = _workspace(tmp_path, paths)
-    monkeypatch.setenv("CONTROL_SECRET", "scan-secret")
-    workspace.manifest.credential_env = ("CONTROL_SECRET",)
-    target = tmp_path / "safe.json"
-    target.write_text("{}")
-    paths.root.joinpath("unsafe.json").symlink_to(target)
-    clock = FakeClock()
-    payload = build_issue_payload(workspace, now=clock())
-    api = FakeApi(_challenged(_contract(payload)), _execution(payload))
-
-    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
-        workspace.lease._handle_active = True
-        with pytest.raises(ProContractCredentialScanError):
+        with pytest.raises(CredentialLeakError):
             run_procontract(
                 job,
                 store,
@@ -1656,26 +1762,76 @@ def test_incomplete_control_scan_refuses_terminal_publication(tmp_path: Path, mo
                 sleeper=clock.sleep,
             )
 
-    assert store.read().phase == "executing"
+    assert api.attestations == []
+    assert _tree_identity(workspace.candidate) == before
+    assert workspace.candidate.joinpath("private.log").read_text() == secret
     assert not paths.root.joinpath("procontract-result.json").exists()
 
 
-@pytest.mark.parametrize("name", ["verifier-report.json", "provider-trace.log"])
-def test_control_artifact_credential_before_attest_is_removed_and_fails_closed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+def test_verification_candidate_credential_fails_before_packaging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from scripts.campaign_freeze import CredentialLeakError
     from scripts.campaign_procontract import build_issue_payload, run_procontract
 
-    secret = "control-secret"
+    secret = "candidate-secret"
     monkeypatch.setenv("CONTROL_SECRET", secret)
     paths = JobPaths(tmp_path / "job")
     paths.root.mkdir()
     store = _state(paths)
-    _, workspace = _workspace(tmp_path, paths)
+    _, workspace = _workspace(tmp_path, paths, contained=True)
     workspace.manifest.credential_env = ("CONTROL_SECRET",)
+    workspace.candidate.joinpath("private.log").write_text(secret)
+    before = _tree_identity(workspace.candidate)
     clock = FakeClock()
     payload = build_issue_payload(workspace, now=clock())
-    api = SecretControlBeforeAttestApi(_contract(payload), _execution(payload), paths.root / name, secret)
+    api = FakeApi(_contract(payload), _execution(payload))
+    packages = 0
+
+    def package(subject: Path, run_dir: Path, iid: str) -> Path:
+        nonlocal packages
+        packages += 1
+        return _package(run_dir, iid)
+
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease._handle_active = True
+        with pytest.raises(CredentialLeakError):
+            run_procontract(
+                job,
+                store,
+                workspace,
+                model="openai/gpt-5.6-luna",
+                variant="max",
+                limits=_limits(),
+                breaker=CircuitBreaker(),
+                api=api,
+                clock=clock,
+                sleeper=clock.sleep,
+                package=package,
+                preflight=lambda archive, iid: SimpleNamespace(executable_hash="e" * 64, output="ok"),
+            )
+
+    assert packages == 0
+    assert not paths.root.joinpath(workspace.manifest.instance_id, "submission.tar.gz").exists()
+    assert api.attestations == []
+    assert _tree_identity(workspace.candidate) == before
+
+
+def test_typed_control_scan_excludes_unknown_bulk_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from scripts.campaign_procontract import build_issue_payload, run_procontract
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    store = _state(paths)
+    _, workspace = _workspace(tmp_path, paths, contained=True)
+    monkeypatch.setenv("CONTROL_SECRET", "scan-secret")
+    workspace.manifest.credential_env = ("CONTROL_SECRET",)
+    target = tmp_path / "safe.json"
+    target.write_text("{}")
+    paths.root.joinpath("unsafe.json").symlink_to(target)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock())
+    api = FakeApi(_challenged(_contract(payload)), _execution(payload))
 
     with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
         workspace.lease._handle_active = True
@@ -1690,13 +1846,56 @@ def test_control_artifact_credential_before_attest_is_removed_and_fails_closed(
             api=api,
             clock=clock,
             sleeper=clock.sleep,
-            package=lambda subject, run_dir, iid: _package(run_dir, iid),
-            preflight=lambda archive, iid: SimpleNamespace(executable_hash="e" * 64, output="ok"),
         )
 
-    assert result.completion.value == "delivery_failed"
+    assert result.completion.value == "challenged"
+    assert paths.root.joinpath("unsafe.json").is_symlink()
+    assert "unsafe.json" not in store.read().artifact_hashes
+
+
+@pytest.mark.parametrize("name", ["verifier-report.json", "provider-trace.log"])
+def test_control_artifact_credential_is_immutable_and_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    from scripts.campaign_freeze import CredentialLeakError
+    from scripts.campaign_procontract import build_issue_payload, run_procontract
+
+    secret = "control-secret"
+    monkeypatch.setenv("CONTROL_SECRET", secret)
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    store = _state(paths)
+    _, workspace = _workspace(tmp_path, paths, contained=True)
+    workspace.manifest.credential_env = ("CONTROL_SECRET",)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock())
+    target = paths.root / name if name.endswith(".json") else workspace.manifest.log_dir / name
+    api = SecretControlBeforeAttestApi(_contract(payload), _execution(payload), target, secret)
+
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease._handle_active = True
+        with pytest.raises(CredentialLeakError):
+            run_procontract(
+                job,
+                store,
+                workspace,
+                model="openai/gpt-5.6-luna",
+                variant="max",
+                limits=_limits(),
+                breaker=CircuitBreaker(),
+                api=api,
+                clock=clock,
+                sleeper=clock.sleep,
+                package=lambda subject, run_dir, iid: _package(run_dir, iid),
+                preflight=lambda archive, iid: SimpleNamespace(executable_hash="e" * 64, output="ok"),
+            )
+
     assert api.attestations == []
-    _assert_secret_absent(paths.root, secret)
+    assert api.identity is not None
+    assert target.exists()
+    assert (target.stat().st_ino, _file_hash(target)) == api.identity
+    assert target.read_text() == secret
+    assert not paths.root.joinpath("procontract-result.json").exists()
 
 
 def test_handoff_change_immediately_after_export_stops_before_host_packaging(tmp_path: Path) -> None:
@@ -1957,6 +2156,172 @@ def test_nonquiet_scope_after_attestation_preserves_discharged_native_evidence(t
     assert result.outstanding == (str(payload["id"]),)
     assert len(api.attestations) == 1
     assert (paths.root / "procontract-discharge.json").is_file()
+
+
+@pytest.mark.parametrize("stage", ["export", "pre_attest", "quiet"])
+def test_stage_http_429_retries_same_read_to_success(tmp_path: Path, stage: str) -> None:
+    from scripts.campaign_procontract import ProContractHttpError, build_issue_payload, run_procontract
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    store = _state(paths)
+    _, workspace = _workspace(tmp_path, paths, contained=True)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock())
+    api = StageHttpApi(
+        _contract(payload),
+        _execution(payload),
+        stage,
+        ProContractHttpError("limited", status_code=429, retry_after="1"),
+        1,
+    )
+
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease._handle_active = True
+        result = run_procontract(
+            job,
+            store,
+            workspace,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=_limits(),
+            breaker=CircuitBreaker(clock=clock),
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+            package=lambda subject, run_dir, iid: _package(run_dir, iid),
+            preflight=lambda archive, iid: SimpleNamespace(executable_hash="e" * 64, output="ok"),
+        )
+
+    assert result.completion.value == "discharged"
+    assert result.quiet_unconfirmed is False
+    assert len(api.attestations) == 1
+
+
+@pytest.mark.parametrize("stage", ["export", "pre_attest", "quiet"])
+def test_stage_http_auth_preserves_auth_completion(tmp_path: Path, stage: str) -> None:
+    from scripts.campaign_procontract import ProContractHttpError, build_issue_payload, run_procontract
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    store = _state(paths)
+    _, workspace = _workspace(tmp_path, paths, contained=True)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock())
+    api = StageHttpApi(
+        _contract(payload),
+        _execution(payload),
+        stage,
+        ProContractHttpError("unauthorized", status_code=401),
+        -1,
+    )
+
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease._handle_active = True
+        result = run_procontract(
+            job,
+            store,
+            workspace,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=_limits(),
+            breaker=CircuitBreaker(clock=clock),
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+            package=lambda subject, run_dir, iid: _package(run_dir, iid),
+            preflight=lambda archive, iid: SimpleNamespace(executable_hash="e" * 64, output="ok"),
+        )
+
+    assert result.completion.value == "auth"
+    assert len(api.attestations) == (1 if stage == "quiet" else 0)
+
+
+@pytest.mark.parametrize("stage", ["export", "pre_attest", "quiet"])
+def test_stage_http_loss_preserves_native_classification(tmp_path: Path, stage: str) -> None:
+    from scripts.campaign_procontract import ProContractHttpError, build_issue_payload, run_procontract
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    store = _state(paths)
+    _, workspace = _workspace(tmp_path, paths, contained=True)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock())
+    api = StageHttpApi(
+        _contract(payload),
+        _execution(payload),
+        stage,
+        ProContractHttpError("server lost", status_code=503, transient=True),
+        -1,
+    )
+
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease._handle_active = True
+        result = run_procontract(
+            job,
+            store,
+            workspace,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=_limits(),
+            breaker=CircuitBreaker(clock=clock),
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+            package=lambda subject, run_dir, iid: _package(run_dir, iid),
+            preflight=lambda archive, iid: SimpleNamespace(executable_hash="e" * 64, output="ok"),
+        )
+
+    if stage == "quiet":
+        assert result.completion.value == "discharged"
+        assert result.quiet_unconfirmed is True
+        assert len(api.attestations) == 1
+    else:
+        assert result.completion.value == "lost_server"
+        assert result.status == "verification"
+        assert result.outstanding == (str(payload["id"]),)
+        assert api.attestations == []
+
+
+@pytest.mark.parametrize("stage", ["export", "pre_attest", "quiet"])
+def test_stage_http_perpetual_429_stops_at_deadline(tmp_path: Path, stage: str) -> None:
+    from scripts.campaign_procontract import ProContractHttpError, build_issue_payload, run_procontract
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    store = _state(paths)
+    _, workspace = _workspace(tmp_path, paths, contained=True)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock())
+    api = StageHttpApi(
+        _contract(payload),
+        _execution(payload),
+        stage,
+        ProContractHttpError("limited", status_code=429, retry_after="21600"),
+        -1,
+    )
+
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease._handle_active = True
+        result = run_procontract(
+            job,
+            store,
+            workspace,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=_limits(),
+            breaker=CircuitBreaker(clock=clock, retry_after_max=21600),
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+            poll_interval=30,
+            package=lambda subject, run_dir, iid: _package(run_dir, iid),
+            preflight=lambda archive, iid: SimpleNamespace(executable_hash="e" * 64, output="ok"),
+        )
+
+    assert result.completion.value == "wall_time"
+    assert clock.now == 21700
+    assert len(api.attestations) == (1 if stage == "quiet" else 0)
 
 
 @pytest.mark.parametrize(
@@ -2518,6 +2883,46 @@ def test_real_public_http_adapter_uses_only_contract_and_read_only_session_endpo
     assert sum(path == f"/api/contract/{payload['id']}/attestation" for _, path, _ in requests) == 1
 
 
+@pytest.mark.parametrize(
+    "active",
+    [
+        {"": {"type": "running"}},
+        {"ses_": {"type": "running"}},
+        {"bad": {"type": "running"}},
+        {"ses_other": "running"},
+        {"ses_other": {"type": "running", "extra": True}},
+        {"ses_other": {"type": "idle"}},
+        {"ses_contract": {"type": "running"}, "bad": {"type": "running"}},
+    ],
+)
+def test_active_session_record_rejects_any_malformed_entry(active: object) -> None:
+    from scripts.campaign_procontract import HttpProContractApi, ProContractError
+
+    api = HttpProContractApi(
+        "http://127.0.0.1:4096",
+        expected_port=4096,
+        password="secret",
+        http_client=StaticHttpClient({"data": active}),
+    )
+
+    with pytest.raises(ProContractError, match="status"):
+        api.status("ses_contract")
+
+
+def test_active_session_record_accepts_multiple_exact_running_sessions() -> None:
+    from scripts.campaign_procontract import HttpProContractApi
+
+    api = HttpProContractApi(
+        "http://127.0.0.1:4096",
+        expected_port=4096,
+        password="secret",
+        http_client=StaticHttpClient({"data": {"ses_other": {"type": "running"}, "ses_contract": {"type": "running"}}}),
+    )
+
+    assert api.status("ses_contract") == "busy"
+    assert api.status("ses_missing") == "idle"
+
+
 def test_run_opencode_reexports_native_contract_surface() -> None:
     from scripts import campaign_procontract, run_opencode
 
@@ -2526,6 +2931,43 @@ def test_run_opencode_reexports_native_contract_surface() -> None:
     assert run_opencode.ProContractResult is campaign_procontract.ProContractResult
     assert run_opencode.ProContractApi is campaign_procontract.ProContractApi
     assert run_opencode.ProContractIssueRequest is campaign_procontract.ProContractIssueRequest
+
+
+def test_result_v1_without_quiet_unconfirmed_remains_readable() -> None:
+    from decimal import Decimal
+
+    from scripts.campaign_procontract import ProContractCompletion, ProContractResult
+
+    raw = ProContractResult(
+        contract_id="pct_existing",
+        session_id="ses_existing",
+        prompt_id="msg_existing",
+        revision=1,
+        spec_hash="spec",
+        status="discharged",
+        completion=ProContractCompletion.DISCHARGED,
+        provider_turns=1,
+        actions=1,
+        cost=Decimal("1"),
+        elapsed_seconds=1,
+        acceptance_hash="acceptance",
+        subject_hash="subject",
+        replay_evidence_hash="replay",
+        report_hash="report",
+        package_hash="package",
+        executable_hash="executable",
+        attestation_id="pca_existing",
+        interrupt_attempted=False,
+        forced_stop=True,
+        workspace_frozen=True,
+        container_stopped_for_freeze=True,
+        quiet=True,
+        outstanding=(),
+        exit_class="discharged",
+    ).to_dict()
+    raw.pop("quiet_unconfirmed")
+
+    assert ProContractResult.from_dict(raw).quiet_unconfirmed is False
 
 
 def test_done_result_is_idempotent_and_makes_no_public_api_mutation(tmp_path: Path) -> None:
@@ -2621,3 +3063,19 @@ def _assert_secret_absent(root: Path, secret: str) -> None:
     for path in root.rglob("*"):
         if path.is_file():
             assert secret.encode() not in path.read_bytes(), path
+
+
+def _file_hash(path: Path) -> str:
+    return __import__("hashlib").sha256(path.read_bytes()).hexdigest()
+
+
+def _tree_identity(root: Path) -> list[tuple[str, int, int, str]]:
+    return [
+        (
+            path.relative_to(root).as_posix(),
+            path.lstat().st_ino,
+            path.lstat().st_mode,
+            _file_hash(path) if path.is_file() and not path.is_symlink() else "",
+        )
+        for path in sorted(root.rglob("*"))
+    ]
