@@ -5,6 +5,8 @@ import json
 import os
 import shutil
 import stat
+import subprocess
+import sys
 import threading
 import traceback
 import uuid
@@ -23,12 +25,14 @@ from scripts.campaign_workspace import (
     DockerNotFoundError,
     WorkspaceError,
     WorkspaceHealthError,
+    WorkspaceLease,
     WorkspaceRequest,
     _run_docker,
-    ensure_workspace,
+    ensure_workspace as ensure_workspace_impl,
 )
 from scripts import run_opencode as runner
 from scripts import campaign_workspace
+from scripts import campaign_workspace_fs
 
 
 class RecordingDocker:
@@ -100,6 +104,9 @@ class RecordingDocker:
             (candidate / "reference").symlink_to("/workspace/executable")
             return ""
         if command[1] == "rm":
+            container = self.containers.pop(command[-1], None)
+            if isinstance(container, dict) and isinstance(container.get("Id"), str):
+                self.containers.pop(container["Id"], None)
             return ""
         if command[1] == "create":
             name = command[command.index("--name") + 1]
@@ -165,6 +172,12 @@ class RecordingDocker:
                 raise DockerNotFoundError("not found")
             container = self.containers[name]
             template = command[command.index("--format") + 1]
+            if template == campaign_workspace._HELPER_LABEL_TEMPLATE:
+                labels = container["Config"]["Labels"]
+                return "\n".join(
+                    json.dumps(labels.get(key))
+                    for key in ("programbench.campaign", "programbench.job", "programbench.helper")
+                )
             if template == campaign_workspace._CONTAINER_CONFIG_TEMPLATE:
                 config = container["Config"]
                 host = container["HostConfig"]
@@ -260,6 +273,24 @@ class PartialInitDocker(RecordingDocker):
         return super().__call__(command, timeout)
 
 
+class LeakyHelperDocker(RecordingDocker):
+    def __init__(self) -> None:
+        super().__init__()
+        self.leaked = False
+
+    def __call__(self, command: tuple[str, ...], timeout: float):
+        if not self.leaked and command[1] == "run" and "--name" in command:
+            self.commands.append(command)
+            name = command[command.index("--name") + 1]
+            labels = dict(value.split("=", 1) for index, value in enumerate(command) if command[index - 1] == "--label")
+            container = {"Id": "b" * 64, "Config": {"Labels": labels}}
+            self.containers[name] = container
+            self.containers["b" * 64] = container
+            self.leaked = True
+            raise RuntimeError("helper CLI timed out")
+        return super().__call__(command, timeout)
+
+
 def install(tmp_path: Path) -> InstallRecord:
     binary = tmp_path / "install" / "opencode"
     binary.parent.mkdir(parents=True, exist_ok=True)
@@ -292,20 +323,52 @@ def install(tmp_path: Path) -> InstallRecord:
 
 
 def request(tmp_path: Path, docker: RecordingDocker) -> WorkspaceRequest:
+    campaign_root = tmp_path / "campaign-output"
+    job_root = campaign_root / "campaign" / "vanilla" / "owner__repo.abc"
     return WorkspaceRequest(
-        job=JobPaths(tmp_path / "job"),
+        job=JobPaths(job_root),
+        campaign_root=campaign_root,
         campaign="campaign",
         instance_id="owner__repo.abc",
         arm="vanilla",
         image="example/task",
         install=install(tmp_path),
-        candidate_root=tmp_path / "candidates",
-        state_root=tmp_path / "state",
-        log_dir=tmp_path / "logs",
+        candidate_root=job_root / "candidates",
+        state_root=job_root / "workspace-state",
+        log_dir=job_root / "logs",
         credential_env=("OPENAI_API_KEY", "OPENAI_BASE_URL"),
         docker_runner=docker,
         health_probe=lambda _url, _timeout: True,
     )
+
+
+_ACTIVE_WORKSPACES: dict[str, object] = {}
+
+
+def ensure_workspace(value: WorkspaceRequest):
+    key = str(value.job.root.absolute())
+    previous = _ACTIVE_WORKSPACES.pop(key, None)
+    if previous is not None:
+        previous.release()
+        previous.lease.__exit__(None, None, None)
+    lease = WorkspaceLease(value)
+    lease.__enter__()
+    try:
+        workspace = ensure_workspace_impl(value, lease)
+    except BaseException as error:
+        lease.__exit__(type(error), error, error.__traceback__)
+        raise
+    _ACTIVE_WORKSPACES[key] = workspace
+    return workspace
+
+
+@pytest.fixture(autouse=True)
+def release_workspace_leases():
+    yield
+    for workspace in _ACTIVE_WORKSPACES.values():
+        workspace.release()
+        workspace.lease.__exit__(None, None, None)
+    _ACTIVE_WORKSPACES.clear()
 
 
 def test_workspace_constructs_redacted_dynamic_loopback_server(tmp_path: Path) -> None:
@@ -324,6 +387,174 @@ def test_workspace_constructs_redacted_dynamic_loopback_server(tmp_path: Path) -
     text = workspace.manifest_path.read_text()
     assert "OPENAI_API_KEY" in text and "secret-value" not in text
     assert docker.observed_phases == ["preparing", "launching"]
+
+
+def test_ensure_workspace_requires_active_matching_lease(tmp_path: Path) -> None:
+    value = request(tmp_path, RecordingDocker())
+
+    with pytest.raises(WorkspaceError):
+        campaign_workspace.ensure_workspace(value, None)
+
+
+def test_workspace_lease_rejects_reentry_mismatch_and_multiple_handles(tmp_path: Path) -> None:
+    value = request(tmp_path, RecordingDocker())
+    mismatch = request(tmp_path / "other", RecordingDocker())
+    lease = WorkspaceLease(value)
+
+    with lease:
+        with pytest.raises(WorkspaceError, match="reentry"):
+            lease.__enter__()
+        workspace = ensure_workspace_impl(value, lease)
+        with pytest.raises(WorkspaceError, match="active handle"):
+            ensure_workspace_impl(value, lease)
+        workspace.release()
+        with pytest.raises(WorkspaceError, match="does not match"):
+            ensure_workspace_impl(mismatch, lease)
+
+
+def test_workspace_lease_is_cross_process_and_preserves_journal(tmp_path: Path) -> None:
+    value = request(tmp_path, RecordingDocker())
+    command = (
+        sys.executable,
+        "-c",
+        "import sys,time\n"
+        "from pathlib import Path\n"
+        "from types import SimpleNamespace\n"
+        "from scripts.campaign_workspace import WorkspaceLease\n"
+        "request=SimpleNamespace(job=SimpleNamespace(root=Path(sys.argv[1])),campaign='campaign',"
+        "instance_id='owner__repo.abc',arm='vanilla')\n"
+        "with WorkspaceLease(request):\n print('held',flush=True)\n time.sleep(30)",
+        str(value.job.root),
+    )
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, text=True)
+    try:
+        assert process.stdout is not None and process.stdout.readline().strip() == "held"
+        with pytest.raises(WorkspaceError, match="already held"):
+            with WorkspaceLease(value):
+                pass
+        assert not value.state_root.joinpath("workspace.json").exists()
+    finally:
+        process.terminate()
+        process.wait(timeout=5)
+
+
+def test_running_adoption_rejects_candidate_inode_substitution(tmp_path: Path) -> None:
+    docker = RecordingDocker()
+    value = request(tmp_path, docker)
+    workspace = ensure_workspace(value)
+    moved = workspace.candidate.with_name("candidate-moved")
+    workspace.candidate.rename(moved)
+    workspace.candidate.mkdir()
+
+    with pytest.raises(ContainerConflictError):
+        ensure_workspace(value)
+
+
+@pytest.mark.parametrize("root", ["state", "cache", "log"])
+def test_running_adoption_rejects_bind_root_inode_substitution(tmp_path: Path, root: str) -> None:
+    value = request(tmp_path, RecordingDocker())
+    workspace = ensure_workspace(value)
+    path = {
+        "state": workspace.manifest.state_dir,
+        "cache": workspace.manifest.cache_dir,
+        "log": workspace.manifest.log_dir,
+    }[root]
+    moved = path.with_name(f"{path.name}-moved")
+    path.rename(moved)
+    path.mkdir()
+
+    with pytest.raises(ContainerConflictError):
+        ensure_workspace(value)
+
+
+def test_workspace_mounts_immutable_owned_binary_snapshot(tmp_path: Path) -> None:
+    docker = RecordingDocker()
+    value = request(tmp_path, docker)
+    workspace = ensure_workspace(value)
+
+    assert workspace.manifest.binary != value.install.binary
+    assert workspace.manifest.binary == (value.job.root / ".binary" / value.install.binary_sha256 / "opencode")
+    assert stat.S_IMODE(workspace.manifest.binary.stat().st_mode) & 0o222 == 0
+    create = next(command for command in docker.commands if command[1] == "create")
+    assert f"{workspace.manifest.binary}:/opencode:ro" in create
+
+    moved = workspace.manifest.binary.with_name("opencode-moved")
+    workspace.manifest.binary.rename(moved)
+    workspace.manifest.binary.write_bytes(moved.read_bytes())
+    workspace.manifest.binary.chmod(0o444)
+
+    with pytest.raises(ContainerConflictError):
+        ensure_workspace(value)
+
+
+def test_binary_snapshot_rejects_source_replacement_during_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    source.write_bytes(b"original")
+    expected = hashlib.sha256(b"original").hexdigest()
+    copy = campaign_workspace_fs.shutil.copyfileobj
+
+    def replace_source(source_handle, target_handle, length: int) -> None:
+        copy(source_handle, target_handle, length)
+        source.write_bytes(b"replaced")
+
+    monkeypatch.setattr(campaign_workspace_fs.shutil, "copyfileobj", replace_source)
+
+    with pytest.raises(campaign_workspace_fs.WorkspaceFilesystemError, match="changed during"):
+        campaign_workspace_fs.snapshot_binary(source, tmp_path / "snapshot" / "opencode", expected)
+
+    assert not tmp_path.joinpath("snapshot/opencode").exists()
+
+
+def test_workspace_rejects_uncontained_or_unclaimed_roots_without_deleting_data(tmp_path: Path) -> None:
+    docker = RecordingDocker()
+    value = request(tmp_path, docker)
+    foreign = value.job.root / "foreign-data"
+    foreign.parent.mkdir(parents=True)
+    foreign.write_text("preserve")
+
+    with pytest.raises(ContainerConflictError):
+        ensure_workspace(value)
+
+    assert foreign.read_text() == "preserve"
+
+    other = request(tmp_path / "other", RecordingDocker())
+    outside = tmp_path / "outside-candidates"
+    outside.mkdir()
+    outside.joinpath("foreign").write_text("preserve")
+    with pytest.raises(WorkspaceError, match="fixed job-relative"):
+        ensure_workspace(replace(other, candidate_root=outside))
+    assert outside.joinpath("foreign").read_text() == "preserve"
+
+
+def test_workspace_persists_exact_job_ownership_marker(tmp_path: Path) -> None:
+    value = request(tmp_path, RecordingDocker())
+
+    workspace = ensure_workspace(value)
+
+    marker = json.loads(value.job.root.joinpath(".programbench-workspace-owner.json").read_text())
+    assert marker["campaign"] == value.campaign
+    assert marker["instance_id"] == value.instance_id
+    assert marker["arm"] == value.arm
+    assert marker["job_root"] == str(value.job.root)
+    assert workspace.manifest.job_root == value.job.root
+
+
+def test_final_publish_reinspects_container_after_health(tmp_path: Path) -> None:
+    docker = RecordingDocker()
+
+    def probe(_url: str, _timeout: float) -> bool:
+        container = next(value for value in docker.containers.values() if value["Name"].startswith("/programbench-"))
+        container["State"] = {"Running": False, "ExitCode": 137}
+        return True
+
+    value = replace(request(tmp_path, docker), health_probe=probe)
+
+    with pytest.raises(ContainerConflictError):
+        ensure_workspace(value)
+
+    assert json.loads(value.state_root.joinpath("workspace.json").read_text())["phase"] == "launching"
 
 
 def test_candidate_init_preserves_workspace_modes_and_pins_platform(tmp_path: Path) -> None:
@@ -357,6 +588,18 @@ def test_candidate_ready_marker_is_synced_before_phase_commit(tmp_path: Path, mo
     ensure_workspace(request(tmp_path, docker))
 
     assert events.index("sync:.programbench-cleanroom.json") < events.index("phase:candidate_ready")
+
+
+def test_failed_helper_is_removed_by_exact_owned_name(tmp_path: Path) -> None:
+    docker = LeakyHelperDocker()
+    value = request(tmp_path, docker)
+
+    with pytest.raises(DockerCommandError):
+        ensure_workspace(value)
+
+    assert not any("-helper-" in name for name in docker.containers)
+    assert any(command[1:3] == ("rm", "-f") for command in docker.commands)
+    assert not list(value.state_root.glob(".*-helper.json"))
 
 
 def test_docker_inspection_uses_only_secret_free_formatted_queries(tmp_path: Path) -> None:
@@ -631,12 +874,13 @@ def test_binary_is_rehashed_immediately_before_adopt_start_and_stop(tmp_path: Pa
     value = request(tmp_path, docker)
     workspace = ensure_workspace(value)
     docker.containers[workspace.container_id]["State"] = {"Running": False}
+    workspace.manifest.binary.chmod(0o644)
     workspace.manifest.binary.write_text("mutated")
 
     with pytest.raises(ContainerConflictError):
-        ensure_workspace(value)
-    with pytest.raises(ContainerConflictError):
         workspace.stop()
+    with pytest.raises(ContainerConflictError):
+        ensure_workspace(value)
 
 
 @pytest.mark.parametrize(("unsafe", "target"), [("candidate", "state"), ("state", "logs"), ("logs", "candidate")])
@@ -667,7 +911,7 @@ def test_workspace_rejects_unsafe_root_overlaps(tmp_path: Path) -> None:
         replace(value, candidate_root=value.install.binary.parent),
         replace(value, log_dir=value.job.root / "subject"),
     ):
-        with pytest.raises(WorkspaceError, match="overlap"):
+        with pytest.raises(WorkspaceError, match="overlap|fixed job-relative"):
             ensure_workspace(changed)
 
 
@@ -675,14 +919,15 @@ def test_workspace_rejects_unsafe_root_overlaps(tmp_path: Path) -> None:
 def test_workspace_rejects_symlinked_derived_mount_before_journaling(tmp_path: Path, leaf: str) -> None:
     docker = RecordingDocker()
     value = request(tmp_path, docker)
+    campaign_workspace._claim_job_root(value.job.root, value)
     target = tmp_path / "outside"
     target.mkdir()
     if leaf == "candidate":
-        value.candidate_root.mkdir()
+        value.candidate_root.mkdir(parents=True)
         job_id = hashlib.sha256("\0".join((value.campaign, value.instance_id, value.arm)).encode()).hexdigest()
         value.candidate_root.joinpath(f"programbench-{job_id[:32]}").symlink_to(target, target_is_directory=True)
     if leaf == "state":
-        value.state_root.mkdir()
+        value.state_root.mkdir(parents=True)
         value.state_root.joinpath("opencode-state").symlink_to(target, target_is_directory=True)
 
     with pytest.raises(WorkspaceError, match="symlink"):
@@ -723,9 +968,15 @@ def test_retry_after_root_init_fault_repairs_unverified_candidate(tmp_path: Path
 
     with pytest.raises(DockerCommandError):
         ensure_workspace(value)
+    job_id = hashlib.sha256("\0".join((value.campaign, value.instance_id, value.arm)).encode()).hexdigest()
+    candidate = value.candidate_root / f"programbench-{job_id[:32]}"
+    staging = candidate.with_name(f".{candidate.name}.staging")
+    assert not candidate.exists()
+    assert staging.is_dir()
     workspace = ensure_workspace(value)
 
     assert not workspace.candidate.joinpath(f"partial-{stage}").exists()
+    assert not staging.exists()
     assert sum(command[1] == "create" for command in docker.commands) == 1
 
 
@@ -1003,10 +1254,12 @@ def _traceback_locals(error: BaseException) -> str:
 
 
 def test_run_opencode_reexports_workspace_api() -> None:
-    assert runner.ensure_workspace is ensure_workspace
+    assert runner.ensure_workspace is ensure_workspace_impl
     assert runner.WorkspaceRequest is WorkspaceRequest
+    assert runner.WorkspaceLease is WorkspaceLease
 
 
+@pytest.mark.slow
 def test_real_docker_runs_two_exact_isolated_workspaces(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     try:
         _run_docker(("docker", "info", "--format", "{{.ServerVersion}}"), 30)
@@ -1021,8 +1274,17 @@ def test_real_docker_runs_two_exact_isolated_workspaces(tmp_path: Path, monkeypa
     monkeypatch.setenv("OPENAI_BASE_URL", secret_url)
     context = tmp_path / "image"
     context.mkdir()
+    try:
+        base_image = json.loads(
+            _run_docker(("docker", "image", "inspect", "--format", "{{json .Id}}", "python:3.11"), 30)
+        )
+    except DockerCommandError:
+        _run_docker(("docker", "pull", "python:3.11"), 300)
+        base_image = json.loads(
+            _run_docker(("docker", "image", "inspect", "--format", "{{json .Id}}", "python:3.11"), 30)
+        )
     context.joinpath("Dockerfile").write_text(
-        "FROM python:3.11\n"
+        f"FROM {base_image}\n"
         "RUN useradd --create-home agent && mkdir -p /workspace && "
         "printf 'fixture workspace\\n' > /workspace/README && "
         "printf 'non executable\\n' > /workspace/member-data && "
@@ -1044,6 +1306,8 @@ def test_real_docker_runs_two_exact_isolated_workspaces(tmp_path: Path, monkeypa
 
     def fixture_request(root: Path, instance_id: str) -> WorkspaceRequest:
         value = request(root, docker)  # type: ignore[arg-type]
+        campaign_root = root / "campaign-output"
+        job_root = campaign_root / campaign / value.arm / instance_id
         value.install.binary.write_text(
             "#!/usr/bin/env python3\n"
             "from http.server import BaseHTTPRequestHandler, HTTPServer\n"
@@ -1059,8 +1323,13 @@ def test_real_docker_runs_two_exact_isolated_workspaces(tmp_path: Path, monkeypa
         value.install.binary.chmod(0o755)
         return replace(
             value,
+            job=JobPaths(job_root),
+            campaign_root=campaign_root,
             campaign=campaign,
             instance_id=instance_id,
+            candidate_root=job_root / "candidates",
+            state_root=job_root / "workspace-state",
+            log_dir=job_root / "logs",
             image=tag,
             install=replace(value.install, binary_sha256=hashlib.sha256(value.install.binary.read_bytes()).hexdigest()),
             health_probe=None,
@@ -1075,6 +1344,21 @@ def test_real_docker_runs_two_exact_isolated_workspaces(tmp_path: Path, monkeypa
 
         assert len({workspace.port for workspace in workspaces}) == 2
         assert all(workspace.manifest.phase == "running" for workspace in workspaces)
+        assert (
+            _run_docker(
+                (
+                    "docker",
+                    "ps",
+                    "-aq",
+                    "--filter",
+                    "label=programbench.helper",
+                    "--filter",
+                    f"label=programbench.campaign={campaign}",
+                ),
+                30,
+            ).strip()
+            == ""
+        )
         assert all(
             _run_docker(("docker", "exec", workspace.container_id, "cat", "/candidate/README"), 30)
             == "fixture workspace\n"
@@ -1128,7 +1412,8 @@ def test_real_docker_runs_two_exact_isolated_workspaces(tmp_path: Path, monkeypa
             _run_docker(("docker", "exec", workspace.container_id, "test", "-x", "/candidate/reference"), 30) == ""
             for workspace in workspaces
         )
-        assert all(ensure_workspace(value).adopted for value in values)
+        workspaces[:] = [ensure_workspace(value) for value in values]
+        assert all(workspace.adopted for workspace in workspaces)
         assert len([command for command in commands if len(command) > 1 and command[1] == "create"]) == 2
         inspections = [
             command for command in commands if command[1] == "inspect" or command[1:3] == ("image", "inspect")
@@ -1166,7 +1451,8 @@ def test_real_docker_runs_two_exact_isolated_workspaces(tmp_path: Path, monkeypa
             ),
             60,
         )
-        assert ensure_workspace(values[0]).adopted
+        workspaces[0] = ensure_workspace(values[0])
+        assert workspaces[0].adopted
         assert len([command for command in commands if command[1] == "start"]) == starts + 1
         assert stat.S_IMODE(workspaces[0].candidate.joinpath("member-data").stat().st_mode) == 0o777
         assert not workspaces[0].candidate.joinpath("reference").exists()

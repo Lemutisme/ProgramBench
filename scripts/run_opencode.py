@@ -59,6 +59,7 @@ from scripts.campaign_workspace import (
     DockerWorkspace,
     WorkspaceError,
     WorkspaceHealthError,
+    WorkspaceLease,
     WorkspaceManifest,
     WorkspaceRequest,
     ensure_workspace,

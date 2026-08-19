@@ -38,6 +38,16 @@ def test_docker_runner_timeout_kills_descendant_process_group(tmp_path: Path) ->
     assert not status or status.startswith("Z")
 
 
+def test_docker_runner_timeout_does_not_require_procfs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    command = tmp_path / "docker"
+    command.write_text("#!/bin/sh\ntrap '' TERM\nwhile :; do sleep 1; done\n")
+    command.chmod(0o755)
+    monkeypatch.setattr(Path, "iterdir", lambda _path: (_ for _ in ()).throw(OSError("no procfs")))
+
+    with pytest.raises(DockerCommandError, match="timed out"):
+        _run_docker((str(command),), 0.1)
+
+
 def test_docker_runner_never_reports_secret_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     secret = "workspace-secret-value"
     command = tmp_path / "docker"
