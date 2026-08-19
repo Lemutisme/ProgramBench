@@ -10,10 +10,14 @@ import hashlib
 import json
 import math
 import os
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Collection, Mapping, Sequence
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.campaign_install import (
     ArmConfig,
@@ -310,9 +314,10 @@ def freeze_campaign_config(config: CampaignConfig, manifest_path: Path) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Plan an OpenCode ProgramBench campaign")
-    parser.add_argument("--config", type=Path)
-    parser.parse_args()
+    """Compatibility entrypoint; campaign orchestration lives in campaign_runner."""
+    from scripts.campaign_runner import main as campaign_main
+
+    raise SystemExit(campaign_main())
 
 
 def _load_limits(raw: object) -> Limits:

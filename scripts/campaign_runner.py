@@ -1,0 +1,615 @@
+"""Bounded paired-trajectory campaign planning and admission.
+
+This module deliberately owns campaign-wide concerns only.  The vanilla and
+ProContract adapters remain the only owners of Session and Contract lifecycle.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import traceback
+from collections import deque
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from dataclasses import asdict, dataclass, is_dataclass
+from pathlib import Path
+from typing import Callable, Mapping, Sequence
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from programbench.utils.load_data import load_all_instances
+from scripts.campaign_install import InstallRecord, prepare_install
+from scripts.campaign_procontract import HttpProContractApi, run_procontract
+from scripts.campaign_state import JobLease, JobPaths, JobState, StateStore
+from scripts.campaign_usage import CircuitBreaker
+from scripts.campaign_vanilla import HttpOpenCodeApi, run_vanilla
+from scripts.campaign_workspace import WorkspaceLease, WorkspaceRequest, ensure_workspace
+from scripts.run_opencode import CampaignConfig, ConfigError, expand_jobs, load_config, select_instances
+
+
+MAX_ACTIVE_JOBS = 8
+DRY_RUN_OUTPUT = Path("campaign-dry-run")
+_CREDENTIAL_ENV = ("OPENAI_API_KEY", "OPENCODE_SERVER_PASSWORD")
+
+
+class CampaignError(RuntimeError):
+    """Raised for an invalid or unsafe campaign operation."""
+
+
+class CampaignPausedError(CampaignError):
+    """Raised rather than silently clearing persisted safety pauses."""
+
+
+@dataclass(frozen=True)
+class CampaignJob:
+    instance_id: str
+    arm: str
+    image: str
+
+    @property
+    def key(self) -> str:
+        return f"{self.instance_id}/{self.arm}"
+
+
+@dataclass(frozen=True)
+class CampaignPlan:
+    output: Path
+    manifest_path: Path
+    config: CampaignConfig
+    selected_ids: tuple[str, ...]
+    jobs: tuple[CampaignJob, ...]
+    installs: Mapping[str, object]
+    dry_run: bool
+
+
+@dataclass(frozen=True)
+class CampaignResult:
+    completed: int
+    failed: int
+    pending: tuple[CampaignJob, ...]
+    running: int
+    pause_reason: str | None
+
+
+@dataclass(frozen=True)
+class JobRunResult:
+    job: CampaignJob
+    status: str
+    result: object | None = None
+
+
+def expand_campaign_jobs(selected_ids: Sequence[str], images: Mapping[str, str], *, seed: int) -> tuple[CampaignJob, ...]:
+    """Expand selected task IDs to two hash-ordered, image-pinned trajectories."""
+    jobs = expand_jobs(tuple(selected_ids), ("procontract", "vanilla"), str(seed))
+    try:
+        return tuple(CampaignJob(job.instance_id, job.arm, images[job.instance_id]) for job in jobs)
+    except KeyError as error:
+        raise CampaignError(f"selected instance has no task image: {error.args[0]}") from None
+
+
+def plan_campaign(
+    config: CampaignConfig,
+    instances: Sequence[Mapping[str, object]],
+    *,
+    output: Path,
+    limit: int = 8,
+    seed: int = 42,
+    instance_filter: str | None = None,
+    all_instances: bool = False,
+    dry_run: bool = False,
+    resume: bool = False,
+    prepare_install_fn: Callable[[object, Path], object] = prepare_install,
+) -> CampaignPlan:
+    """Freeze exact selection and arm installs before any workspace can start."""
+    if limit <= 0:
+        raise CampaignError("limit must be positive")
+    root = Path(output).resolve()
+    manifest_path = root / "campaign.json"
+    canonical = _config_manifest(config)
+    if manifest_path.exists():
+        frozen = _read_json(manifest_path)
+        _require_manifest_config(frozen, canonical, manifest_path)
+        if not resume:
+            raise CampaignError(f"campaign already exists: {manifest_path}; use --resume")
+        breaker_path = root / "breaker.json"
+        if breaker_path.exists():
+            breaker = CircuitBreaker.from_snapshot(_read_json(breaker_path))
+            if breaker.paused:
+                raise CampaignPausedError(
+                    f"campaign is paused ({breaker.pause_reason}); acknowledge it through the persisted breaker state before --resume"
+                )
+        expected_selection = {
+            "limit": limit,
+            "seed": seed,
+            "filter": instance_filter,
+            "all": all_instances,
+        }
+        if frozen.get("selection") != expected_selection:
+            raise CampaignError("campaign manifest conflicts with requested selection")
+        return _plan_from_manifest(config, root, manifest_path, frozen, dry_run)
+
+    filtered = tuple(
+        instance
+        for instance in instances
+        if instance_filter is None or instance_filter in str(instance.get("instance_id", ""))
+    )
+    selected = select_instances(
+        tuple(_selection_instance(instance) for instance in filtered),
+        seed=str(seed),
+        limit=len(filtered) if all_instances else limit,
+        excluded=config.excluded,
+    )
+    selected_ids = tuple(str(instance["instance_id"]) for instance in selected)
+    images = {
+        str(instance["instance_id"]): _image_name(instance)
+        for instance in filtered
+        if str(instance.get("instance_id", "")) in set(selected_ids)
+    }
+    jobs = expand_campaign_jobs(selected_ids, images, seed=seed)
+    root.mkdir(parents=True, exist_ok=True)
+    installs = {arm.name: prepare_install_fn(arm, root / "installs") for arm in config.arms}
+    manifest = {
+        "version": 1,
+        "config": canonical,
+        "selected_ids": list(selected_ids),
+        "jobs": [{"instance_id": job.instance_id, "arm": job.arm, "image": job.image} for job in jobs],
+        "installs": {name: _json_value(record) for name, record in installs.items()},
+        "programbench": _programbench_metadata(),
+        "selection": {"limit": limit, "seed": seed, "filter": instance_filter, "all": all_instances},
+        "seed": seed,
+        "images": {identifier: {"image": image} for identifier, image in sorted(images.items())},
+    }
+    _atomic_json(manifest_path, manifest)
+    return CampaignPlan(root, manifest_path, config, selected_ids, jobs, installs, dry_run)
+
+
+def run_campaign(
+    jobs: Sequence[CampaignJob],
+    *,
+    workers: int = MAX_ACTIVE_JOBS,
+    breaker: CircuitBreaker | None = None,
+    execute: Callable[[CampaignJob, threading.Event], object] | None = None,
+    state_path: Path | None = None,
+    stop_event: threading.Event | None = None,
+    interrupt_timeout: float = 20.0,
+    clock: Callable[[], float] = time.time,
+    sleeper: Callable[[float], None] = time.sleep,
+) -> CampaignResult:
+    """Run at most ``workers`` active trajectories, admitting one only on completion."""
+    if type(workers) is not int or not 0 < workers <= MAX_ACTIVE_JOBS:
+        raise CampaignError(f"workers must be between 1 and {MAX_ACTIVE_JOBS}")
+    if interrupt_timeout <= 0:
+        raise CampaignError("interrupt timeout must be positive")
+    breaker = breaker or CircuitBreaker()
+    execute = execute or (lambda _job, _stop: None)
+    stop = stop_event or threading.Event()
+    pending = deque(jobs)
+    running: dict[Future[object], CampaignJob] = {}
+    completed = 0
+    failed = 0
+    executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="campaign")
+    interrupted = False
+    try:
+        while pending or running:
+            if pending and not running and not stop.is_set() and not breaker.admission_allowed:
+                delay = _backoff_delay(breaker, clock)
+                if delay is None:
+                    break
+                sleeper(delay)
+                continue
+            while pending and len(running) < workers and not stop.is_set() and breaker.admission_allowed:
+                candidate = pending.popleft()
+                running[executor.submit(execute, candidate, stop)] = candidate
+            if not running:
+                break
+            done, _ = wait(tuple(running), return_when=FIRST_COMPLETED)
+            for future in done:
+                candidate = running.pop(future)
+                try:
+                    outcome = future.result()
+                    if isinstance(outcome, JobRunResult) and outcome.status in {"failed", "interrupted"}:
+                        failed += 1
+                        _append_log(state_path, candidate, "failed")
+                    else:
+                        completed += 1
+                        _append_log(state_path, candidate, "completed")
+                except KeyboardInterrupt:
+                    raise
+                except BaseException:
+                    failed += 1
+                    _append_log(state_path, candidate, "failed")
+                _persist_breaker(state_path, breaker)
+                print(f"completed={completed} running={len(running)} pending={len(pending)} failed={failed}", flush=True)
+            if stop.is_set():
+                break
+            if not breaker.admission_allowed:
+                delay = _backoff_delay(breaker, clock)
+                if delay is None:
+                    break
+                sleeper(delay)
+    except KeyboardInterrupt:
+        interrupted = True
+        stop.set()
+        pending.clear()
+        _persist_breaker(state_path, breaker)
+    finally:
+        if interrupted:
+            deadline = time.monotonic() + interrupt_timeout
+            while running and time.monotonic() < deadline:
+                done, _ = wait(tuple(running), timeout=max(0, deadline - time.monotonic()), return_when=FIRST_COMPLETED)
+                for future in done:
+                    candidate = running.pop(future)
+                    try:
+                        outcome = future.result()
+                        if isinstance(outcome, JobRunResult) and outcome.status in {"failed", "interrupted"}:
+                            failed += 1
+                        else:
+                            completed += 1
+                        _append_log(state_path, candidate, "interrupted")
+                    except BaseException:
+                        failed += 1
+                        _append_log(state_path, candidate, "interrupted")
+                    _persist_breaker(state_path, breaker)
+            for future in running:
+                future.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
+    return CampaignResult(completed, failed, tuple(pending), len(running), breaker.pause_reason)
+
+
+def run_job(
+    plan: CampaignPlan,
+    candidate: CampaignJob,
+    *,
+    breaker: CircuitBreaker,
+    resume: bool = False,
+    redo: bool = False,
+    retry_infra: bool = False,
+    stop_event: threading.Event | None = None,
+    workspace_factory: Callable[[WorkspaceRequest, WorkspaceLease], object] = ensure_workspace,
+    vanilla_runner: Callable[..., object] = run_vanilla,
+    procontract_runner: Callable[..., object] = run_procontract,
+    vanilla_api_factory: Callable[[object], object] | None = None,
+    procontract_api_factory: Callable[[object], object] | None = None,
+) -> JobRunResult:
+    """Acquire JobLease then WorkspaceLease and delegate to exactly one arm adapter."""
+    stop = stop_event or threading.Event()
+    paths = JobPaths(plan.output / candidate.arm / candidate.instance_id)
+    store = StateStore(paths.state)
+    with JobLease(paths, resume=resume, redo=redo, retry_infra=retry_infra) as job_lease:
+        if not job_lease.should_run:
+            return JobRunResult(candidate, "skipped")
+        state = store.read_optional()
+        if state is None:
+            store.write(JobState("planned"))
+        elif state.phase != "planned":
+            job_lease.reset_for_rerun()
+        if stop.is_set() or breaker.stop_active:
+            _terminalize(store, "interrupted", "campaign_interrupted")
+            return JobRunResult(candidate, "interrupted")
+        install = _install_for(plan, candidate.arm)
+        request = WorkspaceRequest(
+            job=paths,
+            campaign=_campaign_name(plan.output),
+            campaign_root=plan.output,
+            instance_id=candidate.instance_id,
+            arm=candidate.arm,
+            image=candidate.image,
+            install=install,
+            candidate_root=paths.root / "candidate",
+            state_root=paths.root / "workspace",
+            log_dir=paths.root / "logs",
+            credential_env=tuple(name for name in _CREDENTIAL_ENV if os.environ.get(name)),
+        )
+        try:
+            with WorkspaceLease(request) as workspace_lease:
+                workspace = workspace_factory(request, workspace_lease)
+                if stop.is_set() or breaker.stop_active:
+                    workspace.stop_for_freeze()
+                    _terminalize(store, "interrupted", "campaign_interrupted")
+                    return JobRunResult(candidate, "interrupted")
+                if candidate.arm == "vanilla":
+                    api = vanilla_api_factory(workspace) if vanilla_api_factory else HttpOpenCodeApi(
+                        workspace.base_url, expected_port=workspace.port
+                    )
+                    result = vanilla_runner(
+                        job_lease, store, workspace, install, model=plan.config.model, variant=plan.config.variant,
+                        limits=plan.config.limits, breaker=breaker, api=api,
+                    )
+                else:
+                    api = procontract_api_factory(workspace) if procontract_api_factory else HttpProContractApi(
+                        workspace.base_url, expected_port=workspace.port
+                    )
+                    result = procontract_runner(
+                        job_lease, store, workspace, model=plan.config.model, variant=plan.config.variant,
+                        limits=plan.config.limits, breaker=breaker, api=api,
+                    )
+                return JobRunResult(candidate, "completed", result)
+        except BaseException as error:
+            exit_class, traceback_hash = _exception_metadata(store, error)
+            _terminalize(
+                store,
+                "interrupted" if stop.is_set() else "failed",
+                exit_class,
+                traceback_hash=traceback_hash,
+            )
+            return JobRunResult(candidate, "interrupted" if stop.is_set() else "failed")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Run a bounded ProgramBench campaign: 8 active trajectories, two arms per instance, 6h/1000 limits."
+    )
+    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--workers", type=_positive, default=8, help="active trajectories (1-8; default: 8)")
+    parser.add_argument("--limit", type=_positive, default=8, help="instances in the pilot (default: 8; 16 jobs)")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--filter")
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--retry-infra", action="store_true")
+    parser.add_argument("--redo", action="store_true")
+    parser.add_argument("--all", action="store_true")
+    parser.add_argument("--evaluate", action="store_true", help="reserved for Task10; evaluation is not implemented")
+    parser.add_argument("--dry-run", action="store_true")
+    return parser
+
+
+def parse_args(arguments: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = build_parser()
+    values = list(arguments) if arguments is not None else None
+    args = parser.parse_args(values)
+    supplied = values if values is not None else os.sys.argv[1:]
+    if args.evaluate:
+        parser.error("--evaluate is reserved until Task10")
+    if args.all and any(value == "--limit" or value.startswith("--limit=") for value in supplied):
+        parser.error("--limit and --all conflict")
+    if args.output is None:
+        if not args.dry_run:
+            parser.error("--output is required unless --dry-run is used")
+        args.output = DRY_RUN_OUTPUT
+    return args
+
+
+def main(arguments: Sequence[str] | None = None) -> int:
+    args = parse_args(arguments)
+    config = load_config(args.config)
+    plan = plan_campaign(
+        config,
+        load_all_instances(include_tests=False),
+        output=args.output,
+        limit=args.limit,
+        seed=args.seed,
+        instance_filter=args.filter,
+        all_instances=args.all,
+        dry_run=args.dry_run,
+        resume=args.resume,
+    )
+    if plan.dry_run:
+        return 0
+    required = ("OPENAI_API_KEY", "OPENCODE_SERVER_PASSWORD")
+    missing = tuple(name for name in required if not os.environ.get(name))
+    if missing:
+        raise CampaignError(f"required credential environment variable(s) are missing: {', '.join(missing)}")
+    breaker_path = plan.output / "breaker.json"
+    breaker = CircuitBreaker.from_snapshot(_read_json(breaker_path)) if breaker_path.exists() else CircuitBreaker.from_campaign_config(config)
+    result = run_campaign(
+        plan.jobs,
+        workers=args.workers,
+        breaker=breaker,
+        state_path=breaker_path,
+        execute=lambda candidate, stop: run_job(
+            plan, candidate, breaker=breaker, resume=args.resume, redo=args.redo, retry_infra=args.retry_infra, stop_event=stop
+        ),
+    )
+    return 0 if not result.failed else 1
+
+
+def _plan_from_manifest(config: CampaignConfig, root: Path, manifest_path: Path, raw: Mapping[str, object], dry_run: bool) -> CampaignPlan:
+    selected = raw.get("selected_ids")
+    jobs = raw.get("jobs")
+    installs = raw.get("installs")
+    if not isinstance(selected, list) or not all(isinstance(value, str) for value in selected):
+        raise CampaignError("campaign manifest has invalid selected IDs")
+    if not isinstance(jobs, list) or not isinstance(installs, Mapping):
+        raise CampaignError("campaign manifest has invalid jobs or installs")
+    try:
+        frozen_jobs = tuple(CampaignJob(item["instance_id"], item["arm"], item["image"]) for item in jobs if isinstance(item, Mapping))
+    except (KeyError, TypeError) as error:
+        raise CampaignError("campaign manifest has malformed job") from error
+    if len(frozen_jobs) != len(jobs):
+        raise CampaignError("campaign manifest has malformed jobs")
+    return CampaignPlan(root, manifest_path, config, tuple(selected), frozen_jobs, dict(installs), dry_run)
+
+
+def _selection_instance(instance: Mapping[str, object]) -> Mapping[str, str]:
+    required = ("instance_id", "difficulty", "language")
+    if any(not isinstance(instance.get(name), str) for name in required):
+        raise CampaignError("ProgramBench instance is missing selection metadata")
+    return {name: str(instance[name]) for name in required}
+
+
+def _image_name(instance: Mapping[str, object]) -> str:
+    image = instance.get("image_name")
+    if not isinstance(image, str) or not image:
+        raise CampaignError("ProgramBench instance is missing its task image")
+    return image
+
+
+def _config_manifest(config: CampaignConfig) -> dict[str, object]:
+    return {
+        "model": config.model,
+        "variant": config.variant,
+        "limits": asdict(config.limits),
+        "cache": asdict(config.cache),
+        "arms": {
+            arm.name: {"repo": str(arm.repo.resolve()), "revision": arm.revision, "mode": arm.mode, "binary": str(arm.binary) if arm.binary else None}
+            for arm in config.arms
+        },
+        "excluded": sorted(config.excluded),
+    }
+
+
+def _require_manifest_config(raw: Mapping[str, object], config: Mapping[str, object], path: Path) -> None:
+    if raw.get("config") != config:
+        raise ConfigError(f"campaign manifest conflicts with config: {path}")
+
+
+def _programbench_metadata() -> dict[str, object]:
+    root = Path(__file__).resolve().parents[1]
+    try:
+        sha = subprocess.run(("git", "rev-parse", "HEAD"), cwd=root, check=True, capture_output=True, text=True).stdout.strip()
+        dirty = bool(subprocess.run(("git", "status", "--porcelain"), cwd=root, check=True, capture_output=True, text=True).stdout.strip())
+        return {"sha": sha, "dirty": dirty}
+    except (OSError, subprocess.SubprocessError):
+        return {"sha": None, "dirty": None}
+
+
+def _json_value(value: object) -> object:
+    if isinstance(value, Path):
+        return str(value)
+    if is_dataclass(value):
+        return _json_value(asdict(value))
+    if isinstance(value, Mapping):
+        return {str(key): _json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_value(item) for item in value]
+    return value
+
+
+def _read_json(path: Path) -> Mapping[str, object]:
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, UnicodeError, ValueError) as error:
+        raise CampaignError(f"invalid campaign data: {path}") from error
+    if not isinstance(raw, Mapping):
+        raise CampaignError(f"campaign data must be an object: {path}")
+    return raw
+
+
+def _atomic_json(path: Path, value: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w") as stream:
+            stream.write(json.dumps(value, allow_nan=False, sort_keys=True, indent=2) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        temporary = ""
+        directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        if temporary:
+            Path(temporary).unlink(missing_ok=True)
+
+
+def _persist_breaker(path: Path | None, breaker: CircuitBreaker) -> None:
+    if path is not None:
+        _atomic_json(path, breaker.snapshot())
+
+
+def _backoff_delay(breaker: CircuitBreaker, clock: Callable[[], float]) -> float | None:
+    deadline = breaker.backoff_until
+    if deadline is None:
+        return None
+    return max(0.0, deadline - clock())
+
+
+def _append_log(state_path: Path | None, candidate: CampaignJob, status: str) -> None:
+    """Append only fixed, credential-free progress fields and retain one MiB."""
+    if state_path is None:
+        return
+    path = state_path.with_name("campaign.log")
+    line = f"{int(time.time())} {candidate.instance_id} {candidate.arm} {status}\n".encode()
+    try:
+        existing = path.read_bytes()[-(1024 * 1024 - len(line)) :] if path.exists() else b""
+        _atomic_bytes(path, existing + line)
+    except OSError:
+        return
+
+
+def _atomic_bytes(path: Path, value: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(value)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        temporary = ""
+    finally:
+        if temporary:
+            Path(temporary).unlink(missing_ok=True)
+
+
+def _install_for(plan: CampaignPlan, arm: str) -> InstallRecord:
+    value = plan.installs.get(arm)
+    if isinstance(value, InstallRecord):
+        return value
+    try:
+        from scripts.campaign_install import load_install_record
+
+        record = load_install_record(plan.output / "installs" / arm / "install.json")
+        if not isinstance(value, Mapping) or _json_value(record) != dict(value):
+            raise CampaignError(f"frozen install record conflicts for {arm}")
+        return record
+    except CampaignError:
+        raise
+    except BaseException as error:
+        raise CampaignError(f"frozen install record is unavailable for {arm}") from error
+
+
+def _campaign_name(root: Path) -> str:
+    name = root.name.replace("_", "-")
+    if not name or not all(character.isalnum() or character in ".-" for character in name):
+        return "campaign"
+    return name[:128]
+
+
+def _terminalize(store: StateStore, phase: str, exit_class: str, *, traceback_hash: str | None = None) -> None:
+    try:
+        state = store.read_optional()
+        if state is None or state.phase in {"done", "failed", "interrupted"}:
+            return
+        store.transition(
+            phase,
+            command_identity=state.command_identity or "campaign",
+            expected_generation=state.generation,
+            exit_class=exit_class,
+            artifact_hashes={} if traceback_hash is None else {"traceback": traceback_hash},
+        )
+    except BaseException:
+        return
+
+
+def _exception_metadata(store: StateStore, error: BaseException) -> tuple[str, str]:
+    try:
+        state = store.read_optional()
+    except BaseException:
+        state = None
+    digest = hashlib.sha256("".join(traceback.format_exception(type(error), error, error.__traceback__)).encode()).hexdigest()
+    prefix = "infrastructure_failed_before_provider" if state is None or state.phase in {"planned", "preparing"} else "execution_failed"
+    return prefix, digest
+
+
+def _positive(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be positive")
+    return parsed
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
