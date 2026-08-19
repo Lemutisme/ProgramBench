@@ -34,6 +34,7 @@ TERMINAL_PHASES = frozenset({"frozen", "packaged", "preflighted", "done", "faile
 EVALUATOR_TIMEOUT_SECONDS = 12 * 60 * 60
 EVALUATOR_GRACE_SECONDS = 30
 EVALUATOR_OUTPUT_LIMIT = 4 * 1024 * 1024
+MAX_EVAL_JSON_BYTES = 32 * 1024 * 1024
 _CREDENTIAL_ENV = ("OPENAI_API_KEY", "OPENCODE_SERVER_PASSWORD")
 
 
@@ -64,12 +65,26 @@ def validate_evaluation(path: Path, instance: Mapping[str, object]) -> Evaluated
     """Strictly validate one evaluator result and compute its canonical utility."""
     if not path.is_file():
         return EvaluatedInstance(False, None, 0, 0, ("missing_eval_json",), None)
-    digest = hashlib.sha256(path.read_bytes()).hexdigest()
     try:
-        result = EvaluationResult.model_validate(
-            json.loads(path.read_text(), object_pairs_hook=_reject_duplicate_pairs)
+        if path.stat().st_size > MAX_EVAL_JSON_BYTES:
+            return EvaluatedInstance(False, None, 0, 0, ("oversize_eval_json",), None)
+        with path.open("rb") as source_file:
+            encoded = source_file.read(MAX_EVAL_JSON_BYTES + 1)
+        if len(encoded) > MAX_EVAL_JSON_BYTES:
+            return EvaluatedInstance(False, None, 0, 0, ("oversize_eval_json",), None)
+        source = encoded.decode()
+    except (OSError, UnicodeError):
+        return EvaluatedInstance(False, None, 0, 0, ("malformed_eval_json",), None)
+    digest = hashlib.sha256(encoded).hexdigest()
+    try:
+        raw = json.loads(
+            source,
+            object_pairs_hook=_reject_duplicate_pairs,
+            parse_constant=_reject_json_constant,
         )
-    except (OSError, UnicodeError, ValidationError, ValueError):
+        _reject_nonfinite_numbers(raw)
+        result = EvaluationResult.model_validate(raw)
+    except (OSError, RecursionError, UnicodeError, ValidationError, ValueError):
         return EvaluatedInstance(False, None, 0, 0, ("malformed_eval_json",), digest)
 
     active = get_active_branches(dict(instance))
@@ -345,6 +360,8 @@ def _evaluate_arm(
     cwd = Path(__file__).resolve().parents[1]
     evaluator_identity = _evaluator_identity(cwd)
     campaign_manifest_sha256 = _sha256(root / "campaign.json")
+    blob_root = os.environ.get("PROGRAMBENCH_BLOB_DIR")
+    blob_hashes = _blob_hashes(Path(blob_root), submitted) if blob_root else {}
     submission_hashes = {
         instance_id: evidence[(instance_id, arm)]["submission_sha256"] for instance_id in submitted
     }
@@ -357,6 +374,8 @@ def _evaluate_arm(
         "submission_sha256": submission_hashes,
         "evaluator_identity": evaluator_identity,
         "campaign_manifest_sha256": campaign_manifest_sha256,
+        "blob_root": blob_root,
+        "blob_sha256": blob_hashes,
         "workers": 8,
         "branch_workers": 1,
         "docker_cpus": 4,
@@ -432,8 +451,17 @@ def _evaluate_arm(
             _atomic_json(state_path, interrupted)
             existing = interrupted
         if existing.get("status") == "interrupted" and not retry_evaluator:
-            raise CampaignEvaluationError(f"evaluator for {arm} was interrupted; use --retry-evaluator")
+            missing = existing.get("missing_eval_ids")
+            detail = f"; missing eval IDs: {', '.join(missing)}" if isinstance(missing, list) and missing else ""
+            raise CampaignEvaluationError(
+                f"evaluator for {arm} was interrupted{detail}; use --retry-evaluator"
+            )
 
+    preserved = (
+        _preserve_eval_results(state_root, arm_root, arm, submitted, existing)
+        if retry_evaluator and existing is not None
+        else {}
+    )
     base = {
         "version": 1,
         "status": "planned",
@@ -453,6 +481,9 @@ def _evaluate_arm(
         "submission_sha256": submission_hashes,
         "evaluator_identity": evaluator_identity,
         "campaign_manifest_sha256": campaign_manifest_sha256,
+        "blob_root": blob_root,
+        "blob_sha256": blob_hashes,
+        "preserved_eval_hashes": preserved,
         "artifact_hashes": {},
         "exit_code": None,
         "error": None,
@@ -465,6 +496,7 @@ def _evaluate_arm(
             **base,
             "status": "done",
             "exit_code": 0,
+            "missing_eval_ids": [],
             "artifact_hashes": {
                 stdout_path.name: _sha256(stdout_path),
                 stderr_path.name: _sha256(stderr_path),
@@ -488,7 +520,16 @@ def _evaluate_arm(
 
     environment = {
         name: value
-        for name in ("PATH", "HOME", "TMPDIR", "XDG_CACHE_HOME", "DOCKER_HOST", "LANG", "LC_ALL")
+        for name in (
+            "PATH",
+            "HOME",
+            "TMPDIR",
+            "XDG_CACHE_HOME",
+            "DOCKER_HOST",
+            "LANG",
+            "LC_ALL",
+            "PROGRAMBENCH_BLOB_DIR",
+        )
         if (value := os.environ.get(name))
     }
     try:
@@ -520,6 +561,7 @@ def _evaluate_arm(
         )
         exit_code = None
         error = type(error_value).__name__
+    _restore_preserved_results(base, state_path, arm_root)
     hashes = {
         path.name: _sha256(path)
         for path in (stdout_path, stderr_path)
@@ -532,11 +574,20 @@ def _evaluate_arm(
             if (arm_root / instance_id / f"{instance_id}.eval.json").is_file()
         }
     )
+    missing = sorted(
+        instance_id
+        for instance_id in submitted
+        if not (arm_root / instance_id / f"{instance_id}.eval.json").is_file()
+    )
+    if missing:
+        status = "interrupted"
+        error = "failed_incomplete"
     final = {
         **_read_json(state_path, f"evaluator state for {arm}"),
         "status": status,
         "exit_code": exit_code,
         "error": error,
+        "missing_eval_ids": missing,
         "artifact_hashes": hashes,
     }
     _atomic_json(state_path, final)
@@ -551,6 +602,7 @@ def _reconcile_complete(
     arm_root: Path,
     submitted: Sequence[str],
 ) -> Mapping[str, object] | None:
+    _restore_preserved_results(state, state_path, arm_root)
     if not _evaluation_artifacts_complete(arm_root, submitted):
         return None
     if not stdout_path.is_file():
@@ -565,7 +617,13 @@ def _reconcile_complete(
             for instance_id in submitted
         },
     }
-    done = {**state, "status": "done", "artifact_hashes": artifacts, "error": state.get("error")}
+    done = {
+        **state,
+        "status": "done",
+        "artifact_hashes": artifacts,
+        "error": state.get("error"),
+        "missing_eval_ids": [],
+    }
     _atomic_json(state_path, done)
     return done
 
@@ -927,6 +985,76 @@ def _reject_duplicate_pairs(pairs: list[tuple[str, object]]) -> dict[str, object
             raise ValueError(f"duplicate JSON key: {key}")
         result[key] = value
     return result
+
+
+def _reject_json_constant(value: str) -> object:
+    raise ValueError(f"nonstandard JSON numeric constant: {value}")
+
+
+def _reject_nonfinite_numbers(value: object) -> None:
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, float) and not math.isfinite(current):
+            raise ValueError("nonfinite JSON number")
+        if isinstance(current, Mapping):
+            pending.extend(current.values())
+        elif isinstance(current, list):
+            pending.extend(current)
+
+
+def _blob_hashes(root: Path, instance_ids: Sequence[str]) -> dict[str, str]:
+    return {
+        str(path.relative_to(root)): _sha256(path)
+        for instance_id in sorted(instance_ids)
+        for path in sorted((root / instance_id / "tests").rglob("*"))
+        if path.is_file() and not path.is_symlink()
+    }
+
+
+def _preserve_eval_results(
+    state_root: Path,
+    arm_root: Path,
+    arm: str,
+    submitted: Sequence[str],
+    state: Mapping[str, object],
+) -> dict[str, str]:
+    missing = set(state.get("missing_eval_ids", []))
+    artifacts = state.get("artifact_hashes")
+    expected = artifacts if isinstance(artifacts, Mapping) else {}
+    preserved: dict[str, str] = {}
+    for instance_id in submitted:
+        path = arm_root / instance_id / f"{instance_id}.eval.json"
+        if instance_id in missing or not path.is_file():
+            continue
+        digest = _sha256(path)
+        if expected.get(f"{instance_id}.eval.json") not in {None, digest}:
+            raise CampaignEvaluationError(f"existing eval artifact conflicts before retry: {instance_id}/{arm}")
+        _atomic_bytes(state_root / f"{arm}.preserved" / f"{instance_id}.eval.json", path.read_bytes())
+        preserved[instance_id] = digest
+    return preserved
+
+
+def _restore_preserved_results(state: Mapping[str, object], state_path: Path, arm_root: Path) -> None:
+    hashes = state.get("preserved_eval_hashes")
+    if not isinstance(hashes, Mapping):
+        return
+    backup_root = state_path.parent / f"{state_path.stem}.preserved"
+    for instance_id, digest in hashes.items():
+        if not isinstance(instance_id, str) or not isinstance(digest, str):
+            raise CampaignEvaluationError("preserved evaluator artifact state is malformed")
+        path = arm_root / instance_id / f"{instance_id}.eval.json"
+        backup = backup_root / f"{instance_id}.eval.json"
+        if backup.is_file():
+            if _sha256(backup) != digest:
+                raise CampaignEvaluationError(f"preserved evaluator artifact conflicts: {instance_id}")
+            _atomic_bytes(path, backup.read_bytes())
+            continue
+        if not path.is_file() or _sha256(path) != digest:
+            raise CampaignEvaluationError(f"preserved evaluator artifact is unavailable: {instance_id}")
+    if backup_root.exists():
+        shutil.rmtree(backup_root)
+        _sync_directory(backup_root.parent)
 
 
 def _atomic_json(path: Path, value: object) -> None:

@@ -63,6 +63,7 @@ def _campaign(
     *,
     instance_ids: tuple[str, ...] = ("one",),
     missing: frozenset[tuple[str, str]] = frozenset(),
+    submissions: dict[tuple[str, str], bytes] | None = None,
 ) -> tuple[Path, list[dict[str, object]]]:
     root.mkdir()
     jobs = [
@@ -95,7 +96,7 @@ def _campaign(
         if (instance_id, arm) not in missing:
             archive = job_root / instance_id / "submission.tar.gz"
             archive.parent.mkdir(parents=True)
-            archive.write_bytes(f"{instance_id}-{arm}".encode())
+            archive.write_bytes((submissions or {}).get((instance_id, arm), f"{instance_id}-{arm}".encode()))
         result = {
             "version": 1,
             "completion": "discharged" if arm == "procontract" else "idle",
@@ -239,6 +240,57 @@ def test_validate_evaluation_rejects_missing_json(tmp_path: Path) -> None:
     assert not result.valid
     assert result.reasons == ("missing_eval_json",)
     assert result.eval_sha256 is None
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_validate_evaluation_rejects_nonstandard_json_numeric(tmp_path: Path, constant: str) -> None:
+    from scripts.campaign_evaluate import validate_evaluation
+
+    path = tmp_path / "one.eval.json"
+    _write_eval(path)
+    raw = path.read_text().replace('"extra":{}', f'"extra":{{"nonstandard":{constant}}}', 1)
+    path.write_text(raw)
+
+    assert validate_evaluation(path, _instance()).reasons == ("malformed_eval_json",)
+
+
+def test_validate_evaluation_rejects_oversize_json_before_hash_or_parse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import campaign_evaluate
+
+    path = tmp_path / "one.eval.json"
+    path.write_bytes(b" " * (campaign_evaluate.MAX_EVAL_JSON_BYTES + 1))
+    monkeypatch.setattr(
+        campaign_evaluate,
+        "_sha256",
+        lambda _path: pytest.fail("oversize eval must be rejected before full hashing"),
+    )
+
+    result = campaign_evaluate.validate_evaluation(path, _instance())
+
+    assert result.reasons == ("oversize_eval_json",)
+    assert result.eval_sha256 is None
+
+
+def test_validate_evaluation_rejects_deeply_nested_json_without_crashing(tmp_path: Path) -> None:
+    from scripts.campaign_evaluate import validate_evaluation
+
+    path = tmp_path / "one.eval.json"
+    path.write_text("[" * 10_000 + "]" * 10_000)
+
+    assert validate_evaluation(path, _instance()).reasons == ("malformed_eval_json",)
+
+
+def test_validate_evaluation_rejects_standard_numeric_overflow(tmp_path: Path) -> None:
+    from scripts.campaign_evaluate import validate_evaluation
+
+    path = tmp_path / "one.eval.json"
+    _write_eval(path)
+    path.write_text(path.read_text().replace('"extra":{}', '"extra":{"overflow":1e999999}', 1))
+
+    assert validate_evaluation(path, _instance()).reasons == ("malformed_eval_json",)
 
 
 def test_validate_evaluation_rejects_duplicate_top_error_key(tmp_path: Path) -> None:
@@ -457,6 +509,65 @@ def test_interrupted_evaluator_requires_explicit_retry_and_skips_done_arm(tmp_pa
 
     assert retried.status == "completed"
     assert [Path(call[0][4]).name for call in retry_calls] == ["procontract"]
+
+
+def test_exit_zero_missing_eval_is_interrupted_and_explicit_retry_completes_missing_only(tmp_path: Path) -> None:
+    from scripts.campaign_evaluate import CampaignEvaluationError, evaluate_campaign
+
+    root, instances = _campaign(
+        tmp_path / "campaign",
+        instance_ids=("one", "two"),
+        missing=frozenset({("one", "vanilla"), ("two", "vanilla")}),
+    )
+    first_calls = []
+
+    def partial(command, cwd, _timeout, _grace, _limit, environment, *, on_start):
+        first_calls.append(tuple(command))
+        on_start(os.getpid(), os.getpid(), "partial-process")
+        arm_root = Path(command[4])
+        _write_eval(
+            arm_root / "one/one.eval.json",
+            statuses=("passed", "failure", "failure"),
+            branch_error=True,
+        )
+        return subprocess.CompletedProcess(command, 0, "partial", "")
+
+    first = evaluate_campaign(root, instances=instances, command_runner=partial)
+    interrupted = json.loads((root / "evaluation-state/procontract.json").read_text())
+
+    assert first.status == "evaluator_failed"
+    assert len(first_calls) == 1
+    assert interrupted["status"] == "interrupted"
+    assert interrupted["error"] == "failed_incomplete"
+    assert interrupted["missing_eval_ids"] == ["two"]
+    assert "one.eval.json" in interrupted["artifact_hashes"]
+
+    with pytest.raises(CampaignEvaluationError, match="two"):
+        evaluate_campaign(root, instances=instances, command_runner=lambda *_a, **_k: pytest.fail("must reject"))
+
+    retry_calls = []
+    preserved = (root / "evaluation/procontract/one/one.eval.json").read_bytes()
+
+    def finish(command, cwd, _timeout, _grace, _limit, environment, *, on_start):
+        retry_calls.append(tuple(command))
+        on_start(os.getpid(), os.getpid(), "retry-process")
+        arm_root = Path(command[4])
+        assert (arm_root / "one/one.eval.json").is_file()
+        _write_eval(arm_root / "one/one.eval.json", statuses=("passed", "passed", "passed"))
+        _write_eval(arm_root / "two/two.eval.json", statuses=("failure", "failure", "failure"))
+        return subprocess.CompletedProcess(command, 0, "complete", "")
+
+    evaluate_campaign(root, instances=instances, retry_evaluator=True, command_runner=finish)
+    done = json.loads((root / "evaluation-state/procontract.json").read_text())
+
+    assert len(retry_calls) == 1
+    assert done["status"] == "done"
+    assert done["missing_eval_ids"] == []
+    assert (root / "evaluation/procontract/one/one.eval.json").read_bytes() == preserved
+    assert {name for name in done["artifact_hashes"] if name.endswith(".eval.json")} == {
+        "one.eval.json",
+        "two.eval.json",
+    }
 
 
 def test_response_loss_with_complete_artifacts_reconciles_without_retry(tmp_path: Path) -> None:
@@ -874,6 +985,24 @@ def test_done_state_rejects_frozen_manifest_coordinate_change(tmp_path: Path) ->
         evaluate_campaign(root, instances=instances, command_runner=lambda *_a, **_k: pytest.fail("must not run"))
 
 
+def test_done_state_rejects_local_test_blob_content_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts.campaign_evaluate import CampaignEvaluationError, evaluate_campaign
+
+    root, instances = _campaign(tmp_path / "campaign")
+    blob = tmp_path / "blobs/one/tests/b1.tar.gz"
+    blob.parent.mkdir(parents=True)
+    blob.write_bytes(b"first-tests")
+    monkeypatch.setenv("PROGRAMBENCH_BLOB_DIR", str(tmp_path / "blobs"))
+    evaluate_campaign(root, instances=instances, command_runner=_runner([]))
+    blob.write_bytes(b"changed-tests")
+
+    with pytest.raises(CampaignEvaluationError, match="conflicts"):
+        evaluate_campaign(root, instances=instances, command_runner=lambda *_a, **_k: pytest.fail("must not run"))
+
+
 def test_done_state_rejects_invocation_configuration_conflict(tmp_path: Path) -> None:
     from scripts.campaign_evaluate import CampaignEvaluationError, evaluate_campaign
 
@@ -1234,9 +1363,13 @@ def test_redo_with_evaluate_runs_inference_before_evaluator(
 
 
 @pytest.mark.slow
-def test_real_calculator_evaluator_scores_two_tiny_submissions_when_docker_available(tmp_path: Path) -> None:
+def test_real_calculator_evaluator_scores_two_tiny_submissions_when_docker_available(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from programbench.constants import image_name_from_instance_id
-    from scripts.campaign_evaluate import evaluate_campaign
+    from programbench.utils.load_data import load_all_instances
+    from scripts.campaign_evaluate import evaluate_campaign, validate_evaluation
 
     docker = shutil.which("docker")
     if docker is None:
@@ -1246,26 +1379,60 @@ def test_real_calculator_evaluator_scores_two_tiny_submissions_when_docker_avail
         pytest.skip("Docker daemon is unavailable")
     instance_id = "testorg__calculator.abc1234"
     image = f"{image_name_from_instance_id(instance_id)}:task_cleanroom_v6"
-    available = subprocess.run((docker, "image", "inspect", image), capture_output=True, timeout=10)
-    if available.returncode:
-        pytest.skip("Docker calculator cleanroom fixture is unavailable")
+    tasks = Path(__file__).parents[1] / "src/programbench/data/tasks" / instance_id
+    available = subprocess.run(
+        (docker, "image", "inspect", "--format", "{{.Id}}", image),
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    previous_image = available.stdout.strip() if available.returncode == 0 else None
+    try:
+        subprocess.run((docker, "build", "-t", image, str(tasks)), check=True, timeout=600)
 
-    root, _ = _campaign(tmp_path / "campaign", instance_ids=(instance_id,))
-    fixtures = Path(__file__).parents[1] / "src/programbench/data/test_runs"
-    for arm, source in (("procontract", "correct"), ("vanilla", "incorrect")):
-        archive = root / arm / instance_id / instance_id / "submission.tar.gz"
-        with zipfile.ZipFile(fixtures / source / instance_id / "submission.zip") as zipped:
-            with tarfile.open(archive, "w:gz") as tar:
-                for member in zipped.infolist():
-                    payload = zipped.read(member)
-                    info = tarfile.TarInfo(member.filename)
-                    info.size = len(payload)
-                    info.mode = member.external_attr >> 16
-                    tar.addfile(info, io.BytesIO(payload))
+        fixtures = Path(__file__).parents[1] / "src/programbench/data/test_runs"
+        submissions = {}
+        for arm, source in (("procontract", "correct"), ("vanilla", "incorrect")):
+            archive = io.BytesIO()
+            with zipfile.ZipFile(fixtures / source / instance_id / "submission.zip") as zipped:
+                with tarfile.open(fileobj=archive, mode="w:gz") as tar:
+                    for member in zipped.infolist():
+                        payload = zipped.read(member)
+                        info = tarfile.TarInfo(member.filename)
+                        info.size = len(payload)
+                        info.mode = member.external_attr >> 16
+                        tar.addfile(info, io.BytesIO(payload))
+            submissions[(instance_id, arm)] = archive.getvalue()
 
-    outcome = evaluate_campaign(root)
-    pair = json.loads(outcome.comparison_path.read_text())["pairs"][0]
+        root, _ = _campaign(
+            tmp_path / "campaign",
+            instance_ids=(instance_id,),
+            submissions=submissions,
+        )
+        blob_root = tmp_path / "blobs"
+        branch = "33128f6b8600"
+        test_tar = blob_root / instance_id / "tests" / f"{branch}.tar.gz"
+        test_tar.parent.mkdir(parents=True)
+        with tarfile.open(test_tar, "w:gz") as archive:
+            archive.add(tasks / "tests" / branch / "eval", arcname="eval")
+        monkeypatch.setenv("PROGRAMBENCH_BLOB_DIR", str(blob_root))
+        instance = next(value for value in load_all_instances() if value["instance_id"] == instance_id)
 
-    assert outcome.status == "completed"
-    assert pair["procontract"]["utility"] == {"decimal": "1", "denominator": 1, "numerator": 1}
-    assert pair["vanilla"]["utility"]["numerator"] < pair["vanilla"]["utility"]["denominator"]
+        outcome = evaluate_campaign(root)
+        pair = json.loads(outcome.comparison_path.read_text())["pairs"][0]
+
+        assert outcome.status == "completed"
+        assert pair["procontract"]["utility"] == {"decimal": "1", "denominator": 1, "numerator": 1}
+        assert pair["vanilla"]["utility"] == {"decimal": "0", "denominator": 1, "numerator": 0}
+        for arm in ("procontract", "vanilla"):
+            eval_path = root / "evaluation" / arm / instance_id / f"{instance_id}.eval.json"
+            validated = validate_evaluation(eval_path, instance)
+            assert eval_path.is_file()
+            assert validated.valid
+            assert json.loads((root / f"evaluation-state/{arm}.json").read_text())["status"] == "done"
+            assert pair[arm]["errors"] == []
+    finally:
+        if previous_image:
+            subprocess.run((docker, "tag", previous_image, image), check=True, timeout=60)
+        else:
+            subprocess.run((docker, "rmi", "-f", image), capture_output=True, timeout=60)

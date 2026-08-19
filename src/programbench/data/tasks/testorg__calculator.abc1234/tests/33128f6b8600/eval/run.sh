@@ -7,6 +7,7 @@
 # LICENSE file in the root directory of this source tree.
 
 set -e
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")"
+ln -sf ../executable executable
 pip install pytest --quiet 2>/dev/null || true
-python3 -m pytest eval/tests/ --junitxml=eval/results.xml -v || true
+python3 -m pytest tests/ --junitxml=results.xml -v || true
