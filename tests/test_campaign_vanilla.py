@@ -146,6 +146,18 @@ class JumpingClock:
         self.sleeps.append(seconds)
 
 
+class FlappingBackoffBreaker(CircuitBreaker):
+    def __init__(self, values: list[float | None]) -> None:
+        super().__init__()
+        self.values = values
+        self.reads = 0
+
+    @property
+    def backoff_until(self) -> float | None:
+        self.reads += 1
+        return self.values.pop(0) if self.values else None
+
+
 class FakeOpenCodeApi:
     def __init__(self, polls: list[tuple[list[dict[str, object]], str]]) -> None:
         self.polls = polls
@@ -1330,6 +1342,15 @@ def test_backoff_clock_jump_never_schedules_negative_sleep_and_reaches_wall_safe
     assert (
         vanilla_module._safety_completion(breaker, UsageSummary(), limits(), clock, 101) is VanillaCompletion.WALL_TIME
     )
+
+
+@pytest.mark.parametrize(("values", "expected"), [([105, None], [1]), ([101, 105, None], [1, 1])])
+def test_backoff_uses_one_property_snapshot_per_iteration(values: list[float | None], expected: list[float]) -> None:
+    breaker = FlappingBackoffBreaker(values)
+    clock = FakeClock()
+    assert not vanilla_module._backoff(breaker, clock, clock.sleep, 1, 110)
+    assert clock.sleeps == expected
+    assert breaker.reads == len(expected) + 1
 
 
 def test_projected_retry_part_feeds_429_backoff_once_then_allows_success(tmp_path: Path) -> None:

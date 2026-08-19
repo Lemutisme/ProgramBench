@@ -74,6 +74,12 @@ class VanillaCompletion(str, Enum):
 
 
 @dataclass(frozen=True)
+class _SafetyDecision:
+    completion: VanillaCompletion
+    reason: str | None
+
+
+@dataclass(frozen=True)
 class VanillaResult:
     session_id: str
     message_id: str
@@ -360,8 +366,8 @@ def run_vanilla(
                         messages,
                         max(0.0, clock() - float(started_at)),
                     )
-                safety = _safety_completion(breaker, usage, limits, clock, wall_deadline)
-                if safety is not None:
+                decision = _safety_decision(breaker, usage, limits, clock, wall_deadline)
+                if decision is not None:
                     return _finish_early_stop(
                         job,
                         state_store,
@@ -379,8 +385,8 @@ def run_vanilla(
                         clock,
                         sleeper,
                         poll_interval,
-                        completion=safety,
-                        error_text=breaker.pause_reason or "wall time safety ceiling reached",
+                        completion=decision.completion,
+                        error_text=decision.reason or decision.completion.value,
                         confirmed=False,
                         usage=usage,
                         actions=actions,
@@ -398,8 +404,8 @@ def run_vanilla(
             if execution.get("session_confirmed") is not True:
                 execution = {**execution, "session_confirmed": True}
                 _write_json(execution_path, execution)
-            safety = _safety_completion(breaker, usage, limits, clock, wall_deadline)
-            if safety is not None:
+            decision = _safety_decision(breaker, usage, limits, clock, wall_deadline)
+            if decision is not None:
                 return _finish_early_stop(
                     job,
                     state_store,
@@ -417,8 +423,8 @@ def run_vanilla(
                     clock,
                     sleeper,
                     poll_interval,
-                    completion=safety,
-                    error_text=breaker.pause_reason or safety.value,
+                    completion=decision.completion,
+                    error_text=decision.reason or decision.completion.value,
                     confirmed=True,
                     usage=usage,
                     actions=actions,
@@ -433,8 +439,8 @@ def run_vanilla(
                 if error.status_code == 429:
                     _observe_rate_limit(breaker, error.retry_after, str(error), clock, wall_deadline)
                     if _backoff(breaker, clock, sleeper, poll_interval, wall_deadline):
-                        completion = _safety_completion(breaker, usage, limits, clock, wall_deadline)
-                        if completion is not None:
+                        decision = _safety_decision(breaker, usage, limits, clock, wall_deadline)
+                        if decision is not None:
                             return _finish_early_stop(
                                 job,
                                 state_store,
@@ -452,8 +458,8 @@ def run_vanilla(
                                 clock,
                                 sleeper,
                                 poll_interval,
-                                completion=completion,
-                                error_text=breaker.pause_reason or completion.value,
+                                completion=decision.completion,
+                                error_text=decision.reason or decision.completion.value,
                                 confirmed=execution.get("session_confirmed") is True,
                                 usage=usage,
                                 actions=actions,
@@ -493,8 +499,8 @@ def run_vanilla(
             if error.status_code == 429:
                 _observe_rate_limit(breaker, error.retry_after, str(error), clock, wall_deadline)
                 if _backoff(breaker, clock, sleeper, poll_interval, wall_deadline):
-                    completion = _safety_completion(breaker, usage, limits, clock, wall_deadline)
-                    if completion is not None:
+                    decision = _safety_decision(breaker, usage, limits, clock, wall_deadline)
+                    if decision is not None:
                         return _finish_early_stop(
                             job,
                             state_store,
@@ -512,8 +518,8 @@ def run_vanilla(
                             clock,
                             sleeper,
                             poll_interval,
-                            completion=completion,
-                            error_text=breaker.pause_reason or completion.value,
+                            completion=decision.completion,
+                            error_text=decision.reason or decision.completion.value,
                             confirmed=execution.get("session_confirmed") is True,
                             usage=usage,
                             actions=actions,
@@ -647,9 +653,10 @@ def run_vanilla(
     observed_provider_errors: set[str] = set()
     inactive_messages: Mapping[str, object] | None = None
     while True:
-        safety = _safety_completion(breaker, usage, limits, clock, wall_deadline)
-        if safety is not None:
-            completion = safety
+        decision = _safety_decision(breaker, usage, limits, clock, wall_deadline)
+        if decision is not None:
+            completion = decision.completion
+            error_text = decision.reason
             stopped = _interrupt(api, session_id, workspace, execution_path, execution, clock, sleeper, poll_interval)
             break
         previous_usage = usage
@@ -748,13 +755,14 @@ def run_vanilla(
             error_text = "provider error"
             stopped = _interrupt(api, session_id, workspace, execution_path, execution, clock, sleeper, poll_interval)
             break
-        if breaker.stop_active:
+        pause_reason = breaker.active_stop_reason
+        if pause_reason is not None:
             completion = (
                 VanillaCompletion.AUTH
-                if breaker.pause_reason == "provider authentication failure"
+                if pause_reason == "provider authentication failure"
                 else VanillaCompletion.HARD_COST
             )
-            error_text = breaker.pause_reason
+            error_text = pause_reason
             stopped = _interrupt(api, session_id, workspace, execution_path, execution, clock, sleeper, poll_interval)
             break
         if usage.provider_turns >= limits.provider_turns:
@@ -876,7 +884,8 @@ def _observe_rate_limit(
 ) -> None:
     now = clock()
     breaker.observe_error(429, retry_after=retry_after, detail=detail, now=now)
-    if now >= deadline or breaker.backoff_until is not None and breaker.backoff_until > now:
+    backoff_until = breaker.backoff_until
+    if now >= deadline or backoff_until is not None and backoff_until > now:
         return
     breaker.observe_error(429, retry_after=str(min(1.0, deadline - now)), detail=detail, now=now)
 
@@ -888,16 +897,19 @@ def _backoff(
     poll_interval: float,
     deadline: float,
 ) -> bool:
-    while breaker.backoff_until is not None and not breaker.stop_active:
+    while True:
+        backoff_until = breaker.backoff_until
+        stop_active = breaker.stop_active
+        if backoff_until is None or stop_active:
+            return stop_active
         now = clock()
-        until = min(breaker.backoff_until, deadline)
+        until = min(backoff_until, deadline)
         if now >= until:
-            return now >= deadline or breaker.stop_active
+            return now >= deadline or stop_active
         duration = min(poll_interval, until - now)
         if duration <= 0:
-            return now >= deadline or breaker.stop_active
+            return now >= deadline or stop_active
         sleeper(duration)
-    return breaker.stop_active
 
 
 def _sleep_before_deadline(
@@ -923,16 +935,29 @@ def _safety_completion(
     clock: Callable[[], float],
     deadline: float,
 ) -> VanillaCompletion | None:
-    if breaker.stop_active:
-        return (
+    decision = _safety_decision(breaker, usage, limits, clock, deadline)
+    return None if decision is None else decision.completion
+
+
+def _safety_decision(
+    breaker: CircuitBreaker,
+    usage: UsageSummary,
+    limits: Limits,
+    clock: Callable[[], float],
+    deadline: float,
+) -> _SafetyDecision | None:
+    pause_reason = breaker.active_stop_reason
+    if pause_reason is not None:
+        return _SafetyDecision(
             VanillaCompletion.AUTH
-            if breaker.pause_reason == "provider authentication failure"
-            else VanillaCompletion.HARD_COST
+            if pause_reason == "provider authentication failure"
+            else VanillaCompletion.HARD_COST,
+            pause_reason,
         )
     if usage.provider_turns >= limits.provider_turns:
-        return VanillaCompletion.PROVIDER_TURNS
+        return _SafetyDecision(VanillaCompletion.PROVIDER_TURNS, None)
     if clock() >= deadline:
-        return VanillaCompletion.WALL_TIME
+        return _SafetyDecision(VanillaCompletion.WALL_TIME, None)
     return None
 
 

@@ -468,6 +468,16 @@ class CircuitBreaker:
             return "hard" in self._pause_causes or "auth" in self._pause_causes
 
     @property
+    def active_stop_reason(self) -> str | None:
+        """Return the active-work stop reason from one breaker lock snapshot."""
+        with self._lock:
+            if "auth" in self._pause_causes:
+                return "provider authentication failure"
+            if "hard" in self._pause_causes:
+                return "campaign hard cost cap reached"
+            return None
+
+    @property
     def stop_active(self) -> bool:
         return self.hard_stopped
 
