@@ -593,7 +593,7 @@ def test_pinned_real_binary_completes_native_procontract_lifecycle(
                                         "tool_call": True,
                                         "release_date": "2026-01-01",
                                         "limit": {"context": 100000, "output": 10000},
-                                        "cost": {"input": 0, "output": 0},
+                                        "cost": {"input": 1, "output": 1},
                                         "options": {},
                                         "variants": {"max": {}},
                                     }
@@ -679,6 +679,7 @@ def test_pinned_real_binary_completes_native_procontract_lifecycle(
                 expected_port=workspace.port,
                 password=PASSWORD,
             )
+            breaker = CircuitBreaker()
             result = run_procontract(
                 job,
                 store,
@@ -686,7 +687,7 @@ def test_pinned_real_binary_completes_native_procontract_lifecycle(
                 model="openai/gpt-5.6-luna",
                 variant="max",
                 limits=Limits(21600, 1000, 4000, 100, 150),
-                breaker=CircuitBreaker(),
+                breaker=breaker,
                 api=api,
                 sleeper=sleeper,
                 poll_interval=0.1,
@@ -704,6 +705,20 @@ def test_pinned_real_binary_completes_native_procontract_lifecycle(
                 native = json.loads(paths.root.joinpath("procontract-native-result.json").read_text())
                 assert native["contract"]["pendingRevision"] == result.pending_revision
                 assert native["execution"]["contractID"] == result.contract_id
+                progress = json.loads(paths.root.joinpath("procontract-progress.json").read_text())["current"]
+                assistant = next(message for message in progress["messages"]["data"] if message["type"] == "assistant")
+                assert assistant["finish"] == "tool-calls"
+                assert all(part["state"]["status"] in {"completed", "error"} for part in assistant["content"])
+                assert result.usage_incomplete is False
+                assert result.input_tokens == breaker.campaign_usage.input == 10
+                assert result.output_tokens == breaker.campaign_usage.output == 3
+                assert result.cost == breaker.campaign_usage.cost > 0
+                issued = json.loads(paths.root.joinpath("procontract-issue-response.json").read_text())["execution"]
+                assert (
+                    native["execution"]["dispatched"] is False
+                    or native["execution"]["promptID"] != issued["promptID"]
+                    or result.interrupt_attempted
+                )
             assert tmp_path.joinpath("provider-hits.jsonl").is_file()
             assert workspace.manifest.binary_sha256 == fixture_metadata["sha256"]
             if workspace.lease._handle_active:

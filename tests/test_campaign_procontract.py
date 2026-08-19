@@ -203,6 +203,48 @@ class SafetyApi(FakeApi):
         return "idle" if self.interrupts else "busy"
 
 
+class PendingSettlementApi(FakeApi):
+    def __init__(self, contract: dict[str, object], execution: dict[str, object], *, active: bool) -> None:
+        super().__init__(contract, execution)
+        self.active = active
+
+    def status(self, session_id: str) -> str:
+        return "busy" if self.active else "idle"
+
+    def messages(self, session_id: str) -> dict[str, object]:
+        return _settlement_messages(terminal=not self.active)
+
+    def interrupt(self, session_id: str) -> None:
+        super().interrupt(session_id)
+        self.active = False
+        self.execution = {
+            **self.execution,
+            "sessionID": "ses_settled",
+            "promptID": "msg_settled",
+            "dispatched": False,
+        }
+
+
+class UnsettledPendingApi(FakeApi):
+    def status(self, session_id: str) -> str:
+        return "busy"
+
+    def messages(self, session_id: str) -> dict[str, object]:
+        from scripts.campaign_procontract import ProContractHttpError
+
+        raise ProContractHttpError("messages unavailable", status_code=503, transient=True)
+
+
+class MalformedSettlementApi(FakeApi):
+    def status(self, session_id: str) -> str:
+        return "idle"
+
+    def messages(self, session_id: str) -> dict[str, object]:
+        messages = _settlement_messages(terminal=True)
+        messages["data"][0]["tokens"]["input"] = "bad"  # type: ignore[index]
+        return messages
+
+
 class LostApi(FakeApi):
     def get_contract(self, contract_id: str) -> dict[str, object] | None:
         return None
@@ -794,6 +836,43 @@ def _execution(payload: dict[str, object]) -> dict[str, object]:
         "leaseOwner": "scheduler",
         "leaseExpiresAt": 120000,
     }
+
+
+def _settlement_messages(*, terminal: bool) -> dict[str, object]:
+    assistant = {
+        "id": "msg_assistant",
+        "type": "assistant",
+        "time": {"created": 100001, **({"completed": 100002} if terminal else {})},
+        "agent": "build",
+        "model": {"providerID": "openai", "id": "gpt-5.6-luna", "variant": "max"},
+        "content": [
+            {
+                "type": "tool",
+                "id": "call_settle",
+                "name": "contract_propose_revision",
+                "state": {
+                    "status": "completed" if terminal else "running",
+                    "input": {},
+                    **({"content": [], "outputPaths": [], "structured": {"recorded": True}} if terminal else {}),
+                },
+            }
+        ],
+        **(
+            {
+                "finish": "tool-calls",
+                "cost": 2,
+                "tokens": {
+                    "input": 10,
+                    "output": 3,
+                    "reasoning": 1,
+                    "cache": {"read": 4, "write": 2},
+                },
+            }
+            if terminal
+            else {}
+        ),
+    }
+    return {"data": [assistant]}
 
 
 def _challenged(contract: dict[str, object]) -> dict[str, object]:
@@ -2018,6 +2097,123 @@ def test_pending_revision_precedes_rotated_or_missing_execution_binding(tmp_path
     assert result.completion.value == "pending_revision"
     assert result.prompt_id == ("msg_rotated" if binding == "rotated" else _execution(payload)["promptID"])
     assert api.exports == [] and api.attestations == []
+
+
+@pytest.mark.parametrize("active", [False, True])
+def test_pending_revision_settles_terminal_usage_before_return(tmp_path: Path, active: bool) -> None:
+    from decimal import Decimal
+
+    from scripts.campaign_procontract import build_issue_payload, run_procontract
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    store = _state(paths)
+    _, workspace = _workspace(tmp_path, paths)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock())
+    contract = _contract(payload, status="active")
+    contract["pendingRevision"] = {"spec": contract["spec"], "specHash": "pending", "reason": "requested"}
+    api = PendingSettlementApi(contract, _execution(payload), active=active)
+    breaker = CircuitBreaker(hard_cost_cap=1)
+
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease._handle_active = True
+        result = run_procontract(
+            job,
+            store,
+            workspace,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=_limits(),
+            breaker=breaker,
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+        )
+
+    assert result.completion.value == "pending_revision"
+    assert result.provider_turns == 1
+    assert result.actions == 2
+    assert result.cost == Decimal("2")
+    assert result.input_tokens == 10
+    assert result.output_tokens == 3
+    assert result.reasoning_tokens == 1
+    assert result.cache_read == 4
+    assert result.cache_write == 2
+    assert result.usage_incomplete is False
+    assert result.session_id == ("ses_settled" if active else "ses_contract")
+    assert result.prompt_id == ("msg_settled" if active else _execution(payload)["promptID"])
+    assert api.interrupts == (["ses_contract"] if active else [])
+    assert breaker.active_stop_reason == "campaign hard cost cap reached"
+    assert breaker.campaign_usage.input == 10
+    assert store.read().provider_turns == 1
+    assert store.read().actions == 2
+    assert store.read().cost == 2
+
+
+def test_pending_revision_marks_usage_incomplete_when_settlement_is_bounded(tmp_path: Path) -> None:
+    from scripts.campaign_procontract import build_issue_payload, run_procontract
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    store = _state(paths)
+    _, workspace = _workspace(tmp_path, paths)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock())
+    contract = _contract(payload, status="active")
+    contract["pendingRevision"] = {"spec": contract["spec"], "specHash": "pending", "reason": "requested"}
+    api = UnsettledPendingApi(contract, _execution(payload))
+
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease._handle_active = True
+        result = run_procontract(
+            job,
+            store,
+            workspace,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=_limits(),
+            breaker=CircuitBreaker(),
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+        )
+
+    assert result.completion.value == "pending_revision"
+    assert result.usage_incomplete is True
+    assert api.interrupts == ["ses_contract"]
+    assert workspace.stops == 1
+
+
+def test_pending_revision_contains_malformed_terminal_usage(tmp_path: Path) -> None:
+    from scripts.campaign_procontract import build_issue_payload, run_procontract
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    store = _state(paths)
+    _, workspace = _workspace(tmp_path, paths)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock())
+    contract = _contract(payload, status="active")
+    contract["pendingRevision"] = {"spec": contract["spec"], "specHash": "pending", "reason": "requested"}
+
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease._handle_active = True
+        result = run_procontract(
+            job,
+            store,
+            workspace,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=_limits(),
+            breaker=CircuitBreaker(),
+            api=MalformedSettlementApi(contract, _execution(payload)),
+            clock=clock,
+            sleeper=clock.sleep,
+        )
+
+    assert result.completion.value == "pending_revision"
+    assert result.usage_incomplete is True
 
 
 @pytest.mark.parametrize("native", ["released", "escalated", "challenged"])

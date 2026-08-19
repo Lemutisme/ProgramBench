@@ -235,6 +235,12 @@ class ProContractResult:
     error: str | None = None
     quiet_unconfirmed: bool = False
     pending_revision: Mapping[str, object] | None = None
+    usage_incomplete: bool = False
+    input_tokens: int = 0
+    output_tokens: int = 0
+    reasoning_tokens: int = 0
+    cache_read: int = 0
+    cache_write: int = 0
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -267,6 +273,12 @@ class ProContractResult:
             "error": self.error,
             "quiet_unconfirmed": self.quiet_unconfirmed,
             "pending_revision": dict(self.pending_revision) if self.pending_revision is not None else None,
+            "usage_incomplete": self.usage_incomplete,
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "reasoning_tokens": self.reasoning_tokens,
+            "cache_read": self.cache_read,
+            "cache_write": self.cache_write,
         }
 
     @classmethod
@@ -300,7 +312,16 @@ class ProContractResult:
             "exit_class",
             "error",
         }
-        optional = {"quiet_unconfirmed", "pending_revision"}
+        optional = {
+            "quiet_unconfirmed",
+            "pending_revision",
+            "usage_incomplete",
+            "input_tokens",
+            "output_tokens",
+            "reasoning_tokens",
+            "cache_read",
+            "cache_write",
+        }
         if not isinstance(raw, Mapping) or not required <= set(raw) or set(raw) - (required | optional):
             raise ProContractError("persisted ProContract result is invalid")
         try:
@@ -333,6 +354,12 @@ class ProContractResult:
                 error=raw["error"],
                 quiet_unconfirmed=raw.get("quiet_unconfirmed", False),
                 pending_revision=raw.get("pending_revision"),
+                usage_incomplete=raw.get("usage_incomplete", False),
+                input_tokens=raw.get("input_tokens", 0),
+                output_tokens=raw.get("output_tokens", 0),
+                reasoning_tokens=raw.get("reasoning_tokens", 0),
+                cache_read=raw.get("cache_read", 0),
+                cache_write=raw.get("cache_write", 0),
             )
         except (TypeError, ValueError, KeyError) as error:
             raise ProContractError("persisted ProContract result is invalid") from error
@@ -364,6 +391,17 @@ class ProContractResult:
                     result.container_stopped_for_freeze,
                     result.quiet,
                     result.quiet_unconfirmed,
+                    result.usage_incomplete,
+                )
+            )
+            or any(
+                type(value) is not int or value < 0
+                for value in (
+                    result.input_tokens,
+                    result.output_tokens,
+                    result.reasoning_tokens,
+                    result.cache_read,
+                    result.cache_write,
                 )
             )
             or any(not isinstance(value, str) for value in result.outstanding)
@@ -945,8 +983,13 @@ def _run_procontract(
                         native_execution,
                         usage,
                         actions,
+                        messages,
                         issue,
+                        api,
+                        breaker,
                         clock,
+                        sleeper,
+                        poll_interval,
                     )
                 native = _native_outcome_completion(contract)
                 if native in {
@@ -965,10 +1008,15 @@ def _run_procontract(
                         native_execution,
                         usage,
                         actions,
+                        messages,
                         issue,
                         native,
+                        api,
+                        breaker,
                         clock,
                         quiet,
+                        sleeper,
+                        poll_interval,
                     )
                 if contract["status"] == "discharged":
                     return _resume_discharged(
@@ -3449,6 +3497,180 @@ def _pending_revision_quiet(payload: Mapping[str, object]) -> Mapping[str, objec
     }
 
 
+def _messages_have_terminal_usage(messages: Mapping[str, object], execution: Mapping[str, object]) -> bool:
+    data = messages.get("data")
+    if not isinstance(data, list):
+        return False
+    assistants = [message for message in data if isinstance(message, Mapping) and message.get("type") == "assistant"]
+    if not assistants:
+        return execution.get("turnsUsed") == 0 and execution.get("actionsUsed") == 0
+    for message in assistants:
+        if not isinstance(message.get("finish"), str) or not isinstance(message.get("tokens"), Mapping):
+            return False
+        content = message.get("content")
+        if not isinstance(content, list):
+            return False
+        if any(
+            not isinstance(part.get("state"), Mapping) or part["state"].get("status") not in {"completed", "error"}
+            for part in content
+            if isinstance(part, Mapping) and part.get("type") == "tool"
+        ):
+            return False
+    return True
+
+
+def _settle_native_outcome(
+    job: JobLease,
+    state: JobState,
+    workspace: DockerWorkspace,
+    payload: Mapping[str, object],
+    contract: Mapping[str, object],
+    execution: Mapping[str, object],
+    usage: UsageSummary,
+    actions: int,
+    messages: Mapping[str, object],
+    api: ProContractApi,
+    breaker: CircuitBreaker,
+    sleeper: Callable[[float], None],
+    poll_interval: float,
+) -> tuple[Mapping[str, object], UsageSummary, int, bool, bool]:
+    current_execution = execution
+    current_usage = usage
+    current_actions = actions
+    current_messages = messages
+    messages_session_id = str(execution["sessionID"])
+    interrupt_path = job.job.root / "procontract-interrupt.json"
+    settled = False
+    for attempt in range(MAX_MUTATION_ATTEMPTS):
+        try:
+            found_execution = api.get_execution(str(payload["id"]))
+            if found_execution is not None:
+                current_execution = _validate_execution(found_execution, payload, int(contract["revision"]))
+        except ProContractConflictError:
+            raise
+        except ProContractError:
+            pass
+        terminal = False
+        try:
+            projected = _sanitize_control(
+                api.messages(str(current_execution["sessionID"])),
+                _all_credential_names(workspace.manifest.credential_env),
+            )
+            if not isinstance(projected, Mapping):
+                raise ProContractError("native outcome Session messages are invalid")
+            terminal = _messages_have_terminal_usage(projected, current_execution)
+            if terminal:
+                next_usage = _summarize_usage(projected)
+                next_actions = max(_actions(projected), int(current_execution["actionsUsed"]))
+                _require_monotonic(
+                    current_usage,
+                    next_usage,
+                    current_actions,
+                    next_actions,
+                    current_messages,
+                    projected,
+                )
+                current_usage, current_actions, current_messages = next_usage, next_actions, projected
+                messages_session_id = str(current_execution["sessionID"])
+        except (VanillaError, UsageParseError):
+            terminal = False
+            pass
+        try:
+            active = api.status(str(current_execution["sessionID"])) != "idle"
+        except ProContractError:
+            active = True
+        if active and not interrupt_path.exists():
+            _write_json(
+                interrupt_path,
+                {"version": 1, "sessionID": current_execution["sessionID"], "attempted": True},
+            )
+            try:
+                api.interrupt(str(current_execution["sessionID"]))
+            except ProContractError:
+                pass
+        if not active and terminal:
+            settled = True
+            break
+        if attempt + 1 < MAX_MUTATION_ATTEMPTS:
+            sleeper(poll_interval)
+    if not settled and workspace.lease._handle_active:
+        workspace.stop_for_freeze()
+    if not settled:
+        try:
+            projected = _sanitize_control(
+                api.messages(str(current_execution["sessionID"])),
+                _all_credential_names(workspace.manifest.credential_env),
+            )
+            if isinstance(projected, Mapping) and _messages_have_terminal_usage(projected, current_execution):
+                next_usage = _summarize_usage(projected)
+                next_actions = max(_actions(projected), int(current_execution["actionsUsed"]))
+                _require_monotonic(
+                    current_usage,
+                    next_usage,
+                    current_actions,
+                    next_actions,
+                    current_messages,
+                    projected,
+                )
+                current_usage = next_usage
+                current_actions = next_actions
+                current_messages = projected
+                messages_session_id = str(current_execution["sessionID"])
+                settled = True
+        except (VanillaError, UsageParseError):
+            pass
+    try:
+        found_execution = api.get_execution(str(payload["id"]))
+        if found_execution is not None:
+            current_execution = _validate_execution(found_execution, payload, int(contract["revision"]))
+    except ProContractConflictError:
+        raise
+    except ProContractError:
+        pass
+    if str(current_execution["sessionID"]) != messages_session_id:
+        try:
+            projected = _sanitize_control(
+                api.messages(str(current_execution["sessionID"])),
+                _all_credential_names(workspace.manifest.credential_env),
+            )
+            if not isinstance(projected, Mapping) or not _messages_have_terminal_usage(projected, current_execution):
+                raise ProContractError("rotated native outcome Session messages are incomplete")
+            next_usage = _summarize_usage(projected)
+            next_actions = max(_actions(projected), int(current_execution["actionsUsed"]))
+            _require_monotonic(
+                current_usage,
+                next_usage,
+                current_actions,
+                next_actions,
+                current_messages,
+                projected,
+            )
+            current_usage, current_actions, current_messages = next_usage, next_actions, projected
+            messages_session_id = str(current_execution["sessionID"])
+        except (VanillaError, UsageParseError):
+            settled = False
+    if not settled and workspace.lease._handle_active:
+        workspace.stop_for_freeze()
+    if settled:
+        _write_contract_progress(
+            job.job.root / "procontract-progress.json",
+            state.generation + 1,
+            payload,
+            current_execution,
+            current_messages,
+            max(current_usage.provider_turns, int(current_execution["turnsUsed"])),
+            current_actions,
+            current_usage,
+        )
+    _observe_terminal_usage(
+        breaker,
+        workspace.manifest.job_id,
+        state.generation + 1,
+        current_usage,
+    )
+    return current_execution, current_usage, current_actions, interrupt_path.exists(), not settled
+
+
 def _finish_pending_revision(
     job: JobLease,
     state_store: StateStore,
@@ -3460,10 +3682,30 @@ def _finish_pending_revision(
     execution: Mapping[str, object],
     usage: UsageSummary,
     actions: int,
+    messages: Mapping[str, object],
     issue: Mapping[str, object],
+    api: ProContractApi,
+    breaker: CircuitBreaker,
     clock: Callable[[], float],
+    sleeper: Callable[[float], None],
+    poll_interval: float,
 ) -> ProContractResult:
     quiet = _pending_revision_quiet(payload)
+    execution, usage, actions, interrupted, usage_incomplete = _settle_native_outcome(
+        job,
+        state,
+        workspace,
+        payload,
+        contract,
+        execution,
+        usage,
+        actions,
+        messages,
+        api,
+        breaker,
+        sleeper,
+        poll_interval,
+    )
     _write_or_verify_json(
         job.job.root / "procontract-native-result.json",
         _sanitize_control(
@@ -3488,6 +3730,8 @@ def _finish_pending_revision(
         "native pending revision preserved",
         clock,
         quiet=quiet,
+        interrupt_attempted=interrupted,
+        usage_incomplete=usage_incomplete,
     )
 
 
@@ -3502,11 +3746,35 @@ def _finish_native_state(
     execution: Mapping[str, object],
     usage: UsageSummary,
     actions: int,
+    messages: Mapping[str, object],
     issue: Mapping[str, object],
     completion: ProContractCompletion,
+    api: ProContractApi,
+    breaker: CircuitBreaker,
     clock: Callable[[], float],
     quiet: Mapping[str, object],
+    sleeper: Callable[[float], None],
+    poll_interval: float,
 ) -> ProContractResult:
+    execution, usage, actions, interrupted, usage_incomplete = _settle_native_outcome(
+        job,
+        state,
+        workspace,
+        payload,
+        contract,
+        execution,
+        usage,
+        actions,
+        messages,
+        api,
+        breaker,
+        sleeper,
+        poll_interval,
+    )
+    try:
+        quiet = _validate_quiet(api.quiet(str(payload["scope"])), payload)
+    except ProContractError:
+        pass
     _write_or_verify_json(
         job.job.root / "procontract-native-result.json",
         _sanitize_control(
@@ -3531,6 +3799,8 @@ def _finish_native_state(
         f"native Contract status preserved: {completion.value}",
         clock,
         quiet=quiet,
+        interrupt_attempted=interrupted,
+        usage_incomplete=usage_incomplete,
     )
 
 
@@ -3552,6 +3822,7 @@ def _finish_without_delivery(
     *,
     quiet: Mapping[str, object] | None = None,
     interrupt_attempted: bool = False,
+    usage_incomplete: bool = False,
 ) -> ProContractResult:
     if workspace.lease._handle_active:
         workspace.stop_for_freeze()
@@ -3598,6 +3869,7 @@ def _finish_without_delivery(
         stopped=True,
         error=error,
         interrupt_attempted=interrupt_attempted,
+        usage_incomplete=usage_incomplete,
     )
     if result.pending_revision is not None:
         sanitized_pending = _sanitize_control(
@@ -3628,7 +3900,7 @@ def _finish_without_delivery(
         else "failed",
         command_identity=command_identity,
         expected_generation=state.generation,
-        provider_turns=max(state.provider_turns, int(effective_execution.get("turnsUsed", 0))),
+        provider_turns=max(state.provider_turns, usage.provider_turns, int(effective_execution.get("turnsUsed", 0))),
         actions=max(state.actions, actions, int(effective_execution.get("actionsUsed", 0))),
         cost=max(state.cost, float(usage.cost)),
         exit_class=result.exit_class,
@@ -3723,6 +3995,7 @@ def _result(
     error: str | None = None,
     interrupt_attempted: bool = False,
     quiet_unconfirmed: bool = False,
+    usage_incomplete: bool = False,
 ) -> ProContractResult:
     started = issue["startedAt"]
     return ProContractResult(
@@ -3756,6 +4029,12 @@ def _result(
         pending_revision=dict(contract["pendingRevision"])
         if isinstance(contract.get("pendingRevision"), Mapping)
         else None,
+        usage_incomplete=usage_incomplete,
+        input_tokens=usage.input,
+        output_tokens=usage.output,
+        reasoning_tokens=usage.reasoning,
+        cache_read=usage.cache_read,
+        cache_write=usage.cache_write,
     )
 
 
