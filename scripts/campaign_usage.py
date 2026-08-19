@@ -402,7 +402,6 @@ class CircuitBreaker:
             was_terminal = previous[2] if previous is not None else False
             is_terminal = was_terminal or terminal
             self._jobs[resolved_job] = (resolved_generation, resolved_usage, is_terminal)
-            self._soft_acknowledged = False
             if is_terminal and not was_terminal:
                 self._terminal_sequence.append(resolved_job)
                 self._cache_acknowledged = False
@@ -463,25 +462,35 @@ class CircuitBreaker:
     def observe_provider_error(self, status_code: int, **kwargs: object) -> None:
         self.observe_error(status_code, **kwargs)
 
-    def acknowledge(self) -> None:
+    def acknowledge(self, reason: str | None = None) -> None:
         with self._lock:
+            if reason == "soft":
+                self._pause_causes.discard("soft")
+                self._soft_acknowledged = True
+                return
+            if reason == "cache":
+                self._pause_causes.discard("cache")
+                self._cache_acknowledged = True
+                return
+            if reason == "auth":
+                self._pause_causes.discard("auth")
+                return
+            if reason == "hard":
+                return
+            if reason is not None:
+                raise UsageParseError("unknown acknowledgement reason")
             self._pause_causes.difference_update({"auth", "cache", "soft"})
             self._cache_acknowledged = True
             self._soft_acknowledged = True
 
     def acknowledge_cache(self) -> None:
-        with self._lock:
-            self._pause_causes.discard("cache")
-            self._cache_acknowledged = True
+        self.acknowledge("cache")
 
     def acknowledge_auth(self) -> None:
-        with self._lock:
-            self._pause_causes.discard("auth")
+        self.acknowledge("auth")
 
     def acknowledge_soft_cap(self) -> None:
-        with self._lock:
-            self._pause_causes.discard("soft")
-            self._soft_acknowledged = True
+        self.acknowledge("soft")
 
     def acknowledge_hard_cap(self) -> None:
         return
@@ -498,7 +507,7 @@ class CircuitBreaker:
                 "retry_after_max": self._retry_after_max,
                 "cache_failures": self._cache_failures,
                 "cache_acknowledged": self._cache_acknowledged,
-                "soft_acknowledged": self._soft_acknowledged,
+                "soft_cap_acknowledged": self._soft_acknowledged,
                 "pause_causes": sorted(self._pause_causes),
                 "terminal_sequence": list(self._terminal_sequence),
                 "backoff_until": self._backoff_until,
@@ -533,7 +542,7 @@ class CircuitBreaker:
                 "retry_after_max",
                 "cache_failures",
                 "cache_acknowledged",
-                "soft_acknowledged",
+                "soft_cap_acknowledged",
                 "pause_causes",
                 "terminal_sequence",
                 "backoff_until",
@@ -608,13 +617,13 @@ class CircuitBreaker:
             raise UsageParseError("terminal sequence does not match jobs")
         if type(raw["cache_acknowledged"]) is not bool:
             raise UsageParseError("invalid cache acknowledgement")
-        if type(raw["soft_acknowledged"]) is not bool:
+        if type(raw["soft_cap_acknowledged"]) is not bool:
             raise UsageParseError("invalid soft-cap acknowledgement")
         with breaker._lock:
             persisted_cache_failures = raw["cache_failures"]
             breaker._cache_failures = persisted_cache_failures
             breaker._cache_acknowledged = raw["cache_acknowledged"]
-            breaker._soft_acknowledged = raw["soft_acknowledged"]
+            breaker._soft_acknowledged = raw["soft_cap_acknowledged"]
             breaker._pause_causes = set(causes)
             breaker._backoff_until = backoff
             breaker._campaign_usage = campaign
@@ -625,6 +634,13 @@ class CircuitBreaker:
             if expected_usage != campaign or expected_cache_failures != persisted_cache_failures:
                 raise UsageParseError("breaker snapshot derived state is inconsistent")
             breaker._cache_failures = persisted_cache_failures
+            breaker._apply_cost_caps()
+            if {cause for cause in serialized_causes if cause in {"soft", "hard"}} != {
+                cause for cause in breaker._pause_causes if cause in {"soft", "hard"}
+            }:
+                raise UsageParseError("cost pause causes are inconsistent with totals")
+            if breaker._soft_acknowledged != raw["soft_cap_acknowledged"]:
+                raise UsageParseError("soft-cap acknowledgement is inconsistent with totals")
             if breaker._cache_acknowledged and "cache" in serialized_causes:
                 raise UsageParseError("acknowledged cache pause is inconsistent")
             if (
@@ -674,10 +690,20 @@ class CircuitBreaker:
 
     def _apply_cost_caps(self) -> None:
         cost = self._campaign_usage.cost
-        if self.hard_cost_cap is not None and cost >= self.hard_cost_cap:
+        if "hard" in self._pause_causes or self.hard_cost_cap is not None and cost >= self.hard_cost_cap:
             self._pause_causes.add("hard")
-        elif self.soft_cost_cap is not None and cost >= self.soft_cost_cap and not self._soft_acknowledged:
-            self._pause_causes.add("soft")
+            self._pause_causes.discard("soft")
+            self._soft_acknowledged = False
+            return
+        if self.soft_cost_cap is None or cost < self.soft_cost_cap:
+            self._pause_causes.discard("soft")
+            self._soft_acknowledged = False
+            return
+        # An explicit soft-cap acknowledgement remains valid while cost stays below hard cap.
+        if self._soft_acknowledged:
+            self._pause_causes.discard("soft")
+            return
+        self._pause_causes.add("soft")
 
 
 def _load_json(payload: Mapping[str, object] | bytes | str) -> object:

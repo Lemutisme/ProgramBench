@@ -408,6 +408,47 @@ def test_upstream_info_rejects_flat_type_discriminator() -> None:
         summarize_usage({"data": [{"info": info, "parts": []}]})
 
 
+def test_soft_acknowledgement_persists_across_reload_and_later_growth() -> None:
+    breaker = CircuitBreaker(soft_cost_cap="1", hard_cost_cap="5")
+    breaker.observe("job", 1, usage(turns=1, cost="1"))
+    breaker.acknowledge("soft")
+    restored = CircuitBreaker.from_snapshot(breaker.snapshot())
+    assert restored.admission_allowed
+    restored.observe("job", 2, usage(turns=2, cost="2"))
+    assert restored.admission_allowed
+    assert restored.snapshot()["soft_cap_acknowledged"] is True
+
+
+def test_soft_pause_clears_when_replacement_total_drops_below_cap_and_roundtrips() -> None:
+    breaker = CircuitBreaker(soft_cost_cap="1", hard_cost_cap="5")
+    breaker.observe("job", 1, usage(turns=1, cost="1"))
+    assert breaker.paused
+    breaker.observe("job", 2, usage(turns=1, cost="0.5"))
+    assert breaker.admission_allowed
+    assert CircuitBreaker.from_snapshot(breaker.snapshot()).admission_allowed
+
+
+def test_soft_only_snapshot_above_cap_requires_cause_or_acknowledgement() -> None:
+    breaker = CircuitBreaker(soft_cost_cap="1")
+    breaker.observe("job", 1, usage(turns=1, cost="1"))
+    corrupt = breaker.snapshot()
+    corrupt["pause_causes"] = []
+    corrupt["soft_cap_acknowledged"] = False
+    with pytest.raises(UsageParseError):
+        CircuitBreaker.from_snapshot(corrupt)
+
+
+def test_hard_cap_supersedes_soft_and_remains_after_lower_replacement() -> None:
+    breaker = CircuitBreaker(soft_cost_cap="1", hard_cost_cap="2")
+    breaker.observe("job", 1, usage(turns=1, cost="2"))
+    assert breaker.snapshot()["pause_causes"] == ["hard"]
+    breaker.acknowledge("soft")
+    breaker.acknowledge("hard")
+    breaker.observe("job", 2, usage(turns=1, cost="0.5"))
+    assert breaker.hard_stopped
+    assert breaker.snapshot()["pause_causes"] == ["hard"]
+
+
 def test_acknowledged_recoverable_pause_round_trips_without_derived_drift() -> None:
     breaker = CircuitBreaker(soft_cost_cap="1")
     breaker.observe("job", 1, usage(turns=1, cost="1"))
