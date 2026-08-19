@@ -83,7 +83,7 @@ _CONTAINER_CONFIG_TEMPLATE = "\n".join(
 )
 _MOUNTS_TEMPLATE = "{{json .Mounts}}"
 _PORTS_TEMPLATE = "{{json .NetworkSettings.Ports}}"
-_STATE_TEMPLATE = "{{json .State.Running}}"
+_STATE_TEMPLATE = "\n".join(("{{json .State.Running}}", "{{json .State.ExitCode}}"))
 _IDENTITY_LABEL_NAMES = (
     "programbench.campaign",
     "programbench.job",
@@ -216,6 +216,7 @@ class WorkspaceManifest:
     xdg_config_home: str
     xdg_data_home: str
     candidate_mutable: bool
+    exit_code: int | None
     port: int | None
     phase: str
 
@@ -248,10 +249,16 @@ class WorkspaceManifest:
             raise WorkspaceError("workspace port is invalid")
         if type(self.candidate_mutable) is not bool:
             raise WorkspaceError("candidate_mutable must be bool")
+        if self.exit_code is not None and (type(self.exit_code) is not int or self.exit_code < 0):
+            raise WorkspaceError("workspace exit code must be a nonnegative integer")
         if self.phase in {"planned", "preparing", "candidate_ready"} and self.candidate_mutable:
             raise WorkspaceError("pre-execution candidate cannot be mutable")
         if self.phase in {"running", "stopped"} and not self.candidate_mutable:
             raise WorkspaceError("post-execution candidate must be mutable")
+        if self.phase == "stopped" and self.exit_code is None:
+            raise WorkspaceError("stopped workspace requires an exit code")
+        if self.phase != "stopped" and self.exit_code is not None:
+            raise WorkspaceError("only a stopped workspace may retain an exit code")
 
     def to_dict(self) -> dict[str, object]:
         value = {field.name: getattr(self, field.name) for field in fields(self)}
@@ -272,12 +279,12 @@ class WorkspaceManifest:
         for name in ("credential_env", "environment_names", "entrypoint", "command"):
             value[name] = list(value[name])
         value["mounts"] = [mount.to_dict() for mount in self.mounts]
-        return {"version": 4, **value}
+        return {"version": 5, **value}
 
     @classmethod
     def from_dict(cls, raw: object) -> "WorkspaceManifest":
         expected = {field.name for field in fields(cls)}
-        if not isinstance(raw, dict) or set(raw) != {"version", *expected} or raw["version"] != 4:
+        if not isinstance(raw, dict) or set(raw) != {"version", *expected} or raw["version"] != 5:
             raise WorkspaceError("workspace manifest is invalid")
         paths = {
             "job_root",
@@ -298,7 +305,7 @@ class WorkspaceManifest:
             for name in expected
             - paths
             - sequences
-            - {"container_id", "port", "container_init", "candidate_mutable", "mounts"}
+            - {"container_id", "exit_code", "port", "container_init", "candidate_mutable", "mounts"}
         ):
             raise WorkspaceError("workspace manifest has invalid fields")
         if any(not isinstance(raw[name], str) for name in paths):
@@ -312,6 +319,8 @@ class WorkspaceManifest:
             raise WorkspaceError("workspace manifest has invalid container ID")
         if raw["port"] is not None and type(raw["port"]) is not int:
             raise WorkspaceError("workspace manifest has invalid port")
+        if raw["exit_code"] is not None and type(raw["exit_code"]) is not int:
+            raise WorkspaceError("workspace manifest has invalid exit code")
         if type(raw["container_init"]) is not bool:
             raise WorkspaceError("workspace manifest has invalid init setting")
         if type(raw["candidate_mutable"]) is not bool:
@@ -406,7 +415,18 @@ class DockerWorkspace:
             if inspected is None or _running(inspected):
                 raise ContainerConflictError("owned container did not stop cleanly")
             _require_exact_container(inspected, current, check_port=True)
-        _write_manifest(self.manifest_path, replace(current, phase="stopped"))
+        container_id = inspected.get("Id")
+        if not isinstance(container_id, str) or not _CONTAINER_ID.fullmatch(container_id):
+            raise ContainerConflictError("stopped container has an invalid ID")
+        _write_manifest(
+            self.manifest_path,
+            replace(
+                current,
+                phase="stopped",
+                container_id=container_id,
+                exit_code=_exit_code(inspected),
+            ),
+        )
 
 
 def ensure_workspace(request: WorkspaceRequest) -> DockerWorkspace:
@@ -463,6 +483,13 @@ def _resume(
         _verify_candidate(runner, request.docker, manifest, publish=False)
         _cleanup_candidate_preparation(manifest)
     inspected = _inspect_container(runner, request.docker, manifest.container_name)
+    if (
+        inspected is not None
+        and not _running(inspected)
+        and manifest.candidate_mutable
+        and manifest.phase in {"running", "launching"}
+    ):
+        return _restart_observed_stopped(manifest, request, runner, probe, inspected)
     if manifest.container_id is None:
         if inspected is None:
             return _launch(manifest, request, runner, probe, adopted=False)
@@ -498,7 +525,7 @@ def _restart_stopped(
     inspected = _inspect_container(runner, request.docker, manifest.container_name)
     if inspected is None:
         raise ContainerConflictError("stopped container is missing; evidence retained")
-    _require_exact_container(inspected, manifest, check_port=True)
+    _require_exact_container(inspected, manifest, check_port=manifest.port is not None)
     container_id = inspected.get("Id")
     if not isinstance(container_id, str) or not _CONTAINER_ID.fullmatch(container_id):
         raise ContainerConflictError("stopped container has an invalid ID")
@@ -506,6 +533,7 @@ def _restart_stopped(
         manifest,
         phase="launching",
         container_id=None,
+        exit_code=None,
         port=None,
         candidate_mutable=True,
     )
@@ -519,6 +547,28 @@ def _restart_stopped(
         inspected=inspected,
         runtime_container_id=container_id,
     )
+
+
+def _restart_observed_stopped(
+    manifest: WorkspaceManifest,
+    request: WorkspaceRequest,
+    runner: _DockerRunner,
+    probe: _HealthProbe,
+    inspected: Mapping[str, object],
+) -> DockerWorkspace:
+    _require_exact_container(inspected, manifest, check_port=manifest.port is not None)
+    container_id = inspected.get("Id")
+    if not isinstance(container_id, str) or not _CONTAINER_ID.fullmatch(container_id):
+        raise ContainerConflictError("externally stopped container has an invalid ID")
+    stopped = replace(
+        manifest,
+        phase="stopped",
+        container_id=container_id,
+        exit_code=_exit_code(inspected),
+        candidate_mutable=True,
+    )
+    _write_manifest(stopped.manifest_path, stopped)
+    return _restart_stopped(stopped, request, runner, probe)
 
 
 def _launch(
@@ -615,7 +665,7 @@ def _activate(
         _write_manifest(activated.manifest_path, activated)
     _wait_health(activated, probe, request.health_timeout)
     _require_binary(activated)
-    ready = replace(activated, phase="running", candidate_mutable=True)
+    ready = replace(activated, phase="running", candidate_mutable=True, exit_code=None)
     _write_manifest(ready.manifest_path, ready)
     return DockerWorkspace(ready, ready.manifest_path, request.docker, runner, probe, request.health_timeout, adopted)
 
@@ -672,6 +722,7 @@ def _expected_manifest(
         xdg_config_home=_FIXED_ENV["XDG_CONFIG_HOME"],
         xdg_data_home=_FIXED_ENV["XDG_DATA_HOME"],
         candidate_mutable=False,
+        exit_code=None,
         port=None,
         phase="planned",
     )
@@ -994,12 +1045,12 @@ def _inspect_container(runner: _DockerRunner, docker: str, name: str) -> Mapping
         1,
         "inspect container ports",
     )[0]
-    running = _formatted_json_values(
+    state = _formatted_json_values(
         runner,
         (docker, "inspect", "--format", _STATE_TEMPLATE, name),
-        1,
+        2,
         "inspect container state",
-    )[0]
+    )
     return {
         "Id": values[0],
         "Name": values[1],
@@ -1023,7 +1074,7 @@ def _inspect_container(runner: _DockerRunner, docker: str, name: str) -> Mapping
         },
         "Mounts": mounts,
         "NetworkSettings": {"Ports": ports},
-        "State": {"Running": running},
+        "State": {"Running": state[0], "ExitCode": state[1]},
     }
 
 
@@ -1151,6 +1202,14 @@ def _running(inspected: Mapping[str, object]) -> bool:
     return isinstance(state, Mapping) and state.get("Running") is True
 
 
+def _exit_code(inspected: Mapping[str, object]) -> int:
+    state = inspected.get("State")
+    value = state.get("ExitCode") if isinstance(state, Mapping) else None
+    if type(value) is not int or value < 0:
+        raise ContainerConflictError("container exit code is invalid")
+    return value
+
+
 def _requires_cleanroom_validation(manifest: WorkspaceManifest) -> bool:
     return manifest.phase in _CLEANROOM_PHASES and not manifest.candidate_mutable
 
@@ -1166,7 +1225,7 @@ def _static_identity(manifest: WorkspaceManifest) -> dict[str, object]:
     return {
         key: value
         for key, value in manifest.to_dict().items()
-        if key not in {"container_id", "port", "phase", "candidate_mutable"}
+        if key not in {"container_id", "exit_code", "port", "phase", "candidate_mutable"}
     }
 
 

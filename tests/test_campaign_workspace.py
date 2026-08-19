@@ -129,7 +129,7 @@ class RecordingDocker:
                 "Name": f"/{name}",
                 "Image": self.image_digest,
                 "Platform": "linux",
-                "State": {"Running": False},
+                "State": {"Running": False, "ExitCode": 0},
                 "Mounts": mounts,
                 "Config": {
                     "Image": "example/task:task_cleanroom",
@@ -154,7 +154,7 @@ class RecordingDocker:
             container = self.containers[command[-1]]
             state = Path(next(mount["Source"] for mount in container["Mounts"] if mount["Destination"] == "/state"))
             self.start_manifests.append(json.loads((state.parent / "workspace.json").read_text()))
-            container["State"] = {"Running": True}
+            container["State"] = {"Running": True, "ExitCode": 0}
             container["NetworkSettings"] = {
                 "Ports": {"4096/tcp": [{"HostIp": "127.0.0.1", "HostPort": str(self.next_port)}]}
             }
@@ -201,12 +201,15 @@ class RecordingDocker:
             if template == campaign_workspace._PORTS_TEMPLATE:
                 return json.dumps(container["NetworkSettings"]["Ports"])
             if template == campaign_workspace._STATE_TEMPLATE:
-                return json.dumps(container["State"]["Running"])
+                return "\n".join(
+                    json.dumps(value)
+                    for value in (container["State"]["Running"], container["State"].get("ExitCode", 0))
+                )
             raise AssertionError(command)
         if command[1] == "port":
             return f"127.0.0.1:{self.next_port}\n"
         if command[1] == "stop":
-            self.containers[command[-1]]["State"] = {"Running": False}
+            self.containers[command[-1]]["State"] = {"Running": False, "ExitCode": 0}
             return ""
         raise AssertionError(command)
 
@@ -459,6 +462,44 @@ def test_stopped_restart_health_failure_persists_truthful_launch(tmp_path: Path)
 
     assert resumed.adopted
     assert resumed.port == 48125
+    assert sum(command[1] == "create" for command in docker.commands) == 1
+
+
+def test_external_stop_is_journaled_before_crash_safe_restart(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    docker = FaultDocker("disabled")
+    value = request(tmp_path, docker)
+    workspace = ensure_workspace(value)
+    docker.containers[workspace.container_id]["State"] = {"Running": False, "ExitCode": 137}
+    docker.next_port = 48126
+    docker.fault = "start"
+    docker.faulted = False
+    writes: list[dict[str, object]] = []
+    write = campaign_workspace._write_manifest
+
+    def write_manifest(path: Path, manifest) -> None:
+        write(path, manifest)
+        writes.append(manifest.to_dict())
+
+    monkeypatch.setattr(campaign_workspace, "_write_manifest", write_manifest)
+    with pytest.raises(DockerCommandError):
+        ensure_workspace(value)
+
+    stopped = next(item for item in writes if item["phase"] == "stopped")
+    launching = next(item for item in writes if item["phase"] == "launching")
+    assert stopped["container_id"] == workspace.container_id
+    assert stopped["port"] == workspace.port
+    assert stopped["exit_code"] == 137
+    assert launching["container_id"] is None
+    assert launching["port"] is None
+    assert launching["exit_code"] is None
+    assert docker.start_manifests[-1] == launching
+    assert json.loads(workspace.manifest_path.read_text())["phase"] == "launching"
+
+    resumed = ensure_workspace(value)
+
+    assert resumed.adopted
+    assert resumed.container_id == workspace.container_id
+    assert resumed.port == 48126
     assert sum(command[1] == "create" for command in docker.commands) == 1
 
 
