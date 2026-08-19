@@ -581,6 +581,215 @@ def test_persistent_hard_cost_stop_forces_registered_active_jobs():
     assert result.pending == ()
 
 
+def test_noncooperative_hard_stop_persists_before_force_callback_and_restart_admission(tmp_path: Path):
+    from scripts.campaign_runner import CampaignShutdownError, run_campaign
+    from scripts.campaign_usage import TurnUsage, UsageSummary
+
+    breaker = CircuitBreaker(hard_cost_cap="1")
+    path = tmp_path / "breaker.json"
+    observed = []
+    turn = TurnUsage(input=1, prompt_total=1, cost=Decimal("1"))
+    usage = UsageSummary(
+        provider_turns=1,
+        input=1,
+        prompt_total=1,
+        turns_without_cache=1,
+        max_prompt_total=1,
+        cost=Decimal("1"),
+        turns=(turn,),
+    )
+
+    def execute(candidate, stop):
+        stop.registry.register(
+            candidate,
+            force_stop=lambda: observed.append(CircuitBreaker.from_snapshot(json.loads(path.read_text())).hard_stopped),
+            terminalize=lambda: True,
+        )
+        breaker.observe(candidate.key, 0, usage)
+        while True:
+            time.sleep(1)
+
+    with pytest.raises(CampaignShutdownError):
+        run_campaign((job(0),), workers=1, breaker=breaker, state_path=path, execute=execute, interrupt_timeout=0.01)
+
+    restored = CircuitBreaker.from_snapshot(json.loads(path.read_text()))
+    assert observed == [True]
+    assert restored.hard_stopped
+    assert not restored.admission_allowed
+
+
+@pytest.mark.parametrize("kind", ["auth", "cache", "soft"])
+def test_global_pause_persists_before_active_worker_completion(tmp_path: Path, kind: str):
+    from scripts.campaign_runner import run_campaign
+    from scripts.campaign_usage import TurnUsage, UsageSummary
+
+    breaker = {
+        "auth": CircuitBreaker(),
+        "cache": CircuitBreaker(cache_warmup_turns=0, consecutive_failures=1),
+        "soft": CircuitBreaker(soft_cost_cap="1", hard_cost_cap="2"),
+    }[kind]
+    path = tmp_path / "breaker.json"
+    changed = threading.Event()
+    release = threading.Event()
+    turn = TurnUsage(input=1, prompt_total=1, cost=Decimal("1" if kind == "soft" else "0"))
+    usage = UsageSummary(
+        provider_turns=1,
+        input=1,
+        prompt_total=1,
+        turns_without_cache=1,
+        max_prompt_total=1,
+        cost=turn.cost,
+        turns=(turn,),
+    )
+
+    def execute(candidate, _stop):
+        if kind == "auth":
+            breaker.observe_error(401)
+        else:
+            breaker.observe(candidate.key, 0, usage)
+        changed.set()
+        assert release.wait(1)
+
+    thread = threading.Thread(
+        target=lambda: run_campaign((job(0),), breaker=breaker, state_path=path, execute=execute),
+        daemon=True,
+    )
+    thread.start()
+    try:
+        assert changed.wait(1)
+        deadline = time.monotonic() + 0.3
+        while not path.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert path.is_file()
+        assert CircuitBreaker.from_snapshot(json.loads(path.read_text())).paused
+    finally:
+        release.set()
+        thread.join(1)
+
+
+def test_external_interrupt_persists_breaker_before_active_worker_drain(tmp_path: Path):
+    from scripts.campaign_runner import run_campaign
+
+    path = tmp_path / "breaker.json"
+    stop = threading.Event()
+    started = threading.Event()
+    release = threading.Event()
+
+    def execute(_candidate, _stop):
+        started.set()
+        assert release.wait(1)
+
+    thread = threading.Thread(
+        target=lambda: run_campaign((job(0),), state_path=path, stop_event=stop, execute=execute, interrupt_timeout=1),
+        daemon=True,
+    )
+    thread.start()
+    try:
+        assert started.wait(1)
+        stop.set()
+        deadline = time.monotonic() + 0.3
+        while not path.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert path.is_file()
+        CircuitBreaker.from_snapshot(json.loads(path.read_text()))
+    finally:
+        release.set()
+        thread.join(1)
+
+
+def test_breaker_persistence_failure_forces_cleanup_and_exposes_recovery_evidence(tmp_path: Path, monkeypatch):
+    from scripts import campaign_runner
+    from scripts.campaign_usage import TurnUsage, UsageSummary
+
+    breaker = CircuitBreaker(hard_cost_cap="1")
+    path = tmp_path / "breaker.json"
+    forced = threading.Event()
+    release = threading.Event()
+    turn = TurnUsage(input=1, prompt_total=1, cost=Decimal("1"))
+    usage = UsageSummary(
+        provider_turns=1,
+        input=1,
+        prompt_total=1,
+        turns_without_cache=1,
+        max_prompt_total=1,
+        cost=Decimal("1"),
+        turns=(turn,),
+    )
+
+    def execute(candidate, stop):
+        stop.registry.register(
+            candidate,
+            force_stop=lambda: (forced.set(), release.set()),
+            terminalize=lambda: True,
+        )
+        breaker.observe(candidate.key, 0, usage)
+        assert release.wait(1)
+
+    monkeypatch.setattr(campaign_runner, "_atomic_json", lambda *_: (_ for _ in ()).throw(OSError("disk full")))
+    with pytest.raises(campaign_runner.CampaignDurabilityError) as raised:
+        campaign_runner.run_campaign(
+            (job(0),),
+            workers=1,
+            breaker=breaker,
+            state_path=path,
+            execute=execute,
+            interrupt_timeout=0.01,
+        )
+
+    assert forced.is_set()
+    assert raised.value.recovery_path.is_file()
+    assert CircuitBreaker.from_snapshot(json.loads(raised.value.recovery_path.read_text())).hard_stopped
+    raised.value.recovery_path.unlink()
+
+
+def test_secondary_recovery_failure_still_forces_cleanup_and_keeps_in_memory_evidence(tmp_path: Path, monkeypatch):
+    from scripts import campaign_runner
+    from scripts.campaign_usage import TurnUsage, UsageSummary
+
+    breaker = CircuitBreaker(hard_cost_cap="1")
+    forced = threading.Event()
+    release = threading.Event()
+    turn = TurnUsage(input=1, prompt_total=1, cost=Decimal("1"))
+    usage = UsageSummary(
+        provider_turns=1,
+        input=1,
+        prompt_total=1,
+        turns_without_cache=1,
+        max_prompt_total=1,
+        cost=Decimal("1"),
+        turns=(turn,),
+    )
+
+    def execute(candidate, stop):
+        stop.registry.register(
+            candidate,
+            force_stop=lambda: (forced.set(), release.set()),
+            terminalize=lambda: True,
+        )
+        breaker.observe(candidate.key, 0, usage)
+        assert release.wait(1)
+
+    monkeypatch.setattr(campaign_runner, "_atomic_json", lambda *_: (_ for _ in ()).throw(OSError("disk full")))
+    monkeypatch.setattr(
+        campaign_runner,
+        "_breaker_recovery",
+        lambda *_: (_ for _ in ()).throw(OSError("recovery disk full")),
+    )
+    with pytest.raises(campaign_runner.CampaignDurabilityError) as raised:
+        campaign_runner.run_campaign(
+            (job(0),),
+            workers=1,
+            breaker=breaker,
+            state_path=tmp_path / "breaker.json",
+            execute=execute,
+            interrupt_timeout=0.01,
+        )
+
+    assert forced.is_set()
+    assert raised.value.recovery_path is None
+    assert CircuitBreaker.from_snapshot(raised.value.recovery_snapshot).hard_stopped
+
+
 def test_keyboard_interrupt_raises_when_worker_ignores_stop_until_released():
     from scripts.campaign_runner import CampaignShutdownError, run_campaign
 
@@ -1569,8 +1778,10 @@ def test_fake_paired_campaign_pause_and_interrupt_drain_real_active_job_paths(tm
         assert state.exit_class == "campaign_stop"
 
 
-@pytest.mark.parametrize("outcome", ["paused", "interrupted", "fatal"])
-def test_cli_returns_nonzero_for_paused_interrupted_and_fatal_campaigns(tmp_path: Path, monkeypatch, outcome: str):
+@pytest.mark.parametrize("outcome", ["paused", "interrupted", "fatal", "durability"])
+def test_cli_returns_nonzero_for_paused_interrupted_and_fatal_campaigns(
+    tmp_path: Path, monkeypatch, capsys, outcome: str
+):
     from scripts import campaign_runner
     from scripts.run_opencode import load_config
 
@@ -1589,6 +1800,14 @@ def test_cli_returns_nonzero_for_paused_interrupted_and_fatal_campaigns(tmp_path
     def run(*_args, **_kwargs):
         if outcome == "fatal":
             raise campaign_runner.CampaignShutdownError("noncooperative worker")
+        if outcome == "durability":
+            recovery = tmp_path / "breaker-recovery.json"
+            recovery.write_text("{}")
+            raise campaign_runner.CampaignDurabilityError(
+                plan.output / "breaker.json",
+                recovery,
+                CircuitBreaker().snapshot(),
+            )
         return campaign_runner.CampaignResult(
             0,
             0,
@@ -1602,6 +1821,8 @@ def test_cli_returns_nonzero_for_paused_interrupted_and_fatal_campaigns(tmp_path
     monkeypatch.setattr(campaign_runner, "run_campaign", run)
 
     assert campaign_runner.main(["--config", str(config_path), "--output", str(plan.output)]) == 1
+    if outcome == "durability":
+        assert str(tmp_path / "breaker-recovery.json") in capsys.readouterr().err
 
 
 def _config(repo: Path) -> str:

@@ -55,6 +55,22 @@ class CampaignShutdownError(CampaignError):
     """Raised when a worker ignores a bounded campaign shutdown request."""
 
 
+class CampaignDurabilityError(CampaignShutdownError):
+    """Raised after shutdown when required breaker persistence failed."""
+
+    def __init__(
+        self,
+        path: Path,
+        recovery_path: Path | None,
+        recovery_snapshot: Mapping[str, object],
+    ) -> None:
+        self.path = path
+        self.recovery_path = recovery_path
+        self.recovery_snapshot = recovery_snapshot
+        evidence = str(recovery_path) if recovery_path is not None else "attached in-memory breaker snapshot"
+        super().__init__(f"campaign breaker persistence failed; recovery evidence: {evidence}")
+
+
 @dataclass(frozen=True)
 class CampaignJob:
     instance_id: str
@@ -208,7 +224,7 @@ def plan_campaign(
                     breaker.acknowledge()
                 else:
                     breaker.acknowledge(acknowledge)
-                _persist_breaker(breaker_path, breaker)
+                _persist_breaker_required(breaker_path, breaker, None)
             if breaker.paused:
                 raise CampaignPausedError(
                     f"campaign is paused ({breaker.pause_reason}); acknowledge it through the persisted breaker state before --resume"
@@ -289,10 +305,34 @@ def run_campaign(
     paused = False
     shutdown_failed = False
     force_failures: tuple[object, ...] = ()
+    persisted_breaker: Mapping[str, object] | None = None
+    durability_error: CampaignDurabilityError | None = None
+
+    def persist_breaker() -> bool:
+        nonlocal durability_error, interrupted, persisted_breaker
+        if durability_error is not None:
+            return False
+        try:
+            persisted_breaker = _persist_breaker_required(state_path, breaker, persisted_breaker)
+            return True
+        except CampaignDurabilityError as error:
+            durability_error = error
+            interrupted = True
+            stop.set("breaker_persistence_failed")
+            pending.clear()
+            return False
+
+    if interrupted:
+        persist_breaker()
+
     try:
         while pending or running:
+            if (stop.is_set() or not breaker.admission_allowed) and not persist_breaker():
+                break
             if pending and not running and not stop.is_set() and not breaker.admission_allowed:
                 admission = _wait_for_admission(breaker, stop, clock, sleeper)
+                if not persist_breaker():
+                    break
                 if admission == "interrupted":
                     interrupted = True
                     pending.clear()
@@ -307,6 +347,8 @@ def run_campaign(
             if not running:
                 break
             done, _ = wait(tuple(running), timeout=0.1, return_when=FIRST_COMPLETED)
+            if (stop.is_set() or not breaker.admission_allowed) and not persist_breaker():
+                break
             for future in done:
                 candidate = running.pop(future)
                 try:
@@ -322,20 +364,27 @@ def run_campaign(
                 except BaseException:
                     failed += 1
                     _append_log(state_path, candidate, "failed")
-                _persist_breaker(state_path, breaker)
+                if not persist_breaker():
+                    break
                 print(
                     f"completed={completed} running={len(running)} pending={len(pending)} failed={failed}", flush=True
                 )
+            if durability_error is not None:
+                break
             if breaker.active_stop_reason == "campaign hard cost cap reached":
                 interrupted = True
                 stop.set("campaign_hard_stop")
                 pending.clear()
+                persist_breaker()
                 break
             if stop.is_set():
                 interrupted = True
                 pending.clear()
+                persist_breaker()
                 break
             if not breaker.admission_allowed:
+                if not persist_breaker():
+                    break
                 if running:
                     continue
                 continue
@@ -343,7 +392,7 @@ def run_campaign(
         interrupted = True
         stop.set("keyboard_interrupt")
         pending.clear()
-        _persist_breaker(state_path, breaker)
+        persist_breaker()
     finally:
         if interrupted:
             deadline = time.monotonic() + interrupt_timeout
@@ -361,7 +410,7 @@ def run_campaign(
                     except BaseException:
                         failed += 1
                         _append_log(state_path, candidate, "interrupted")
-                    _persist_breaker(state_path, breaker)
+                    persist_breaker()
             if running:
                 force_failures = stop.registry.force_stop_all(deadline=time.monotonic() + interrupt_timeout)
                 deadline = time.monotonic() + interrupt_timeout
@@ -382,11 +431,13 @@ def run_campaign(
                         except BaseException:
                             failed += 1
                         _append_log(state_path, candidate, "interrupted")
-                        _persist_breaker(state_path, breaker)
+                        persist_breaker()
             shutdown_failed = bool(running) or bool(force_failures)
             for future in running:
                 future.cancel()
         executor.shutdown(wait=not running, cancel_futures=True)
+    if durability_error is not None:
+        raise durability_error
     if shutdown_failed:
         raise CampaignShutdownError(f"campaign shutdown failed for {len(running) + len(force_failures)} active job(s)")
     return CampaignResult(completed, failed, tuple(pending), len(running), breaker.pause_reason, paused, interrupted)
@@ -612,6 +663,11 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 stop_token=stop,
             ),
         )
+    except CampaignDurabilityError as error:
+        print(str(error), file=sys.stderr, flush=True)
+        if error.recovery_path is None:
+            print(json.dumps(error.recovery_snapshot, allow_nan=False, sort_keys=True), file=sys.stderr, flush=True)
+        return 1
     except CampaignShutdownError:
         return 1
     return 0 if not (result.failed or result.paused or result.interrupted or result.pending) else 1
@@ -734,9 +790,38 @@ def _atomic_json(path: Path, value: object) -> None:
             Path(temporary).unlink(missing_ok=True)
 
 
-def _persist_breaker(path: Path | None, breaker: CircuitBreaker) -> None:
-    if path is not None:
-        _atomic_json(path, breaker.snapshot())
+def _persist_breaker_required(
+    path: Path | None,
+    breaker: CircuitBreaker,
+    previous: Mapping[str, object] | None,
+) -> Mapping[str, object]:
+    snapshot = breaker.snapshot()
+    if path is None or previous == snapshot and path.is_file():
+        return snapshot
+    try:
+        _atomic_json(path, snapshot)
+    except BaseException as error:
+        try:
+            recovery_path = _breaker_recovery(snapshot)
+        except BaseException:
+            recovery_path = None
+        raise CampaignDurabilityError(path, recovery_path, snapshot) from error
+    return snapshot
+
+
+def _breaker_recovery(snapshot: Mapping[str, object]) -> Path:
+    descriptor, name = tempfile.mkstemp(prefix="programbench-breaker-recovery-", suffix=".json")
+    path = Path(name)
+    with os.fdopen(descriptor, "w") as stream:
+        stream.write(json.dumps(snapshot, allow_nan=False, sort_keys=True, indent=2) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+    return path
 
 
 def _backoff_delay(breaker: CircuitBreaker, clock: Callable[[], float]) -> float | None:
