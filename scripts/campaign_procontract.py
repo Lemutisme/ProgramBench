@@ -223,6 +223,7 @@ class ProContractResult:
     exit_class: str
     error: str | None = None
     quiet_unconfirmed: bool = False
+    pending_revision: Mapping[str, object] | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -254,6 +255,7 @@ class ProContractResult:
             "exit_class": self.exit_class,
             "error": self.error,
             "quiet_unconfirmed": self.quiet_unconfirmed,
+            "pending_revision": dict(self.pending_revision) if self.pending_revision is not None else None,
         }
 
     @classmethod
@@ -287,7 +289,8 @@ class ProContractResult:
             "exit_class",
             "error",
         }
-        if not isinstance(raw, Mapping) or set(raw) not in (required, required | {"quiet_unconfirmed"}):
+        optional = {"quiet_unconfirmed", "pending_revision"}
+        if not isinstance(raw, Mapping) or not required <= set(raw) or set(raw) - (required | optional):
             raise ProContractError("persisted ProContract result is invalid")
         try:
             result = cls(
@@ -318,6 +321,7 @@ class ProContractResult:
                 exit_class=raw["exit_class"],
                 error=raw["error"],
                 quiet_unconfirmed=raw.get("quiet_unconfirmed", False),
+                pending_revision=raw.get("pending_revision"),
             )
         except (TypeError, ValueError, KeyError) as error:
             raise ProContractError("persisted ProContract result is invalid") from error
@@ -352,6 +356,8 @@ class ProContractResult:
                 )
             )
             or any(not isinstance(value, str) for value in result.outstanding)
+            or result.pending_revision is not None
+            and not isinstance(result.pending_revision, Mapping)
         ):
             raise ProContractError("persisted ProContract result is invalid")
         return result
@@ -888,21 +894,6 @@ def _run_procontract(
                 if _binding_identity(current_execution) != _binding_identity(bound_execution):
                     raise ProContractConflictError("native Contract execution binding changed after issue")
                 execution = current_execution
-                if contract.get("pendingRevision") is not None:
-                    return _finish_pending_revision(
-                        job,
-                        state_store,
-                        state,
-                        workspace,
-                        command_identity,
-                        payload,
-                        contract,
-                        execution,
-                        usage,
-                        actions,
-                        issue,
-                        clock,
-                    )
                 previous_usage, previous_actions, previous_messages = usage, actions, messages
                 sanitized = _sanitize_control(
                     api.messages(str(execution["sessionID"])),
@@ -943,6 +934,38 @@ def _run_procontract(
                         cost=float(usage.cost),
                     )
                 quiet = _validate_quiet(api.quiet(str(payload["scope"])), payload)
+                if contract.get("pendingRevision") is not None:
+                    if quiet["quiet"] is True or payload["id"] not in quiet["outstanding"]:
+                        latest = api.get_contract(str(payload["id"]))
+                        if latest is None:
+                            raise ProContractConflictError("pending Contract disappeared from quiet scope")
+                        latest = _validate_contract(latest, payload)
+                        native = _native_outcome_completion(latest)
+                        if native is not None and native is not ProContractCompletion.PENDING_REVISION:
+                            raise ProContractNativeOutcome(native, latest, execution)
+                        if latest.get("pendingRevision") is None:
+                            raise ProContractConflictError("pending Contract is absent from quiet outstanding set")
+                        contract = latest
+                    return _stop_and_finish(
+                        job,
+                        state_store,
+                        state,
+                        workspace,
+                        command_identity,
+                        payload,
+                        contract,
+                        execution,
+                        usage,
+                        actions,
+                        issue,
+                        api,
+                        ProContractCompletion.PENDING_REVISION,
+                        "native pending revision preserved",
+                        clock,
+                        sleeper,
+                        poll_interval,
+                        quiet,
+                    )
                 if turns > MAX_PROVIDER_TURNS or actions > MAX_ACTIONS:
                     completion = (
                         ProContractCompletion.PROVIDER_TURNS
@@ -2489,7 +2512,11 @@ def _git_snapshot_identity(export: Path) -> str | None:
     identity = tree.stdout.decode(errors="strict").strip()
     if len(identity) not in {40, 64} or any(character not in "0123456789abcdef" for character in identity):
         return None
-    if not _worktree_matches_git_tree(export, git_dir, listed.stdout):
+    try:
+        matches = _worktree_matches_git_tree(export, git_dir, listed.stdout)
+    except VanillaError:
+        return None
+    if not matches:
         return None
     return identity
 
@@ -2511,30 +2538,28 @@ def _worktree_matches_git_tree(export: Path, git_dir: Path, listing: bytes) -> b
     expected_dirs = {
         parent.as_posix() for name in expected for parent in PurePosixPath(name).parents if str(parent) != "."
     }
-    actual: set[str] = set()
-    for root, directories, files in os.walk(export, followlinks=False):
-        base = Path(root)
-        if base == export and ".git" in directories:
-            directories.remove(".git")
-        for name in [*directories, *files]:
-            relative = (base / name).relative_to(export).as_posix()
-            if relative == ".git":
-                continue
-            actual.add(relative)
-    if actual != set(expected) | expected_dirs:
+    inventory = _inventory(export, excluded=(".git",))
+    expected_hashes = {hashlib.sha256(name.encode()).hexdigest() for name in {".", *expected, *expected_dirs}}
+    if {str(item["path_sha256"]) for item in inventory} != expected_hashes:
         return False
+    observed = {str(item["path_sha256"]): item for item in inventory}
     command = ["git", f"--git-dir={git_dir}", f"--work-tree={export}", "hash-object"]
     for relative, (mode, digest) in expected.items():
         path = export / relative
         info = path.lstat()
+        item = observed[hashlib.sha256(relative.encode()).hexdigest()]
         if mode == "120000":
-            if not stat.S_ISLNK(info.st_mode):
+            if not stat.S_ISLNK(info.st_mode) or item.get("kind") != "symlink":
                 return False
             result = subprocess.run(
                 command + ["--stdin"], input=os.readlink(path).encode(), capture_output=True, check=False
             )
         else:
-            if not stat.S_ISREG(info.st_mode) or bool(info.st_mode & 0o111) != (mode == "100755"):
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or item.get("kind") != "file"
+                or bool(info.st_mode & 0o111) != (mode == "100755")
+            ):
                 return False
             result = subprocess.run(command + [str(path)], capture_output=True, check=False)
         if result.returncode != 0 or result.stdout.decode().strip() != digest:
@@ -3220,6 +3245,9 @@ def _result(
         exit_class=completion.value,
         error=error,
         quiet_unconfirmed=quiet_unconfirmed,
+        pending_revision=dict(contract["pendingRevision"])
+        if isinstance(contract.get("pendingRevision"), Mapping)
+        else None,
     )
 
 
