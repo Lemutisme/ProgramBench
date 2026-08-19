@@ -514,7 +514,7 @@ def test_prepare_install_pins_detached_worktree_and_records_auditable_binary(tmp
     assert manifest["source_dirty"] is False
     assert manifest["platform"]
     assert manifest["catalog_command"] == [str(install.binary), "models"]
-    assert bool(manifest["catalog_output_sha256"]) != bool(manifest["catalog_unavailable_reason"])
+    assert bool(manifest["full_model_catalog_output_sha256"]) != bool(manifest["full_model_catalog_unavailable_reason"])
     assert manifest["owned_paths"] == [str((tmp_path / "installs/procontract").resolve()), str(install.worktree)]
     assert manifest["publication_phase"] == "manifest_published"
 
@@ -899,6 +899,69 @@ def test_prepare_install_refuses_stale_foreign_final_worktree_registration(tmp_p
     assert not (root / ".install-state/procontract.json").exists()
 
 
+def test_reconciliation_refuses_staging_worktree_symlink_to_dirty_foreign_worktree(tmp_path: Path, monkeypatch):
+    repo, revision, _ = _fake_opencode_repo(tmp_path)
+    _fake_bun(monkeypatch, tmp_path)
+    root = tmp_path / "installs"
+    environment = os.environ.copy()
+    environment["_PROGRAMBENCH_TEST_INSTALL_CRASH_AFTER"] = "staging_metadata"
+    child = subprocess.run(
+        [
+            __import__("sys").executable,
+            "-c",
+            (
+                "from pathlib import Path\n"
+                "from scripts.campaign_install import ArmConfig, prepare_install\n"
+                f"prepare_install(ArmConfig('procontract', Path({str(repo)!r}), 'HEAD', 'procontract'), "
+                f"Path({str(root)!r}))\n"
+            ),
+        ],
+        cwd=Path(__file__).parents[1],
+        env=environment,
+    )
+    assert child.returncode == 86
+    state_path = root / ".install-state/procontract.json"
+    staging = Path(json.loads(state_path.read_text())["staging"])
+    staging.mkdir(parents=True)
+    foreign = tmp_path / "foreign-worktree"
+    _git(repo, "worktree", "add", "--detach", str(foreign), revision)
+    evidence = foreign / "dirty-evidence"
+    evidence.write_text("preserve")
+    (staging / "worktree").symlink_to(foreign, target_is_directory=True)
+
+    with pytest.raises(runner.InstallRecoveryError, match="symlink"):
+        runner.prepare_install(runner.ArmConfig("procontract", repo, "HEAD", "procontract"), root)
+
+    assert evidence.read_text() == "preserve"
+    assert str(foreign) in _git(repo, "worktree", "list", "--porcelain")
+    assert (staging / "worktree").is_symlink()
+    assert state_path.exists()
+
+
+def test_owned_directory_cleanup_refuses_substituted_symlink_parent(tmp_path: Path):
+    root = tmp_path / "installs"
+    owned_parent = root / ".install-staging"
+    owned = owned_parent / "vanilla-owned"
+    owned.mkdir(parents=True)
+    state_path = root / ".install-state/vanilla.json"
+    state_path.parent.mkdir()
+    state_path.write_text("evidence")
+    original_parent = root / ".install-staging-original"
+    owned_parent.rename(original_parent)
+    foreign_parent = tmp_path / "foreign"
+    foreign = foreign_parent / owned.name
+    foreign.mkdir(parents=True)
+    evidence = foreign / "preserve"
+    evidence.write_text("foreign")
+    owned_parent.symlink_to(foreign_parent, target_is_directory=True)
+
+    with pytest.raises(runner.InstallCleanupError, match="symlink"):
+        installer._remove_owned_directory(owned, owned_parent, state_path, "cleanup")
+
+    assert evidence.read_text() == "foreign"
+    assert state_path.exists()
+
+
 def test_prepare_install_surfaces_cleanup_failure_and_reconciles_it_later(tmp_path: Path, monkeypatch):
     repo, _, _ = _fake_opencode_repo(tmp_path)
     _fake_bun(monkeypatch, tmp_path)
@@ -924,6 +987,21 @@ def test_prepare_install_surfaces_cleanup_failure_and_reconciles_it_later(tmp_pa
     install = runner.prepare_install(runner.ArmConfig("procontract", repo, "HEAD", "procontract"), root)
     assert install.binary.is_file()
     assert not (root / ".install-state/procontract.json").exists()
+
+
+def test_prepare_install_preserves_install_cleanup_error_identity(tmp_path: Path):
+    repo, _, _ = _fake_opencode_repo(tmp_path)
+    failure = runner.InstallCleanupError("cleanup failed; retained path=/owned phase=command containment")
+
+    def fail_cleanup(command, cwd):
+        raise failure
+
+    with pytest.raises(runner.InstallCleanupError) as error:
+        runner.prepare_install(
+            runner.ArmConfig("procontract", repo, "HEAD", "procontract"), tmp_path / "installs", fail_cleanup
+        )
+
+    assert error.value is failure
 
 
 def test_prepare_install_refuses_foreign_final_path_and_preserves_it(tmp_path: Path, monkeypatch):
@@ -1035,6 +1113,25 @@ def test_interrupted_supplied_binary_recovery_requires_same_source_path(tmp_path
     assert not (root / "vanilla/install.json").exists()
 
 
+@pytest.mark.parametrize("audit_argument", ["--version", "models"])
+def test_supplied_binary_rejects_self_modification_during_audit(tmp_path: Path, audit_argument: str):
+    repo, _, _ = _fake_opencode_repo(tmp_path)
+    binary = tmp_path / "opencode"
+    binary.write_text(
+        "#!/bin/sh\n"
+        f'if [ "$1" = {audit_argument!r} ]; then '
+        'printf \'#!/bin/sh\\necho mutated\\n\' > "$0"; chmod +x "$0"; fi\n'
+        "echo stable-v1\n"
+    )
+    binary.chmod(0o755)
+    root = tmp_path / "installs"
+
+    with pytest.raises(runner.InstallError, match="changed during audit"):
+        runner.prepare_install(runner.ArmConfig("vanilla", repo, "HEAD", "vanilla", binary), root)
+
+    assert not (root / "vanilla/install.json").exists()
+
+
 def test_catalog_unavailable_reason_is_stable_and_sanitized(tmp_path: Path):
     repo, _, _ = _fake_opencode_repo(tmp_path)
     binary = tmp_path / "opencode"
@@ -1048,6 +1145,35 @@ def test_catalog_unavailable_reason_is_stable_and_sanitized(tmp_path: Path):
     assert install.catalog_output_sha256 is None
     assert install.catalog_unavailable_reason == "catalog command exit=4"
     assert "secret" not in (tmp_path / "installs/vanilla/install.json").read_text()
+
+
+@pytest.mark.parametrize(
+    ("origin", "expected"),
+    [
+        (
+            "https://user:credential@example.invalid/org/opencode.git?access_token=credential",
+            "https://example.invalid/org/opencode.git",
+        ),
+        ("credential@example.invalid:org/opencode.git", "example.invalid:org/opencode.git"),
+    ],
+)
+def test_install_audit_records_sanitized_remote_url_and_full_catalog_scope(tmp_path: Path, origin: str, expected: str):
+    repo, _, _ = _fake_opencode_repo(tmp_path)
+    _git(repo, "remote", "add", "origin", origin)
+    binary = tmp_path / "opencode"
+    binary.write_text("#!/bin/sh\necho safe-v1\n")
+    binary.chmod(0o755)
+
+    install = runner.prepare_install(
+        runner.ArmConfig("vanilla", repo, "HEAD", "vanilla", binary), tmp_path / "installs"
+    )
+    manifest = json.loads((tmp_path / "installs/vanilla/install.json").read_text())
+
+    assert install.repo_url == expected
+    assert install.repo_identity == f"remote:{expected}"
+    assert manifest["full_model_catalog_output_sha256"]
+    assert manifest["full_model_catalog_status"] == "available"
+    assert "credential" not in json.dumps(manifest)
 
 
 def test_run_checked_timeout_kills_descendant_process_group(tmp_path: Path, monkeypatch):
@@ -1094,6 +1220,35 @@ def test_run_checked_fails_closed_when_descendant_containment_is_unavailable(tmp
         installer.run_checked((str(command),))
 
     assert not marker.exists()
+
+
+def test_cgroup_v2_preflight_reports_actionable_missing_capability(tmp_path: Path):
+    membership = tmp_path / "membership"
+    membership.write_text("0::/unit\n")
+
+    with pytest.raises(runner.InstallError, match="cgroup v2.*not mounted"):
+        installer._create_command_cgroup(tmp_path / "missing-cgroup", membership)
+
+
+def test_run_checked_bounds_noisy_output_and_kills_descendant(tmp_path: Path, monkeypatch):
+    pid_file = tmp_path / "descendant.pid"
+    command = tmp_path / "noisy"
+    command.write_text(
+        f"#!/bin/sh\nsh -c 'trap \"\" TERM; echo $$ > {pid_file}; while :; do printf credential-secret; done' &\nwait\n"
+    )
+    command.chmod(0o755)
+    monkeypatch.setattr(installer, "_OUTPUT_LIMIT_BYTES", 1024)
+    started = time.monotonic()
+
+    with pytest.raises(runner.InstallError, match="output limit") as error:
+        installer.run_checked((str(command),), action="noisy-test")
+
+    assert time.monotonic() - started < 2
+    assert "credential-secret" not in str(error.value)
+    assert len(str(error.value)) < 200
+    descendant = int(pid_file.read_text())
+    status = subprocess.run(["ps", "-o", "stat=", "-p", str(descendant)], capture_output=True, text=True).stdout.strip()
+    assert not status or status.startswith("Z")
 
 
 def _fake_opencode_repo(tmp_path: Path) -> tuple[Path, str, str]:

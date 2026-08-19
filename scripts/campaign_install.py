@@ -9,14 +9,16 @@ import os
 import platform
 import re
 import shutil
-import signal
+import stat
 import subprocess
 import tempfile
-import time
+import urllib.parse
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Literal, Mapping, Sequence
+
+from scripts import campaign_process
 
 
 class InstallError(RuntimeError):
@@ -29,6 +31,14 @@ class InstallRecoveryError(InstallError):
 
 class InstallCleanupError(InstallError):
     """Raised when an owned temporary installation cannot be cleaned safely."""
+
+
+class InstallContainmentError(InstallError):
+    """Raised before launch when cgroup-v2 descendant containment is unavailable."""
+
+
+class InstallOutputLimitError(InstallError):
+    """Raised after bounded output collection terminates an overproducing command."""
 
 
 @dataclass(frozen=True)
@@ -46,6 +56,7 @@ class InstallRecord:
     repo: Path
     common_dir: Path
     repo_identity: str
+    repo_url: str | None
     requested_revision: str
     revision: str
     source_dirty: bool
@@ -59,10 +70,19 @@ class InstallRecord:
     smoke_command: tuple[str, ...]
     catalog_command: tuple[str, ...]
     platform: str
-    catalog_output_sha256: str | None
-    catalog_unavailable_reason: str | None
+    full_model_catalog_output_sha256: str | None
+    full_model_catalog_unavailable_reason: str | None
+    full_model_catalog_status: Literal["available", "unavailable"]
     owned_paths: tuple[Path, ...]
     publication_phase: Literal["manifest_published"]
+
+    @property
+    def catalog_output_sha256(self) -> str | None:
+        return self.full_model_catalog_output_sha256
+
+    @property
+    def catalog_unavailable_reason(self) -> str | None:
+        return self.full_model_catalog_unavailable_reason
 
 
 @dataclass(frozen=True)
@@ -70,6 +90,8 @@ class _InstallState:
     arm: str
     repo: Path
     common_dir: Path
+    repo_identity: str
+    repo_url: str | None
     requested_revision: str
     revision: str
     supplied_binary: Path | None
@@ -106,6 +128,7 @@ _ACTION_TIMEOUTS = {
     "build": 1800,
 }
 _TERMINATION_GRACE_SECONDS = 5
+_OUTPUT_LIMIT_BYTES = 8 * 1024 * 1024
 _STATE_PHASES = frozenset(
     {
         "staging_metadata",
@@ -137,154 +160,31 @@ _PRESERVE_PHASES = frozenset(
 def run_checked(
     command: Sequence[str], cwd: Path | None = None, action: str = "command"
 ) -> subprocess.CompletedProcess[str]:
-    """Run an approved command with a minimal environment and a process-group timeout."""
-    executable = shutil.which(command[0])
-    invocation = (executable, *command[1:]) if executable else command
-    command_cgroup = _create_command_cgroup()
-    if command_cgroup is None:
-        raise InstallError("subprocess descendant containment is unavailable")
+    """Run with bounded output; requires writable delegated cgroup v2 before launch."""
     try:
-        process = subprocess.Popen(
-            _contained_invocation(command_cgroup, invocation),
-            cwd=cwd,
-            env={"PATH": os.defpath, "LANG": "C", "LC_ALL": "C"},
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            start_new_session=True,
+        return campaign_process.run_checked(
+            command,
+            cwd,
+            _ACTION_TIMEOUTS.get(action, 60),
+            _TERMINATION_GRACE_SECONDS,
+            _OUTPUT_LIMIT_BYTES,
+            _create_command_cgroup,
         )
-    except OSError:
-        _remove_command_cgroup(command_cgroup)
-        raise
-    timed_out = False
+    except campaign_process.ProcessCleanupError as error:
+        raise InstallCleanupError(str(error)) from None
+    except campaign_process.ProcessContainmentError as error:
+        raise InstallContainmentError(str(error)) from None
+    except campaign_process.ProcessOutputLimitError as error:
+        raise InstallOutputLimitError(str(error)) from None
+
+
+def _create_command_cgroup(root: Path = Path("/sys/fs/cgroup"), membership: Path = Path("/proc/self/cgroup")) -> Path:
     try:
-        stdout, stderr = process.communicate(timeout=_ACTION_TIMEOUTS.get(action, 60))
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        descendants = _descendant_pids(process.pid)
-        _signal_process_group(process.pid, signal.SIGTERM)
-        _signal_processes(_cgroup_pids(command_cgroup), signal.SIGTERM)
-        _signal_processes(descendants, signal.SIGTERM)
-        try:
-            process.communicate(timeout=_TERMINATION_GRACE_SECONDS)
-        except subprocess.TimeoutExpired:
-            pass
-        descendants.update(_descendant_pids(process.pid))
-        _signal_process_group(process.pid, signal.SIGKILL)
-        _kill_cgroup(command_cgroup)
-        _signal_processes(descendants, signal.SIGKILL)
-        try:
-            process.communicate(timeout=_TERMINATION_GRACE_SECONDS)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            if process.stdout:
-                process.stdout.close()
-            if process.stderr:
-                process.stderr.close()
-    finally:
-        _kill_cgroup(command_cgroup)
-        _remove_command_cgroup(command_cgroup)
-    if timed_out:
-        raise TimeoutError(action) from None
-    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
-
-
-def _create_command_cgroup() -> Path | None:
-    try:
-        relative = next(
-            line.split("::", 1)[1]
-            for line in Path("/proc/self/cgroup").read_text().splitlines()
-            if line.startswith("0::")
-        )
-        path = Path("/sys/fs/cgroup") / relative.removeprefix("/") / f"programbench-{os.getpid()}-{uuid.uuid4().hex}"
-        path.mkdir()
-        if os.access(path / "cgroup.procs", os.W_OK) and os.access(path / "cgroup.kill", os.W_OK):
-            return path
-        path.rmdir()
-        return None
-    except (OSError, StopIteration):
-        return None
-
-
-def _contained_invocation(cgroup: Path | None, invocation: Sequence[str]) -> Sequence[str]:
-    if cgroup is None:
-        return invocation
-    return (
-        "/bin/sh",
-        "-c",
-        'printf "%s\\n" "$$" > "$1/cgroup.procs" || exit 125; shift; exec "$@"',
-        "programbench-cgroup",
-        str(cgroup),
-        *invocation,
-    )
-
-
-def _cgroup_pids(cgroup: Path | None) -> set[int]:
-    if cgroup is None:
-        return set()
-    try:
-        return {int(value) for value in (cgroup / "cgroup.procs").read_text().splitlines()}
-    except OSError:
-        return set()
-
-
-def _kill_cgroup(cgroup: Path | None) -> None:
-    if cgroup is None:
-        return
-    try:
-        (cgroup / "cgroup.kill").write_text("1")
-    except OSError:
-        _signal_processes(_cgroup_pids(cgroup), signal.SIGKILL)
-
-
-def _remove_command_cgroup(cgroup: Path | None) -> None:
-    if cgroup is None:
-        return
-    deadline = time.monotonic() + _TERMINATION_GRACE_SECONDS
-    while True:
-        try:
-            cgroup.rmdir()
-            return
-        except OSError as error:
-            if time.monotonic() >= deadline:
-                raise InstallCleanupError(
-                    f"cleanup failed; retained path={cgroup} phase=command containment"
-                ) from error
-            time.sleep(0.01)
-
-
-def _descendant_pids(root: int) -> set[int]:
-    parents: dict[int, int] = {}
-    for entry in Path("/proc").iterdir():
-        if not entry.name.isdigit():
-            continue
-        try:
-            parent = next(line for line in (entry / "status").read_text().splitlines() if line.startswith("PPid:"))
-        except (OSError, StopIteration):
-            continue
-        parents[int(entry.name)] = int(parent.split()[1])
-    descendants: set[int] = set()
-    frontier = {root}
-    while frontier:
-        children = {pid for pid, parent in parents.items() if parent in frontier and pid not in descendants}
-        descendants.update(children)
-        frontier = children
-    return descendants
-
-
-def _signal_process_group(process_group: int, requested_signal: signal.Signals) -> None:
-    try:
-        os.killpg(process_group, requested_signal)
-    except ProcessLookupError:
-        return
-
-
-def _signal_processes(processes: set[int], requested_signal: signal.Signals) -> None:
-    for process in processes:
-        try:
-            os.kill(process, requested_signal)
-        except ProcessLookupError:
-            continue
+        return campaign_process.create_command_cgroup(root, membership)
+    except campaign_process.ProcessCleanupError as error:
+        raise InstallCleanupError(str(error)) from None
+    except campaign_process.ProcessContainmentError as error:
+        raise InstallContainmentError(str(error)) from None
 
 
 def prepare_install(arm: ArmConfig, root: Path, run_command: _RunCommand = run_checked) -> InstallRecord:
@@ -298,6 +198,8 @@ def prepare_install(arm: ArmConfig, root: Path, run_command: _RunCommand = run_c
     with _ArmLock(root, arm.name):
         manifest = root / arm.name / "install.json"
         state_path = _state_path(root, arm.name)
+        _require_no_symlink_components(root, manifest.parent, allow_missing_leaf=True)
+        _require_no_symlink_components(root, state_path.parent, allow_missing_leaf=True)
         if manifest.exists():
             return _reuse_published_install(arm, root, repo, manifest, state_path, run_command)
 
@@ -317,11 +219,19 @@ def prepare_install(arm: ArmConfig, root: Path, run_command: _RunCommand = run_c
         if not re.fullmatch(r"[0-9a-f]{40}", revision):
             raise InstallError("git did not resolve a commit SHA")
         common_dir = _git_common_directory(repo, repo, run_command, "source-common-dir")
+        repo_url = _repo_url(repo, run_command)
+        repo_identity = f"remote:{repo_url}" if repo_url else f"local:{repo}"
         supplied = arm.binary.resolve() if arm.binary else None
         supplied_hash = _binary_sha256(supplied) if supplied else None
         staging = root / ".install-staging" / f"{arm.name}-{uuid.uuid4().hex}"
         final_dir = root / arm.name
         final_worktree = None if supplied else root / "worktrees" / f"{arm.name}-{revision}"
+        _mkdir_and_sync(staging.parent)
+        _require_no_symlink_components(root, staging, allow_missing_leaf=True)
+        _require_no_symlink_components(root, final_dir, allow_missing_leaf=True)
+        if final_worktree:
+            _mkdir_and_sync(final_worktree.parent)
+            _require_no_symlink_components(root, final_worktree, allow_missing_leaf=True)
         if final_dir.exists():
             raise InstallRecoveryError(f"occupied foreign final path; evidence preserved: {final_dir}")
         if final_worktree and final_worktree.exists():
@@ -332,6 +242,8 @@ def prepare_install(arm: ArmConfig, root: Path, run_command: _RunCommand = run_c
             arm=arm.name,
             repo=repo,
             common_dir=common_dir,
+            repo_identity=repo_identity,
+            repo_url=repo_url,
             requested_revision=arm.revision,
             revision=revision,
             supplied_binary=supplied,
@@ -426,6 +338,8 @@ def _stage_build(
         run_command,
         temporary_worktree,
     )
+    _require_worktree_identity(temporary_worktree, root, state.repo, state.common_dir, state.revision, run_command)
+    _require_no_symlink_components(root, state.final_worktree, allow_missing_leaf=True)
     state = replace(state, phase="staged", record=record)
     _write_state(state_path, state)
     _crash_after("staged")
@@ -477,8 +391,11 @@ def _stage_supplied(
     state = _claim_final(root, state_path, state)
     state = replace(state, phase="publishing_binary")
     _write_state(state_path, state)
+    _require_no_symlink_components(root, record.binary.parent)
     os.replace(staged_binary, record.binary)
     _fsync_directory(state.final_dir)
+    if _binary_sha256(record.binary) != record.binary_sha256:
+        raise InstallError("supplied binary changed after publication move; recovery evidence preserved")
     state = replace(state, phase="binary_published")
     _write_state(state_path, state)
     return _publish_manifest(root, state_path, state)
@@ -494,30 +411,36 @@ def _new_record(
     build_command: tuple[str, ...],
     run_command: _RunCommand,
     cwd: Path | None,
-    binary_sha256: str | None = None,
+    expected_binary_sha256: str | None = None,
 ) -> InstallRecord:
     catalog_command = (str(final_binary), "models")
+    version = _binary_version(staged_binary, run_command, cwd)
     catalog_output_sha256, catalog_unavailable_reason = _model_catalog(staged_binary, run_command, cwd)
+    binary_sha256 = _binary_sha256(staged_binary)
+    if expected_binary_sha256 and binary_sha256 != expected_binary_sha256:
+        raise InstallError("supplied binary changed during audit; retry installation")
     return InstallRecord(
         arm=arm.name,
         repo=state.repo,
         common_dir=state.common_dir,
-        repo_identity=f"local:{state.repo}",
+        repo_identity=state.repo_identity,
+        repo_url=state.repo_url,
         requested_revision=arm.revision,
         revision=state.revision,
         source_dirty=False,
         supplied_binary=arm.binary.resolve() if arm.binary else None,
         worktree=worktree,
         binary=final_binary,
-        binary_sha256=binary_sha256 or _binary_sha256(staged_binary),
-        version=_binary_version(staged_binary, run_command, cwd),
+        binary_sha256=binary_sha256,
+        version=version,
         install_command=install_command,
         build_command=build_command,
         smoke_command=(str(final_binary), "--version"),
         catalog_command=catalog_command,
         platform=f"{platform.system().lower()}-{platform.machine().lower()}",
-        catalog_output_sha256=catalog_output_sha256,
-        catalog_unavailable_reason=catalog_unavailable_reason,
+        full_model_catalog_output_sha256=catalog_output_sha256,
+        full_model_catalog_unavailable_reason=catalog_unavailable_reason,
+        full_model_catalog_status="available" if catalog_output_sha256 else "unavailable",
         owned_paths=tuple(path for path in (state.final_dir, worktree) if path),
         publication_phase="manifest_published",
     )
@@ -527,6 +450,8 @@ def _model_catalog(binary: Path, run_command: _RunCommand, cwd: Path | None) -> 
     command = (str(binary), "models")
     try:
         result = _run_optional(run_command, command, cwd, "catalog")
+    except (InstallCleanupError, InstallContainmentError, InstallOutputLimitError):
+        raise
     except InstallError:
         return None, "catalog command unavailable"
     if result.returncode != 0:
@@ -549,6 +474,7 @@ def _finish_publication(root: Path, state_path: Path, state: _InstallState, run_
 
 
 def _claim_final(root: Path, state_path: Path, state: _InstallState) -> _InstallState:
+    _require_no_symlink_components(root, state.final_dir, allow_missing_leaf=True)
     if state.final_dir.exists():
         if not state.final_dir.is_dir() or any(state.final_dir.iterdir()):
             raise InstallRecoveryError(f"occupied foreign final path; evidence preserved: {state.final_dir}")
@@ -567,6 +493,7 @@ def _publish_manifest(root: Path, state_path: Path, state: _InstallState) -> Ins
         raise InstallRecoveryError(f"recovery metadata has no audit record: {state_path}")
     state = replace(state, phase="publishing_manifest")
     _write_state(state_path, state)
+    _require_no_symlink_components(root, state.final_dir)
     manifest = state.final_dir / "install.json"
     _atomic_write_json(manifest, _install_manifest(state.record))
     _fsync_directory(state.final_dir)
@@ -587,6 +514,8 @@ def _reconcile_state(
     run_command: _RunCommand,
 ) -> InstallRecord | None:
     _require_state_identity(state, arm, root, repo, run_command)
+    _require_no_symlink_components(root, state.staging, allow_missing_leaf=True)
+    _require_no_symlink_components(root, state.final_dir, allow_missing_leaf=True)
     if state.final_worktree and not state.final_worktree.exists():
         registration = _worktree_registration(state.repo, state.final_worktree, run_command)
         if registration:
@@ -594,7 +523,16 @@ def _reconcile_state(
                 raise InstallRecoveryError(
                     f"final worktree registration cannot be validated; evidence preserved: {state.final_worktree}"
                 )
-            _remove_owned_worktree(state.repo, state.final_worktree, state_path, state.phase, run_command)
+            _remove_owned_worktree(
+                state.repo,
+                state.final_worktree,
+                root,
+                state.common_dir,
+                state.revision,
+                state_path,
+                state.phase,
+                run_command,
+            )
     if state.record:
         record = state.record
         if state.supplied_binary is None and state.final_worktree and state.final_worktree.exists():
@@ -621,8 +559,13 @@ def _reconcile_state(
                 state = _claim_final(root, state_path, state)
                 state = replace(state, phase="publishing_binary")
                 _write_state(state_path, state)
+                _require_no_symlink_components(root, record.binary.parent)
                 os.replace(staged_binary, record.binary)
                 _fsync_directory(state.final_dir)
+                if _binary_sha256(record.binary) != record.binary_sha256:
+                    raise InstallRecoveryError(
+                        f"owned binary changed after recovery move; evidence preserved: {record.binary}"
+                    )
                 state = replace(state, phase="binary_published")
                 _write_state(state_path, state)
                 return _publish_manifest(root, state_path, state)
@@ -635,15 +578,33 @@ def _reconcile_state(
 
 
 def _discard_incomplete_state(root: Path, state_path: Path, state: _InstallState, run_command: _RunCommand) -> None:
+    _require_no_symlink_components(root, state.staging, allow_missing_leaf=True)
+    _require_no_symlink_components(root, state.final_dir, allow_missing_leaf=True)
     temporary_worktree = state.staging / "worktree"
-    if temporary_worktree.exists():
+    try:
+        temporary_worktree.lstat()
+        worktree_exists = True
+    except FileNotFoundError:
+        worktree_exists = False
+    if worktree_exists:
         try:
-            _require_worktree_identity(temporary_worktree, state.repo, state.common_dir, state.revision, run_command)
+            _require_worktree_identity(
+                temporary_worktree, root, state.repo, state.common_dir, state.revision, run_command
+            )
         except InstallError as error:
             raise InstallRecoveryError(
                 f"staged worktree cannot be validated; evidence preserved: {temporary_worktree}: {error}"
             ) from None
-        _remove_owned_worktree(state.repo, temporary_worktree, state_path, state.phase, run_command)
+        _remove_owned_worktree(
+            state.repo,
+            temporary_worktree,
+            root,
+            state.common_dir,
+            state.revision,
+            state_path,
+            state.phase,
+            run_command,
+        )
     else:
         registration = _worktree_registration(state.repo, temporary_worktree, run_command)
         if registration:
@@ -651,7 +612,16 @@ def _discard_incomplete_state(root: Path, state_path: Path, state: _InstallState
                 raise InstallRecoveryError(
                     f"staged worktree registration cannot be validated; evidence preserved: {temporary_worktree}"
                 )
-            _remove_owned_worktree(state.repo, temporary_worktree, state_path, state.phase, run_command)
+            _remove_owned_worktree(
+                state.repo,
+                temporary_worktree,
+                root,
+                state.common_dir,
+                state.revision,
+                state_path,
+                state.phase,
+                run_command,
+            )
     if state.final_dir.exists():
         if not state.final_dir.is_dir() or any(state.final_dir.iterdir()):
             raise InstallRecoveryError(f"occupied foreign final path; evidence preserved: {state.final_dir}")
@@ -662,6 +632,7 @@ def _discard_incomplete_state(root: Path, state_path: Path, state: _InstallState
 
 
 def _cleanup_journal(root: Path, state_path: Path, state: _InstallState) -> None:
+    _require_no_symlink_components(root, state.staging, allow_missing_leaf=True)
     if state.staging.exists():
         _remove_owned_directory(state.staging, root / ".install-staging", state_path, state.phase)
     _unlink_state(state_path, state.phase)
@@ -687,7 +658,7 @@ def _require_matching_install(
 ) -> None:
     _require_requested_identity(record, arm, repo)
     common_dir = _git_common_directory(repo, repo, run_command, "source-common-dir")
-    if record.common_dir != common_dir or record.repo_identity != f"local:{repo}" or record.source_dirty is not False:
+    if record.common_dir != common_dir or record.source_dirty is not False:
         raise InstallError("install manifest source identity conflicts with requested arm")
     if record.worktree is None:
         if record.binary != (root / arm.name / "opencode").resolve() or record.install_command or record.build_command:
@@ -700,7 +671,7 @@ def _require_matching_install(
             raise InstallError("install manifest identity conflicts with requested arm")
         if record.binary != record.worktree / _BUILT_BINARY:
             raise InstallError("install manifest identity conflicts with requested arm")
-        _require_live_worktree(record, repo, run_command)
+        _require_live_worktree(record, repo, root, run_command)
     if record.smoke_command != (str(record.binary), "--version"):
         raise InstallError("install manifest identity conflicts with requested arm")
     if record.catalog_command != (str(record.binary), "models"):
@@ -713,22 +684,22 @@ def _require_matching_install(
         raise InstallError("install manifest version does not match installed binary")
 
 
-def _require_live_worktree(record: InstallRecord, repo: Path, run_command: _RunCommand) -> None:
+def _require_live_worktree(record: InstallRecord, repo: Path, root: Path, run_command: _RunCommand) -> None:
     if record.worktree is None:
         return
-    _require_worktree_identity(record.worktree, repo, record.common_dir, record.revision, run_command)
-    if not _registered_worktree(repo, record.worktree, record.revision, run_command):
-        raise InstallError("install manifest worktree is not the exact registered worktree")
+    _require_worktree_identity(record.worktree, root, repo, record.common_dir, record.revision, run_command)
 
 
 def _require_worktree_identity(
     worktree: Path,
+    root: Path,
     repo: Path,
     common_dir: Path,
     revision: str,
     run_command: _RunCommand,
 ) -> None:
-    if not worktree.is_dir():
+    _require_no_symlink_components(root, worktree)
+    if not stat.S_ISDIR(worktree.lstat().st_mode):
         raise InstallError("install manifest worktree does not exist")
     if (
         _command_text(run_command, ("git", "-C", str(worktree), "rev-parse", "HEAD"), None, "worktree-rev-parse")
@@ -749,6 +720,36 @@ def _require_worktree_identity(
         raise InstallError("install manifest worktree does not belong to source repository")
     if _git_common_directory(repo, repo, run_command, "source-common-dir") != common_dir:
         raise InstallError("install manifest source common directory changed")
+    if not _registered_worktree(repo, worktree, revision, run_command):
+        raise InstallError("install manifest worktree is not the exact registered worktree")
+
+
+def _require_no_symlink_components(root: Path, path: Path, allow_missing_leaf: bool = False) -> None:
+    try:
+        root_mode = root.lstat().st_mode
+    except FileNotFoundError:
+        raise InstallError(f"install root is missing: {root}") from None
+    if stat.S_ISLNK(root_mode) or not stat.S_ISDIR(root_mode):
+        raise InstallError(f"install root is not an owned directory: {root}")
+    if path != Path(os.path.abspath(path)):
+        raise InstallError(f"owned worktree path is not canonical: {path}")
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        raise InstallError(f"owned worktree path escapes install root: {path}") from None
+    current = root
+    for index, component in enumerate(relative.parts):
+        current /= component
+        try:
+            mode = current.lstat().st_mode
+        except FileNotFoundError:
+            if allow_missing_leaf and index == len(relative.parts) - 1:
+                return
+            raise InstallError(f"owned worktree path component is missing: {current}") from None
+        if stat.S_ISLNK(mode):
+            raise InstallError(f"owned worktree path contains symlink: {current}")
+        if index < len(relative.parts) - 1 and not stat.S_ISDIR(mode):
+            raise InstallError(f"owned worktree parent is not a directory: {current}")
 
 
 def _registered_worktree(repo: Path, path: Path, revision: str, run_command: _RunCommand) -> bool:
@@ -775,6 +776,38 @@ def _git_common_directory(location: Path, base: Path, run_command: _RunCommand, 
     common = _command_text(run_command, ("git", "-C", str(location), "rev-parse", "--git-common-dir"), None, action)
     path = Path(common)
     return path.resolve() if path.is_absolute() else (base / path).resolve()
+
+
+def _repo_url(repo: Path, run_command: _RunCommand) -> str | None:
+    result = _run_optional(
+        run_command,
+        ("git", "-C", str(repo), "remote", "get-url", "origin"),
+        None,
+        "repo-url",
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    return _sanitize_repo_url(result.stdout.strip().splitlines()[0])
+
+
+def _sanitize_repo_url(value: str) -> str | None:
+    if any(character in value for character in ("\x00", "\n", "\r")):
+        return None
+    if "://" not in value:
+        scp = re.fullmatch(r"(?:[^@/:]+@)?([^/:]+):(.+)", value)
+        return f"{scp.group(1)}:{scp.group(2)}" if scp else None
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        return None
+    if parsed.scheme == "file":
+        return urllib.parse.urlunsplit((parsed.scheme, "", parsed.path, "", ""))
+    if not parsed.hostname:
+        return None
+    hostname = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+    netloc = f"{hostname}:{port}" if port else hostname
+    return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
 
 
 def _require_clean_source(repo: Path, run_command: _RunCommand) -> None:
@@ -812,6 +845,10 @@ def _run_command(
 ) -> subprocess.CompletedProcess[str]:
     try:
         result = run_checked(command, cwd, action) if run_command is run_checked else run_command(command, cwd)
+    except InstallCleanupError:
+        raise
+    except (InstallContainmentError, InstallOutputLimitError):
+        raise
     except TimeoutError:
         raise InstallError(_command_failure(action, command, cwd, "timeout")) from None
     except Exception:
@@ -829,6 +866,10 @@ def _run_optional(
 ) -> subprocess.CompletedProcess[str]:
     try:
         return run_checked(command, cwd, action) if run_command is run_checked else run_command(command, cwd)
+    except InstallCleanupError:
+        raise
+    except (InstallContainmentError, InstallOutputLimitError):
+        raise
     except TimeoutError:
         raise InstallError(_command_failure(action, command, cwd, "timeout")) from None
     except Exception:
@@ -850,6 +891,7 @@ def _install_manifest(record: InstallRecord) -> dict[str, object]:
         "repo": str(record.repo),
         "common_dir": str(record.common_dir),
         "repo_identity": record.repo_identity,
+        "repo_url": record.repo_url,
         "requested_revision": record.requested_revision,
         "revision": record.revision,
         "source_dirty": record.source_dirty,
@@ -863,8 +905,9 @@ def _install_manifest(record: InstallRecord) -> dict[str, object]:
         "smoke_command": list(record.smoke_command),
         "catalog_command": list(record.catalog_command),
         "platform": record.platform,
-        "catalog_output_sha256": record.catalog_output_sha256,
-        "catalog_unavailable_reason": record.catalog_unavailable_reason,
+        "full_model_catalog_output_sha256": record.full_model_catalog_output_sha256,
+        "full_model_catalog_unavailable_reason": record.full_model_catalog_unavailable_reason,
+        "full_model_catalog_status": record.full_model_catalog_status,
         "owned_paths": [str(path) for path in record.owned_paths],
         "publication_phase": record.publication_phase,
     }
@@ -876,6 +919,7 @@ def _record_from_mapping(raw: object) -> InstallRecord:
         "repo",
         "common_dir",
         "repo_identity",
+        "repo_url",
         "requested_revision",
         "revision",
         "source_dirty",
@@ -889,8 +933,9 @@ def _record_from_mapping(raw: object) -> InstallRecord:
         "smoke_command",
         "catalog_command",
         "platform",
-        "catalog_output_sha256",
-        "catalog_unavailable_reason",
+        "full_model_catalog_output_sha256",
+        "full_model_catalog_unavailable_reason",
+        "full_model_catalog_status",
         "owned_paths",
         "publication_phase",
     }
@@ -906,8 +951,9 @@ def _record_from_mapping(raw: object) -> InstallRecord:
     binary_sha256 = _mapping_string(raw, "binary_sha256")
     supplied_binary = None if raw["supplied_binary"] is None else _mapping_path(raw, "supplied_binary")
     worktree = None if raw["worktree"] is None else _mapping_path(raw, "worktree")
-    catalog_output = raw["catalog_output_sha256"]
-    catalog_reason = raw["catalog_unavailable_reason"]
+    repo_url = raw["repo_url"]
+    catalog_output = raw["full_model_catalog_output_sha256"]
+    catalog_reason = raw["full_model_catalog_unavailable_reason"]
     if raw["source_dirty"] is not False:
         raise ValueError("source_dirty")
     if not re.fullmatch(r"[0-9a-f]{40}", revision) or not re.fullmatch(r"[0-9a-f]{64}", binary_sha256):
@@ -915,12 +961,20 @@ def _record_from_mapping(raw: object) -> InstallRecord:
     if catalog_output is not None and (
         not isinstance(catalog_output, str) or not re.fullmatch(r"[0-9a-f]{64}", catalog_output)
     ):
-        raise ValueError("catalog_output_sha256")
+        raise ValueError("full_model_catalog_output_sha256")
     if catalog_reason is not None and (not isinstance(catalog_reason, str) or not catalog_reason):
-        raise ValueError("catalog_unavailable_reason")
+        raise ValueError("full_model_catalog_unavailable_reason")
     if (catalog_output is None) == (catalog_reason is None):
         raise ValueError("catalog evidence")
-    if _mapping_string(raw, "repo_identity") != f"local:{repo}":
+    catalog_status = raw["full_model_catalog_status"]
+    if catalog_status != ("available" if catalog_output else "unavailable"):
+        raise ValueError("full_model_catalog_status")
+    if repo_url is not None and (
+        not isinstance(repo_url, str) or not repo_url or _sanitize_repo_url(repo_url) != repo_url
+    ):
+        raise ValueError("repo_url")
+    expected_identity = f"remote:{repo_url}" if repo_url else f"local:{repo}"
+    if _mapping_string(raw, "repo_identity") != expected_identity:
         raise ValueError("repo_identity")
     owned = raw["owned_paths"]
     if not isinstance(owned, list) or not owned:
@@ -932,7 +986,8 @@ def _record_from_mapping(raw: object) -> InstallRecord:
         arm=arm,
         repo=repo,
         common_dir=common_dir,
-        repo_identity=f"local:{repo}",
+        repo_identity=expected_identity,
+        repo_url=repo_url,
         requested_revision=requested_revision,
         revision=revision,
         source_dirty=False,
@@ -946,8 +1001,9 @@ def _record_from_mapping(raw: object) -> InstallRecord:
         smoke_command=_mapping_command(raw, "smoke_command"),
         catalog_command=_mapping_command(raw, "catalog_command"),
         platform=_mapping_string(raw, "platform"),
-        catalog_output_sha256=catalog_output,
-        catalog_unavailable_reason=catalog_reason,
+        full_model_catalog_output_sha256=catalog_output,
+        full_model_catalog_unavailable_reason=catalog_reason,
+        full_model_catalog_status=catalog_status,
         owned_paths=owned_paths,
         publication_phase="manifest_published",
     )
@@ -966,6 +1022,8 @@ def _write_state(path: Path, state: _InstallState) -> None:
             "arm": state.arm,
             "repo": str(state.repo),
             "common_dir": str(state.common_dir),
+            "repo_identity": state.repo_identity,
+            "repo_url": state.repo_url,
             "requested_revision": state.requested_revision,
             "revision": state.revision,
             "supplied_binary": str(state.supplied_binary) if state.supplied_binary else None,
@@ -988,6 +1046,8 @@ def _load_state(path: Path, root: Path, arm: str) -> _InstallState:
             "arm",
             "repo",
             "common_dir",
+            "repo_identity",
+            "repo_url",
             "requested_revision",
             "revision",
             "supplied_binary",
@@ -1008,12 +1068,23 @@ def _load_state(path: Path, root: Path, arm: str) -> _InstallState:
         if not isinstance(owned, list) or not owned:
             raise ValueError("state ownership")
         supplied_binary = None if raw["supplied_binary"] is None else _mapping_path(raw, "supplied_binary")
+        repo_url = raw["repo_url"]
+        if repo_url is not None and (
+            not isinstance(repo_url, str) or not repo_url or _sanitize_repo_url(repo_url) != repo_url
+        ):
+            raise ValueError("repo_url")
+        repo = _mapping_path(raw, "repo")
+        expected_identity = f"remote:{repo_url}" if repo_url else f"local:{repo}"
+        if _mapping_string(raw, "repo_identity") != expected_identity:
+            raise ValueError("repo_identity")
         final_worktree = None if raw["final_worktree"] is None else _mapping_path(raw, "final_worktree")
         record = None if raw["record"] is None else _record_from_mapping(raw["record"])
         state = _InstallState(
             arm=state_arm,
-            repo=_mapping_path(raw, "repo"),
+            repo=repo,
             common_dir=_mapping_path(raw, "common_dir"),
+            repo_identity=expected_identity,
+            repo_url=repo_url,
             requested_revision=_mapping_string(raw, "requested_revision"),
             revision=_mapping_string(raw, "revision"),
             supplied_binary=supplied_binary,
@@ -1057,6 +1128,8 @@ def _validate_state_record(state: _InstallState) -> None:
         record.arm != state.arm
         or record.repo != state.repo
         or record.common_dir != state.common_dir
+        or record.repo_identity != state.repo_identity
+        or record.repo_url != state.repo_url
         or record.requested_revision != state.requested_revision
         or record.revision != state.revision
         or record.supplied_binary != state.supplied_binary
@@ -1099,11 +1172,36 @@ def _atomic_write_json(path: Path, value: Mapping[str, object]) -> None:
             os.unlink(temporary_name)
 
 
-def _remove_owned_worktree(repo: Path, worktree: Path, state_path: Path, phase: str, run_command: _RunCommand) -> None:
+def _remove_owned_worktree(
+    repo: Path,
+    worktree: Path,
+    root: Path,
+    common_dir: Path,
+    revision: str,
+    state_path: Path,
+    phase: str,
+    run_command: _RunCommand,
+) -> None:
+    try:
+        _require_no_symlink_components(root, worktree, allow_missing_leaf=True)
+        if _git_common_directory(repo, repo, run_command, "source-common-dir") != common_dir:
+            raise InstallError("owned worktree source common directory changed")
+        if _worktree_registration(repo, worktree, run_command) != (revision, True):
+            raise InstallError("owned worktree is not the exact detached registered worktree")
+        try:
+            worktree.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            _require_worktree_identity(worktree, root, repo, common_dir, revision, run_command)
+    except InstallError as error:
+        raise InstallRecoveryError(
+            f"owned worktree changed before cleanup; evidence preserved: {worktree}: {error}"
+        ) from None
     try:
         _run_command(
             run_command,
-            ("git", "-C", str(repo), "worktree", "remove", "--force", "--force", str(worktree)),
+            ("git", "-C", str(repo), "worktree", "remove", "--force", str(worktree)),
             None,
             "remove",
         )
@@ -1114,8 +1212,10 @@ def _remove_owned_worktree(repo: Path, worktree: Path, state_path: Path, phase: 
 def _remove_owned_directory(path: Path, parent: Path, state_path: Path, phase: str, allow_final: bool = False) -> None:
     if path.parent != parent or (not allow_final and not path.name.startswith(("procontract-", "vanilla-"))):
         raise InstallCleanupError(f"refusing cleanup; retained path={path} phase={phase}")
-    if path.is_symlink():
-        raise InstallCleanupError(f"refusing symlink cleanup; retained path={path} phase={phase}")
+    try:
+        _require_no_symlink_components(parent if allow_final else parent.parent, path)
+    except InstallError as error:
+        raise InstallCleanupError(f"refusing cleanup; retained path={state_path} phase={phase}: {error}") from None
     try:
         shutil.rmtree(path)
         _fsync_directory(parent)
@@ -1138,7 +1238,7 @@ def _mkdir_and_sync(path: Path) -> None:
     try:
         path.mkdir(parents=True)
     except FileExistsError:
-        if path.is_dir():
+        if stat.S_ISDIR(path.lstat().st_mode):
             return
         raise InstallError(f"directory path is occupied: {path}") from None
     except OSError as error:

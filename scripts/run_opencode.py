@@ -18,7 +18,9 @@ from typing import Collection, Mapping, Sequence
 from scripts.campaign_install import (
     ArmConfig,
     InstallCleanupError,
+    InstallContainmentError,
     InstallError,
+    InstallOutputLimitError,
     InstallRecord,
     InstallRecoveryError,
     load_install_record,
