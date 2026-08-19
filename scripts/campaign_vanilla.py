@@ -677,7 +677,7 @@ def run_vanilla(
     progress_path = job.job.root / "vanilla-progress.json"
     session: Mapping[str, object] = {"id": session_id, "status": "unconfirmed"}
     try:
-        usage, actions, messages, restored_breaker_usage = _restore_progress(progress_path, state)
+        usage, actions, messages, _ = _restore_progress(progress_path, state)
     except (UsageParseError, VanillaError):
         if execution.get("prompt_may_be_active") is not True:
             raise
@@ -987,6 +987,7 @@ def run_vanilla(
                     message_id,
                     session,
                     {"data": []},
+                    breaker,
                     max(0.0, clock() - float(started_at)),
                 )
             raise
@@ -1047,7 +1048,6 @@ def run_vanilla(
 
     stopped = False
     error_text = None
-    breaker_usage = restored_breaker_usage
     invalid_error: VanillaError | None = None
     observed_provider_errors: set[str] = set()
     inactive_messages: Mapping[str, object] | None = None
@@ -1133,7 +1133,6 @@ def run_vanilla(
             stopped = _interrupt(api, session_id, workspace, execution_path, execution, clock, sleeper, poll_interval)
             break
         breaker.observe(workspace.manifest.job_id, state.generation, usage, terminal=False)
-        breaker_usage = usage
         provider_error = _provider_error(messages)
         rate_limited = provider_error is not None and provider_error[0] == 429
         if provider_error is not None and provider_error[0] == 429:
@@ -1249,10 +1248,7 @@ def run_vanilla(
             already_stopped=stopped,
         )
     _verify_no_credentials(job.job.root, workspace.manifest.credential_env)
-    if usage.provider_turns > MAX_PROVIDER_TURNS:
-        breaker.observe_terminal_overshoot(workspace.manifest.job_id, state.generation, usage)
-    else:
-        breaker.observe(workspace.manifest.job_id, state.generation, breaker_usage, terminal=True)
+    _observe_terminal_usage(breaker, workspace.manifest.job_id, state.generation, usage)
     hashes = {
         name: _sha256(job.job.root / name)
         for name in ("trajectory.json", "usage.json", "workspace-inventory.json", "vanilla-result.json")
@@ -1307,6 +1303,19 @@ def _safety_completion(
     if clock() >= deadline:
         return VanillaCompletion.WALL_TIME
     return None
+
+
+def _observe_terminal_usage(
+    breaker: CircuitBreaker,
+    job_id: str,
+    generation: int,
+    usage: UsageSummary,
+) -> None:
+    """Publish one exact terminal summary, including bounded turn overshoots."""
+    if usage.provider_turns > MAX_PROVIDER_TURNS:
+        breaker.observe_terminal_overshoot(job_id, generation, usage)
+        return
+    breaker.observe(job_id, generation, usage, terminal=True)
 
 
 def _usage_from_state(state: JobState) -> UsageSummary:
@@ -1645,6 +1654,7 @@ def _fail_before_provider(
     message_id: str,
     session: Mapping[str, object],
     messages: Mapping[str, object],
+    breaker: CircuitBreaker,
     elapsed: float,
 ) -> VanillaResult:
     result = _result(
@@ -1668,6 +1678,7 @@ def _fail_before_provider(
     _write_json(job.job.root / "usage.json", result.to_dict())
     _write_json(job.job.root / "vanilla-result.json", result.to_dict())
     _verify_no_credentials(job.job.root, workspace.manifest.credential_env)
+    _observe_terminal_usage(breaker, workspace.manifest.job_id, state.generation, UsageSummary())
     state_store.transition(
         "failed",
         command_identity=command_identity,
@@ -1731,12 +1742,7 @@ def _credential_leak_result(
     _write_json(job.job.root / "usage.json", result.to_dict())
     _write_json(job.job.root / "vanilla-result.json", result.to_dict())
     _verify_no_credentials(job.job.root, workspace.manifest.credential_env)
-    breaker.observe(
-        workspace.manifest.job_id,
-        state.generation,
-        usage if usage.provider_turns <= MAX_PROVIDER_TURNS else UsageSummary(),
-        terminal=True,
-    )
+    _observe_terminal_usage(breaker, workspace.manifest.job_id, state.generation, usage)
     state_store.transition(
         "failed",
         command_identity=command_identity,
@@ -1818,12 +1824,7 @@ def _finish_early_stop(
         )
     _verify_no_credentials(job.job.root, workspace.manifest.credential_env)
     if observe_breaker:
-        breaker.observe(
-            workspace.manifest.job_id,
-            state.generation,
-            usage if usage.provider_turns <= MAX_PROVIDER_TURNS else UsageSummary(),
-            terminal=True,
-        )
+        _observe_terminal_usage(breaker, workspace.manifest.job_id, state.generation, usage)
     state_store.transition(
         "frozen",
         command_identity=command_identity,
@@ -1905,12 +1906,7 @@ def _lost_server(
             already_stopped=False,
         )
     _verify_no_credentials(job.job.root, workspace.manifest.credential_env)
-    breaker.observe(
-        workspace.manifest.job_id,
-        state.generation,
-        usage if usage.provider_turns <= MAX_PROVIDER_TURNS else UsageSummary(),
-        terminal=True,
-    )
+    _observe_terminal_usage(breaker, workspace.manifest.job_id, state.generation, usage)
     state_store.transition(
         "frozen",
         command_identity=command_identity,

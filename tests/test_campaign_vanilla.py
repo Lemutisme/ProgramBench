@@ -998,7 +998,7 @@ def test_provider_turn_poll_overshoot_records_exact_absolute_evidence_without_br
     second = [*first, *(turn(index, tool=True) for index in range(999, 1003))]
     api = SafetyApi([(first, "busy"), (second, "busy")])
     clock = FakeClock()
-    breaker = CircuitBreaker(clock=clock)
+    breaker = CircuitBreaker(clock=clock, hard_cost_cap="10")
     with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
         workspace.lease.claim_handle(request)
         result = run_vanilla(
@@ -1023,6 +1023,9 @@ def test_provider_turn_poll_overshoot_records_exact_absolute_evidence_without_br
     snapshot = breaker.snapshot()
     assert snapshot["jobs"][workspace.manifest.job_id]["usage"]["provider_turns"] == 1003
     assert snapshot["jobs"][workspace.manifest.job_id]["turn_limit_violation"] is True
+    assert breaker.campaign_usage.cost == result.cost
+    assert breaker.campaign_usage.cache_read == result.cache_read
+    assert breaker.hard_stopped
 
 
 def test_overshoot_resume_restores_previous_safe_breaker_snapshot(tmp_path: Path) -> None:
