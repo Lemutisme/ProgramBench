@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from email.utils import format_datetime
@@ -604,6 +605,80 @@ def test_concurrent_multi_job_snapshots_have_deterministic_aggregate_order() -> 
         list(pool.map(lambda item: breaker.observe(item[0], 1, item[1]), values.items()))
     assert breaker.campaign_usage.turns == values["job-a"].turns + values["job-b"].turns + values["job-c"].turns
     assert CircuitBreaker.from_snapshot(breaker.snapshot()).snapshot() == breaker.snapshot()
+
+
+def test_usage_json_numeric_bounds_fail_closed_without_raw_errors() -> None:
+    with pytest.raises(UsageParseError):
+        summarize_usage(
+            b'{"data":[{"type":"assistant","tokens":{"input":1e10000000,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"content":"ok"}]}'
+        )
+    with pytest.raises(UsageParseError):
+        summarize_usage(b'{"data":[' + b'{"type":"assistant",' * 1002 + b"}")
+    with pytest.raises(UsageParseError):
+        TurnUsage(input=10**10000)
+
+
+def test_assistant_tokens_are_required_and_user_telemetry_is_rejected() -> None:
+    with pytest.raises(UsageParseError):
+        summarize_usage({"data": [{"type": "assistant", "content": "ok"}]})
+    with pytest.raises(UsageParseError):
+        summarize_usage(
+            {"data": [{"type": "assistant", "tokens": {"input": 1, "output": 0, "reasoning": 0}, "content": "ok"}]}
+        )
+    with pytest.raises(UsageParseError):
+        summarize_usage({"data": [{"type": "user", "content": "x", "tokens": {"input": 1}}]})
+
+
+def test_cache_threshold_is_exact_at_and_below_boundary() -> None:
+    at = CircuitBreaker(cache_warmup_turns=1, minimum_cache_ratio="0.8", consecutive_failures=1)
+    at.observe("at", 1, usage(turns=1, read=400))
+    assert not at.paused
+    below = CircuitBreaker(cache_warmup_turns=1, minimum_cache_ratio="0.8", consecutive_failures=1)
+    below.observe("below", 1, usage(turns=1, read=399))
+    assert below.paused
+
+
+def test_caps_reject_nonpositive_values() -> None:
+    with pytest.raises(UsageParseError):
+        CircuitBreaker(soft_cost_cap=0)
+    with pytest.raises(UsageParseError):
+        CircuitBreaker(hard_cost_cap="0")
+
+
+def test_terminal_retry_false_after_terminal_true_is_idempotent() -> None:
+    breaker = CircuitBreaker()
+    value = usage(turns=1)
+    breaker.observe("job", 1, value, terminal=True)
+    breaker.observe("job", 1, value, terminal=False)
+    assert breaker.campaign_usage == value
+
+
+def test_negative_retry_after_uses_safe_default_but_past_date_is_immediate() -> None:
+    breaker = CircuitBreaker(clock=lambda: 100.0, retry_after_default=7)
+    breaker.observe_error(429, retry_after="-1")
+    assert breaker.backoff_until == 107
+    breaker.observe_error(429, retry_after="Thu, 01 Jan 1970 00:01:39 GMT")
+    assert breaker.backoff_until == 107
+
+
+def test_campaign_replacements_scale_without_reaggregating_all_turns() -> None:
+    breaker = CircuitBreaker()
+    summary = usage(turns=100)
+    started = time.perf_counter()
+    for index in range(75):
+        breaker.observe(f"job-{index:03d}", 1, summary)
+    for index in range(75):
+        breaker.observe(f"job-{index:03d}", 2, summary)
+    assert breaker.campaign_usage.provider_turns == 75 * 100
+    assert time.perf_counter() - started < 5
+
+
+def test_large_campaign_summary_has_structural_turn_count() -> None:
+    breaker = CircuitBreaker()
+    summary = usage(turns=1000)
+    for index in range(200):
+        breaker.observe(f"job-{index:03d}", 1, summary)
+    assert len(breaker.campaign_usage.turns) == 200 * 1000
 
 
 def test_acknowledged_recoverable_pause_round_trips_without_derived_drift() -> None:

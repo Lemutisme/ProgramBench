@@ -6,7 +6,8 @@ import json
 import math
 import threading
 import time
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, field
 from datetime import timezone
 from decimal import Decimal, InvalidOperation
 from email.utils import parsedate_to_datetime
@@ -15,6 +16,13 @@ from typing import Callable, Mapping
 
 class UsageParseError(ValueError):
     """Raised when projected usage or persisted breaker state is invalid."""
+
+
+MAX_PROJECTED_PAYLOAD_BYTES = 8 * 1024 * 1024
+MAX_MESSAGES_PER_JOB = 1001
+MAX_TOKEN_COUNT = 10**12
+MAX_DECIMAL_DIGITS = 256
+MAX_DECIMAL_EXPONENT_SPAN = 10000
 
 
 class StaleObservationError(UsageParseError):
@@ -34,12 +42,13 @@ class TurnUsage:
     def __post_init__(self) -> None:
         for name in ("input", "output", "reasoning", "cache_read", "cache_write", "prompt_total"):
             value = getattr(self, name)
-            if type(value) is not int or value < 0:
+            if type(value) is not int or value < 0 or value > MAX_TOKEN_COUNT:
                 raise UsageParseError(f"{name} must be a nonnegative integer")
         if self.prompt_total != self.input + self.cache_read + self.cache_write:
             raise UsageParseError("turn prompt total is inconsistent with token totals")
         if not isinstance(self.cost, Decimal) or not self.cost.is_finite() or self.cost < 0:
             raise UsageParseError("turn cost must be a nonnegative finite decimal")
+        _validate_decimal_bounds(self.cost)
         if self.cost.is_zero():
             object.__setattr__(self, "cost", Decimal(0))
 
@@ -78,10 +87,11 @@ class UsageSummary:
             "max_prompt_total",
         ):
             value = getattr(self, name)
-            if type(value) is not int or value < 0:
+            if type(value) is not int or value < 0 or value > MAX_TOKEN_COUNT:
                 raise UsageParseError(f"{name} must be a nonnegative integer")
         if not isinstance(self.cost, Decimal) or not self.cost.is_finite() or self.cost < 0:
             raise UsageParseError("cost must be a nonnegative finite decimal")
+        _validate_decimal_bounds(self.cost)
         if self.cost.is_zero():
             object.__setattr__(self, "cost", Decimal(0))
         if type(self.telemetry_gap) is not bool or not isinstance(self.turns, tuple):
@@ -162,6 +172,8 @@ def summarize_usage(messages: Mapping[str, object] | bytes | str) -> UsageSummar
     payload = _load_json(messages)
     if not isinstance(payload, Mapping) or set(payload) != {"data"} or not isinstance(payload["data"], list):
         raise UsageParseError("projected messages must contain only a data list")
+    if len(payload["data"]) > MAX_MESSAGES_PER_JOB:
+        raise UsageParseError("projected message count exceeds limit")
 
     turns: list[TurnUsage] = []
     for message in payload["data"]:
@@ -201,6 +213,8 @@ def _projected_turn(message: object) -> TurnUsage | None:
             raise UsageParseError("upstream info contains flat-only fields")
         role = source.get("role")
         if role == "user":
+            if "tokens" in source:
+                raise UsageParseError("user message cannot contain usage tokens")
             return None
         if role != "assistant":
             raise UsageParseError("upstream message role must be assistant or user")
@@ -209,6 +223,8 @@ def _projected_turn(message: object) -> TurnUsage | None:
         raise UsageParseError("mixed projected message schema")
     message_type = message.get("type")
     if message_type == "user":
+        if "tokens" in message:
+            raise UsageParseError("user message cannot contain usage tokens")
         if not isinstance(message.get("content"), str):
             raise UsageParseError("flat user message requires content")
         return None
@@ -221,10 +237,10 @@ def _projected_turn(message: object) -> TurnUsage | None:
 
 def _turn_from_source(source: Mapping[str, object]) -> TurnUsage:
     tokens = source.get("tokens")
-    if not isinstance(tokens, Mapping):
+    if not isinstance(tokens, Mapping) or set(tokens) != {"input", "output", "reasoning", "cache"}:
         raise UsageParseError("assistant tokens must be an object")
     cache = tokens.get("cache")
-    if not isinstance(cache, Mapping):
+    if not isinstance(cache, Mapping) or set(cache) != {"read", "write"}:
         raise UsageParseError("assistant cache tokens must be an object")
     input_tokens = _token(tokens.get("input"))
     output_tokens = _token(tokens.get("output"))
@@ -242,6 +258,58 @@ def _turn_from_source(source: Mapping[str, object]) -> TurnUsage:
         prompt_total=prompt_total,
         cost=cost,
     )
+
+
+@dataclass
+class _CampaignTotals:
+    provider_turns: int = 0
+    input: int = 0
+    output: int = 0
+    reasoning: int = 0
+    cache_read: int = 0
+    cache_write: int = 0
+    prompt_total: int = 0
+    turns_with_cache: int = 0
+    turns_without_cache: int = 0
+    cost: Decimal = Decimal(0)
+    max_prompts: Counter[int] = field(default_factory=Counter)
+    telemetry_gaps: int = 0
+
+    def add(self, summary: UsageSummary, sign: int) -> None:
+        for name in (
+            "provider_turns",
+            "input",
+            "output",
+            "reasoning",
+            "cache_read",
+            "cache_write",
+            "prompt_total",
+            "turns_with_cache",
+            "turns_without_cache",
+        ):
+            setattr(self, name, getattr(self, name) + sign * getattr(summary, name))
+        self.cost = _sum_decimals((self.cost, summary.cost if sign > 0 else -summary.cost))
+        self.max_prompts[summary.max_prompt_total] += sign
+        if self.max_prompts[summary.max_prompt_total] == 0:
+            del self.max_prompts[summary.max_prompt_total]
+        self.telemetry_gaps += sign * int(summary.telemetry_gap)
+
+    def summary(self, turns: tuple[TurnUsage, ...]) -> UsageSummary:
+        return UsageSummary(
+            provider_turns=self.provider_turns,
+            input=self.input,
+            output=self.output,
+            reasoning=self.reasoning,
+            cache_read=self.cache_read,
+            cache_write=self.cache_write,
+            prompt_total=self.prompt_total,
+            turns_with_cache=self.turns_with_cache,
+            turns_without_cache=self.turns_without_cache,
+            max_prompt_total=max(self.max_prompts, default=0),
+            cost=self.cost,
+            telemetry_gap=self.telemetry_gaps > 0,
+            turns=turns,
+        )
 
 
 class CircuitBreaker:
@@ -273,10 +341,8 @@ class CircuitBreaker:
             hard_cost_cap = total_cost_hard
         if type(cache_warmup_turns) is not int or cache_warmup_turns < 0:
             raise UsageParseError("cache warmup turns must be a nonnegative integer")
-        if isinstance(minimum_cache_ratio, bool) or not isinstance(minimum_cache_ratio, (int, float, Decimal)):
-            raise UsageParseError("minimum cache ratio must be numeric")
-        ratio = float(minimum_cache_ratio)
-        if not math.isfinite(ratio) or not 0 <= ratio <= 1:
+        ratio = _decimal(minimum_cache_ratio)
+        if not 0 <= ratio <= 1:
             raise UsageParseError("minimum cache ratio must be finite and between zero and one")
         if type(consecutive_failures) is not int or consecutive_failures <= 0:
             raise UsageParseError("consecutive failures must be a positive integer")
@@ -286,12 +352,12 @@ class CircuitBreaker:
             raise UsageParseError("retry-after maximum is invalid")
         soft = None if soft_cost_cap is None else _decimal(soft_cost_cap)
         hard = None if hard_cost_cap is None else _decimal(hard_cost_cap)
-        if soft is not None and soft < 0 or hard is not None and hard < 0:
-            raise UsageParseError("cost caps must be nonnegative")
+        if soft is not None and soft <= 0 or hard is not None and hard <= 0:
+            raise UsageParseError("cost caps must be positive")
         if soft is not None and hard is not None and soft > hard:
             raise UsageParseError("soft cost cap must not exceed hard cost cap")
         self.cache_warmup_turns = cache_warmup_turns
-        self.minimum_cache_ratio = Decimal(str(ratio))
+        self.minimum_cache_ratio = ratio
         self.consecutive_failures = consecutive_failures
         self.soft_cost_cap = soft
         self.hard_cost_cap = hard
@@ -299,7 +365,10 @@ class CircuitBreaker:
         self._retry_after_default = retry_after_default
         self._retry_after_max = retry_after_max
         self._lock = threading.RLock()
+        self._totals = _CampaignTotals()
         self._campaign_usage = UsageSummary()
+        self._usage_version = 0
+        self._materialized_version = 0
         self._jobs: dict[str, tuple[int, UsageSummary, bool]] = {}
         self._terminal_sequence: list[str] = []
         self._cache_failures = 0
@@ -324,6 +393,7 @@ class CircuitBreaker:
     @property
     def campaign_usage(self) -> UsageSummary:
         with self._lock:
+            self._materialize_usage()
             return self._campaign_usage
 
     @property
@@ -417,25 +487,40 @@ class CircuitBreaker:
             if previous is not None and resolved_generation < previous[0]:
                 raise StaleObservationError("stale usage generation")
             if previous is not None and resolved_generation == previous[0]:
-                if resolved_usage != previous[1] or terminal != previous[2]:
+                effective_terminal = previous[2] or terminal
+                if resolved_usage != previous[1]:
                     raise StaleObservationError("usage changed without a newer generation")
+                if effective_terminal != previous[2]:
+                    self._jobs[resolved_job] = (previous[0], previous[1], effective_terminal)
+                    self._terminal_sequence.append(resolved_job)
+                    self._recompute_cache()
                 return
             was_terminal = previous[2] if previous is not None else False
             is_terminal = was_terminal or terminal
             self._jobs[resolved_job] = (resolved_generation, resolved_usage, is_terminal)
+            if previous is not None:
+                self._totals.add(previous[1], -1)
+            self._totals.add(resolved_usage, 1)
+            self._usage_version += 1
             if is_terminal and not was_terminal:
                 self._terminal_sequence.append(resolved_job)
                 self._cache_acknowledged = False
-            self._recompute_usage()
             self._apply_cost_caps()
             self._recompute_cache()
 
     def _recompute_usage(self) -> None:
-        total = UsageSummary()
+        self._totals = _CampaignTotals()
         for job in sorted(self._jobs):
             summary = self._jobs[job][1]
-            total = _add(total, summary)
-        self._campaign_usage = total
+            self._totals.add(summary, 1)
+        self._usage_version += 1
+
+    def _materialize_usage(self) -> None:
+        if self._materialized_version == self._usage_version:
+            return
+        turns = tuple(turn for job in sorted(self._jobs) for turn in self._jobs[job][1].turns)
+        self._campaign_usage = self._totals.summary(turns)
+        self._materialized_version = self._usage_version
 
     def _recompute_cache(self) -> None:
         failures = 0
@@ -443,7 +528,7 @@ class CircuitBreaker:
             summary = self._jobs[job][1]
             if summary.provider_turns < self.cache_warmup_turns:
                 continue
-            if summary.cache_read_ratio < self.minimum_cache_ratio:
+            if not _ratio_at_least(summary.cache_read, summary.prompt_total, self.minimum_cache_ratio):
                 failures += 1
             else:
                 failures = 0
@@ -531,7 +616,7 @@ class CircuitBreaker:
     def snapshot(self) -> dict[str, object]:
         with self._lock:
             self._release_backoff()
-            self._apply_cost_caps()
+            self._materialize_usage()
             return {
                 "version": 1,
                 "cache_warmup_turns": self.cache_warmup_turns,
@@ -711,6 +796,7 @@ class CircuitBreaker:
     @staticmethod
     def _derived_from_jobs(breaker: CircuitBreaker) -> tuple[UsageSummary, int]:
         breaker._recompute_usage()
+        breaker._materialize_usage()
         breaker._recompute_cache()
         return breaker._campaign_usage, breaker._cache_failures
 
@@ -723,7 +809,7 @@ class CircuitBreaker:
         return bool(self._pause_causes) or self._backoff_until is not None
 
     def _apply_cost_caps(self) -> None:
-        cost = self._campaign_usage.cost
+        cost = self._totals.cost
         if "hard" in self._pause_causes or self.hard_cost_cap is not None and cost >= self.hard_cost_cap:
             self._pause_causes.add("hard")
             self._pause_causes.discard("soft")
@@ -745,6 +831,11 @@ def _load_json(payload: Mapping[str, object] | bytes | str) -> object:
         return payload
     if not isinstance(payload, (bytes, str)):
         raise UsageParseError("payload must be an object or JSON bytes")
+    if isinstance(payload, str) and len(payload) > MAX_PROJECTED_PAYLOAD_BYTES * 4:
+        raise UsageParseError("serialized payload exceeds size limit")
+    payload_size = len(payload) if isinstance(payload, bytes) else len(payload.encode())
+    if payload_size > MAX_PROJECTED_PAYLOAD_BYTES:
+        raise UsageParseError("serialized payload exceeds size limit")
 
     def duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
         result: dict[str, object] = {}
@@ -757,11 +848,25 @@ def _load_json(payload: Mapping[str, object] | bytes | str) -> object:
     def reject_constant(value: str) -> object:
         raise UsageParseError(f"invalid JSON number: {value}")
 
+    def parse_int(value: str) -> int:
+        if len(value.lstrip("-")) > MAX_DECIMAL_DIGITS:
+            raise UsageParseError("integer exceeds size limit")
+        result = int(value)
+        if abs(result) > MAX_TOKEN_COUNT:
+            raise UsageParseError("integer exceeds size limit")
+        return result
+
+    def parse_float(value: str) -> Decimal:
+        result = Decimal(value)
+        _validate_decimal_bounds(result)
+        return result
+
     try:
         return json.loads(
             payload,
             object_pairs_hook=duplicate_keys,
-            parse_float=Decimal,
+            parse_int=parse_int,
+            parse_float=parse_float,
             parse_constant=reject_constant,
         )
     except (TypeError, ValueError, json.JSONDecodeError) as error:
@@ -787,11 +892,19 @@ def _decimal(value: object) -> Decimal:
         result = Decimal(str(value))
     except (InvalidOperation, ValueError) as error:
         raise UsageParseError("cost must be numeric") from error
-    if not result.is_finite() or result < 0:
+    _validate_decimal_bounds(result)
+    if result < 0:
         raise UsageParseError("cost must be a nonnegative finite decimal")
     if result.is_zero():
         return Decimal(0)
     return result
+
+
+def _validate_decimal_bounds(value: Decimal) -> None:
+    if not value.is_finite() or len(value.as_tuple().digits) > MAX_DECIMAL_DIGITS:
+        raise UsageParseError("decimal exceeds size limit")
+    if abs(value.as_tuple().exponent) > MAX_DECIMAL_EXPONENT_SPAN:
+        raise UsageParseError("decimal exponent exceeds size limit")
 
 
 def _usage_cost(value: object) -> Decimal:
@@ -803,6 +916,7 @@ def _usage_cost(value: object) -> Decimal:
 
 
 def _decimal_string(value: Decimal) -> str:
+    _validate_decimal_bounds(value)
     result = format(value, "f")
     if "." in result:
         result = result.rstrip("0").rstrip(".")
@@ -813,15 +927,22 @@ def _sum_decimals(values: object) -> Decimal:
     decimals = tuple(values)
     if not decimals:
         return Decimal(0)
+    for value in decimals:
+        if not isinstance(value, Decimal):
+            raise UsageParseError("internal cost must be Decimal")
+        _validate_decimal_bounds(value)
     minimum_exponent = min(value.as_tuple().exponent for value in decimals)
     total = sum(
-        int("".join(str(digit) for digit in value.as_tuple().digits) or "0")
+        (-1 if value.as_tuple().sign else 1)
+        * int("".join(str(digit) for digit in value.as_tuple().digits) or "0")
         * (10 ** (value.as_tuple().exponent - minimum_exponent))
         for value in decimals
     )
     if total == 0:
         return Decimal(0)
-    return Decimal((0, tuple(int(digit) for digit in str(total)), minimum_exponent))
+    sign = 1 if total < 0 else 0
+    digits = str(abs(total))
+    return Decimal((sign, tuple(int(digit) for digit in digits), minimum_exponent))
 
 
 def _summary_fields(turns: tuple[TurnUsage, ...]) -> tuple[object, ...]:
@@ -956,30 +1077,23 @@ def _require_keys(value: Mapping[str, object], allowed: set[str]) -> None:
         raise UsageParseError("snapshot contains unknown or missing fields")
 
 
-def _add(total: UsageSummary, delta: UsageSummary) -> UsageSummary:
-    turns = total.turns + delta.turns
-    fields = _summary_fields(turns)
-    return UsageSummary(
-        provider_turns=fields[0],
-        input=fields[1],
-        output=fields[2],
-        reasoning=fields[3],
-        cache_read=fields[4],
-        cache_write=fields[5],
-        prompt_total=fields[6],
-        turns_with_cache=fields[7],
-        turns_without_cache=fields[8],
-        max_prompt_total=fields[9],
-        cost=fields[10],
-        telemetry_gap=fields[11],
-        turns=turns,
-    )
-
-
 def _finite_time(value: object) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)) or not math.isfinite(float(value)):
+    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
         raise UsageParseError("time must be finite")
-    return float(value)
+    try:
+        converted = float(value)
+    except (OverflowError, ValueError) as error:
+        raise UsageParseError("time must be finite") from error
+    if not math.isfinite(converted):
+        raise UsageParseError("time must be finite")
+    return converted
+
+
+def _ratio_at_least(read: int, prompt_total: int, threshold: Decimal) -> bool:
+    if prompt_total == 0:
+        return threshold == 0
+    numerator, denominator = threshold.as_integer_ratio()
+    return read * denominator >= prompt_total * numerator
 
 
 def _retry_after_seconds(value: object, now: float, default: int, maximum: int) -> float:
@@ -987,7 +1101,7 @@ def _retry_after_seconds(value: object, now: float, default: int, maximum: int) 
         return float(default)
     try:
         seconds = float(Decimal(str(value)))
-    except (InvalidOperation, ValueError):
+    except (InvalidOperation, ValueError, OverflowError):
         try:
             parsed = parsedate_to_datetime(str(value))
         except (TypeError, ValueError, OverflowError):
@@ -998,5 +1112,7 @@ def _retry_after_seconds(value: object, now: float, default: int, maximum: int) 
             parsed = parsed.replace(tzinfo=timezone.utc)
         seconds = parsed.timestamp() - now
     if not math.isfinite(seconds):
+        return float(default)
+    if seconds < 0:
         return float(default)
     return max(0.0, min(float(maximum), seconds))
