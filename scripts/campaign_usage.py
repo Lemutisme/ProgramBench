@@ -540,12 +540,14 @@ class CircuitBreaker:
                     candidate_jobs[resolved_job] = (previous[0], previous[1], effective_terminal)
                     candidate_sequence = list(self._terminal_sequence)
                     candidate_sequence.append(resolved_job)
+                    candidate_cache_acknowledged = False
                     candidate_failures = self._cache_failures_for(candidate_jobs, candidate_sequence)
                     candidate_causes = set(self._pause_causes)
-                    if candidate_failures >= self.consecutive_failures and not self._cache_acknowledged:
+                    if candidate_failures >= self.consecutive_failures:
                         candidate_causes.add("cache")
                     self._jobs = candidate_jobs
                     self._terminal_sequence = candidate_sequence
+                    self._cache_acknowledged = candidate_cache_acknowledged
                     self._cache_failures = candidate_failures
                     self._pause_causes = candidate_causes
                     self._state_version += 1
@@ -710,36 +712,31 @@ class CircuitBreaker:
         return
 
     def snapshot(self) -> dict[str, object]:
-        for _ in range(3):
-            with self._lock:
-                self._release_backoff()
-                version = self._state_version
-                jobs = dict(self._jobs)
-                state = {
-                    "version": 1,
-                    "cache_warmup_turns": self.cache_warmup_turns,
-                    "minimum_cache_ratio": _decimal_string(self.minimum_cache_ratio),
-                    "consecutive_failures": self.consecutive_failures,
-                    "retry_after_default": self._retry_after_default,
-                    "retry_after_max": self._retry_after_max,
-                    "cache_failures": self._cache_failures,
-                    "cache_acknowledged": self._cache_acknowledged,
-                    "soft_cap_acknowledged": self._soft_acknowledged,
-                    "pause_causes": sorted(self._pause_causes),
-                    "terminal_sequence": list(self._terminal_sequence),
-                    "backoff_until": self._backoff_until,
-                    "soft_cost_cap": None if self.soft_cost_cap is None else _decimal_string(self.soft_cost_cap),
-                    "hard_cost_cap": None if self.hard_cost_cap is None else _decimal_string(self.hard_cost_cap),
-                    "campaign_usage": self._totals.compact_dict(),
-                }
-            state["jobs"] = {
-                job: {"generation": generation, "usage": summary.to_dict(), "terminal": terminal}
-                for job, (generation, summary, terminal) in sorted(jobs.items())
+        with self._lock:
+            self._release_backoff()
+            jobs = dict(self._jobs)
+            state = {
+                "version": 1,
+                "cache_warmup_turns": self.cache_warmup_turns,
+                "minimum_cache_ratio": _decimal_string(self.minimum_cache_ratio),
+                "consecutive_failures": self.consecutive_failures,
+                "retry_after_default": self._retry_after_default,
+                "retry_after_max": self._retry_after_max,
+                "cache_failures": self._cache_failures,
+                "cache_acknowledged": self._cache_acknowledged,
+                "soft_cap_acknowledged": self._soft_acknowledged,
+                "pause_causes": sorted(self._pause_causes),
+                "terminal_sequence": list(self._terminal_sequence),
+                "backoff_until": self._backoff_until,
+                "soft_cost_cap": None if self.soft_cost_cap is None else _decimal_string(self.soft_cost_cap),
+                "hard_cost_cap": None if self.hard_cost_cap is None else _decimal_string(self.hard_cost_cap),
+                "campaign_usage": self._totals.compact_dict(),
             }
-            with self._lock:
-                if self._state_version == version:
-                    return state
-        raise UsageParseError("campaign changed during snapshot")
+        state["jobs"] = {
+            job: {"generation": generation, "usage": summary.to_dict(), "terminal": terminal}
+            for job, (generation, summary, terminal) in sorted(jobs.items())
+        }
+        return state
 
     @classmethod
     def from_snapshot(
@@ -966,7 +963,10 @@ def _load_json(payload: Mapping[str, object] | bytes | str, *, max_bytes: int = 
         return result
 
     def parse_float(value: str) -> Decimal:
-        result = Decimal(value)
+        try:
+            result = Decimal(value)
+        except Exception as error:
+            raise UsageParseError("decimal exceeds size limit") from error
         _validate_decimal_bounds(result)
         return result
 
@@ -978,7 +978,7 @@ def _load_json(payload: Mapping[str, object] | bytes | str, *, max_bytes: int = 
             parse_float=parse_float,
             parse_constant=reject_constant,
         )
-    except (TypeError, ValueError, json.JSONDecodeError) as error:
+    except (TypeError, ValueError, OverflowError, RecursionError, json.JSONDecodeError) as error:
         if isinstance(error, UsageParseError):
             raise
         raise UsageParseError("invalid JSON payload") from error

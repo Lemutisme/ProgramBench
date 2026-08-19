@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
@@ -759,6 +760,44 @@ def test_combined_cost_failure_leaves_observation_snapshot_atomic() -> None:
     with pytest.raises(UsageParseError):
         breaker.observe("second", 1, second)
     assert breaker.snapshot() == before
+
+
+def test_absurd_decimal_exponent_parse_is_normalized_usage_error() -> None:
+    with pytest.raises(UsageParseError):
+        summarize_usage(
+            b'{"data":[{"type":"assistant","cost":1e9999999999999999999,"tokens":{"input":1,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"content":"ok"}]}'
+        )
+
+
+def test_same_generation_terminal_promotion_clears_cache_acknowledgement() -> None:
+    breaker = CircuitBreaker(cache_warmup_turns=1, consecutive_failures=1)
+    breaker.observe("seed", 1, usage(turns=1, read=0), terminal=True)
+    breaker.acknowledge("cache")
+    breaker.observe("job", 1, usage(turns=1, read=0), terminal=False)
+    assert breaker.snapshot()["cache_acknowledged"] is True
+    breaker.observe("job", 1, usage(turns=1, read=0), terminal=True)
+    assert breaker.paused
+
+
+def test_continuous_writes_do_not_make_snapshot_retry_failures() -> None:
+    breaker = CircuitBreaker()
+    value = usage(turns=1)
+    stop = threading.Event()
+
+    def writer() -> None:
+        generation = 1
+        while not stop.is_set():
+            breaker.observe("writer", generation, value)
+            generation += 1
+
+    thread = threading.Thread(target=writer)
+    thread.start()
+    try:
+        snapshots = [breaker.snapshot() for _ in range(50)]
+    finally:
+        stop.set()
+        thread.join(timeout=5)
+    assert all(CircuitBreaker.from_snapshot(snapshot).snapshot() == snapshot for snapshot in snapshots)
 
 
 def test_acknowledged_recoverable_pause_round_trips_without_derived_drift() -> None:
