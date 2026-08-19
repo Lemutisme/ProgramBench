@@ -108,6 +108,7 @@ CONTROL_ARTIFACT_NAMES = (
     "procontract-admission-error.json",
 )
 _CONTRACT_STATUSES = {"dormant", "active", "verification", "escalated", "discharged", "released"}
+_EXPECTED_PORT_UNSET = object()
 
 
 class ProContractError(VanillaError):
@@ -452,18 +453,7 @@ class HttpProContractApi:
         username: str | None = None,
         password: str | None = None,
     ) -> None:
-        parsed = urlparse(base_url)
-        if (
-            parsed.scheme != "http"
-            or parsed.hostname not in {"127.0.0.1", "::1"}
-            or parsed.port != expected_port
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.path not in {"", "/"}
-            or parsed.query
-            or parsed.fragment
-        ):
-            raise ProContractError("OpenCode API must use its exact loopback origin")
+        origin = _loopback_origin(base_url, expected_port)
         if not 0 < request_timeout <= 30 or not 0 < max_response_bytes <= MAX_RESPONSE_BYTES:
             raise ProContractError("OpenCode API bounds are invalid")
         resolved_username = username if username is not None else os.environ.get("OPENCODE_SERVER_USERNAME", "opencode")
@@ -480,7 +470,7 @@ class HttpProContractApi:
             or any(character in resolved_password for character in "\r\n")
         ):
             raise ProContractError("principal server credential is required for native Contract mutations")
-        self.base_url = base_url.rstrip("/")
+        self.base_url = origin
         self._owns_http_client = http_client is None
         self.http_client = http_client or UrllibHttpClient()
         self.request_timeout = request_timeout
@@ -488,17 +478,8 @@ class HttpProContractApi:
         self._authorization = "Basic " + base64.b64encode(f"{resolved_username}:{resolved_password}".encode()).decode()
 
     def rebind(self, base_url: str) -> None:
-        parsed = urlparse(base_url)
-        if (
-            parsed.scheme != "http"
-            or parsed.hostname not in {"127.0.0.1", "::1"}
-            or parsed.port is None
-            or parsed.path not in {"", "/"}
-            or parsed.query
-            or parsed.fragment
-        ):
-            raise ProContractError("OpenCode rebound origin is invalid")
-        self.base_url = base_url.rstrip("/")
+        origin = _loopback_origin(base_url)
+        self.base_url = origin
         if self._owns_http_client:
             self.http_client = UrllibHttpClient()
 
@@ -700,6 +681,19 @@ def build_issue_payload(workspace: DockerWorkspace, *, now: float) -> dict[str, 
             "benchmark evaluation is performed externally by ProgramBench after discharge."
         ),
     ).to_dict()
+
+
+def restart_delivery_workspace(
+    workspace: ProContractWorkspace,
+    api: ProContractApi,
+) -> ProContractWorkspace:
+    restarted = workspace.restart()
+    try:
+        api.rebind(restarted.base_url)
+    except BaseException:
+        restarted.stop_for_freeze()
+        raise
+    return restarted
 
 
 def run_procontract(
@@ -1591,9 +1585,8 @@ def _deliver(
         raise ProContractDeliveryError("principal evidence hash must be distinct from native replay evidence")
 
     try:
-        workspace = workspace.restart()
-        api.rebind(workspace.base_url)
-    except WorkspaceError:
+        workspace = restart_delivery_workspace(workspace, api)
+    except (WorkspaceError, ProContractError):
         raise ProContractNativeOutcome(
             ProContractCompletion.LOST_SERVER,
             contract,
@@ -3560,6 +3553,34 @@ def _id(value: str, prefix: str) -> str:
     if not isinstance(value, str) or not value.startswith(prefix) or len(value) > 256:
         raise ProContractError("OpenCode ID is invalid")
     return quote(value, safe="_-.")
+
+
+def _loopback_origin(value: str, expected_port: object = _EXPECTED_PORT_UNSET) -> str:
+    try:
+        parsed = urlparse(value)
+        port = parsed.port
+    except (TypeError, ValueError):
+        raise ProContractError("OpenCode API must use its exact loopback origin") from None
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname not in {"127.0.0.1", "::1"}
+        or port is None
+        or type(port) is not int
+        or not 0 < port < 65536
+        or expected_port is not _EXPECTED_PORT_UNSET
+        and (type(expected_port) is not int or not 0 < expected_port < 65536)
+        or expected_port is not _EXPECTED_PORT_UNSET
+        and port != expected_port
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ProContractError("OpenCode API must use its exact loopback origin")
+    host = "[::1]" if parsed.hostname == "::1" else "127.0.0.1"
+    return f"http://{host}:{port}"
 
 
 def _session_id(value: object) -> str:

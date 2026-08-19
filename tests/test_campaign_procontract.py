@@ -3222,6 +3222,22 @@ def test_active_session_record_accepts_multiple_exact_running_sessions() -> None
     assert api.status("ses_missing") == "idle"
 
 
+def test_rebind_rejects_userinfo_without_changing_origin() -> None:
+    from scripts.campaign_procontract import HttpProContractApi, ProContractError
+
+    api = HttpProContractApi(
+        "http://127.0.0.1:4096",
+        expected_port=4096,
+        password="secret",
+        http_client=StaticHttpClient({"data": {}}),
+    )
+    with pytest.raises(ProContractError):
+        api.rebind("http://user:pass@127.0.0.1:4097")
+    assert api.base_url == "http://127.0.0.1:4096"
+    with pytest.raises(ProContractError):
+        HttpProContractApi("http://127.0.0.1:4096", expected_port=None, password="secret")  # type: ignore[arg-type]
+
+
 @pytest.mark.parametrize("session_id", ["bad", "", 1])
 def test_active_session_record_rejects_invalid_target_id(session_id: object) -> None:
     from scripts.campaign_procontract import HttpProContractApi, ProContractError
