@@ -43,6 +43,16 @@ from scripts.campaign_state import (
     should_run,
 )
 
+from scripts.campaign_usage import (
+    CircuitBreaker,
+    StaleObservationError,
+    TurnUsage,
+    UsageTurn,
+    UsageParseError,
+    UsageSummary,
+    summarize_usage,
+)
+
 # Public compatibility re-exports for callers that historically imported state helpers here.
 import yaml
 
