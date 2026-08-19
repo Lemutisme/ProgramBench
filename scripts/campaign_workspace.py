@@ -6,10 +6,9 @@ import hashlib
 import json
 import os
 import re
-import subprocess
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from typing import Callable, Mapping
 from urllib.error import URLError
@@ -24,7 +23,7 @@ class WorkspaceError(RuntimeError):
 
 
 class ContainerConflictError(WorkspaceError):
-    """Raised when a container name is occupied by non-identical evidence."""
+    """Raised when persisted and current workspace evidence differ."""
 
 
 class WorkspaceHealthError(WorkspaceError):
@@ -41,7 +40,16 @@ class DockerNotFoundError(DockerCommandError):
 
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 _ENV = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
-_OUTPUT_LIMIT = 64 * 1024
+_CONTAINER_ID = re.compile(r"[0-9a-f]{12,64}\Z")
+_PHASES = frozenset({"planned", "preparing", "candidate_ready", "launching", "running", "stopped"})
+_FIXED_ENV = {
+    "HOME": "/state/home",
+    "XDG_CACHE_HOME": "/cache",
+    "XDG_CONFIG_HOME": "/state/config",
+    "XDG_DATA_HOME": "/state/data",
+}
+_ENTRYPOINT = ("/opencode",)
+_COMMAND = ("serve", "--hostname", "0.0.0.0", "--port", "4096")
 _DockerRunner = Callable[[tuple[str, ...], float], str]
 _HealthProbe = Callable[[str, float], bool]
 
@@ -49,80 +57,122 @@ _HealthProbe = Callable[[str, float], bool]
 @dataclass(frozen=True)
 class WorkspaceManifest:
     campaign: str
+    job_id: str
     instance_id: str
     arm: str
     job_root: Path
+    candidate_root: Path
+    candidate: Path
+    state_root: Path
+    state_dir: Path
+    cache_dir: Path
+    log_dir: Path
+    subject_dir: Path
+    install_dir: Path
+    manifest_path: Path
     container_name: str
     container_id: str | None
     image: str
     image_digest: str
+    platform: str
     binary: Path
     binary_sha256: str
-    candidate: Path
-    state_dir: Path
-    log_dir: Path
     credential_env: tuple[str, ...]
+    environment_names: tuple[str, ...]
+    container_user: str
+    container_init: bool
+    network_mode: str
+    workdir: str
+    entrypoint: tuple[str, ...]
+    command: tuple[str, ...]
+    home: str
+    xdg_cache_home: str
+    xdg_config_home: str
+    xdg_data_home: str
     port: int | None
     phase: str
-    bridge_network: bool = True
 
     def __post_init__(self) -> None:
-        if self.phase not in {"planned", "candidate_ready", "launching", "running", "stopped"}:
+        if self.phase not in _PHASES:
             raise WorkspaceError("workspace manifest has an invalid phase")
         if any(not _NAME.fullmatch(value) for value in (self.campaign, self.instance_id, self.arm)):
             raise WorkspaceError("workspace identity contains unsafe characters")
-        if not all(_ENV.fullmatch(value) for value in self.credential_env):
+        if not re.fullmatch(r"[0-9a-f]{64}", self.job_id):
+            raise WorkspaceError("workspace job ID is invalid")
+        if self.container_id is not None and not _CONTAINER_ID.fullmatch(self.container_id):
+            raise WorkspaceError("workspace container ID is invalid")
+        if len(set(self.credential_env)) != len(self.credential_env) or not all(
+            _ENV.fullmatch(value) for value in self.credential_env
+        ):
             raise WorkspaceError("credential environment names are invalid")
+        if tuple(sorted(set(self.environment_names))) != self.environment_names or not all(
+            _ENV.fullmatch(value) for value in self.environment_names
+        ):
+            raise WorkspaceError("container environment names are invalid")
         if self.port is not None and (type(self.port) is not int or not 1 <= self.port <= 65535):
             raise WorkspaceError("workspace port is invalid")
 
     def to_dict(self) -> dict[str, object]:
-        return {
-            "version": 1,
-            "campaign": self.campaign,
-            "instance_id": self.instance_id,
-            "arm": self.arm,
-            "job_root": str(self.job_root),
-            "container_name": self.container_name,
-            "container_id": self.container_id,
-            "image": self.image,
-            "image_digest": self.image_digest,
-            "binary": str(self.binary),
-            "binary_sha256": self.binary_sha256,
-            "candidate": str(self.candidate),
-            "state_dir": str(self.state_dir),
-            "log_dir": str(self.log_dir),
-            "credential_env": list(self.credential_env),
-            "port": self.port,
-            "phase": self.phase,
-            "bridge_network": self.bridge_network,
-        }
+        value = {field.name: getattr(self, field.name) for field in fields(self)}
+        for name in (
+            "job_root",
+            "candidate_root",
+            "candidate",
+            "state_root",
+            "state_dir",
+            "cache_dir",
+            "log_dir",
+            "subject_dir",
+            "install_dir",
+            "manifest_path",
+            "binary",
+        ):
+            value[name] = str(value[name])
+        for name in ("credential_env", "environment_names", "entrypoint", "command"):
+            value[name] = list(value[name])
+        return {"version": 2, **value}
 
     @classmethod
     def from_dict(cls, raw: object) -> "WorkspaceManifest":
-        if not isinstance(raw, dict) or set(raw) != {
-            "version", "campaign", "instance_id", "arm", "job_root", "container_name", "container_id", "image",
-            "image_digest", "binary", "binary_sha256", "candidate", "state_dir", "log_dir", "credential_env", "port",
-            "phase", "bridge_network",
-        } or raw["version"] != 1:
+        expected = {field.name for field in fields(cls)}
+        if not isinstance(raw, dict) or set(raw) != {"version", *expected} or raw["version"] != 2:
             raise WorkspaceError("workspace manifest is invalid")
-        values = ("campaign", "instance_id", "arm", "job_root", "container_name", "image", "image_digest", "binary", "binary_sha256", "candidate", "state_dir", "log_dir", "phase")
-        if any(not isinstance(raw[name], str) for name in values):
+        paths = {
+            "job_root",
+            "candidate_root",
+            "candidate",
+            "state_root",
+            "state_dir",
+            "cache_dir",
+            "log_dir",
+            "subject_dir",
+            "install_dir",
+            "manifest_path",
+            "binary",
+        }
+        sequences = {"credential_env", "environment_names", "entrypoint", "command"}
+        if any(
+            not isinstance(raw[name], str)
+            for name in expected - paths - sequences - {"container_id", "port", "container_init"}
+        ):
             raise WorkspaceError("workspace manifest has invalid fields")
+        if any(not isinstance(raw[name], str) for name in paths):
+            raise WorkspaceError("workspace manifest has invalid paths")
+        if any(
+            not isinstance(raw[name], list) or not all(isinstance(value, str) for value in raw[name])
+            for name in sequences
+        ):
+            raise WorkspaceError("workspace manifest has invalid sequences")
         if raw["container_id"] is not None and not isinstance(raw["container_id"], str):
             raise WorkspaceError("workspace manifest has invalid container ID")
-        if not isinstance(raw["credential_env"], list) or not all(isinstance(value, str) for value in raw["credential_env"]):
-            raise WorkspaceError("workspace manifest has invalid credentials")
         if raw["port"] is not None and type(raw["port"]) is not int:
             raise WorkspaceError("workspace manifest has invalid port")
-        if type(raw["bridge_network"]) is not bool:
-            raise WorkspaceError("workspace manifest has invalid network")
-        return cls(
-            raw["campaign"], raw["instance_id"], raw["arm"], Path(raw["job_root"]), raw["container_name"],
-            raw["container_id"], raw["image"], raw["image_digest"], Path(raw["binary"]), raw["binary_sha256"],
-            Path(raw["candidate"]), Path(raw["state_dir"]), Path(raw["log_dir"]), tuple(raw["credential_env"]), raw["port"],
-            raw["phase"], raw["bridge_network"],
-        )
+        if type(raw["container_init"]) is not bool:
+            raise WorkspaceError("workspace manifest has invalid init setting")
+        value = {name: raw[name] for name in expected}
+        value.update({name: Path(raw[name]) for name in paths})
+        value.update({name: tuple(raw[name]) for name in sequences})
+        return cls(**value)
 
 
 @dataclass(frozen=True)
@@ -178,15 +228,23 @@ class DockerWorkspace:
         return self.manifest.state_dir
 
     def stop(self) -> None:
-        inspected = _inspect_container(self.docker_runner, self.docker, self.container_id)
+        current = _load_manifest(self.manifest_path)
+        if _static_identity(current) != _static_identity(self.manifest) or current.container_id != self.container_id:
+            raise ContainerConflictError("persisted workspace changed before stop")
+        _require_safe_manifest_paths(current)
+        _require_binary(current)
+        inspected = _inspect_container(self.docker_runner, self.docker, current.container_name)
         if inspected is None:
             raise ContainerConflictError("owned container is missing; evidence retained")
-        _require_exact_container(inspected, self.manifest)
-        if not isinstance(inspected.get("State"), Mapping) or not inspected["State"].get("Running"):
-            _write_manifest(self.manifest_path, _replace_manifest(self.manifest, phase="stopped", port=None))
-            return
-        _docker(self.docker_runner, (self.docker, "stop", "--time", "10", self.container_id), 30, "stop")
-        _write_manifest(self.manifest_path, _replace_manifest(self.manifest, phase="stopped", port=None))
+        _require_exact_container(inspected, current, check_port=True)
+        if _running(inspected):
+            _require_binary(current)
+            _docker(self.docker_runner, (self.docker, "stop", "--time", "10", self.container_id), 30, "stop")
+            inspected = _inspect_container(self.docker_runner, self.docker, current.container_name)
+            if inspected is None or _running(inspected):
+                raise ContainerConflictError("owned container did not stop cleanly")
+            _require_exact_container(inspected, current, check_port=True)
+        _write_manifest(self.manifest_path, replace(current, phase="stopped"))
 
 
 def ensure_workspace(request: WorkspaceRequest) -> DockerWorkspace:
@@ -194,28 +252,22 @@ def ensure_workspace(request: WorkspaceRequest) -> DockerWorkspace:
     request = _validate_request(request)
     runner = request.docker_runner or _run_docker
     probe = request.health_probe or _probe_health
-    manifest_path = request.state_root / "workspace.json"
-    existing = _load_manifest(manifest_path) if manifest_path.exists() else None
-    expected_name = _container_name(request.campaign, request.instance_id, request.arm)
-    if existing:
-        _require_manifest_identity(existing, request, expected_name)
-        return _resume(existing, manifest_path, request, runner, probe)
-    image_digest = _image_digest(runner, request.docker, request.image)
-    occupied = _inspect_container(runner, request.docker, expected_name)
-    if occupied is not None:
+    image_digest, platform, image_environment = _image_spec(runner, request.docker, request.image)
+    expected = _expected_manifest(request, image_digest, platform, image_environment)
+    if expected.manifest_path.exists():
+        existing = _load_manifest(expected.manifest_path)
+        _require_manifest_identity(existing, expected)
+        return _resume(existing, request, runner, probe)
+    if _inspect_container(runner, request.docker, expected.container_name) is not None:
         raise ContainerConflictError("container name is occupied without owned persisted evidence")
-    candidate = request.candidate_root / expected_name
-    manifest = WorkspaceManifest(
-        request.campaign, request.instance_id, request.arm, request.job.root, expected_name, None, request.image, image_digest,
-        request.install.binary, request.install.binary_sha256, candidate, request.state_root, request.log_dir,
-        request.credential_env, None, "planned",
-    )
-    _write_manifest(manifest_path, manifest)
-    _copy_cleanroom(runner, request.docker, request.image, candidate, request.state_root, request.log_dir)
-    _prepare_bind_paths(candidate, request.state_root, request.log_dir)
-    manifest = _replace_manifest(manifest, phase="candidate_ready")
-    _write_manifest(manifest_path, manifest)
-    return _launch(manifest, manifest_path, request, runner, probe, adopted=False)
+    _write_manifest(expected.manifest_path, expected)
+    preparing = replace(expected, phase="preparing")
+    _write_manifest(expected.manifest_path, preparing)
+    _copy_cleanroom(runner, request.docker, preparing)
+    _prepare_bind_paths(preparing)
+    candidate_ready = replace(preparing, phase="candidate_ready")
+    _write_manifest(expected.manifest_path, candidate_ready)
+    return _launch(candidate_ready, request, runner, probe, adopted=False)
 
 
 def prepare_workspace(request: WorkspaceRequest) -> DockerWorkspace:
@@ -223,112 +275,357 @@ def prepare_workspace(request: WorkspaceRequest) -> DockerWorkspace:
     return ensure_workspace(request)
 
 
-def _resume(manifest: WorkspaceManifest, path: Path, request: WorkspaceRequest, runner: _DockerRunner, probe: _HealthProbe) -> DockerWorkspace:
-    if manifest.phase == "planned":
-        _copy_cleanroom(runner, request.docker, request.image, manifest.candidate, manifest.state_dir, manifest.log_dir)
-        _prepare_bind_paths(manifest.candidate, manifest.state_dir, manifest.log_dir)
-        manifest = _replace_manifest(manifest, phase="candidate_ready")
-        _write_manifest(path, manifest)
+def _resume(
+    manifest: WorkspaceManifest,
+    request: WorkspaceRequest,
+    runner: _DockerRunner,
+    probe: _HealthProbe,
+) -> DockerWorkspace:
+    _require_binary(manifest)
+    if manifest.phase in {"planned", "preparing"}:
+        preparing = replace(manifest, phase="preparing")
+        _write_manifest(manifest.manifest_path, preparing)
+        _copy_cleanroom(runner, request.docker, preparing)
+        _prepare_bind_paths(preparing)
+        manifest = replace(preparing, phase="candidate_ready")
+        _write_manifest(manifest.manifest_path, manifest)
+    _require_candidate_ready(manifest)
     inspected = _inspect_container(runner, request.docker, manifest.container_name)
     if manifest.container_id is None:
-        if inspected is not None:
-            raise ContainerConflictError("container appeared before owned launch could be persisted")
-        return _launch(manifest, path, request, runner, probe, adopted=False)
+        if inspected is None:
+            return _launch(manifest, request, runner, probe, adopted=False)
+        _require_exact_container(inspected, manifest, check_port=False)
+        container_id = inspected.get("Id")
+        if not isinstance(container_id, str) or not _CONTAINER_ID.fullmatch(container_id):
+            raise ContainerConflictError("recovered container has an invalid ID")
+        manifest = replace(manifest, container_id=container_id, phase="launching")
+        _write_manifest(manifest.manifest_path, manifest)
+        return _activate(manifest, request, runner, probe, adopted=True, inspected=inspected)
     if inspected is None:
         raise ContainerConflictError("owned container is missing; evidence retained")
-    _require_exact_container(inspected, manifest)
-    if not _running(inspected):
-        _docker(runner, (request.docker, "start", manifest.container_id), 30, "start")
-    port = _published_port(runner, request.docker, manifest.container_id)
-    ready = _replace_manifest(manifest, port=port, phase="launching")
-    _write_manifest(path, ready)
-    _wait_health(ready, probe, request.health_timeout)
-    ready = _replace_manifest(ready, phase="running")
-    _write_manifest(path, ready)
-    return DockerWorkspace(ready, path, request.docker, runner, probe, request.health_timeout, adopted=True)
+    _require_exact_container(inspected, manifest, check_port=manifest.port is not None)
+    return _activate(manifest, request, runner, probe, adopted=True, inspected=inspected)
 
 
-def _launch(manifest: WorkspaceManifest, path: Path, request: WorkspaceRequest, runner: _DockerRunner, probe: _HealthProbe, *, adopted: bool) -> DockerWorkspace:
-    command = [request.docker, "create", "--name", manifest.container_name, "--platform", "linux/amd64", "--init", "--user", "agent", "--network", "bridge", "-p", "127.0.0.1::4096", "-w", "/candidate"]
-    command.extend(value for label in _identity_labels(manifest).items() for value in ("--label", f"{label[0]}={label[1]}"))
-    command.extend(value for name in manifest.credential_env for value in ("-e", name))
-    command.extend(("-e", "HOME=/state/home", "-e", "XDG_CACHE_HOME=/state/cache", "-e", "XDG_CONFIG_HOME=/state/config", "-e", "XDG_DATA_HOME=/state/data"))
-    command.extend(("-v", f"{manifest.candidate}:/candidate:rw", "-v", f"{manifest.state_dir}:/state:rw", "-v", f"{manifest.binary}:/opencode:ro"))
-    command.extend((manifest.image, "/opencode", "serve", "--hostname", "0.0.0.0", "--port", "4096"))
-    _write_manifest(path, _replace_manifest(manifest, phase="launching"))
+def _launch(
+    manifest: WorkspaceManifest,
+    request: WorkspaceRequest,
+    runner: _DockerRunner,
+    probe: _HealthProbe,
+    *,
+    adopted: bool,
+) -> DockerWorkspace:
+    _require_binary(manifest)
+    launching = replace(manifest, container_id=None, port=None, phase="launching")
+    _write_manifest(manifest.manifest_path, launching)
+    command = [
+        request.docker,
+        "create",
+        "--name",
+        launching.container_name,
+        "--platform",
+        launching.platform,
+        "--init",
+        "--user",
+        launching.container_user,
+        "--network",
+        launching.network_mode,
+        "-p",
+        "127.0.0.1::4096",
+        "-w",
+        launching.workdir,
+        "--entrypoint",
+        launching.entrypoint[0],
+    ]
+    command.extend(
+        value for label in _identity_labels(launching).items() for value in ("--label", f"{label[0]}={label[1]}")
+    )
+    command.extend(value for name in launching.credential_env for value in ("-e", name))
+    command.extend(value for item in _FIXED_ENV.items() for value in ("-e", f"{item[0]}={item[1]}"))
+    command.extend(value for mount in _mounts(launching) for value in ("-v", ":".join(mount[:3])))
+    command.extend((launching.image, *launching.command))
     container_id = _docker(runner, tuple(command), 60, "create").strip()
-    if not re.fullmatch(r"[0-9a-f]{12,64}", container_id):
+    if not _CONTAINER_ID.fullmatch(container_id):
         raise DockerCommandError("docker create returned an invalid container ID")
-    started = _replace_manifest(manifest, container_id=container_id, phase="launching")
-    _write_manifest(path, started)
-    _docker(runner, (request.docker, "start", container_id), 30, "start")
-    port = _published_port(runner, request.docker, container_id)
-    started = _replace_manifest(started, port=port)
-    _write_manifest(path, started)
-    _wait_health(started, probe, request.health_timeout)
-    ready = _replace_manifest(started, phase="running")
-    _write_manifest(path, ready)
-    return DockerWorkspace(ready, path, request.docker, runner, probe, request.health_timeout, adopted)
+    inspected = _inspect_container(runner, request.docker, launching.container_name)
+    if inspected is None:
+        raise ContainerConflictError("created container is missing")
+    _require_exact_container(inspected, launching, check_port=False)
+    if inspected.get("Id") != container_id:
+        raise ContainerConflictError("created container ID does not match its deterministic name")
+    launching = replace(launching, container_id=container_id)
+    _write_manifest(launching.manifest_path, launching)
+    return _activate(launching, request, runner, probe, adopted=adopted, inspected=inspected)
+
+
+def _activate(
+    manifest: WorkspaceManifest,
+    request: WorkspaceRequest,
+    runner: _DockerRunner,
+    probe: _HealthProbe,
+    *,
+    adopted: bool,
+    inspected: Mapping[str, object],
+) -> DockerWorkspace:
+    if manifest.container_id is None:
+        raise WorkspaceError("workspace has no container to activate")
+    if not _running(inspected):
+        _require_binary(manifest)
+        _docker(runner, (request.docker, "start", manifest.container_id), 30, "start")
+    inspected = _inspect_container(runner, request.docker, manifest.container_name)
+    if inspected is None or not _running(inspected):
+        raise ContainerConflictError("owned container did not start cleanly")
+    _require_exact_container(inspected, manifest, check_port=False)
+    port = _published_port(runner, request.docker, manifest.container_id)
+    launching = replace(manifest, port=port, phase="launching")
+    _require_exact_container(inspected, launching, check_port=True)
+    _write_manifest(launching.manifest_path, launching)
+    _wait_health(launching, probe, request.health_timeout)
+    _require_binary(launching)
+    ready = replace(launching, phase="running")
+    _write_manifest(ready.manifest_path, ready)
+    return DockerWorkspace(ready, ready.manifest_path, request.docker, runner, probe, request.health_timeout, adopted)
+
+
+def _expected_manifest(
+    request: WorkspaceRequest,
+    image_digest: str,
+    platform: str,
+    image_environment: tuple[str, ...],
+) -> WorkspaceManifest:
+    job_id = _job_id(request.campaign, request.instance_id, request.arm)
+    candidate = request.candidate_root / f"programbench-{job_id[:32]}"
+    return WorkspaceManifest(
+        campaign=request.campaign,
+        job_id=job_id,
+        instance_id=request.instance_id,
+        arm=request.arm,
+        job_root=request.job.root,
+        candidate_root=request.candidate_root,
+        candidate=candidate,
+        state_root=request.state_root,
+        state_dir=request.state_root / "opencode-state",
+        cache_dir=request.state_root / "cache",
+        log_dir=request.log_dir,
+        subject_dir=request.job.root / "subject",
+        install_dir=request.install.binary.parent,
+        manifest_path=request.state_root / "workspace.json",
+        container_name=f"programbench-{job_id[:32]}",
+        container_id=None,
+        image=request.image,
+        image_digest=image_digest,
+        platform=platform,
+        binary=request.install.binary,
+        binary_sha256=request.install.binary_sha256,
+        credential_env=request.credential_env,
+        environment_names=tuple(sorted({*image_environment, *request.credential_env, *_FIXED_ENV})),
+        container_user="agent",
+        container_init=True,
+        network_mode="bridge",
+        workdir="/candidate",
+        entrypoint=_ENTRYPOINT,
+        command=_COMMAND,
+        home=_FIXED_ENV["HOME"],
+        xdg_cache_home=_FIXED_ENV["XDG_CACHE_HOME"],
+        xdg_config_home=_FIXED_ENV["XDG_CONFIG_HOME"],
+        xdg_data_home=_FIXED_ENV["XDG_DATA_HOME"],
+        port=None,
+        phase="planned",
+    )
 
 
 def _validate_request(request: WorkspaceRequest) -> WorkspaceRequest:
-    if any(not isinstance(value, str) or not _NAME.fullmatch(value) for value in (request.campaign, request.instance_id, request.arm)):
+    if any(
+        not isinstance(value, str) or not _NAME.fullmatch(value)
+        for value in (request.campaign, request.instance_id, request.arm)
+    ):
         raise WorkspaceError("campaign, instance, and arm names must be safe identifiers")
     if not isinstance(request.image, str) or not request.image or "@" in request.image:
         raise WorkspaceError("image name is invalid")
     if not request.image.endswith(":task_cleanroom"):
-        request = WorkspaceRequest(**{**request.__dict__, "image": f"{request.image}:task_cleanroom"})
-    if not request.credential_env or len(set(request.credential_env)) != len(request.credential_env) or not all(_ENV.fullmatch(name) for name in request.credential_env):
+        request = replace(request, image=f"{request.image}:task_cleanroom")
+    if (
+        not request.credential_env
+        or len(set(request.credential_env)) != len(request.credential_env)
+        or not all(_ENV.fullmatch(name) for name in request.credential_env)
+    ):
         raise WorkspaceError("credential environment names must be distinct valid names")
     if request.health_timeout <= 0:
         raise WorkspaceError("health timeout must be positive")
     binary = _canonical_existing(request.install.binary, "installed binary")
-    roots = tuple(_canonical_root(path, label) for path, label in ((request.job.root, "job root"), (request.candidate_root, "candidate root"), (request.state_root, "state root"), (request.log_dir, "log directory")))
-    candidate, state, logs = roots[1:]
-    if any(_overlap(left, right) for left, right in ((candidate, state), (candidate, binary.parent), (state, binary.parent))):
-        raise WorkspaceError("candidate, state, and installation roots must not overlap")
-    return WorkspaceRequest(**{**request.__dict__, "candidate_root": candidate, "state_root": state, "log_dir": logs, "install": request.install.__class__(**{**request.install.__dict__, "binary": binary})})
+    job_root = _canonical_root(request.job.root, "job root")
+    job = JobPaths(
+        job_root,
+        _canonical_job_path(request.job.state, job_root, "job state"),
+        _canonical_job_path(request.job.lock, job_root, "job lock"),
+        _canonical_job_path(request.job.submission, job_root, "job submission"),
+    )
+    candidate = _canonical_root(request.candidate_root, "candidate root")
+    state = _canonical_root(request.state_root, "state root")
+    logs = _canonical_root(request.log_dir, "log root")
+    subject = _canonical_root(job_root / "subject", "subject root")
+    install = _canonical_root(binary.parent, "install root")
+    cache = _canonical_root(state / "cache", "cache root")
+    state_dir = _canonical_root(state / "opencode-state", "OpenCode state root")
+    manifest = _canonical_root(state / "workspace.json", "workspace manifest")
+    candidate_dir = _canonical_root(
+        candidate / f"programbench-{_job_id(request.campaign, request.instance_id, request.arm)[:32]}",
+        "candidate directory",
+    )
+    independent = (candidate, state, logs, subject, install)
+    if any(_overlap(left, right) for index, left in enumerate(independent) for right in independent[index + 1 :]):
+        raise WorkspaceError("workspace roots overlap outside their intended containment")
+    if not (
+        _contains(candidate, candidate_dir)
+        and _contains(state, cache)
+        and _contains(state, state_dir)
+        and _contains(state, manifest)
+        and _contains(install, binary)
+    ):
+        raise WorkspaceError("workspace paths escape their intended roots")
+    record = replace(request.install, binary=binary)
+    if _sha256(binary) != record.binary_sha256:
+        raise ContainerConflictError("installed OpenCode binary hash does not match installation evidence")
+    return replace(
+        request,
+        job=job,
+        candidate_root=candidate,
+        state_root=state,
+        log_dir=logs,
+        install=record,
+    )
 
 
-def _copy_cleanroom(runner: _DockerRunner, docker: str, image: str, candidate: Path, state: Path, logs: Path) -> None:
-    if candidate.exists():
-        if (candidate / ".programbench-cleanroom").is_file():
+def _canonical_job_path(path: Path | None, root: Path, label: str) -> Path:
+    if path is None:
+        raise WorkspaceError(f"{label} is missing")
+    value = _canonical_root(path, label)
+    if not _contains(root, value):
+        raise WorkspaceError(f"{label} escapes the job root")
+    return value
+
+
+def _job_id(campaign: str, instance_id: str, arm: str) -> str:
+    return hashlib.sha256("\0".join((campaign, instance_id, arm)).encode()).hexdigest()
+
+
+def _copy_cleanroom(runner: _DockerRunner, docker: str, manifest: WorkspaceManifest) -> None:
+    marker = manifest.candidate / ".programbench-cleanroom.json"
+    preparing_marker = manifest.candidate / ".programbench-preparing.json"
+    if manifest.candidate.is_symlink() or marker.is_symlink() or preparing_marker.is_symlink():
+        raise WorkspaceError("candidate evidence contains a symlink")
+    if manifest.candidate.exists():
+        if manifest.phase != "preparing":
+            _require_candidate_ready(manifest)
             return
-        raise ContainerConflictError("candidate path is occupied by foreign evidence")
-    candidate.mkdir(parents=True, mode=0o700)
-    state.mkdir(parents=True, exist_ok=True)
-    logs.mkdir(parents=True, exist_ok=True)
-    # This is intentionally a fixed in-container init command: it never interpolates host or credential values.
+        if marker.is_file() and _load_candidate_marker(marker) == _candidate_identity(manifest):
+            return
+        if not manifest.candidate.is_dir():
+            raise ContainerConflictError("candidate path is occupied by foreign evidence")
+        if _load_candidate_marker(preparing_marker) != _candidate_identity(manifest):
+            raise ContainerConflictError("candidate preparation identity does not match persisted workspace")
+    else:
+        manifest.candidate.mkdir(parents=True, mode=0o700)
+        _sync_directory(manifest.candidate.parent)
+    manifest.state_dir.mkdir(parents=True, exist_ok=True)
+    manifest.cache_dir.mkdir(parents=True, exist_ok=True)
+    manifest.log_dir.mkdir(parents=True, exist_ok=True)
+    _prepare_bind_paths(manifest)
+    if not preparing_marker.exists():
+        _write_json(preparing_marker, _candidate_identity(manifest))
     command = (
-        docker, "run", "--rm", "--user", "root", "--network", "none", "-v", f"{candidate}:/candidate:rw",
-        "-v", f"{state}:/state:rw", "-v", f"{logs}:/logs:rw", image, "/bin/sh", "-ec",
-        "cp -a /workspace/. /candidate/; rm -f /candidate/executable; ln -s /workspace/executable /candidate/reference; "
-        "mkdir -p /state/home /state/cache /state/config /state/data; chown -R agent:agent /candidate /state /logs; touch /candidate/.programbench-cleanroom",
+        docker,
+        "run",
+        "--rm",
+        "--user",
+        "root",
+        "--network",
+        "none",
+        "-v",
+        f"{manifest.candidate}:/candidate:rw",
+        "-v",
+        f"{manifest.state_dir}:/state:rw",
+        "-v",
+        f"{manifest.cache_dir}:/cache:rw",
+        "-v",
+        f"{manifest.log_dir}:/logs:rw",
+        manifest.image,
+        "/bin/sh",
+        "-ec",
+        "find /candidate -mindepth 1 -maxdepth 1 ! -name .programbench-preparing.json -exec rm -rf -- {} +; "
+        "cp -a /workspace/. /candidate/; rm -f /candidate/executable; "
+        "ln -s /workspace/executable /candidate/reference; "
+        "mkdir -p /state/home /state/config /state/data; "
+        "mv /candidate/.programbench-preparing.json /candidate/.programbench-cleanroom.json; "
+        "chown -R agent:agent /candidate /state /cache /logs; "
+        "chmod -R a+rwX /candidate /state /cache /logs",
     )
     _docker(runner, command, 90, "initialize candidate")
+    _require_candidate_ready(manifest)
 
 
-def _prepare_bind_paths(candidate: Path, state: Path, logs: Path) -> None:
-    for path in (state, logs, *(state / name for name in ("home", "cache", "config", "data"))):
+def _prepare_bind_paths(manifest: WorkspaceManifest) -> None:
+    for path in (
+        manifest.state_dir,
+        manifest.cache_dir,
+        manifest.log_dir,
+        *(manifest.state_dir / name for name in ("home", "config", "data")),
+    ):
         path.mkdir(parents=True, exist_ok=True)
-    # The agent identity is image-defined.  Preserve safe modes and make bind roots writable to the launching user;
-    # Docker's user namespace then applies its normal agent mapping without changing the source image.
-    for path in (candidate, state, logs):
-        path.chmod(path.stat().st_mode | 0o700)
 
 
+def _candidate_identity(manifest: WorkspaceManifest) -> dict[str, str]:
+    return {
+        "version": "1",
+        "job_id": manifest.job_id,
+        "candidate": str(manifest.candidate),
+        "image_digest": manifest.image_digest,
+        "binary_sha256": manifest.binary_sha256,
+    }
 
 
-def _image_digest(runner: _DockerRunner, docker: str, image: str) -> str:
+def _require_candidate_ready(manifest: WorkspaceManifest) -> None:
+    marker = manifest.candidate / ".programbench-cleanroom.json"
+    if (
+        not manifest.candidate.is_dir()
+        or marker.is_symlink()
+        or not marker.is_file()
+        or _load_candidate_marker(marker) != _candidate_identity(manifest)
+        or manifest.candidate.joinpath("executable").exists()
+        or not manifest.candidate.joinpath("reference").is_symlink()
+        or os.readlink(manifest.candidate / "reference") != "/workspace/executable"
+    ):
+        raise ContainerConflictError("candidate-ready identity does not match persisted workspace")
+
+
+def _load_candidate_marker(path: Path) -> object:
+    try:
+        return json.loads(path.read_text(), object_pairs_hook=_unique_object)
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def _image_spec(runner: _DockerRunner, docker: str, image: str) -> tuple[str, str, tuple[str, ...]]:
     raw = _docker(runner, (docker, "image", "inspect", image), 30, "inspect image")
     try:
-        inspected = json.loads(raw)
-        digest = inspected[0].get("Id") if isinstance(inspected, list) and inspected and isinstance(inspected[0], dict) else None
+        values = json.loads(raw)
+        inspected = values[0] if isinstance(values, list) and len(values) == 1 and isinstance(values[0], dict) else None
+        config = inspected.get("Config") if isinstance(inspected, Mapping) else None
+        environment = config.get("Env") if isinstance(config, Mapping) else None
+        names = _environment_names(environment)
+        digest = inspected.get("Id") if isinstance(inspected, Mapping) else None
+        operating_system = inspected.get("Os") if isinstance(inspected, Mapping) else None
+        architecture = inspected.get("Architecture") if isinstance(inspected, Mapping) else None
     except (TypeError, ValueError):
-        digest = None
+        digest = operating_system = architecture = None
+        names = None
     if not isinstance(digest, str) or not digest.startswith("sha256:"):
         raise DockerCommandError("docker image inspect returned an invalid image digest")
-    return digest
+    if not isinstance(operating_system, str) or not isinstance(architecture, str):
+        raise DockerCommandError("docker image inspect returned an invalid platform")
+    if names is None:
+        raise DockerCommandError("docker image inspect returned invalid environment data")
+    return digest, f"{operating_system}/{architecture}", names
 
 
 def _inspect_container(runner: _DockerRunner, docker: str, name: str) -> Mapping[str, object] | None:
@@ -345,31 +642,110 @@ def _inspect_container(runner: _DockerRunner, docker: str, name: str) -> Mapping
     return value[0]
 
 
-def _require_exact_container(inspected: Mapping[str, object], manifest: WorkspaceManifest) -> None:
-    if inspected.get("Id") != manifest.container_id or inspected.get("Image") not in {manifest.image_digest, manifest.image}:
-        raise ContainerConflictError("container identity or image does not match persisted workspace")
-    mounts = inspected.get("Mounts")
-    if not isinstance(mounts, list):
-        raise ContainerConflictError("container mount evidence is incomplete")
-    expected = {(str(manifest.candidate), "/candidate"), (str(manifest.state_dir), "/state"), (str(manifest.binary), "/opencode")}
-    actual = {(str(item.get("Source")), str(item.get("Destination"))) for item in mounts if isinstance(item, dict)}
-    if actual != expected:
-        raise ContainerConflictError("container mounts do not match persisted workspace")
+def _require_exact_container(inspected: Mapping[str, object], manifest: WorkspaceManifest, *, check_port: bool) -> None:
+    if manifest.container_id is not None and inspected.get("Id") != manifest.container_id:
+        raise ContainerConflictError("container ID does not match persisted workspace")
+    if (
+        inspected.get("Name") != f"/{manifest.container_name}"
+        or inspected.get("Image") != manifest.image_digest
+        or inspected.get("Platform") != manifest.platform.split("/", 1)[0]
+    ):
+        raise ContainerConflictError("container name, image, or platform does not match")
     config = inspected.get("Config")
-    env = config.get("Env") if isinstance(config, Mapping) else None
-    labels = config.get("Labels") if isinstance(config, Mapping) else None
-    if not isinstance(env, list) or not {str(value).split("=", 1)[0] for value in env if isinstance(value, str)}.issuperset(manifest.credential_env):
-        raise ContainerConflictError("container credential environment names do not match")
-    if not isinstance(labels, Mapping) or any(labels.get(key) != value for key, value in _identity_labels(manifest).items()):
+    host = inspected.get("HostConfig")
+    if not isinstance(config, Mapping) or not isinstance(host, Mapping):
+        raise ContainerConflictError("container configuration evidence is incomplete")
+    if (
+        config.get("Image") != manifest.image
+        or config.get("User") != manifest.container_user
+        or config.get("WorkingDir") != manifest.workdir
+        or config.get("Entrypoint") != list(manifest.entrypoint)
+        or config.get("Cmd") != list(manifest.command)
+        or host.get("Init") is not manifest.container_init
+        or host.get("NetworkMode") != manifest.network_mode
+        or host.get("PortBindings") != {"4096/tcp": [{"HostIp": "127.0.0.1", "HostPort": ""}]}
+    ):
+        raise ContainerConflictError("container runtime configuration does not match")
+    environment = _environment(config.get("Env"))
+    if environment is None or tuple(sorted(environment)) != manifest.environment_names:
+        raise ContainerConflictError("container environment names do not match")
+    fixed = {
+        "HOME": manifest.home,
+        "XDG_CACHE_HOME": manifest.xdg_cache_home,
+        "XDG_CONFIG_HOME": manifest.xdg_config_home,
+        "XDG_DATA_HOME": manifest.xdg_data_home,
+    }
+    if any(environment.get(name) != value for name, value in fixed.items()):
+        raise ContainerConflictError("container HOME or XDG paths do not match")
+    labels = config.get("Labels")
+    if not isinstance(labels, Mapping) or any(
+        labels.get(key) != value for key, value in _identity_labels(manifest).items()
+    ):
         raise ContainerConflictError("container job identity does not match")
+    expected_mounts = set(_mounts(manifest))
+    binds = host.get("Binds")
+    if (
+        not isinstance(binds, list)
+        or not all(isinstance(value, str) for value in binds)
+        or set(binds) != {":".join(value[:3]) for value in expected_mounts}
+    ):
+        raise ContainerConflictError("container bind configuration does not match")
+    mounts = inspected.get("Mounts")
+    if not isinstance(mounts, list) or len(mounts) != len(expected_mounts):
+        raise ContainerConflictError("container mount evidence is incomplete")
+    actual_mounts = {
+        (
+            str(value.get("Source")),
+            str(value.get("Destination")),
+            str(value.get("Mode")),
+            str(value.get("Type")),
+            value.get("RW") is True,
+        )
+        for value in mounts
+        if isinstance(value, Mapping)
+    }
+    if actual_mounts != expected_mounts:
+        raise ContainerConflictError("container mounts do not match persisted workspace")
+    if check_port:
+        network = inspected.get("NetworkSettings")
+        ports = network.get("Ports") if isinstance(network, Mapping) else None
+        expected_port = {"4096/tcp": [{"HostIp": "127.0.0.1", "HostPort": str(manifest.port)}]}
+        stopped_empty = not _running(inspected) and ports in (None, {}, {"4096/tcp": None})
+        if manifest.port is None or (ports != expected_port and not stopped_empty):
+            raise ContainerConflictError("container loopback port does not match persisted workspace")
+
+
+def _environment(raw: object) -> dict[str, str] | None:
+    if not isinstance(raw, list) or not all(isinstance(value, str) and "=" in value for value in raw):
+        return None
+    pairs = [value.split("=", 1) for value in raw]
+    if len({pair[0] for pair in pairs}) != len(pairs) or not all(_ENV.fullmatch(pair[0]) for pair in pairs):
+        return None
+    return dict(pairs)
+
+
+def _environment_names(raw: object) -> tuple[str, ...] | None:
+    environment = _environment(raw)
+    return tuple(sorted(environment)) if environment is not None else None
+
+
+def _mounts(manifest: WorkspaceManifest) -> tuple[tuple[str, str, str, str, bool], ...]:
+    return (
+        (str(manifest.candidate), "/candidate", "rw", "bind", True),
+        (str(manifest.state_dir), "/state", "rw", "bind", True),
+        (str(manifest.cache_dir), "/cache", "rw", "bind", True),
+        (str(manifest.log_dir), "/logs", "rw", "bind", True),
+        (str(manifest.binary), "/opencode", "ro", "bind", False),
+    )
 
 
 def _identity_labels(manifest: WorkspaceManifest) -> dict[str, str]:
     return {
         "programbench.campaign": manifest.campaign,
+        "programbench.job": manifest.job_id,
         "programbench.instance": manifest.instance_id,
         "programbench.arm": manifest.arm,
-        "programbench.job": hashlib.sha256(str(manifest.job_root).encode()).hexdigest(),
+        "programbench.job-root": hashlib.sha256(str(manifest.job_root).encode()).hexdigest(),
     }
 
 
@@ -406,32 +782,87 @@ def _running(inspected: Mapping[str, object]) -> bool:
     return isinstance(state, Mapping) and state.get("Running") is True
 
 
-def _container_name(campaign: str, instance: str, arm: str) -> str:
-    identity = "\0".join((campaign, instance, arm))
-    return f"programbench-{hashlib.sha256(identity.encode()).hexdigest()[:32]}"
-
-
-def _require_manifest_identity(manifest: WorkspaceManifest, request: WorkspaceRequest, name: str) -> None:
-    if (manifest.campaign, manifest.instance_id, manifest.arm, manifest.container_name, manifest.image, manifest.binary, manifest.binary_sha256, manifest.credential_env) != (request.campaign, request.instance_id, request.arm, name, request.image, request.install.binary, request.install.binary_sha256, request.credential_env):
+def _require_manifest_identity(manifest: WorkspaceManifest, expected: WorkspaceManifest) -> None:
+    if _static_identity(manifest) != _static_identity(expected):
         raise ContainerConflictError("persisted workspace identity does not match this job")
-    if _sha256(request.install.binary) != manifest.binary_sha256:
+    _require_safe_manifest_paths(manifest)
+    _require_binary(manifest)
+
+
+def _static_identity(manifest: WorkspaceManifest) -> dict[str, object]:
+    return {key: value for key, value in manifest.to_dict().items() if key not in {"container_id", "port", "phase"}}
+
+
+def _require_safe_manifest_paths(manifest: WorkspaceManifest) -> None:
+    paths = (
+        (manifest.job_root, "job root"),
+        (manifest.candidate_root, "candidate root"),
+        (manifest.candidate, "candidate directory"),
+        (manifest.state_root, "state root"),
+        (manifest.state_dir, "OpenCode state root"),
+        (manifest.cache_dir, "cache root"),
+        (manifest.log_dir, "log root"),
+        (manifest.subject_dir, "subject root"),
+        (manifest.install_dir, "install root"),
+        (manifest.manifest_path, "workspace manifest"),
+        (manifest.binary, "installed binary"),
+    )
+    if any(_canonical_root(path, label) != path for path, label in paths):
+        raise WorkspaceError("workspace manifest contains a non-canonical path")
+    if (
+        manifest.job_id != _job_id(manifest.campaign, manifest.instance_id, manifest.arm)
+        or manifest.container_name != f"programbench-{manifest.job_id[:32]}"
+        or manifest.candidate != manifest.candidate_root / manifest.container_name
+        or manifest.state_dir != manifest.state_root / "opencode-state"
+        or manifest.cache_dir != manifest.state_root / "cache"
+        or manifest.manifest_path != manifest.state_root / "workspace.json"
+        or manifest.subject_dir != manifest.job_root / "subject"
+        or manifest.binary.parent != manifest.install_dir
+    ):
+        raise ContainerConflictError("workspace manifest paths do not match their intended containment")
+    independent = (
+        manifest.candidate_root,
+        manifest.state_root,
+        manifest.log_dir,
+        manifest.subject_dir,
+        manifest.install_dir,
+    )
+    if any(_overlap(left, right) for index, left in enumerate(independent) for right in independent[index + 1 :]):
+        raise ContainerConflictError("workspace manifest roots overlap outside their intended containment")
+
+
+def _require_binary(manifest: WorkspaceManifest) -> None:
+    if _canonical_existing(manifest.binary, "installed binary") != manifest.binary:
+        raise ContainerConflictError("installed OpenCode binary path changed; evidence retained")
+    if _sha256(manifest.binary) != manifest.binary_sha256:
         raise ContainerConflictError("installed OpenCode binary changed; evidence retained")
 
 
 def _load_manifest(path: Path) -> WorkspaceManifest:
+    canonical = _canonical_root(path, "workspace manifest")
+    if canonical != path or path.is_symlink():
+        raise WorkspaceError("workspace manifest path is unsafe")
     try:
-        raw = json.loads(path.read_text(), object_pairs_hook=_unique_object)
-        return WorkspaceManifest.from_dict(raw)
+        manifest = WorkspaceManifest.from_dict(json.loads(path.read_text(), object_pairs_hook=_unique_object))
     except (OSError, TypeError, ValueError, WorkspaceError) as error:
         raise WorkspaceError("workspace manifest cannot be safely read") from error
+    if manifest.manifest_path != path:
+        raise ContainerConflictError("workspace manifest was copied to a different path")
+    return manifest
 
 
 def _write_manifest(path: Path, manifest: WorkspaceManifest) -> None:
+    if path != manifest.manifest_path or _canonical_root(path, "workspace manifest") != path or path.is_symlink():
+        raise WorkspaceError("workspace manifest path is unsafe")
+    _write_json(path, manifest.to_dict())
+
+
+def _write_json(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
         with os.fdopen(descriptor, "w") as handle:
-            handle.write(json.dumps(manifest.to_dict(), sort_keys=True, indent=2) + "\n")
+            handle.write(json.dumps(value, sort_keys=True, indent=2) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
@@ -439,10 +870,6 @@ def _write_manifest(path: Path, manifest: WorkspaceManifest) -> None:
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
-
-
-def _replace_manifest(manifest: WorkspaceManifest, **changes: object) -> WorkspaceManifest:
-    return WorkspaceManifest(**{**manifest.__dict__, **changes})
 
 
 def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -474,13 +901,17 @@ def _canonical_root(path: Path, label: str) -> Path:
     current = Path(original.anchor)
     for part in original.parts[1:]:
         current /= part
-        if current.exists() and current.is_symlink():
+        if current.is_symlink():
             raise WorkspaceError(f"{label} contains a symlink")
     return original.resolve(strict=False)
 
 
+def _contains(root: Path, path: Path) -> bool:
+    return path == root or root in path.parents
+
+
 def _overlap(left: Path, right: Path) -> bool:
-    return left == right or left in right.parents or right in left.parents
+    return _contains(left, right) or _contains(right, left)
 
 
 def _sync_directory(path: Path) -> None:
@@ -497,17 +928,15 @@ def _docker(runner: _DockerRunner, command: tuple[str, ...], timeout: float, act
     except DockerNotFoundError:
         raise
     except Exception as error:
-        raise DockerCommandError(f"docker {action} failed ({type(error).__name__})") from error
+        raise DockerCommandError(f"docker {action} failed ({type(error).__name__})") from None
 
 
 def _run_docker(command: tuple[str, ...], timeout: float) -> str:
+    from scripts.campaign_docker import DockerProcessError, DockerProcessNotFoundError, run_docker
+
     try:
-        result = subprocess.run(command, check=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout)
-    except (OSError, subprocess.TimeoutExpired) as error:
-        raise DockerCommandError(f"docker command failed ({type(error).__name__})") from error
-    output = (result.stdout or "")[:_OUTPUT_LIMIT]
-    if result.returncode != 0 and any(marker in output.lower() for marker in ("no such", "not found")):
-        raise DockerNotFoundError("docker object was not found")
-    if result.returncode != 0:
-        raise DockerCommandError(f"docker command failed (exit {result.returncode})")
-    return output
+        return run_docker(command, timeout)
+    except DockerProcessNotFoundError as error:
+        raise DockerNotFoundError(str(error)) from None
+    except DockerProcessError as error:
+        raise DockerCommandError(str(error)) from None

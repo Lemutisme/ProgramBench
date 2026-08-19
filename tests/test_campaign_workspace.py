@@ -2,30 +2,77 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import shutil
+import threading
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from scripts.campaign_install import InstallRecord
 from scripts.campaign_state import JobPaths
-from scripts.campaign_workspace import ContainerConflictError, DockerNotFoundError, WorkspaceRequest, ensure_workspace
+from scripts.campaign_workspace import (
+    ContainerConflictError,
+    DockerCommandError,
+    DockerNotFoundError,
+    WorkspaceError,
+    WorkspaceRequest,
+    _run_docker,
+    ensure_workspace,
+)
 from scripts import run_opencode as runner
+from scripts import campaign_workspace
 
 
 class RecordingDocker:
     def __init__(self) -> None:
         self.commands: list[tuple[str, ...]] = []
         self.containers: dict[str, dict[str, object]] = {}
+        self.next_port = 48123
+        self.image_digest = "sha256:image-digest"
+        self.observed_phases: list[str] = []
 
     def __call__(self, command: tuple[str, ...], timeout: float):
         self.commands.append(command)
         if command[1:3] == ("image", "inspect"):
-            return '[{"Id": "sha256:image-digest"}]'
+            return json.dumps(
+                [
+                    {
+                        "Id": self.image_digest,
+                        "Os": "linux",
+                        "Architecture": "amd64",
+                        "Config": {"Env": ["PATH=/usr/bin", "LANG=C.UTF-8"]},
+                    }
+                ]
+            )
         if command[1] == "run" and "--user" in command and command[command.index("--user") + 1] == "root":
-            candidate = Path(next(value for index, value in enumerate(command) if command[index - 1] == "-v" and value.endswith(":/candidate:rw")).removesuffix(":/candidate:rw"))
+            candidate = Path(
+                next(
+                    value
+                    for index, value in enumerate(command)
+                    if command[index - 1] == "-v" and value.endswith(":/candidate:rw")
+                ).removesuffix(":/candidate:rw")
+            )
+            state = Path(
+                next(
+                    value
+                    for index, value in enumerate(command)
+                    if command[index - 1] == "-v" and value.endswith(":/state:rw")
+                ).removesuffix(":/state:rw")
+            )
+            self.observed_phases.append(json.loads((state.parent / "workspace.json").read_text())["phase"])
+            if candidate.exists():
+                for child in candidate.iterdir():
+                    if child.name == ".programbench-preparing.json":
+                        continue
+                    child.unlink() if child.is_symlink() or child.is_file() else shutil.rmtree(child)
             candidate.mkdir(parents=True, exist_ok=True)
             (candidate / "reference").symlink_to("/workspace/executable")
-            (candidate / ".programbench-cleanroom").touch()
+            candidate.joinpath(".programbench-preparing.json").replace(candidate / ".programbench-cleanroom.json")
             return ""
         if command[1] == "rm":
             return ""
@@ -33,15 +80,48 @@ class RecordingDocker:
             name = command[command.index("--name") + 1]
             values = list(command)
             mounts = [
-                {"Source": value.split(":", 2)[0], "Destination": value.split(":", 2)[1]}
+                {
+                    "Type": "bind",
+                    "Source": value.split(":", 2)[0],
+                    "Destination": value.split(":", 2)[1],
+                    "Mode": value.split(":", 2)[2],
+                    "RW": value.split(":", 2)[2] == "rw",
+                }
                 for index, value in enumerate(values)
                 if values[index - 1] == "-v"
             ]
-            env = [f"{value}=present" for index, value in enumerate(values) if values[index - 1] == "-e"]
+            env = ["PATH=/usr/bin", "LANG=C.UTF-8"] + [
+                value if "=" in value else f"{value}={os.environ.get(value, '')}"
+                for index, value in enumerate(values)
+                if values[index - 1] == "-e"
+            ]
             labels = dict(value.split("=", 1) for index, value in enumerate(values) if values[index - 1] == "--label")
+            image_index = values.index("example/task:task_cleanroom")
+            state = Path(next(value for value in values if value.endswith(":/state:rw")).removesuffix(":/state:rw"))
+            self.observed_phases.append(json.loads((state.parent / "workspace.json").read_text())["phase"])
             self.containers[name] = {
-                "Id": "a" * 64, "Image": "sha256:image-digest", "State": {"Running": False}, "Mounts": mounts,
-                "Config": {"Env": env, "Labels": labels},
+                "Id": "a" * 64,
+                "Name": f"/{name}",
+                "Image": self.image_digest,
+                "Platform": "linux",
+                "State": {"Running": False},
+                "Mounts": mounts,
+                "Config": {
+                    "Image": "example/task:task_cleanroom",
+                    "User": values[values.index("--user") + 1],
+                    "Env": env,
+                    "Labels": labels,
+                    "WorkingDir": values[values.index("-w") + 1],
+                    "Entrypoint": [values[values.index("--entrypoint") + 1]],
+                    "Cmd": values[image_index + 1 :],
+                },
+                "HostConfig": {
+                    "Init": True,
+                    "NetworkMode": values[values.index("--network") + 1],
+                    "Binds": [value for index, value in enumerate(values) if values[index - 1] == "-v"],
+                    "PortBindings": {"4096/tcp": [{"HostIp": "127.0.0.1", "HostPort": ""}]},
+                },
+                "NetworkSettings": {"Ports": {"4096/tcp": [{"HostIp": "127.0.0.1", "HostPort": str(self.next_port)}]}},
             }
             self.containers["a" * 64] = self.containers[name]
             return "a" * 64
@@ -54,32 +134,71 @@ class RecordingDocker:
                 raise DockerNotFoundError("not found")
             return json.dumps([self.containers[name]])
         if command[1] == "port":
-            return "127.0.0.1:48123\n"
+            return f"127.0.0.1:{self.next_port}\n"
         if command[1] == "stop":
             self.containers[command[-1]]["State"] = {"Running": False}
             return ""
         raise AssertionError(command)
 
 
+class FaultDocker(RecordingDocker):
+    def __init__(self, fault: str) -> None:
+        super().__init__()
+        self.fault = fault
+        self.faulted = False
+
+    def __call__(self, command: tuple[str, ...], timeout: float):
+        result = super().__call__(command, timeout)
+        if not self.faulted and command[1] == self.fault:
+            self.faulted = True
+            raise RuntimeError(f"fault after docker {self.fault}")
+        return result
+
+
 def install(tmp_path: Path) -> InstallRecord:
     binary = tmp_path / "install" / "opencode"
-    binary.parent.mkdir(exist_ok=True)
+    binary.parent.mkdir(parents=True, exist_ok=True)
     binary.write_text("binary")
     return InstallRecord(
-        arm="vanilla", repo=tmp_path / "repo", common_dir=tmp_path / "repo", repo_identity="repo", repo_url=None,
-        requested_revision="HEAD", revision="a" * 40, source_dirty=False, supplied_binary=binary, worktree=None,
-        binary=binary, binary_sha256=hashlib.sha256(b"binary").hexdigest(), version="test", install_command=(),
-        build_command=(), smoke_command=(), catalog_command=(), platform="linux", full_model_catalog_output_sha256=None,
-        full_model_catalog_unavailable_reason="not requested", full_model_catalog_status="unavailable", owned_paths=(),
+        arm="vanilla",
+        repo=tmp_path / "repo",
+        common_dir=tmp_path / "repo",
+        repo_identity="repo",
+        repo_url=None,
+        requested_revision="HEAD",
+        revision="a" * 40,
+        source_dirty=False,
+        supplied_binary=binary,
+        worktree=None,
+        binary=binary,
+        binary_sha256=hashlib.sha256(b"binary").hexdigest(),
+        version="test",
+        install_command=(),
+        build_command=(),
+        smoke_command=(),
+        catalog_command=(),
+        platform="linux",
+        full_model_catalog_output_sha256=None,
+        full_model_catalog_unavailable_reason="not requested",
+        full_model_catalog_status="unavailable",
+        owned_paths=(),
         publication_phase="manifest_published",
     )
 
 
 def request(tmp_path: Path, docker: RecordingDocker) -> WorkspaceRequest:
     return WorkspaceRequest(
-        job=JobPaths(tmp_path / "job"), campaign="campaign", instance_id="owner__repo.abc", arm="vanilla",
-        image="example/task", install=install(tmp_path), candidate_root=tmp_path / "candidates", state_root=tmp_path / "state",
-        log_dir=tmp_path / "logs", credential_env=("OPENAI_API_KEY", "OPENAI_BASE_URL"), docker_runner=docker,
+        job=JobPaths(tmp_path / "job"),
+        campaign="campaign",
+        instance_id="owner__repo.abc",
+        arm="vanilla",
+        image="example/task",
+        install=install(tmp_path),
+        candidate_root=tmp_path / "candidates",
+        state_root=tmp_path / "state",
+        log_dir=tmp_path / "logs",
+        credential_env=("OPENAI_API_KEY", "OPENAI_BASE_URL"),
+        docker_runner=docker,
         health_probe=lambda _url, _timeout: True,
     )
 
@@ -99,6 +218,7 @@ def test_workspace_constructs_redacted_dynamic_loopback_server(tmp_path: Path) -
     assert workspace.candidate.joinpath("reference").is_symlink()
     text = workspace.manifest_path.read_text()
     assert "OPENAI_API_KEY" in text and "secret-value" not in text
+    assert docker.observed_phases == ["preparing", "launching"]
 
 
 def test_existing_unowned_name_is_never_adopted(tmp_path: Path) -> None:
@@ -123,6 +243,138 @@ def test_exact_manifest_adopts_and_restarts_a_stopped_container(tmp_path: Path) 
     assert any(command[1] == "start" for command in docker.commands)
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("Name", "/foreign"),
+        ("Image", "sha256:foreign"),
+        ("Platform", "windows"),
+        ("Config.User", "root"),
+        ("Config.WorkingDir", "/workspace"),
+        ("Config.Entrypoint", ["/bin/sh"]),
+        ("Config.Cmd", ["serve", "--port", "1"]),
+        ("HostConfig.Init", False),
+        ("HostConfig.NetworkMode", "host"),
+        ("HostConfig.PortBindings", {"4096/tcp": [{"HostIp": "0.0.0.0", "HostPort": ""}]}),
+        ("NetworkSettings.Ports", {"4096/tcp": [{"HostIp": "127.0.0.1", "HostPort": "48124"}]}),
+    ],
+)
+def test_adoption_rejects_every_container_config_mismatch(tmp_path: Path, field: str, value: object) -> None:
+    docker = RecordingDocker()
+    workspace = ensure_workspace(request(tmp_path, docker))
+    inspected = docker.containers[workspace.container_id]
+    target = inspected
+    parts = field.split(".")
+    for part in parts[:-1]:
+        target = target[part]  # type: ignore[assignment,index]
+    target[parts[-1]] = value
+
+    with pytest.raises(ContainerConflictError):
+        ensure_workspace(request(tmp_path, docker))
+
+
+@pytest.mark.parametrize(("field", "value"), [("Type", "volume"), ("Mode", "ro"), ("RW", False)])
+def test_adoption_rejects_mount_metadata_mismatch(tmp_path: Path, field: str, value: object) -> None:
+    docker = RecordingDocker()
+    workspace = ensure_workspace(request(tmp_path, docker))
+    docker.containers[workspace.container_id]["Mounts"][0][field] = value  # type: ignore[index]
+
+    with pytest.raises(ContainerConflictError):
+        ensure_workspace(request(tmp_path, docker))
+
+
+def test_adoption_requires_exact_environment_names_and_fixed_paths(tmp_path: Path) -> None:
+    docker = RecordingDocker()
+    workspace = ensure_workspace(request(tmp_path, docker))
+    original = deepcopy(docker.containers[workspace.container_id]["Config"]["Env"])  # type: ignore[index]
+
+    for environment in (
+        [*original, "FOREIGN=value"],
+        [value for value in original if not value.startswith("OPENAI_BASE_URL=")],
+        ["HOME=/tmp", *[value for value in original if not value.startswith("HOME=")]],
+    ):
+        docker.containers[workspace.container_id]["Config"]["Env"] = environment  # type: ignore[index]
+        with pytest.raises(ContainerConflictError):
+            ensure_workspace(request(tmp_path, docker))
+    docker.containers[workspace.container_id]["Config"]["Env"] = original  # type: ignore[index]
+
+
+def test_copied_manifest_at_a_different_job_path_is_rejected(tmp_path: Path) -> None:
+    docker = RecordingDocker()
+    workspace = ensure_workspace(request(tmp_path / "first", docker))
+    copied = request(tmp_path / "second", docker)
+    copied.state_root.mkdir(parents=True)
+    copied.state_root.joinpath("workspace.json").write_bytes(workspace.manifest_path.read_bytes())
+
+    with pytest.raises(ContainerConflictError):
+        ensure_workspace(copied)
+
+
+def test_binary_is_rehashed_immediately_before_adopt_start_and_stop(tmp_path: Path) -> None:
+    docker = RecordingDocker()
+    value = request(tmp_path, docker)
+    workspace = ensure_workspace(value)
+    docker.containers[workspace.container_id]["State"] = {"Running": False}
+    workspace.manifest.binary.write_text("mutated")
+
+    with pytest.raises(ContainerConflictError):
+        ensure_workspace(value)
+    with pytest.raises(ContainerConflictError):
+        workspace.stop()
+
+
+@pytest.mark.parametrize(("unsafe", "target"), [("candidate", "state"), ("state", "logs"), ("logs", "candidate")])
+def test_workspace_rejects_symlinked_roots(tmp_path: Path, unsafe: str, target: str) -> None:
+    docker = RecordingDocker()
+    paths = {name: tmp_path / name for name in ("candidate", "state", "logs")}
+    paths[target].mkdir()
+    paths[unsafe].symlink_to(paths[target], target_is_directory=True)
+    value = request(tmp_path, docker)
+    value = replace(
+        value,
+        candidate_root=paths["candidate"],
+        state_root=paths["state"],
+        log_dir=paths["logs"],
+    )
+
+    with pytest.raises(WorkspaceError, match="symlink"):
+        ensure_workspace(value)
+
+
+def test_workspace_rejects_unsafe_root_overlaps(tmp_path: Path) -> None:
+    docker = RecordingDocker()
+    value = request(tmp_path, docker)
+
+    for changed in (
+        replace(value, state_root=value.candidate_root / "state"),
+        replace(value, log_dir=value.state_root / "logs"),
+        replace(value, candidate_root=value.install.binary.parent),
+        replace(value, log_dir=value.job.root / "subject"),
+    ):
+        with pytest.raises(WorkspaceError, match="overlap"):
+            ensure_workspace(changed)
+
+
+@pytest.mark.parametrize("leaf", ["candidate", "state"])
+def test_workspace_rejects_symlinked_derived_mount_before_journaling(tmp_path: Path, leaf: str) -> None:
+    docker = RecordingDocker()
+    value = request(tmp_path, docker)
+    target = tmp_path / "outside"
+    target.mkdir()
+    if leaf == "candidate":
+        value.candidate_root.mkdir()
+        job_id = hashlib.sha256("\0".join((value.campaign, value.instance_id, value.arm)).encode()).hexdigest()
+        value.candidate_root.joinpath(f"programbench-{job_id[:32]}").symlink_to(target, target_is_directory=True)
+    if leaf == "state":
+        value.state_root.mkdir()
+        value.state_root.joinpath("opencode-state").symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(WorkspaceError, match="symlink"):
+        ensure_workspace(value)
+
+    assert not value.state_root.joinpath("workspace.json").exists()
+
+
 def test_stop_is_idempotent_for_exact_owned_container(tmp_path: Path) -> None:
     docker = RecordingDocker()
     workspace = ensure_workspace(request(tmp_path, docker))
@@ -133,6 +385,310 @@ def test_stop_is_idempotent_for_exact_owned_container(tmp_path: Path) -> None:
     assert sum(command[1] == "stop" for command in docker.commands) == 1
 
 
+@pytest.mark.parametrize("fault", ["run", "create", "port"])
+def test_retry_after_docker_effect_reuses_one_candidate_and_container(tmp_path: Path, fault: str) -> None:
+    docker = FaultDocker(fault)
+    value = request(tmp_path, docker)
+
+    with pytest.raises(DockerCommandError):
+        ensure_workspace(value)
+    workspace = ensure_workspace(value)
+
+    assert workspace.manifest.phase == "running"
+    assert len(list(value.candidate_root.iterdir())) == 1
+    assert sum(command[1] == "create" for command in docker.commands) == 1
+    assert workspace.candidate.joinpath(".programbench-cleanroom.json").is_file()
+
+
+@pytest.mark.parametrize(
+    ("phase", "predicate"),
+    [
+        ("planned", lambda manifest: True),
+        ("preparing", lambda manifest: True),
+        ("candidate_ready", lambda manifest: True),
+        ("launching", lambda manifest: manifest.container_id is None),
+        ("launching", lambda manifest: manifest.container_id is not None and manifest.port is None),
+        ("launching", lambda manifest: manifest.port is not None),
+        ("running", lambda manifest: True),
+    ],
+)
+def test_retry_after_each_manifest_commit_converges(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str, predicate
+) -> None:
+    docker = RecordingDocker()
+    value = request(tmp_path, docker)
+    original = campaign_workspace._write_manifest
+    faulted = False
+
+    def write(path: Path, manifest) -> None:
+        nonlocal faulted
+        original(path, manifest)
+        if not faulted and manifest.phase == phase and predicate(manifest):
+            faulted = True
+            raise RuntimeError("fault after manifest commit")
+
+    monkeypatch.setattr(campaign_workspace, "_write_manifest", write)
+    with pytest.raises(RuntimeError, match="fault after manifest"):
+        ensure_workspace(value)
+    workspace = ensure_workspace(value)
+
+    assert workspace.manifest.phase == "running"
+    assert len(list(value.candidate_root.iterdir())) == 1
+    assert sum(command[1] == "create" for command in docker.commands) == 1
+
+
+def test_post_create_recovery_rejects_a_foreign_container(tmp_path: Path) -> None:
+    docker = FaultDocker("create")
+    value = request(tmp_path, docker)
+
+    with pytest.raises(DockerCommandError):
+        ensure_workspace(value)
+    container = next(iter(docker.containers.values()))
+    container["Config"]["Cmd"] = ["foreign"]  # type: ignore[index]
+
+    with pytest.raises(ContainerConflictError):
+        ensure_workspace(value)
+
+
+def test_candidate_ready_marker_is_exact_owned_identity(tmp_path: Path) -> None:
+    docker = RecordingDocker()
+    value = request(tmp_path, docker)
+    workspace = ensure_workspace(value)
+    marker = workspace.candidate / ".programbench-cleanroom.json"
+    marker.write_text('{"version":"1","job_id":"foreign"}')
+
+    with pytest.raises(ContainerConflictError, match="candidate-ready"):
+        ensure_workspace(value)
+
+
+def test_stopped_workspace_retains_port_and_reconciles_full_spec(tmp_path: Path) -> None:
+    docker = RecordingDocker()
+    value = request(tmp_path, docker)
+    workspace = ensure_workspace(value)
+    workspace.stop()
+    stopped = json.loads(workspace.manifest_path.read_text())
+
+    assert stopped["phase"] == "stopped"
+    assert stopped["port"] == workspace.port
+    assert ensure_workspace(value).adopted
+    assert sum(command[1] == "create" for command in docker.commands) == 1
+
+
+@pytest.mark.parametrize("mismatch", ["mount", "environment", "command", "port"])
+def test_stop_refuses_current_container_spec_mismatch(tmp_path: Path, mismatch: str) -> None:
+    docker = RecordingDocker()
+    workspace = ensure_workspace(request(tmp_path, docker))
+    container = docker.containers[workspace.container_id]
+    if mismatch == "mount":
+        container["Mounts"][0]["Mode"] = "ro"  # type: ignore[index]
+    if mismatch == "environment":
+        container["Config"]["Env"].append("FOREIGN=value")  # type: ignore[index]
+    if mismatch == "command":
+        container["Config"]["Cmd"] = ["foreign"]  # type: ignore[index]
+    if mismatch == "port":
+        container["NetworkSettings"]["Ports"]["4096/tcp"][0]["HostPort"] = "1"  # type: ignore[index]
+
+    with pytest.raises(ContainerConflictError):
+        workspace.stop()
+
+
+def test_stop_retry_after_stopped_manifest_commit_is_idempotent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    docker = RecordingDocker()
+    workspace = ensure_workspace(request(tmp_path, docker))
+    original = campaign_workspace._write_manifest
+    faulted = False
+
+    def write(path: Path, manifest) -> None:
+        nonlocal faulted
+        original(path, manifest)
+        if not faulted and manifest.phase == "stopped":
+            faulted = True
+            raise RuntimeError("fault after stopped manifest commit")
+
+    monkeypatch.setattr(campaign_workspace, "_write_manifest", write)
+    with pytest.raises(RuntimeError, match="stopped manifest"):
+        workspace.stop()
+    workspace.stop()
+
+    assert sum(command[1] == "stop" for command in docker.commands) == 1
+    assert json.loads(workspace.manifest_path.read_text())["phase"] == "stopped"
+
+
+def test_stop_rejects_a_mount_source_replaced_by_symlink(tmp_path: Path) -> None:
+    docker = RecordingDocker()
+    workspace = ensure_workspace(request(tmp_path, docker))
+    moved = workspace.candidate.with_name("moved-candidate")
+    workspace.candidate.rename(moved)
+    workspace.candidate.symlink_to(moved, target_is_directory=True)
+
+    with pytest.raises(WorkspaceError, match="symlink"):
+        workspace.stop()
+
+
+def test_docker_wrapper_drops_secret_exception_chain() -> None:
+    secret = "runner-secret-value"
+
+    def unsafe_runner(_command: tuple[str, ...], _timeout: float) -> str:
+        raise RuntimeError(secret)
+
+    with pytest.raises(DockerCommandError) as error:
+        campaign_workspace._docker(unsafe_runner, ("docker", "info"), 1, "inspect")
+
+    assert error.value.__cause__ is None
+    assert secret not in str(error.value)
+    assert secret not in repr(error.value)
+
+
+def test_image_tag_must_still_resolve_to_persisted_digest(tmp_path: Path) -> None:
+    docker = RecordingDocker()
+    value = request(tmp_path, docker)
+    ensure_workspace(value)
+    docker.image_digest = "sha256:changed"
+
+    with pytest.raises(ContainerConflictError):
+        ensure_workspace(value)
+
+
 def test_run_opencode_reexports_workspace_api() -> None:
     assert runner.ensure_workspace is ensure_workspace
     assert runner.WorkspaceRequest is WorkspaceRequest
+
+
+def test_real_docker_runs_two_exact_isolated_workspaces(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    try:
+        _run_docker(("docker", "info", "--format", "{{.ServerVersion}}"), 30)
+    except DockerCommandError as error:
+        pytest.skip(f"Docker daemon unavailable: {error}")
+
+    tag = f"programbench-workspace-fixture-{uuid.uuid4().hex}:task_cleanroom"
+    campaign = f"integration-{uuid.uuid4().hex}"
+    secret_key = "integration-secret-key-value"
+    secret_url = "https://integration-secret.invalid/v1"
+    monkeypatch.setenv("OPENAI_API_KEY", secret_key)
+    monkeypatch.setenv("OPENAI_BASE_URL", secret_url)
+    context = tmp_path / "image"
+    context.mkdir()
+    context.joinpath("Dockerfile").write_text(
+        "FROM python:3.11\n"
+        "RUN useradd --create-home agent && mkdir -p /workspace && "
+        "printf 'fixture workspace\\n' > /workspace/README && "
+        "printf '#!/bin/sh\\necho reference executable\\n' > /workspace/executable && "
+        "chmod 755 /workspace/executable && chown -R agent:agent /workspace\n"
+    )
+    commands: list[tuple[str, ...]] = []
+    command_lock = threading.Lock()
+    workspaces = []
+
+    def docker(command: tuple[str, ...], timeout: float) -> str:
+        with command_lock:
+            commands.append(command)
+        return _run_docker(command, timeout)
+
+    def fixture_request(root: Path, instance_id: str) -> WorkspaceRequest:
+        value = request(root, docker)  # type: ignore[arg-type]
+        value.install.binary.write_text(
+            "#!/usr/bin/env python3\n"
+            "from http.server import BaseHTTPRequestHandler, HTTPServer\n"
+            "class Handler(BaseHTTPRequestHandler):\n"
+            "    def do_GET(self):\n"
+            "        self.send_response(200 if self.path in ('/health', '/global/health') else 404)\n"
+            "        self.end_headers()\n"
+            "        self.wfile.write(b'ok')\n"
+            "    def log_message(self, *_args):\n"
+            "        pass\n"
+            "HTTPServer(('0.0.0.0', 4096), Handler).serve_forever()\n"
+        )
+        value.install.binary.chmod(0o755)
+        return replace(
+            value,
+            campaign=campaign,
+            instance_id=instance_id,
+            image=tag,
+            install=replace(value.install, binary_sha256=hashlib.sha256(value.install.binary.read_bytes()).hexdigest()),
+            health_probe=None,
+            health_timeout=20,
+        )
+
+    values = [fixture_request(tmp_path / str(index), f"owner__fixture.{index}") for index in range(2)]
+    try:
+        _run_docker(("docker", "build", "--quiet", "-t", tag, str(context)), 300)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            workspaces.extend(pool.map(ensure_workspace, values))
+
+        assert len({workspace.port for workspace in workspaces}) == 2
+        assert all(workspace.manifest.phase == "running" for workspace in workspaces)
+        assert all(
+            workspace.candidate.joinpath("README").read_text() == "fixture workspace\n" for workspace in workspaces
+        )
+        assert all(not workspace.candidate.joinpath("executable").exists() for workspace in workspaces)
+        assert all(
+            os.readlink(workspace.candidate / "reference") == "/workspace/executable" for workspace in workspaces
+        )
+        assert all(
+            _run_docker(("docker", "exec", workspace.container_id, "id", "-un"), 30).strip() == "agent"
+            for workspace in workspaces
+        )
+        assert all(
+            _run_docker(
+                (
+                    "docker",
+                    "exec",
+                    workspace.container_id,
+                    "stat",
+                    "-c",
+                    "%U",
+                    "/candidate",
+                    "/state",
+                    "/cache",
+                    "/logs",
+                ),
+                30,
+            ).splitlines()
+            == ["agent"] * 4
+            for workspace in workspaces
+        )
+        inspected = [
+            json.loads(_run_docker(("docker", "inspect", workspace.container_id), 30))[0] for workspace in workspaces
+        ]
+        sources = [{mount["Source"] for mount in value["Mounts"]} for value in inspected]
+        assert sources[0].isdisjoint(sources[1])
+        assert all(
+            next(mount for mount in value["Mounts"] if mount["Destination"] == "/opencode")["RW"] is False
+            for value in inspected
+        )
+        assert all(
+            _run_docker(("docker", "exec", workspace.container_id, "test", "-x", "/candidate/reference"), 30) == ""
+            for workspace in workspaces
+        )
+        assert all(ensure_workspace(value).adopted for value in values)
+        assert len([command for command in commands if len(command) > 1 and command[1] == "create"]) == 2
+
+        serialized_commands = json.dumps(commands)
+        files = "".join(
+            path.read_text(errors="replace")
+            for path in tmp_path.rglob("*")
+            if path.is_file() and path.stat().st_size < 1024 * 1024
+        )
+        assert secret_key not in serialized_commands + files
+        assert secret_url not in serialized_commands + files
+        assert all(
+            {"OPENAI_API_KEY", "OPENAI_BASE_URL"}.issubset(workspace.manifest.environment_names)
+            for workspace in workspaces
+        )
+
+        for workspace in workspaces:
+            workspace.stop()
+            workspace.stop()
+            assert json.loads(workspace.manifest_path.read_text())["phase"] == "stopped"
+            assert not json.loads(_run_docker(("docker", "inspect", workspace.container_id), 30))[0]["State"]["Running"]
+    finally:
+        try:
+            containers = _run_docker(
+                ("docker", "ps", "-aq", "--filter", f"label=programbench.campaign={campaign}"), 30
+            ).split()
+            if containers:
+                _run_docker(("docker", "rm", "-f", *containers), 60)
+        finally:
+            _run_docker(("docker", "rmi", "-f", tag), 60)
