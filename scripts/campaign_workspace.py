@@ -215,6 +215,7 @@ class WorkspaceManifest:
     xdg_cache_home: str
     xdg_config_home: str
     xdg_data_home: str
+    candidate_mutable: bool
     port: int | None
     phase: str
 
@@ -245,6 +246,12 @@ class WorkspaceManifest:
             raise WorkspaceError("container environment names are invalid")
         if self.port is not None and (type(self.port) is not int or not 1 <= self.port <= 65535):
             raise WorkspaceError("workspace port is invalid")
+        if type(self.candidate_mutable) is not bool:
+            raise WorkspaceError("candidate_mutable must be bool")
+        if self.phase in {"planned", "preparing", "candidate_ready"} and self.candidate_mutable:
+            raise WorkspaceError("pre-execution candidate cannot be mutable")
+        if self.phase in {"running", "stopped"} and not self.candidate_mutable:
+            raise WorkspaceError("post-execution candidate must be mutable")
 
     def to_dict(self) -> dict[str, object]:
         value = {field.name: getattr(self, field.name) for field in fields(self)}
@@ -265,12 +272,12 @@ class WorkspaceManifest:
         for name in ("credential_env", "environment_names", "entrypoint", "command"):
             value[name] = list(value[name])
         value["mounts"] = [mount.to_dict() for mount in self.mounts]
-        return {"version": 3, **value}
+        return {"version": 4, **value}
 
     @classmethod
     def from_dict(cls, raw: object) -> "WorkspaceManifest":
         expected = {field.name for field in fields(cls)}
-        if not isinstance(raw, dict) or set(raw) != {"version", *expected} or raw["version"] != 3:
+        if not isinstance(raw, dict) or set(raw) != {"version", *expected} or raw["version"] != 4:
             raise WorkspaceError("workspace manifest is invalid")
         paths = {
             "job_root",
@@ -288,7 +295,10 @@ class WorkspaceManifest:
         sequences = {"credential_env", "environment_names", "entrypoint", "command"}
         if any(
             not isinstance(raw[name], str)
-            for name in expected - paths - sequences - {"container_id", "port", "container_init", "mounts"}
+            for name in expected
+            - paths
+            - sequences
+            - {"container_id", "port", "container_init", "candidate_mutable", "mounts"}
         ):
             raise WorkspaceError("workspace manifest has invalid fields")
         if any(not isinstance(raw[name], str) for name in paths):
@@ -304,6 +314,8 @@ class WorkspaceManifest:
             raise WorkspaceError("workspace manifest has invalid port")
         if type(raw["container_init"]) is not bool:
             raise WorkspaceError("workspace manifest has invalid init setting")
+        if type(raw["candidate_mutable"]) is not bool:
+            raise WorkspaceError("workspace manifest has invalid candidate mutability")
         if not isinstance(raw["mounts"], list):
             raise WorkspaceError("workspace manifest has invalid mounts")
         value = {name: raw[name] for name in expected}
@@ -348,7 +360,7 @@ class DockerWorkspace:
     adopted: bool = False
 
     def __post_init__(self) -> None:
-        if self.manifest.phase != "running":
+        if self.manifest.phase != "running" or not self.manifest.candidate_mutable:
             raise WorkspaceError("adapter workspace requires a durably running manifest")
         if _load_manifest(self.manifest_path) != self.manifest:
             raise ContainerConflictError("adapter workspace does not match its durable running manifest")
@@ -444,7 +456,9 @@ def _resume(
         _prepare_bind_paths(preparing)
         manifest = replace(preparing, phase="candidate_ready")
         _write_manifest(manifest.manifest_path, manifest)
-    if manifest.phase in _CLEANROOM_PHASES:
+    if manifest.phase == "stopped":
+        return _restart_stopped(manifest, request, runner, probe)
+    if _requires_cleanroom_validation(manifest):
         _require_candidate_ready(manifest)
         _verify_candidate(runner, request.docker, manifest, publish=False)
         _cleanup_candidate_preparation(manifest)
@@ -456,6 +470,16 @@ def _resume(
         container_id = inspected.get("Id")
         if not isinstance(container_id, str) or not _CONTAINER_ID.fullmatch(container_id):
             raise ContainerConflictError("recovered container has an invalid ID")
+        if manifest.candidate_mutable:
+            return _activate(
+                manifest,
+                request,
+                runner,
+                probe,
+                adopted=True,
+                inspected=inspected,
+                runtime_container_id=container_id,
+            )
         manifest = replace(manifest, container_id=container_id, phase="launching")
         _write_manifest(manifest.manifest_path, manifest)
         return _activate(manifest, request, runner, probe, adopted=True, inspected=inspected)
@@ -463,6 +487,38 @@ def _resume(
         raise ContainerConflictError("owned container is missing; evidence retained")
     _require_exact_container(inspected, manifest, check_port=manifest.port is not None)
     return _activate(manifest, request, runner, probe, adopted=True, inspected=inspected)
+
+
+def _restart_stopped(
+    manifest: WorkspaceManifest,
+    request: WorkspaceRequest,
+    runner: _DockerRunner,
+    probe: _HealthProbe,
+) -> DockerWorkspace:
+    inspected = _inspect_container(runner, request.docker, manifest.container_name)
+    if inspected is None:
+        raise ContainerConflictError("stopped container is missing; evidence retained")
+    _require_exact_container(inspected, manifest, check_port=True)
+    container_id = inspected.get("Id")
+    if not isinstance(container_id, str) or not _CONTAINER_ID.fullmatch(container_id):
+        raise ContainerConflictError("stopped container has an invalid ID")
+    launching = replace(
+        manifest,
+        phase="launching",
+        container_id=None,
+        port=None,
+        candidate_mutable=True,
+    )
+    _write_manifest(launching.manifest_path, launching)
+    return _activate(
+        launching,
+        request,
+        runner,
+        probe,
+        adopted=True,
+        inspected=inspected,
+        runtime_container_id=container_id,
+    )
 
 
 def _launch(
@@ -474,7 +530,7 @@ def _launch(
     adopted: bool,
 ) -> DockerWorkspace:
     _require_binary(manifest)
-    if manifest.phase not in {"candidate_ready", "launching"}:
+    if manifest.phase not in {"candidate_ready", "launching"} or manifest.candidate_mutable:
         raise WorkspaceError("workspace launch requires a verified pre-execution phase")
     _require_candidate_ready(manifest)
     _verify_candidate(runner, request.docker, manifest, publish=False)
@@ -532,28 +588,34 @@ def _activate(
     *,
     adopted: bool,
     inspected: Mapping[str, object],
+    runtime_container_id: str | None = None,
 ) -> DockerWorkspace:
-    if manifest.container_id is None:
+    container_id = manifest.container_id or runtime_container_id
+    if container_id is None or not _CONTAINER_ID.fullmatch(container_id):
         raise WorkspaceError("workspace has no container to activate")
     if not _running(inspected):
         _require_binary(manifest)
-        _docker(runner, (request.docker, "start", manifest.container_id), 30, "start")
+        _docker(runner, (request.docker, "start", container_id), 30, "start")
     inspected = _inspect_container(runner, request.docker, manifest.container_name)
     if inspected is None or not _running(inspected):
         raise ContainerConflictError("owned container did not start cleanly")
     _require_exact_container(inspected, manifest, check_port=False)
-    port = _published_port(runner, request.docker, manifest.container_id)
+    current_id = inspected.get("Id")
+    if not isinstance(current_id, str) or not _CONTAINER_ID.fullmatch(current_id):
+        raise ContainerConflictError("started container has an invalid ID")
+    port = _published_port(runner, request.docker, current_id)
     activated = replace(
         manifest,
+        container_id=current_id,
         port=port,
-        phase="launching" if manifest.phase in _CLEANROOM_PHASES else manifest.phase,
+        phase="launching" if _requires_cleanroom_validation(manifest) else manifest.phase,
     )
     _require_exact_container(inspected, activated, check_port=True)
     if activated.phase == "launching":
         _write_manifest(activated.manifest_path, activated)
     _wait_health(activated, probe, request.health_timeout)
     _require_binary(activated)
-    ready = replace(activated, phase="running")
+    ready = replace(activated, phase="running", candidate_mutable=True)
     _write_manifest(ready.manifest_path, ready)
     return DockerWorkspace(ready, ready.manifest_path, request.docker, runner, probe, request.health_timeout, adopted)
 
@@ -609,6 +671,7 @@ def _expected_manifest(
         xdg_cache_home=_FIXED_ENV["XDG_CACHE_HOME"],
         xdg_config_home=_FIXED_ENV["XDG_CONFIG_HOME"],
         xdg_data_home=_FIXED_ENV["XDG_DATA_HOME"],
+        candidate_mutable=False,
         port=None,
         phase="planned",
     )
@@ -1088,6 +1151,10 @@ def _running(inspected: Mapping[str, object]) -> bool:
     return isinstance(state, Mapping) and state.get("Running") is True
 
 
+def _requires_cleanroom_validation(manifest: WorkspaceManifest) -> bool:
+    return manifest.phase in _CLEANROOM_PHASES and not manifest.candidate_mutable
+
+
 def _require_manifest_identity(manifest: WorkspaceManifest, expected: WorkspaceManifest) -> None:
     if _static_identity(manifest) != _static_identity(expected):
         raise ContainerConflictError("persisted workspace identity does not match this job")
@@ -1096,7 +1163,11 @@ def _require_manifest_identity(manifest: WorkspaceManifest, expected: WorkspaceM
 
 
 def _static_identity(manifest: WorkspaceManifest) -> dict[str, object]:
-    return {key: value for key, value in manifest.to_dict().items() if key not in {"container_id", "port", "phase"}}
+    return {
+        key: value
+        for key, value in manifest.to_dict().items()
+        if key not in {"container_id", "port", "phase", "candidate_mutable"}
+    }
 
 
 def _require_safe_manifest_paths(manifest: WorkspaceManifest) -> None:

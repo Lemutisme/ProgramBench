@@ -22,6 +22,7 @@ from scripts.campaign_workspace import (
     DockerCommandError,
     DockerNotFoundError,
     WorkspaceError,
+    WorkspaceHealthError,
     WorkspaceRequest,
     _run_docker,
     ensure_workspace,
@@ -39,6 +40,7 @@ class RecordingDocker:
         self.image_os = "linux"
         self.image_architecture = "amd64"
         self.observed_phases: list[str] = []
+        self.start_manifests: list[dict[str, object]] = []
 
     def __call__(self, command: tuple[str, ...], timeout: float):
         self.commands.append(command)
@@ -149,7 +151,13 @@ class RecordingDocker:
             self.containers["a" * 64] = self.containers[name]
             return "a" * 64
         if command[1] == "start":
-            self.containers[command[-1]]["State"] = {"Running": True}
+            container = self.containers[command[-1]]
+            state = Path(next(mount["Source"] for mount in container["Mounts"] if mount["Destination"] == "/state"))
+            self.start_manifests.append(json.loads((state.parent / "workspace.json").read_text()))
+            container["State"] = {"Running": True}
+            container["NetworkSettings"] = {
+                "Ports": {"4096/tcp": [{"HostIp": "127.0.0.1", "HostPort": str(self.next_port)}]}
+            }
             return ""
         if command[1] == "inspect":
             name = command[-1]
@@ -400,6 +408,60 @@ def test_exact_manifest_adopts_and_restarts_a_stopped_container(tmp_path: Path) 
     assert any(command[1] == "start" for command in docker.commands)
 
 
+def test_stopped_restart_crash_after_start_reconciles_new_port(tmp_path: Path) -> None:
+    docker = FaultDocker("disabled")
+    value = request(tmp_path, docker)
+    workspace = ensure_workspace(value)
+    workspace.stop()
+    docker.next_port = 48124
+    docker.fault = "start"
+    docker.faulted = False
+
+    with pytest.raises(DockerCommandError):
+        ensure_workspace(value)
+
+    interrupted = json.loads(workspace.manifest_path.read_text())
+    assert interrupted["phase"] == "launching"
+    assert interrupted["candidate_mutable"] is True
+    assert interrupted["container_id"] is None
+    assert interrupted["port"] is None
+    assert docker.start_manifests[-1]["phase"] == "launching"
+    assert docker.start_manifests[-1]["candidate_mutable"] is True
+    assert docker.start_manifests[-1]["container_id"] is None
+    assert docker.start_manifests[-1]["port"] is None
+
+    resumed = ensure_workspace(value)
+
+    assert resumed.adopted
+    assert resumed.container_id == workspace.container_id
+    assert resumed.port == 48124
+    assert sum(command[1] == "create" for command in docker.commands) == 1
+
+
+def test_stopped_restart_health_failure_persists_truthful_launch(tmp_path: Path) -> None:
+    docker = RecordingDocker()
+    value = request(tmp_path, docker)
+    workspace = ensure_workspace(value)
+    workspace.stop()
+    docker.next_port = 48125
+
+    with pytest.raises(WorkspaceHealthError):
+        ensure_workspace(replace(value, health_probe=lambda _url, _timeout: False, health_timeout=0.01))
+
+    interrupted = json.loads(workspace.manifest_path.read_text())
+    assert interrupted["phase"] == "launching"
+    assert interrupted["candidate_mutable"] is True
+    assert interrupted["container_id"] == workspace.container_id
+    assert interrupted["port"] == 48125
+    assert interrupted["port"] != workspace.port
+
+    resumed = ensure_workspace(value)
+
+    assert resumed.adopted
+    assert resumed.port == 48125
+    assert sum(command[1] == "create" for command in docker.commands) == 1
+
+
 @pytest.mark.parametrize("phase", ["running", "stopped"])
 def test_running_and_stopped_adoption_allows_mutable_candidate_tree(tmp_path: Path, phase: str) -> None:
     docker = RecordingDocker()
@@ -428,7 +490,12 @@ def test_preexecution_phase_rejects_mutated_candidate_before_launch(tmp_path: Pa
     workspace = ensure_workspace(value)
     campaign_workspace._write_manifest(
         workspace.manifest_path,
-        replace(workspace.manifest, phase=phase, port=None if phase == "candidate_ready" else workspace.port),
+        replace(
+            workspace.manifest,
+            phase=phase,
+            candidate_mutable=False,
+            port=None if phase == "candidate_ready" else workspace.port,
+        ),
     )
     workspace.candidate.joinpath("mutated-before-agent").write_text("foreign")
     starts = sum(command[1] == "start" for command in docker.commands)
@@ -443,7 +510,10 @@ def test_docker_workspace_is_an_adapter_token_only_after_running_commit(tmp_path
     workspace = ensure_workspace(request(tmp_path, RecordingDocker()))
 
     with pytest.raises(WorkspaceError, match="adapter.*running"):
-        replace(workspace, manifest=replace(workspace.manifest, phase="candidate_ready"))
+        replace(
+            workspace,
+            manifest=replace(workspace.manifest, phase="candidate_ready", candidate_mutable=False),
+        )
 
     assert json.loads(workspace.manifest_path.read_text())["phase"] == "running"
 
@@ -624,7 +694,7 @@ def test_forged_ready_marker_with_wrong_candidate_mode_never_launches(tmp_path: 
     workspace = ensure_workspace(value)
     campaign_workspace._write_manifest(
         workspace.manifest_path,
-        replace(workspace.manifest, phase="launching"),
+        replace(workspace.manifest, phase="launching", candidate_mutable=False),
     )
     workspace.candidate.joinpath("forged-mode").write_text("foreign")
     starts = sum(command[1] == "start" for command in docker.commands)
@@ -691,7 +761,7 @@ def test_candidate_ready_marker_is_exact_owned_identity(tmp_path: Path) -> None:
     workspace = ensure_workspace(value)
     campaign_workspace._write_manifest(
         workspace.manifest_path,
-        replace(workspace.manifest, phase="candidate_ready", port=None),
+        replace(workspace.manifest, phase="candidate_ready", candidate_mutable=False, port=None),
     )
     marker = workspace.candidate / ".programbench-cleanroom.json"
     marker.write_text('{"version":"1","job_id":"foreign"}')
