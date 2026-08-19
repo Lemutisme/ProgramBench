@@ -176,6 +176,8 @@ def _projected_turn(message: object) -> TurnUsage | None:
         ):
             raise UsageParseError("mixed or malformed upstream message schema")
         source = message["info"]
+        if {"type", "content"} & set(source):
+            raise UsageParseError("upstream info contains flat-only fields")
         role = source.get("role")
         if role == "user":
             return None
@@ -571,6 +573,10 @@ class CircuitBreaker:
             retry_after_max=raw["retry_after_max"],
             **kwargs,
         )
+        if "soft" in causes and breaker.soft_cost_cap is None:
+            raise UsageParseError("soft pause requires a soft cost cap")
+        if "hard" in causes and breaker.hard_cost_cap is None:
+            raise UsageParseError("hard pause requires a hard cost cap")
         campaign = _summary_from_dict(raw["campaign_usage"])
         jobs = raw["jobs"]
         if not isinstance(jobs, Mapping):
@@ -629,6 +635,12 @@ class CircuitBreaker:
                 raise UsageParseError("cache pause is missing")
             if breaker._soft_acknowledged and "soft" in serialized_causes:
                 raise UsageParseError("acknowledged soft pause is inconsistent")
+            if (
+                "soft" in serialized_causes
+                and breaker.soft_cost_cap is not None
+                and campaign.cost < breaker.soft_cost_cap
+            ):
+                raise UsageParseError("soft cost pause is below its configured cap")
             if (
                 breaker.soft_cost_cap is not None
                 and campaign.cost >= breaker.soft_cost_cap
@@ -717,6 +729,8 @@ def _decimal(value: object) -> Decimal:
         raise UsageParseError("cost must be numeric") from error
     if not result.is_finite() or result < 0:
         raise UsageParseError("cost must be a nonnegative finite decimal")
+    if result.is_zero():
+        return Decimal(0)
     return result
 
 
@@ -780,8 +794,6 @@ def _summary_from_dict(value: object, *, require_turns: bool = False) -> UsageSu
     turns_value = value["turns"]
     if not isinstance(turns_value, list):
         raise UsageParseError("usage turns must be a list")
-    if require_turns and not turns_value:
-        raise UsageParseError("job usage must include per-turn records")
     turns: list[TurnUsage] = []
     for item in turns_value:
         if not isinstance(item, Mapping) or set(item) != {
@@ -825,6 +837,8 @@ def _summary_from_dict(value: object, *, require_turns: bool = False) -> UsageSu
         raise UsageParseError("usage summary turn counts are inconsistent")
     if summary.turns_with_cache + summary.turns_without_cache != summary.provider_turns:
         raise UsageParseError("usage summary turn counts are inconsistent")
+    if require_turns and not turns and summary != UsageSummary():
+        raise UsageParseError("zero-turn job usage has nonzero aggregate fields")
     if turns:
         recomputed = UsageSummary(
             provider_turns=len(turns),

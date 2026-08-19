@@ -360,6 +360,54 @@ def test_newer_generation_lower_usage_replaces_and_decreases_totals() -> None:
     assert breaker.campaign_usage.cost == Decimal("0.1")
 
 
+def test_zero_turn_job_snapshot_round_trips_but_nonzero_empty_aggregate_rejects() -> None:
+    breaker = CircuitBreaker()
+    breaker.observe("empty", 1, UsageSummary())
+    restored = CircuitBreaker.from_snapshot(breaker.snapshot())
+    assert restored.campaign_usage == UsageSummary()
+    corrupt = breaker.snapshot()
+    corrupt["jobs"]["empty"]["usage"]["input"] = 1
+    with pytest.raises(UsageParseError):
+        CircuitBreaker.from_snapshot(corrupt)
+
+
+def test_snapshot_rejects_pause_causes_without_caps_and_impossible_derived_causes() -> None:
+    breaker = CircuitBreaker()
+    breaker.observe("job", 1, usage(turns=1, cost="0"))
+    for cause in ("soft", "hard"):
+        corrupt = breaker.snapshot()
+        corrupt["pause_causes"] = [cause]
+        with pytest.raises(UsageParseError):
+            CircuitBreaker.from_snapshot(corrupt)
+    capped = CircuitBreaker(soft_cost_cap="1")
+    capped.observe("job", 1, usage(turns=1, cost="0"))
+    corrupt = capped.snapshot()
+    corrupt["pause_causes"] = ["soft"]
+    with pytest.raises(UsageParseError):
+        CircuitBreaker.from_snapshot(corrupt)
+
+
+def test_signed_zero_projected_cost_is_canonicalized() -> None:
+    usage_result = summarize_usage(
+        b'{"data":[{"type":"assistant","cost":-0.0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"content":"ok"}]}'
+    )
+    assert usage_result.cost == Decimal(0)
+    assert usage_result.turns[0].cost == Decimal(0)
+    assert usage_result.to_dict()["cost"] == "0"
+    assert usage_result.to_dict()["turns"][0]["cost"] == "0"
+
+
+def test_upstream_info_rejects_flat_type_discriminator() -> None:
+    info = {
+        "role": "assistant",
+        "type": "assistant",
+        "cost": 0,
+        "tokens": {"input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}},
+    }
+    with pytest.raises(UsageParseError):
+        summarize_usage({"data": [{"info": info, "parts": []}]})
+
+
 def test_acknowledged_recoverable_pause_round_trips_without_derived_drift() -> None:
     breaker = CircuitBreaker(soft_cost_cap="1")
     breaker.observe("job", 1, usage(turns=1, cost="1"))
