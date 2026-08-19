@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import textwrap
+import time
 import uuid
 from pathlib import Path
 
@@ -369,3 +371,350 @@ def test_real_delivery_restart_rebinds_procontract_api_and_preserves_attestation
     assert _run_docker(("docker", "ps", "-aq", "--filter", f"label=programbench.campaign={campaign}"), 30).strip() == ""
     with pytest.raises(DockerCommandError):
         _run_docker(("docker", "image", "inspect", tag), 30)
+
+
+@pytest.mark.slow
+def test_pinned_real_binary_completes_native_procontract_lifecycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts.run_opencode import (
+        CircuitBreaker,
+        HttpProContractApi,
+        JobLease,
+        JobState,
+        Limits,
+        StateStore,
+        WorkspaceLease,
+        run_procontract,
+    )
+
+    binary = Path(
+        os.environ.get(
+            "PROGRAMBENCH_PROCONTRACT_BINARY",
+            "/home/duozhou/opencode/packages/opencode/dist/opencode-linux-x64/bin/opencode",
+        )
+    )
+    if not binary.is_file() or not os.access(binary, os.X_OK):
+        pytest.skip(f"Pinned ProContract binary unavailable: {binary}")
+    try:
+        _run_docker(("docker", "info", "--format", "{{.ServerVersion}}"), 30)
+    except DockerCommandError as error:
+        pytest.skip(f"Docker daemon unavailable: {error}")
+
+    tag = f"programbench-real-procontract-{uuid.uuid4().hex}:task_cleanroom"
+    campaign = f"real-contract-{uuid.uuid4().hex}"
+    instance_id = f"owner__real.{uuid.uuid4().hex}"
+    preflight_image = f"programbench/{instance_id.replace('__', '_1776_')}:task_cleanroom_v6"
+    context = tmp_path / "image"
+    context.mkdir()
+    image_built = False
+    preflight_tagged = False
+    provider_container: str | None = None
+    monkeypatch.setenv("OPENCODE_SERVER_PASSWORD", PASSWORD)
+    monkeypatch.setenv("OPENAI_API_KEY", "deterministic-provider-key")
+    try:
+        try:
+            base_image = json.loads(
+                _run_docker(("docker", "image", "inspect", "--format", "{{json .Id}}", "python:3.11"), 30)
+            )
+        except DockerCommandError:
+            _run_docker(("docker", "pull", "python:3.11"), 300)
+            base_image = json.loads(
+                _run_docker(("docker", "image", "inspect", "--format", "{{json .Id}}", "python:3.11"), 30)
+            )
+        context.joinpath("Dockerfile").write_text(
+            f"FROM {base_image}\n"
+            f"RUN useradd --uid {os.getuid()} --create-home agent && mkdir -p /workspace && "
+            "printf '#!/bin/sh\\necho reference\\n' > /workspace/executable && "
+            "printf 'Real ProContract lifecycle fixture\\n' > /workspace/README.md && "
+            "chmod 755 /workspace/executable && chmod 644 /workspace/README.md\n"
+        )
+        _run_docker(("docker", "build", "--quiet", "-t", tag, str(context)), 300)
+        image_built = True
+        _run_docker(("docker", "tag", tag, preflight_image), 30)
+        preflight_tagged = True
+        provider_script = tmp_path / "provider.py"
+        provider_script.write_text(
+            textwrap.dedent(
+                """\
+                import json
+                from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+                responses = 0
+
+                class Handler(BaseHTTPRequestHandler):
+                    def do_POST(self):
+                        global responses
+                        body = self.rfile.read(int(self.headers.get("content-length", "0")))
+                        with open("/record/provider-hits.jsonl", "ab") as output:
+                            output.write(body + b"\\n")
+                        if self.path.endswith("/responses"):
+                            responses += 1
+                            if responses == 1:
+                                args = json.dumps({"summary":"Candidate and replay are ready.","uncertainties":[]}, separators=(",", ":"))
+                                events = [
+                                    {"type":"response.created","sequence_number":1,"response":{"id":"resp_programbench","created_at":1,"model":"gpt-5.6-luna","service_tier":None}},
+                                    {"type":"response.output_item.added","sequence_number":2,"output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"contract_report_ready","arguments":"","status":"in_progress"}},
+                                    {"type":"response.function_call_arguments.delta","sequence_number":3,"output_index":0,"item_id":"fc_1","delta":args},
+                                    {"type":"response.function_call_arguments.done","sequence_number":4,"output_index":0,"item_id":"fc_1","arguments":args},
+                                    {"type":"response.output_item.done","sequence_number":5,"output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"contract_report_ready","arguments":args,"status":"completed"}},
+                                    {"type":"response.completed","sequence_number":6,"response":{"incomplete_details":None,"service_tier":None,"usage":{"input_tokens":10,"input_tokens_details":{"cached_tokens":0},"output_tokens":3,"output_tokens_details":{"reasoning_tokens":0}}}},
+                                ]
+                            else:
+                                events = [
+                                    {"type":"response.created","sequence_number":1,"response":{"id":"resp_programbench_next","created_at":1,"model":"gpt-5.6-luna","service_tier":None}},
+                                    {"type":"response.output_item.added","sequence_number":2,"output_index":0,"item":{"type":"message","id":"msg_provider_next"}},
+                                    {"type":"response.output_text.delta","sequence_number":3,"item_id":"msg_provider_next","delta":"Settlement recorded.","logprobs":None},
+                                    {"type":"response.output_item.done","sequence_number":4,"output_index":0,"item":{"type":"message","id":"msg_provider_next"}},
+                                    {"type":"response.completed","sequence_number":5,"response":{"incomplete_details":None,"service_tier":None,"usage":{"input_tokens":10,"input_tokens_details":{"cached_tokens":0},"output_tokens":3,"output_tokens_details":{"reasoning_tokens":0}}}},
+                                ]
+                            payload = "".join("data: " + json.dumps(event) + "\\n\\n" for event in events) + "data: [DONE]\\n\\n"
+                        elif self.path.endswith("/chat/completions"):
+                            chunks = [
+                                {"id":"chatcmpl-programbench","object":"chat.completion.chunk","choices":[{"delta":{"role":"assistant"}}]},
+                                {"id":"chatcmpl-programbench","object":"chat.completion.chunk","choices":[{"delta":{"content":"Delivery is ready."}}]},
+                                {"id":"chatcmpl-programbench","object":"chat.completion.chunk","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":3,"total_tokens":13}},
+                            ]
+                            payload = "".join("data: " + json.dumps(chunk) + "\\n\\n" for chunk in chunks) + "data: [DONE]\\n\\n"
+                        else:
+                            self.send_error(404)
+                            return
+                        encoded = payload.encode()
+                        self.send_response(200)
+                        self.send_header("content-type", "text/event-stream")
+                        self.send_header("content-length", str(len(encoded)))
+                        self.end_headers()
+                        self.wfile.write(encoded)
+                    def log_message(self, _format, *_args):
+                        return
+
+                ThreadingHTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
+                """
+            )
+        )
+        provider_name = f"programbench-provider-{uuid.uuid4().hex}"
+        provider_container = _run_docker(
+            (
+                "docker",
+                "run",
+                "-d",
+                "--name",
+                provider_name,
+                "--network",
+                "bridge",
+                "-v",
+                f"{provider_script}:/provider.py:ro",
+                "-v",
+                f"{tmp_path}:/record:rw",
+                "python:3.11",
+                "python",
+                "/provider.py",
+            ),
+            60,
+        ).strip()
+        provider_host = _run_docker(
+            (
+                "docker",
+                "inspect",
+                "--format",
+                "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+                provider_container,
+            ),
+            30,
+        ).strip()
+        campaign_root = tmp_path / "campaign-output"
+        paths = JobPaths(campaign_root / campaign / "procontract" / instance_id)
+        paths.root.mkdir(parents=True)
+        request = WorkspaceRequest(
+            job=paths,
+            campaign_root=campaign_root,
+            campaign=campaign,
+            instance_id=instance_id,
+            arm="procontract",
+            image=tag,
+            install=fixture_install(tmp_path, binary),
+            candidate_root=paths.root / "candidates",
+            state_root=paths.root / "workspace-state",
+            log_dir=paths.root / "logs",
+            credential_env=("OPENAI_API_KEY", "OPENCODE_SERVER_PASSWORD"),
+            health_timeout=30,
+        )
+        started = time.monotonic()
+
+        def sleeper(seconds: float) -> None:
+            if time.monotonic() - started > 90:
+                raise AssertionError("real ProContract lifecycle exceeded 90 seconds")
+            time.sleep(min(seconds, 0.1))
+
+        with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, WorkspaceLease(request) as lease:
+            workspace = ensure_workspace(request, lease)
+            workspace.stop_for_freeze()
+            seed = tmp_path / "seed"
+            seed.mkdir()
+            seed.joinpath("compile.sh").write_text(
+                "#!/bin/sh\nprintf '#!/bin/sh\\necho real-procontract-fixture\\n' > ./executable\nchmod +x ./executable\n"
+            )
+            seed.joinpath("executable").write_text("#!/bin/sh\necho real-procontract-fixture\n")
+            seed.joinpath("opencode.json").write_text(
+                json.dumps(
+                    {
+                        "formatter": False,
+                        "lsp": False,
+                        "model": "openai/gpt-5.6-luna",
+                        "small_model": "openai/gpt-5.6-luna",
+                        "provider": {
+                            "openai": {
+                                "name": "Deterministic OpenAI",
+                                "id": "openai",
+                                "env": ["OPENAI_API_KEY"],
+                                "npm": "@ai-sdk/openai-compatible",
+                                "models": {
+                                    "gpt-5.6-luna": {
+                                        "id": "gpt-5.6-luna",
+                                        "name": "Deterministic GPT",
+                                        "attachment": False,
+                                        "reasoning": False,
+                                        "temperature": False,
+                                        "tool_call": True,
+                                        "release_date": "2026-01-01",
+                                        "limit": {"context": 100000, "output": 10000},
+                                        "cost": {"input": 0, "output": 0},
+                                        "options": {},
+                                        "variants": {"max": {}},
+                                    }
+                                },
+                                "options": {
+                                    "baseURL": f"http://{provider_host}:8080/v1",
+                                },
+                            }
+                        },
+                    }
+                )
+            )
+            _run_docker(
+                (
+                    "docker",
+                    "run",
+                    "--rm",
+                    "--user",
+                    "root",
+                    "--network",
+                    "none",
+                    "-v",
+                    f"{seed}:/seed:ro",
+                    "-v",
+                    f"{workspace.candidate}:/candidate:rw",
+                    "-v",
+                    f"{workspace.state_dir}:/state:rw",
+                    tag,
+                    "/bin/sh",
+                    "-ec",
+                    "cp /seed/compile.sh /seed/executable /candidate/; chmod 755 /candidate/compile.sh /candidate/executable; "
+                    "chown -R root:root /candidate; "
+                    "git -C /candidate init -q; git -C /candidate config user.name fixture; "
+                    "git -C /candidate config user.email fixture@example.com; git -C /candidate add -A; "
+                    "git -C /candidate commit -qm snapshot; "
+                    "mkdir -p /state/config/opencode; cp /seed/opencode.json /state/config/opencode/opencode.json; "
+                    "chown -R agent:agent /candidate /state",
+                ),
+                60,
+            )
+            workspace = workspace.restart()
+            configured = _run_docker(
+                (
+                    "docker",
+                    "exec",
+                    "--user",
+                    workspace.manifest.container_user,
+                    "--workdir",
+                    "/candidate",
+                    "--env",
+                    f"HOME={workspace.manifest.home}",
+                    "--env",
+                    f"XDG_CACHE_HOME={workspace.manifest.xdg_cache_home}",
+                    "--env",
+                    f"XDG_CONFIG_HOME={workspace.manifest.xdg_config_home}",
+                    "--env",
+                    f"XDG_DATA_HOME={workspace.manifest.xdg_data_home}",
+                    workspace.container_id,
+                    "/opencode",
+                    "debug",
+                    "config",
+                ),
+                30,
+            )
+            assert provider_host in configured
+            _run_docker(
+                (
+                    "docker",
+                    "exec",
+                    workspace.container_id,
+                    "python",
+                    "-c",
+                    "import urllib.request; "
+                    f"urllib.request.urlopen(urllib.request.Request('http://{provider_host}:8080/v1/chat/completions', "
+                    "data=b'{}', headers={'content-type':'application/json'}), timeout=5).read()",
+                ),
+                15,
+            )
+            store = StateStore(paths.state)
+            store.write(JobState("planned"))
+            api = HttpProContractApi(
+                workspace.base_url,
+                expected_port=workspace.port,
+                password=PASSWORD,
+            )
+            result = run_procontract(
+                job,
+                store,
+                workspace,
+                model="openai/gpt-5.6-luna",
+                variant="max",
+                limits=Limits(21600, 1000, 4000, 100, 150),
+                breaker=CircuitBreaker(),
+                api=api,
+                sleeper=sleeper,
+                poll_interval=0.1,
+            )
+
+            assert result.completion.value == "discharged"
+            assert result.quiet is True
+            assert result.report_hash is not None
+            assert result.attestation_id is not None
+            assert tmp_path.joinpath("provider-hits.jsonl").is_file()
+            assert workspace.manifest.binary_sha256 == hashlib.sha256(binary.read_bytes()).hexdigest()
+            if workspace.lease._handle_active:
+                workspace.stop_for_freeze()
+    finally:
+        if provider_container is not None:
+            _run_docker(("docker", "rm", "-f", provider_container), 60)
+        if image_built:
+            containers = _run_docker(
+                ("docker", "ps", "-aq", "--filter", f"label=programbench.campaign={campaign}"), 30
+            ).split()
+            if containers:
+                _run_docker(("docker", "rm", "-f", *containers), 60)
+            try:
+                _run_docker(
+                    (
+                        "docker",
+                        "run",
+                        "--rm",
+                        "--user",
+                        "root",
+                        "-v",
+                        f"{tmp_path}:/cleanup",
+                        "--entrypoint",
+                        "chmod",
+                        tag,
+                        "-R",
+                        "a+rwX",
+                        "/cleanup",
+                    ),
+                    60,
+                )
+            finally:
+                _run_docker(
+                    ("docker", "rmi", "-f", tag, *((preflight_image,) if preflight_tagged else ())),
+                    60,
+                )

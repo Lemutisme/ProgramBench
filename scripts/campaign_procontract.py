@@ -7,7 +7,6 @@ import hashlib
 import json
 import math
 import os
-import subprocess
 import stat
 import tempfile
 import time
@@ -19,6 +18,7 @@ from typing import Callable, Mapping, Protocol
 from urllib.parse import quote, urlencode, urlparse
 
 from programbench.candidate import CandidateError, PreflightResult, package_workspace, preflight_candidate
+from scripts import campaign_process
 from scripts.campaign_freeze import (
     MAX_FREEZE_BYTES,
     MAX_INVENTORY_SECONDS,
@@ -131,18 +131,26 @@ class ProContractCredentialScanError(ProContractError):
 class ProContractCredentialPaths:
     job_root: Path
     state_dir: Path
+    cache_dir: Path
     candidate: Path
     subject: Path
     export: Path
+    git_dir: Path | None
     log_dir: Path | None
     controls: tuple[Path, ...]
 
     def __post_init__(self) -> None:
-        paths = (self.job_root, self.state_dir, self.candidate)
+        paths = (self.job_root, self.state_dir, self.cache_dir, self.candidate)
         if any(not path.is_absolute() or path.resolve() != path for path in paths):
             raise ProContractCredentialScanError("credential scan roots must be canonical absolute paths")
         if self.subject != self.job_root / "subject" or self.export.parent != self.state_dir:
             raise ProContractCredentialScanError("credential scan path classification is invalid")
+        if self.git_dir is not None and not any(
+            self.git_dir == root or root in self.git_dir.parents
+            for root in (self.job_root, self.state_dir, self.cache_dir, self.log_dir)
+            if root is not None
+        ):
+            raise ProContractCredentialScanError("export Git directory escapes owned writable roots")
         if self.log_dir is not None and (not self.log_dir.is_absolute() or self.log_dir.resolve() != self.log_dir):
             raise ProContractCredentialScanError("credential log root must be canonical")
         expected = tuple(self.job_root / name for name in CONTROL_ARTIFACT_NAMES)
@@ -518,9 +526,13 @@ class HttpProContractApi:
                 or not isinstance(raw["data"], list)
                 or not isinstance(raw["cursor"], Mapping)
                 or set(raw["cursor"]) - {"previous", "next"}
-                or any(not isinstance(raw["cursor"][key], str) or not raw["cursor"][key] for key in raw["cursor"])
+                or any(
+                    raw["cursor"][key] is not None
+                    and (not isinstance(raw["cursor"][key], str) or not raw["cursor"][key])
+                    for key in raw["cursor"]
+                )
                 or not raw["data"]
-                and bool(raw["cursor"])
+                and any(value is not None for value in raw["cursor"].values())
                 or raw["cursor"].get("previous") is not None
                 and raw["cursor"].get("previous") == raw["cursor"].get("next")
                 or cursor is not None
@@ -919,11 +931,40 @@ def _run_procontract(
                 if _binding_identity(current_execution) != _binding_identity(bound_execution):
                     raise ProContractConflictError("native Contract execution binding changed after issue")
                 execution = current_execution
+                if execution["dispatched"] is False:
+                    safety = _verification_safety_completion(breaker, clock, deadline)
+                    if safety is not None:
+                        return _stop_and_finish(
+                            job,
+                            state_store,
+                            state,
+                            workspace,
+                            command_identity,
+                            payload,
+                            contract,
+                            execution,
+                            usage,
+                            actions,
+                            issue,
+                            api,
+                            safety,
+                            safety.value,
+                            clock,
+                            sleeper,
+                            poll_interval,
+                            quiet,
+                        )
+                    sleeper(min(poll_interval, max(0.001, deadline - clock())))
+                    continue
                 previous_usage, previous_actions, previous_messages = usage, actions, messages
-                sanitized = _sanitize_control(
-                    api.messages(str(execution["sessionID"])),
-                    _all_credential_names(workspace.manifest.credential_env),
-                )
+                try:
+                    projected = api.messages(str(execution["sessionID"]))
+                except ProContractHttpError as error:
+                    if error.status_code == 404 and contract["status"] in {"dormant", "active"}:
+                        sleeper(min(poll_interval, max(0.001, deadline - clock())))
+                        continue
+                    raise
+                sanitized = _sanitize_control(projected, _all_credential_names(workspace.manifest.credential_env))
                 if not isinstance(sanitized, Mapping):
                     raise ProContractError("sanitized Session messages are invalid")
                 messages = sanitized
@@ -1039,23 +1080,7 @@ def _run_procontract(
                         quiet,
                     )
                 status = str(contract["status"])
-                if status == "verification":
-                    if api.status(str(execution["sessionID"])) == "idle":
-                        _write_or_verify_json(
-                            job.job.root / "procontract-verification.json",
-                            _sanitize_control(
-                                {
-                                    "version": 1,
-                                    "contract": contract,
-                                    "execution": execution,
-                                    "quiet": quiet,
-                                    "messages": messages,
-                                },
-                                _all_credential_names(workspace.manifest.credential_env),
-                            ),
-                            "native Contract verification observation",
-                        )
-                        break
+                if status in {"verification", "discharged"}:
                     breaker.observe(workspace.manifest.job_id, state.generation, usage, terminal=False)
                     safety = _verification_safety_completion(breaker, clock, deadline)
                     if safety is not None:
@@ -1079,6 +1104,99 @@ def _run_procontract(
                             poll_interval,
                             quiet,
                         )
+                if status == "verification":
+                    if api.status(str(execution["sessionID"])) == "idle":
+                        settled: Mapping[str, object] | None = None
+                        settled_usage = usage
+                        settled_actions = actions
+                        for attempt in range(MAX_MUTATION_ATTEMPTS):
+                            latest = _sanitize_control(
+                                api.messages(str(execution["sessionID"])),
+                                _all_credential_names(workspace.manifest.credential_env),
+                            )
+                            if not isinstance(latest, Mapping):
+                                raise ProContractError("sanitized settled Session messages are invalid")
+                            latest_usage = _summarize_usage(latest)
+                            latest_actions = max(_actions(latest), int(execution["actionsUsed"]))
+                            _require_monotonic(
+                                settled_usage,
+                                latest_usage,
+                                settled_actions,
+                                latest_actions,
+                                settled or messages,
+                                latest,
+                            )
+                            if settled == latest:
+                                settled_usage, settled_actions = latest_usage, latest_actions
+                                break
+                            settled, settled_usage, settled_actions = latest, latest_usage, latest_actions
+                            if attempt + 1 >= MAX_MUTATION_ATTEMPTS:
+                                raise ProContractConflictError("Session messages did not settle before delivery")
+                            sleeper(min(poll_interval, max(0.001, deadline - clock())))
+                        if settled is None:
+                            raise ProContractError("settled Session messages are unavailable")
+                        settled_turns = max(settled_usage.provider_turns, int(execution["turnsUsed"]))
+                        if (
+                            settled_turns != state.provider_turns
+                            or settled_actions != state.actions
+                            or float(settled_usage.cost) != state.cost
+                            or settled != messages
+                        ):
+                            _write_contract_progress(
+                                progress_path,
+                                state.generation + 1,
+                                payload,
+                                execution,
+                                settled,
+                                settled_turns,
+                                settled_actions,
+                                settled_usage,
+                            )
+                            state = state_store.update(
+                                expected_generation=state.generation,
+                                provider_turns=settled_turns,
+                                actions=settled_actions,
+                                cost=float(settled_usage.cost),
+                            )
+                        messages, usage, actions = settled, settled_usage, settled_actions
+                        breaker.observe(workspace.manifest.job_id, state.generation, usage, terminal=False)
+                        safety = _verification_safety_completion(breaker, clock, deadline)
+                        if safety is not None:
+                            return _stop_and_finish(
+                                job,
+                                state_store,
+                                state,
+                                workspace,
+                                command_identity,
+                                payload,
+                                contract,
+                                execution,
+                                usage,
+                                actions,
+                                issue,
+                                api,
+                                safety,
+                                safety.value,
+                                clock,
+                                sleeper,
+                                poll_interval,
+                                quiet,
+                            )
+                        _write_or_verify_json(
+                            job.job.root / "procontract-verification.json",
+                            _sanitize_control(
+                                {
+                                    "version": 1,
+                                    "contract": contract,
+                                    "execution": execution,
+                                    "quiet": quiet,
+                                    "messages": messages,
+                                },
+                                _all_credential_names(workspace.manifest.credential_env),
+                            ),
+                            "native Contract verification observation",
+                        )
+                        break
                     sleeper(min(poll_interval, max(0.001, deadline - clock())))
                     continue
                 if status == "discharged":
@@ -1309,6 +1427,9 @@ def _deliver(
 ) -> ProContractResult:
     contract = _validate_contract(contract, payload)
     execution = _validate_execution(execution, payload, int(contract["revision"]))
+    safety = _verification_safety_completion(breaker, clock, deadline)
+    if safety is not None:
+        raise ProContractNativeOutcome(safety, contract, execution)
     handoff, replay = _verification(contract, payload)
     export_dir = Path(workspace.manifest.state_dir) / f"contract-export-{payload['id']}"
     export_path = job.job.root / "procontract-export.json"
@@ -1385,18 +1506,29 @@ def _deliver(
             raise ProContractConflictError("Contract handoff changed while its exact subject was exported")
         if workspace.lease._handle_active:
             workspace.stop_for_freeze()
+        export_identity = _git_snapshot_identity(export_dir, _owned_writable_roots(workspace))
         if direct_success:
+            if export_identity != handoff["subjectHash"]:
+                raise ProContractDeliveryError("stopped Contract export does not match its native snapshot")
             _write_export_complete(
                 complete_path,
                 export_dir,
                 str(payload["id"]),
                 str(handoff["subjectHash"]),
-                str(handoff["subjectHash"]),
+                export_identity,
             )
         elif complete_path.exists():
-            _validate_export_complete(complete_path, export_dir, str(payload["id"]), str(handoff["subjectHash"]))
+            if export_identity != handoff["subjectHash"]:
+                raise ProContractDeliveryError("persisted Contract export does not match its native snapshot")
+            _validate_export_complete(
+                complete_path,
+                export_dir,
+                str(payload["id"]),
+                str(handoff["subjectHash"]),
+                export_identity,
+            )
         elif ambiguous_invocation:
-            reconciled_complete = _git_snapshot_identity(export_dir) == handoff["subjectHash"]
+            reconciled_complete = export_identity == handoff["subjectHash"]
         if ambiguous_invocation:
             if reconciled_complete:
                 _write_export_complete(
@@ -1404,7 +1536,7 @@ def _deliver(
                     export_dir,
                     str(payload["id"]),
                     str(handoff["subjectHash"]),
-                    str(handoff["subjectHash"]),
+                    export_identity,
                 )
                 _write_or_verify_json(export_path, exported, "reconciled Contract export response")
             else:
@@ -1593,6 +1725,11 @@ def _deliver(
             execution,
             "restart_failed",
         ) from None
+    safety = _verification_safety_completion(breaker, clock, deadline)
+    if safety is not None:
+        raise ProContractNativeOutcome(safety, contract, execution)
+    if _git_snapshot_identity(export_dir, _owned_writable_roots(workspace)) != handoff["subjectHash"]:
+        raise ProContractDeliveryError("Contract export changed before attestation")
 
     current, current_execution = _stage_contract_observation(
         api,
@@ -1615,7 +1752,16 @@ def _deliver(
     ):
         raise ProContractConflictError("Contract execution advanced during delivery restart")
     restarted_messages = _sanitize_control(
-        api.messages(str(execution["sessionID"])),
+        _stage_http(
+            lambda: api.messages(str(execution["sessionID"])),
+            breaker,
+            current,
+            current_execution,
+            clock,
+            sleeper,
+            poll_interval,
+            deadline,
+        ),
         _all_credential_names(workspace.manifest.credential_env),
     )
     if restarted_messages != messages:
@@ -1643,94 +1789,104 @@ def _deliver(
     if current["status"] == "discharged":
         if not isinstance(current.get("attestationID"), str):
             raise ProContractConflictError("discharged Contract has no attestation identity")
+        if not attestation_path.exists():
+            _write_json(
+                attestation_path,
+                {
+                    "version": 1,
+                    "contractID": payload["id"],
+                    "attestationID": current["attestationID"],
+                    "status": "attestation_evidence_unverified",
+                },
+            )
+            raise ProContractNativeOutcome(
+                ProContractCompletion.LOST_SERVER,
+                current,
+                current_execution,
+                "attestation_evidence_unverified",
+            )
+        attestation_record = _read_json(attestation_path)
+        if isinstance(attestation_record, Mapping) and attestation_record.get("status") == (
+            "attestation_evidence_unverified"
+        ):
+            raise ProContractNativeOutcome(
+                ProContractCompletion.LOST_SERVER,
+                current,
+                current_execution,
+                "attestation_evidence_unverified",
+            )
+        _validate_receipt(attestation_record, "attestation")
     elif current["status"] == "verification":
         if attestation_path.exists():
             raise ProContractConflictError("attestation response exists but Contract remains in verification")
-        for attempt in range(MAX_MUTATION_ATTEMPTS):
-            try:
-                response = api.attest(str(payload["id"]), report_hash)
-                _validate_receipt(response, "attestation")
+        safety = _verification_safety_completion(breaker, clock, deadline)
+        if safety is not None:
+            raise ProContractNativeOutcome(safety, current, current_execution)
+        if _git_snapshot_identity(export_dir, _owned_writable_roots(workspace)) != handoff["subjectHash"]:
+            raise ProContractDeliveryError("Contract export changed at the attestation boundary")
+        _scan_all_credentials(job.job.root, workspace, export_dir)
+        safety = _verification_safety_completion(breaker, clock, deadline)
+        if safety is not None:
+            raise ProContractNativeOutcome(safety, current, current_execution)
+        try:
+            response = api.attest(str(payload["id"]), report_hash)
+            _validate_receipt(response, "attestation")
+            _write_json(
+                attestation_path,
+                _sanitize_control(response, _all_credential_names(workspace.manifest.credential_env)),
+            )
+        except ProContractError as error:
+            status_code = error.status_code if isinstance(error, ProContractHttpError) else None
+            observed, observed_execution = _stage_contract_observation(
+                api,
+                payload,
+                breaker,
+                current,
+                current_execution,
+                clock,
+                sleeper,
+                poll_interval,
+                deadline,
+            )
+            observed = _validate_contract(observed, payload)
+            observed_execution = _validate_execution(observed_execution, payload, int(observed["revision"]))
+            if _binding_identity(observed_execution) != _binding_identity(execution):
+                raise ProContractConflictError("Contract coordinates changed after ambiguous attestation") from None
+            if _attestation_coordinates(observed) != _attestation_coordinates(contract):
+                raise ProContractConflictError("Contract coordinates changed after ambiguous attestation") from None
+            native = _native_outcome_completion(observed)
+            if native is not None and native is not ProContractCompletion.DISCHARGED:
+                raise ProContractNativeOutcome(native, observed, observed_execution)
+            if observed["status"] == "discharged":
+                if not isinstance(observed.get("attestationID"), str):
+                    raise ProContractConflictError("discharged Contract has no attestation identity") from None
                 _write_json(
                     attestation_path,
-                    _sanitize_control(response, _all_credential_names(workspace.manifest.credential_env)),
+                    {
+                        "version": 1,
+                        "contractID": payload["id"],
+                        "attestationID": observed["attestationID"],
+                        "status": "attestation_evidence_unverified",
+                    },
                 )
-                break
-            except ProContractError as error:
-                status_code = error.status_code if isinstance(error, ProContractHttpError) else None
-                transient = error.transient if isinstance(error, ProContractHttpError) else True
-                observed, observed_execution = _stage_contract_observation(
-                    api,
-                    payload,
-                    breaker,
-                    current,
-                    current_execution,
-                    clock,
-                    sleeper,
-                    poll_interval,
-                    deadline,
-                )
-                observed = _validate_contract(observed, payload)
-                observed_execution = _validate_execution(observed_execution, payload, int(observed["revision"]))
-                if _binding_identity(observed_execution) != _binding_identity(execution):
-                    raise ProContractConflictError("Contract coordinates changed after ambiguous attestation") from None
-                native = _native_outcome_completion(observed)
-                if native is not None and native is not ProContractCompletion.DISCHARGED:
-                    raise ProContractNativeOutcome(native, observed, observed_execution)
-                if _attestation_coordinates(observed) != _attestation_coordinates(contract):
-                    raise ProContractConflictError("Contract coordinates changed after ambiguous attestation") from None
-                if observed["status"] == "discharged":
-                    if not isinstance(observed.get("attestationID"), str):
-                        raise ProContractConflictError("discharged Contract has no attestation identity") from None
-                    _write_json(
-                        attestation_path,
-                        {
-                            "version": 1,
-                            "reconciled": True,
-                            "contractID": payload["id"],
-                            "attestationID": observed["attestationID"],
-                            "intendedEvidenceHash": report_hash,
-                        },
-                    )
-                    break
-                if observed["status"] != "verification":
-                    raise ProContractConflictError("Contract left verification after ambiguous attestation") from None
-                if status_code in {401, 403}:
-                    breaker.observe_error(status_code, detail=str(error))
-                    raise ProContractNativeOutcome(
-                        ProContractCompletion.AUTH,
-                        observed if isinstance(observed, Mapping) else current,
-                        observed_execution if isinstance(observed_execution, Mapping) else current_execution,
-                    ) from None
-                if status_code == 429:
-                    retry_after = error.retry_after if isinstance(error, ProContractHttpError) else None
-                    _observe_rate_limit(breaker, retry_after, str(error), clock, deadline)
-                    if _backoff(breaker, clock, sleeper, poll_interval, deadline):
-                        raise ProContractNativeOutcome(
-                            _verification_safety_completion(breaker, clock, deadline)
-                            or ProContractCompletion.LOST_SERVER,
-                            observed if isinstance(observed, Mapping) else current,
-                            observed_execution if isinstance(observed_execution, Mapping) else current_execution,
-                        ) from None
-                    if attempt + 1 >= MAX_MUTATION_ATTEMPTS:
-                        raise ProContractNativeOutcome(
-                            ProContractCompletion.LOST_SERVER,
-                            observed if isinstance(observed, Mapping) else current,
-                            observed_execution if isinstance(observed_execution, Mapping) else current_execution,
-                        ) from None
-                    continue
-                if not (transient or status_code is None or status_code >= 500):
-                    raise ProContractNativeOutcome(
-                        ProContractCompletion.LOST_SERVER,
-                        observed if isinstance(observed, Mapping) else current,
-                        observed_execution if isinstance(observed_execution, Mapping) else current_execution,
-                    ) from None
-                if attempt + 1 >= MAX_MUTATION_ATTEMPTS or clock() >= deadline:
-                    raise ProContractNativeOutcome(
-                        ProContractCompletion.LOST_SERVER,
-                        observed if isinstance(observed, Mapping) else current,
-                        observed_execution if isinstance(observed_execution, Mapping) else current_execution,
-                    ) from None
-                sleeper(min(poll_interval, deadline - clock()))
+                raise ProContractNativeOutcome(
+                    ProContractCompletion.LOST_SERVER,
+                    observed,
+                    observed_execution,
+                    "attestation_evidence_unverified",
+                ) from None
+            if observed["status"] != "verification":
+                raise ProContractConflictError("Contract left verification after ambiguous attestation") from None
+            if status_code in {401, 403}:
+                breaker.observe_error(status_code, detail=str(error))
+            if status_code == 429:
+                _observe_rate_limit(breaker, error.retry_after, str(error), clock, deadline)
+            raise ProContractNativeOutcome(
+                _verification_safety_completion(breaker, clock, deadline)
+                or (ProContractCompletion.AUTH if status_code in {401, 403} else ProContractCompletion.LOST_SERVER),
+                observed,
+                observed_execution,
+            ) from None
     else:
         raise ProContractConflictError("Contract left verification before attestation")
     final, final_execution = _observe_after_attestation(
@@ -1755,16 +1911,7 @@ def _deliver(
     if _attestation_coordinates(final) != _attestation_coordinates(contract):
         raise ProContractConflictError("discharged Contract coordinates conflict with verified handoff")
     if not attestation_path.exists():
-        _write_json(
-            attestation_path,
-            {
-                "version": 1,
-                "reconciled": True,
-                "contractID": payload["id"],
-                "attestationID": final["attestationID"],
-                "intendedEvidenceHash": report_hash,
-            },
-        )
+        raise ProContractConflictError("successful attestation receipt disappeared before discharge verification")
     _write_or_verify_json(
         job.job.root / "procontract-discharge.json",
         _sanitize_control(
@@ -2520,7 +2667,13 @@ def _write_export_complete(
     )
 
 
-def _validate_export_complete(path: Path, export: Path, contract_id: str, subject_hash: str) -> bool:
+def _validate_export_complete(
+    path: Path,
+    export: Path,
+    contract_id: str,
+    subject_hash: str,
+    git_identity: str,
+) -> bool:
     raw = _read_json(path)
     if raw != {
         "version": 1,
@@ -2528,38 +2681,57 @@ def _validate_export_complete(path: Path, export: Path, contract_id: str, subjec
         "subjectHash": subject_hash,
         "directory": str(export),
         "treeHash": _tree_hash(_semantic_inventory(export)),
-        "gitSnapshotIdentity": subject_hash,
+        "gitSnapshotIdentity": git_identity,
     }:
         raise ProContractConflictError("persisted complete Contract export evidence is invalid")
     return True
 
 
-def _git_snapshot_identity(export: Path) -> str | None:
+def _git_snapshot_identity(export: Path, owned_roots: tuple[Path, ...] = ()) -> str | None:
     if not export.is_dir():
         return None
-    git_dir = export / ".git" if export.joinpath(".git").is_dir() else Path(str(export) + ".git")
-    if not git_dir.is_dir():
+    owned_roots = owned_roots or (export.parent,)
+    git_dir = _resolve_export_git_dir(export, owned_roots)
+    if git_dir is None:
         return None
-    command = ["git", f"--git-dir={git_dir}", f"--work-tree={export}"]
+    objects = _git_primary_object_directory(git_dir, export, owned_roots)
+    if objects is None:
+        return None
+    command = [
+        "git",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.hooksPath=/dev/null",
+        f"--git-dir={git_dir}",
+        f"--work-tree={export}",
+    ]
+    environment = {
+        "PATH": os.defpath,
+        "LANG": "C",
+        "LC_ALL": "C",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_ATTR_NOSYSTEM": "1",
+    }
+    alternates = _git_alternate_object_directories(objects, export, owned_roots)
+    if alternates is None:
+        return None
+    if alternates:
+        environment["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = os.pathsep.join(str(path) for path in alternates)
     try:
-        tree = subprocess.run(
-            [*command, "rev-parse", "HEAD^{tree}"],
-            capture_output=True,
-            timeout=10,
-            check=False,
+        tree, listed, status_result, index_diff, file_diff = tuple(
+            campaign_process.run_bounded(tuple([*command, *arguments]), None, 10, 1, limit, environment)
+            for arguments, limit in (
+                (("rev-parse", "HEAD^{tree}"), 1024),
+                (("ls-tree", "-rz", "-r", "HEAD"), MAX_CREDENTIAL_SCAN_BYTES),
+                (("status", "--porcelain=v1", "--ignored", "--untracked-files=all"), 64 * 1024),
+                (("diff-index", "--quiet", "--cached", "HEAD", "--"), 1024),
+                (("diff-files", "--quiet", "--"), 1024),
+            )
         )
-        listed = subprocess.run(
-            [*command, "ls-tree", "-rz", "-r", "HEAD"], capture_output=True, timeout=10, check=False
-        )
-        status_result = subprocess.run(
-            [*command, "status", "--porcelain=v1", "--ignored", "--untracked-files=all"],
-            capture_output=True,
-            timeout=10,
-            check=False,
-        )
-        index_diff = subprocess.run([*command, "diff-index", "--quiet", "--cached", "HEAD", "--"], timeout=10)
-        file_diff = subprocess.run([*command, "diff-files", "--quiet", "--"], timeout=10)
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, TimeoutError, campaign_process.ProcessError):
         return None
     if (
         tree.returncode != 0
@@ -2567,22 +2739,132 @@ def _git_snapshot_identity(export: Path) -> str | None:
         or status_result.returncode != 0
         or index_diff.returncode != 0
         or file_diff.returncode != 0
-        or len(tree.stdout) > 256
-        or len(listed.stdout) > MAX_CREDENTIAL_SCAN_BYTES
-        or len(status_result.stdout) > 64 * 1024
+        or len(tree.stdout.encode()) > 256
+        or len(listed.stdout.encode()) > MAX_CREDENTIAL_SCAN_BYTES
+        or len(status_result.stdout.encode()) > 64 * 1024
         or status_result.stdout.strip()
     ):
         return None
-    identity = tree.stdout.decode(errors="strict").strip()
+    identity = tree.stdout.strip()
     if len(identity) not in {40, 64} or any(character not in "0123456789abcdef" for character in identity):
         return None
     try:
-        matches = _worktree_matches_git_tree(export, listed.stdout)
+        matches = _worktree_matches_git_tree(export, listed.stdout.encode())
     except VanillaError:
         return None
     if not matches:
         return None
     return identity
+
+
+def _resolve_export_git_dir(export: Path, owned_roots: tuple[Path, ...]) -> Path | None:
+    marker = export / ".git"
+    if marker.is_symlink():
+        return None
+    if marker.is_dir():
+        candidate = marker
+    elif marker.is_file():
+        if marker.stat().st_size > 4096:
+            return None
+        try:
+            prefix, value = marker.read_text().strip().split(" ", 1)
+        except (OSError, UnicodeError, ValueError):
+            return None
+        if prefix != "gitdir:" or not value:
+            return None
+        candidate = (
+            _host_owned_git_path(Path(value), export, owned_roots)
+            if Path(value).is_absolute()
+            else marker.parent / value
+        )
+    else:
+        candidate = Path(str(export) + ".git")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError:
+        return None
+    roots = tuple(root.resolve() for root in owned_roots)
+    if not resolved.is_dir() or not any(resolved == root or root in resolved.parents for root in roots):
+        return None
+    return resolved
+
+
+def _git_primary_object_directory(git_dir: Path, export: Path, owned_roots: tuple[Path, ...]) -> Path | None:
+    common = git_dir
+    marker = git_dir / "commondir"
+    if marker.exists():
+        if marker.is_symlink() or not marker.is_file() or marker.stat().st_size > 4096:
+            return None
+        try:
+            value = Path(marker.read_text().strip())
+        except (OSError, UnicodeError):
+            return None
+        candidate = _host_owned_git_path(value, export, owned_roots) if value.is_absolute() else git_dir / value
+        try:
+            common = candidate.resolve(strict=True)
+        except OSError:
+            return None
+    roots = tuple(root.resolve() for root in owned_roots)
+    if not common.is_dir() or not any(common == root or root in common.parents for root in roots):
+        return None
+    for config in {git_dir / "config", common / "config"}:
+        if config.is_symlink():
+            return None
+    objects = common / "objects"
+    if objects.is_symlink():
+        return None
+    try:
+        resolved = objects.resolve(strict=True)
+    except OSError:
+        return None
+    if not resolved.is_dir() or not any(resolved == root or root in resolved.parents for root in roots):
+        return None
+    return resolved
+
+
+def _git_alternate_object_directories(
+    primary: Path,
+    export: Path,
+    owned_roots: tuple[Path, ...],
+) -> tuple[Path, ...] | None:
+    pending = [primary]
+    result: list[Path] = []
+    while pending:
+        objects = pending.pop(0)
+        alternates = objects / "info/alternates"
+        if not alternates.exists():
+            continue
+        if alternates.is_symlink() or not alternates.is_file() or alternates.stat().st_size > 64 * 1024:
+            return None
+        try:
+            values = tuple(line for line in alternates.read_text().splitlines() if line)
+        except (OSError, UnicodeError):
+            return None
+        if len(result) + len(values) > 16:
+            return None
+        for value in values:
+            raw = Path(value)
+            candidate = _host_owned_git_path(raw, export, owned_roots) if raw.is_absolute() else objects / raw
+            try:
+                resolved = candidate.resolve(strict=True)
+            except OSError:
+                return None
+            roots = tuple(root.resolve() for root in owned_roots)
+            if not resolved.is_dir() or not any(resolved == root or root in resolved.parents for root in roots):
+                return None
+            if resolved in result:
+                continue
+            result.append(resolved)
+            pending.append(resolved)
+    return tuple(result)
+
+
+def _host_owned_git_path(path: Path, export: Path, owned_roots: tuple[Path, ...]) -> Path:
+    if len(path.parts) > 1 and path.parts[1] == "state":
+        return export.parent.joinpath(*path.parts[2:])
+    if len(path.parts) > 1 and path.parts[1] == "candidate" and owned_roots:
+        return owned_roots[0].joinpath(*path.parts[2:])
+    return path
 
 
 def _worktree_matches_git_tree(export: Path, listing: bytes) -> bool:
@@ -2729,21 +3011,42 @@ def _credential_paths(
 ) -> ProContractCredentialPaths:
     root = Path(job_root).absolute()
     state_dir = Path(workspace.manifest.state_dir).absolute()
+    cache_dir = Path(workspace.manifest.cache_dir).absolute()
+    log_dir = Path(workspace.manifest.log_dir).absolute() if workspace.manifest.log_dir is not None else None
+    export = state_dir / f"contract-export-{contract_id}"
     return ProContractCredentialPaths(
         job_root=root,
         state_dir=state_dir,
+        cache_dir=cache_dir,
         candidate=Path(workspace.candidate).absolute(),
         subject=Path(workspace.manifest.subject_dir).absolute(),
-        export=state_dir / f"contract-export-{contract_id}",
-        log_dir=Path(log_dir).absolute() if (log_dir := getattr(workspace.manifest, "log_dir", None)) else None,
+        export=export,
+        git_dir=_resolve_export_git_dir(export, _owned_writable_roots(workspace)) if export.exists() else None,
+        log_dir=log_dir,
         controls=tuple(root / name for name in CONTROL_ARTIFACT_NAMES),
     )
 
 
 def _scan_credential_roots(paths: ProContractCredentialPaths, names: tuple[str, ...]) -> None:
-    for root in (paths.candidate, paths.subject, paths.export, paths.log_dir):
+    roots = tuple(
+        dict.fromkeys((paths.candidate, paths.subject, paths.state_dir, paths.cache_dir, paths.log_dir, paths.git_dir))
+    )
+    for root in roots:
         if root is not None and root.is_dir():
             _verify_no_credentials(root, names, published_only=False)
+
+
+def _owned_writable_roots(workspace: DockerWorkspace) -> tuple[Path, ...]:
+    return tuple(
+        Path(root).absolute()
+        for root in (
+            workspace.candidate,
+            workspace.manifest.subject_dir,
+            workspace.manifest.state_dir,
+            workspace.manifest.cache_dir,
+            workspace.manifest.log_dir,
+        )
+    )
 
 
 def _scan_control_credentials(paths: ProContractCredentialPaths, names: tuple[str, ...]) -> None:

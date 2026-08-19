@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -15,7 +16,7 @@ from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Callable, Mapping
 from urllib.error import URLError
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 from scripts.campaign_install import InstallRecord
 from scripts.campaign_state import JobLockedError, JobPaths, job_lock
@@ -1592,8 +1593,17 @@ def _wait_health(manifest: WorkspaceManifest, probe: _HealthProbe, timeout: floa
 
 
 def _probe_health(url: str, timeout: float) -> bool:
+    password = os.environ.get("OPENCODE_SERVER_PASSWORD")
+    headers = (
+        {
+            "Authorization": "Basic "
+            + base64.b64encode(f"{os.environ.get('OPENCODE_SERVER_USERNAME', 'opencode')}:{password}".encode()).decode()
+        }
+        if password
+        else {}
+    )
     try:
-        with urlopen(url, timeout=timeout) as response:
+        with urlopen(Request(url, headers=headers), timeout=timeout) as response:
             return 200 <= response.status < 300
     except (OSError, URLError):
         return False

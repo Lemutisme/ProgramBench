@@ -121,6 +121,100 @@ def run_checked(
     )
 
 
+def run_bounded(
+    command: Sequence[str],
+    cwd: Path | None,
+    timeout: float,
+    grace: float,
+    output_limit: int,
+    environment: Mapping[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run a non-provider evidence reader with bounded output, time, and descendants."""
+    executable = shutil.which(command[0])
+    invocation = (executable, *command[1:]) if executable else command
+    process = subprocess.Popen(
+        invocation,
+        cwd=cwd,
+        env=dict(environment) if environment is not None else {"PATH": os.defpath, "LANG": "C", "LC_ALL": "C"},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    output = _BoundedOutput(output_limit)
+    readers = (
+        threading.Thread(target=_drain_bounded, args=(process.stdout, output, output.stdout, process.pid), daemon=True),
+        threading.Thread(target=_drain_bounded, args=(process.stderr, output, output.stderr, process.pid), daemon=True),
+    )
+    for reader in readers:
+        reader.start()
+    timed_out = False
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        _terminate_bounded(process, grace)
+    finally:
+        _join_bounded_readers(process, readers, grace)
+    if output.cleanup_error:
+        raise output.cleanup_error
+    if timed_out:
+        raise TimeoutError from None
+    if output.exceeded:
+        raise ProcessOutputLimitError(f"command output limit exceeded: {output_limit} bytes")
+    return subprocess.CompletedProcess(
+        command,
+        process.returncode,
+        output.stdout.decode(errors="replace"),
+        output.stderr.decode(errors="replace"),
+    )
+
+
+def _drain_bounded(stream: object, output: _BoundedOutput, target: bytearray, process_group: int) -> None:
+    if not hasattr(stream, "read"):
+        return
+    try:
+        while chunk := stream.read(64 * 1024):
+            if output.add(target, chunk):
+                _signal_process_group(process_group, signal.SIGKILL)
+    except (OSError, ValueError) as error:
+        output.fail_cleanup(ProcessCleanupError(f"bounded output drain failed: {type(error).__name__}"))
+
+
+def _terminate_bounded(process: subprocess.Popen[bytes], grace: float) -> None:
+    descendants = _descendant_pids(process.pid)
+    _signal_process_group(process.pid, signal.SIGTERM)
+    _signal_processes(descendants, signal.SIGTERM)
+    try:
+        process.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        descendants.update(_descendant_pids(process.pid))
+        _signal_process_group(process.pid, signal.SIGKILL)
+        _signal_processes(descendants, signal.SIGKILL)
+        process.wait(timeout=grace)
+
+
+def _join_bounded_readers(
+    process: subprocess.Popen[bytes],
+    readers: tuple[threading.Thread, threading.Thread],
+    grace: float,
+) -> None:
+    deadline = time.monotonic() + grace
+    for reader in readers:
+        reader.join(max(0, deadline - time.monotonic()))
+    if not any(reader.is_alive() for reader in readers):
+        return
+    _signal_process_group(process.pid, signal.SIGKILL)
+    _signal_processes(_descendant_pids(process.pid), signal.SIGKILL)
+    if process.stdout:
+        process.stdout.close()
+    if process.stderr:
+        process.stderr.close()
+    for reader in readers:
+        reader.join(max(0, deadline - time.monotonic()))
+    if any(reader.is_alive() for reader in readers):
+        raise ProcessCleanupError("bounded output drain cleanup failed")
+
+
 def create_command_cgroup(root: Path = Path("/sys/fs/cgroup"), membership: Path = Path("/proc/self/cgroup")) -> Path:
     """Create one delegated cgroup-v2 command boundary or report the missing capability."""
     if not (root / "cgroup.controllers").is_file():

@@ -21,6 +21,7 @@ ORIGINAL_TASK = (
     "Implement the documented program in this cleanroom. Produce source, a relocatable compile.sh, and "
     "./executable. Use the reference only for black-box experiments."
 )
+DEFAULT_SUBJECT_HASH = "d3e72673fb616c6b6676409ca333ac2e360820c0"
 
 
 class FakeClock:
@@ -111,12 +112,8 @@ class FakeApi:
 
     def export(self, workspace: object, contract_id: str, destination: Path) -> dict[str, object]:
         self.exports.append((contract_id, destination))
-        destination.mkdir()
-        destination.joinpath("compile.sh").write_text("#!/bin/sh\n")
-        destination.joinpath("compile.sh").chmod(0o755)
-        destination.joinpath("executable").write_text("binary")
-        destination.joinpath("executable").chmod(0o755)
-        return {"contractID": contract_id, "subjectHash": "snapshot", "directory": str(destination)}
+        assert _write_git_export(destination) == DEFAULT_SUBJECT_HASH
+        return {"contractID": contract_id, "subjectHash": DEFAULT_SUBJECT_HASH, "directory": str(destination)}
 
     def attest(self, contract_id: str, evidence_hash: str) -> dict[str, object]:
         self.attestations.append((contract_id, evidence_hash))
@@ -168,6 +165,14 @@ class ExactExportDropApi(FakeApi):
         raise WorkspaceError("export response lost")
 
 
+class GitExportApi(FakeApi):
+    def export(self, workspace: object, contract_id: str, destination: Path) -> dict[str, object]:
+        self.exports.append((contract_id, destination))
+        subject_hash = _write_git_export(destination)
+        assert subject_hash == self.contract["handoff"]["subjectHash"]
+        return {"contractID": contract_id, "subjectHash": subject_hash, "directory": str(destination)}
+
+
 class PartialExportDropApi(FakeApi):
     def __init__(self, contract: dict[str, object], execution: dict[str, object]) -> None:
         super().__init__(contract, execution)
@@ -201,6 +206,28 @@ class SafetyApi(FakeApi):
 class LostApi(FakeApi):
     def get_contract(self, contract_id: str) -> dict[str, object] | None:
         return None
+
+
+class DelayedDispatchApi(FakeApi):
+    def __init__(self, contract: dict[str, object], execution: dict[str, object]) -> None:
+        pending = {**execution, "dispatched": False, "attempts": 0, "turnsUsed": 0, "actionsUsed": 0}
+        super().__init__(
+            {**{key: value for key, value in contract.items() if key != "handoff"}, "status": "dormant"}, pending
+        )
+        self.ready_contract = contract
+        self.ready_execution = execution
+        self.polls = 0
+
+    def get_execution(self, contract_id: str) -> dict[str, object] | None:
+        self.polls += 1
+        if self.polls == 2:
+            self.contract = self.ready_contract
+            self.execution = self.ready_execution
+        return self.execution
+
+    def messages(self, session_id: str) -> dict[str, object]:
+        assert self.execution["dispatched"] is True
+        return super().messages(session_id)
 
 
 class PollErrorApi(SafetyApi):
@@ -328,6 +355,15 @@ class CommitDropAttestApi(FakeApi):
             self.dropped = True
             raise self.error
         return response
+
+
+class ConcurrentAttestApi(FakeApi):
+    def attest(self, contract_id: str, evidence_hash: str) -> dict[str, object]:
+        from scripts.campaign_procontract import ProContractHttpError
+
+        self.attestations.append((contract_id, evidence_hash))
+        self.contract = {**self.contract, "status": "discharged", "attestationID": "pca_external"}
+        raise ProContractHttpError("attestation response lost", status_code=503, transient=True)
 
 
 class AttestErrorApi(FakeApi):
@@ -687,11 +723,13 @@ def _workspace(
         job_root=paths.root,
         subject_dir=paths.root / "subject",
         state_dir=base / "state",
+        cache_dir=base / "cache",
         log_dir=base / "logs",
         candidate=candidate,
         credential_env=(),
     )
     manifest.state_dir.mkdir()
+    manifest.cache_dir.mkdir()
     manifest.log_dir.mkdir()
     return request, FakeWorkspace(manifest, lease)
 
@@ -700,7 +738,7 @@ def _contract(
     payload: dict[str, object],
     *,
     status: str = "verification",
-    subject_hash: str = "snapshot",
+    subject_hash: str = DEFAULT_SUBJECT_HASH,
 ) -> dict[str, object]:
     replay = payload["evidence"]["replay"]  # type: ignore[index]
     spec = {
@@ -759,7 +797,7 @@ def _challenged(contract: dict[str, object]) -> dict[str, object]:
         "status": "dormant",
         "challenge": {
             "revision": 1,
-            "subjectHash": "snapshot",
+            "subjectHash": contract["handoff"]["subjectHash"],
             "evidenceHash": "native-challenge",
             "disclosure": "executor",
             "time": 100003,
@@ -972,6 +1010,38 @@ def test_ambiguous_issue_commit_is_reconciled_before_retry(tmp_path: Path) -> No
 
     assert result.completion.value == "discharged"
     assert len(api.issues) == 1
+
+
+def test_admitted_contract_waits_for_durable_execution_dispatch_before_session_reads(tmp_path: Path) -> None:
+    from scripts.campaign_procontract import build_issue_payload, run_procontract
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    store = _state(paths)
+    _, workspace = _workspace(tmp_path, paths)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock())
+    api = DelayedDispatchApi(_contract(payload), _execution(payload))
+
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease._handle_active = True
+        result = run_procontract(
+            job,
+            store,
+            workspace,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=_limits(),
+            breaker=CircuitBreaker(),
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+            package=lambda subject, run_dir, iid: _package(run_dir, iid),
+            preflight=lambda archive, iid: SimpleNamespace(executable_hash="e" * 64, output="ok"),
+        )
+
+    assert result.completion.value == "discharged"
+    assert api.polls >= 2
     assert len(api.attestations) == 1
 
 
@@ -1045,7 +1115,9 @@ def test_malformed_committed_issue_response_reconciles_public_coordinates(tmp_pa
 
 
 @pytest.mark.parametrize("status", [None, 429, 503])
-def test_ambiguous_attestation_commit_reconciles_without_second_mutation(tmp_path: Path, status: int | None) -> None:
+def test_ambiguous_attestation_commit_is_not_attributed_without_evidence_history(
+    tmp_path: Path, status: int | None
+) -> None:
     from scripts.campaign_procontract import ProContractHttpError, build_issue_payload, run_procontract
 
     paths = JobPaths(tmp_path / "job")
@@ -1079,18 +1151,64 @@ def test_ambiguous_attestation_commit_reconciles_without_second_mutation(tmp_pat
             preflight=lambda archive, iid: SimpleNamespace(executable_hash="e" * 64, output="ok"),
         )
 
-    assert result.completion.value == "discharged"
+    assert result.completion.value == "lost_server"
+    assert result.status == "discharged"
     assert len(api.attestations) == 1
     assert result.attestation_id == "pca_attestation"
+    record = json.loads((paths.root / "procontract-attestation.json").read_text())
+    assert record == {
+        "version": 1,
+        "contractID": payload["id"],
+        "attestationID": "pca_attestation",
+        "status": "attestation_evidence_unverified",
+    }
+    assert not (paths.root / "procontract-quiet.json").exists()
+
+
+def test_concurrent_attestation_cannot_be_attributed_to_intended_report(tmp_path: Path) -> None:
+    from scripts.campaign_procontract import build_issue_payload, run_procontract
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    store = _state(paths)
+    _, workspace = _workspace(tmp_path, paths)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock())
+    api = ConcurrentAttestApi(_contract(payload), _execution(payload))
+
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease._handle_active = True
+        result = run_procontract(
+            job,
+            store,
+            workspace,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=_limits(),
+            breaker=CircuitBreaker(),
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+            package=lambda subject, run_dir, iid: _package(run_dir, iid),
+            preflight=lambda archive, iid: SimpleNamespace(executable_hash="e" * 64, output="ok"),
+        )
+
+    assert result.completion.value == "lost_server"
+    assert result.attestation_id == "pca_external"
+    assert len(api.attestations) == 1
+    record = json.loads((paths.root / "procontract-attestation.json").read_text())
+    assert record["status"] == "attestation_evidence_unverified"
+    assert "intendedEvidenceHash" not in record
+    assert not (paths.root / "procontract-quiet.json").exists()
 
 
 @pytest.mark.parametrize(
     ("status", "retry_after", "completion", "calls"),
     [
         (401, None, "auth", 1),
-        (503, None, "lost_server", 3),
-        (429, "21600", "wall_time", 1),
-        (429, "1", "lost_server", 3),
+        (503, None, "lost_server", 1),
+        (429, "21600", "lost_server", 1),
+        (429, "1", "lost_server", 1),
     ],
 )
 def test_uncommitted_attestation_errors_preserve_terminal_trajectory(
@@ -1142,7 +1260,7 @@ def test_uncommitted_attestation_errors_preserve_terminal_trajectory(
     assert api.attestations == []
 
 
-def test_malformed_committed_attestation_response_reconciles_without_retry(tmp_path: Path) -> None:
+def test_malformed_committed_attestation_response_is_not_falsely_attributed(tmp_path: Path) -> None:
     from scripts.campaign_procontract import build_issue_payload, run_procontract
 
     paths = JobPaths(tmp_path / "job")
@@ -1170,11 +1288,14 @@ def test_malformed_committed_attestation_response_reconciles_without_retry(tmp_p
             preflight=lambda archive, iid: SimpleNamespace(executable_hash="e" * 64, output="ok"),
         )
 
-    assert result.completion.value == "discharged"
+    assert result.completion.value == "lost_server"
     assert len(api.attestations) == 1
+    assert json.loads((paths.root / "procontract-attestation.json").read_text())["status"] == (
+        "attestation_evidence_unverified"
+    )
 
 
-@pytest.mark.parametrize(("status", "failures", "completion"), [(401, -1, "auth"), (429, 1, "discharged")])
+@pytest.mark.parametrize(("status", "failures", "completion"), [(401, -1, "auth"), (429, 1, "lost_server")])
 def test_attestation_reconcile_uses_stage_http_policy(
     tmp_path: Path, status: int, failures: int, completion: str
 ) -> None:
@@ -1215,7 +1336,7 @@ def test_attestation_reconcile_uses_stage_http_policy(
         )
 
     assert result.completion.value == completion
-    assert api.attest_calls == (1 if status == 401 else 2)
+    assert api.attest_calls == 1
     if status == 429:
         assert api.reconcile_calls == 2
         assert clock.now >= 101
@@ -1356,10 +1477,13 @@ def test_resume_after_delivery_response_loss_does_not_repeat_native_mutation(tmp
         invoke()
     result = invoke()
 
-    assert result.completion.value == "discharged"
+    assert result.completion.value == "lost_server"
+    assert result.status == "discharged"
     assert len(api.exports) == 1
     assert len(api.attestations) == 1
-    assert (paths.root / "procontract-attestation.json").is_file()
+    record = json.loads((paths.root / "procontract-attestation.json").read_text())
+    assert record["status"] == "attestation_evidence_unverified"
+    assert "intendedEvidenceHash" not in record
 
 
 def test_ambiguous_cli_export_exact_tree_reconciles_without_second_export(tmp_path: Path) -> None:
@@ -1510,6 +1634,148 @@ def test_ambiguous_cli_export_rejects_ignored_untracked_residue(tmp_path: Path) 
             sleeper=clock.sleep,
         )
     assert result.completion.value == "lost_server"
+    assert api.attestations == []
+
+
+def test_direct_export_identity_is_measured_only_after_writer_stops(tmp_path: Path) -> None:
+    from scripts.campaign_procontract import build_issue_payload, run_procontract
+
+    subject_hash = _write_git_export(tmp_path / "prototype")
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    store = _state(paths)
+    _, workspace = _workspace(tmp_path, paths, contained=True)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock())
+    api = GitExportApi(_contract(payload, subject_hash=subject_hash), _execution(payload))
+    stop = workspace.stop
+    packages = 0
+
+    def mutate_then_stop() -> None:
+        if api.exports and workspace.lease._handle_active:
+            api.exports[0][1].joinpath("compile.sh").write_text("#!/bin/sh\nexit 1\n")
+        stop()
+
+    def package(subject: Path, run_dir: Path, iid: str) -> Path:
+        nonlocal packages
+        packages += 1
+        return _package(run_dir, iid)
+
+    workspace.stop = mutate_then_stop  # type: ignore[method-assign]
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease._handle_active = True
+        result = run_procontract(
+            job,
+            store,
+            workspace,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=_limits(),
+            breaker=CircuitBreaker(),
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+            package=package,
+            preflight=lambda archive, iid: SimpleNamespace(executable_hash="e" * 64, output="ok"),
+        )
+
+    assert result.completion.value == "delivery_failed"
+    assert packages == 0
+    assert api.attestations == []
+
+
+def test_persisted_complete_export_recomputes_git_identity_on_resume(tmp_path: Path) -> None:
+    from scripts.campaign_procontract import _semantic_inventory, _tree_hash, build_issue_payload, run_procontract
+
+    subject_hash = _write_git_export(tmp_path / "prototype")
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    store = _state(paths)
+    _, workspace = _workspace(tmp_path, paths, contained=True)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock())
+    api = GitExportApi(_contract(payload, subject_hash=subject_hash), _execution(payload))
+    export = workspace.manifest.state_dir / f"contract-export-{payload['id']}"
+    _write_git_export(export)
+    export.joinpath(".git/HEAD").write_text("corrupt\n")
+    (paths.root / "procontract-export.json").write_text(
+        json.dumps({"contractID": payload["id"], "subjectHash": subject_hash, "directory": str(export)})
+    )
+    (paths.root / "procontract-export-complete.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "contractID": payload["id"],
+                "subjectHash": subject_hash,
+                "directory": str(export),
+                "treeHash": _tree_hash(_semantic_inventory(export)),
+                "gitSnapshotIdentity": subject_hash,
+            }
+        )
+    )
+    packages = 0
+
+    def package(subject: Path, run_dir: Path, iid: str) -> Path:
+        nonlocal packages
+        packages += 1
+        return _package(run_dir, iid)
+
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease._handle_active = True
+        result = run_procontract(
+            job,
+            store,
+            workspace,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=_limits(),
+            breaker=CircuitBreaker(),
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+            package=package,
+            preflight=lambda archive, iid: SimpleNamespace(executable_hash="e" * 64, output="ok"),
+        )
+
+    assert result.completion.value == "delivery_failed"
+    assert packages == 0
+    assert api.attestations == []
+
+
+def test_export_identity_is_recomputed_after_package_before_attestation(tmp_path: Path) -> None:
+    from scripts.campaign_procontract import build_issue_payload, run_procontract
+
+    subject_hash = _write_git_export(tmp_path / "prototype")
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    store = _state(paths)
+    _, workspace = _workspace(tmp_path, paths, contained=True)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock())
+    api = GitExportApi(_contract(payload, subject_hash=subject_hash), _execution(payload))
+
+    def package(subject: Path, run_dir: Path, iid: str) -> Path:
+        api.exports[0][1].joinpath(".git/HEAD").write_text("corrupt\n")
+        return _package(run_dir, iid)
+
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease._handle_active = True
+        result = run_procontract(
+            job,
+            store,
+            workspace,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=_limits(),
+            breaker=CircuitBreaker(),
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+            package=package,
+            preflight=lambda archive, iid: SimpleNamespace(executable_hash="e" * 64, output="ok"),
+        )
+
+    assert result.completion.value == "delivery_failed"
     assert api.attestations == []
 
 
@@ -1790,7 +2056,7 @@ def test_delivery_failure_stops_writer_and_never_attests(tmp_path: Path, failure
     assert api.attestations == []
     assert "secret" not in __import__("json").dumps(result.to_dict())
     assert result.workspace_frozen is (failure != "replay")
-    assert result.subject_hash == (None if failure == "replay" else "snapshot")
+    assert result.subject_hash == (None if failure == "replay" else DEFAULT_SUBJECT_HASH)
 
 
 def test_package_side_effect_is_reconciled_after_response_loss(tmp_path: Path) -> None:
@@ -1977,6 +2243,220 @@ def test_credential_in_export_fails_closed_without_package_or_attestation(
     leak = next(workspace.manifest.state_dir.glob("contract-export-*/leak.txt"))
     assert (leak.stat().st_ino, _file_hash(leak)) == leak_identity
     assert not paths.root.joinpath("procontract-result.json").exists()
+
+
+@pytest.mark.parametrize("surface", ["state", "cache"])
+def test_credential_in_owned_persisted_surface_fails_closed_without_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, surface: str
+) -> None:
+    from scripts.campaign_freeze import CredentialLeakError
+    from scripts.campaign_procontract import build_issue_payload, run_procontract
+
+    secret = f"{surface}-surface-secret"
+    monkeypatch.setenv("CONTROL_SECRET", secret)
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    store = _state(paths)
+    _, workspace = _workspace(tmp_path, paths, contained=True)
+    workspace.manifest.credential_env = ("CONTROL_SECRET",)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock())
+    api = FakeApi(_contract(payload), _execution(payload))
+    export = api.export
+    leaked: Path | None = None
+    before: list[tuple[str, int, int, str]] | None = None
+    packages = 0
+
+    def leak(owner: object, contract_id: str, destination: Path) -> dict[str, object]:
+        nonlocal leaked, before
+        response = export(owner, contract_id, destination)
+        root = workspace.manifest.state_dir if surface == "state" else workspace.manifest.cache_dir
+        leaked = root / ("opencode.db-wal" if surface == "state" else "provider-cache.log")
+        leaked.write_text(secret)
+        before = _tree_identity(root)
+        return response
+
+    def package(subject: Path, run_dir: Path, iid: str) -> Path:
+        nonlocal packages
+        packages += 1
+        return _package(run_dir, iid)
+
+    api.export = leak  # type: ignore[method-assign]
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease._handle_active = True
+        with pytest.raises(CredentialLeakError) as error:
+            run_procontract(
+                job,
+                store,
+                workspace,
+                model="openai/gpt-5.6-luna",
+                variant="max",
+                limits=_limits(),
+                breaker=CircuitBreaker(),
+                api=api,
+                clock=clock,
+                sleeper=clock.sleep,
+                package=package,
+                preflight=lambda archive, iid: SimpleNamespace(executable_hash="e" * 64, output="ok"),
+            )
+
+    assert secret not in str(error.value)
+    assert packages == 0
+    assert api.attestations == []
+    assert leaked is not None and before is not None
+    assert _tree_identity(leaked.parent) == before
+    assert leaked.read_text() == secret
+
+
+def test_credential_in_external_git_object_store_fails_closed_without_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts.campaign_freeze import CredentialLeakError
+    from scripts.campaign_procontract import build_issue_payload, run_procontract
+
+    secret = "git-object-secret"
+    monkeypatch.setenv("CONTROL_SECRET", secret)
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    store = _state(paths)
+    _, workspace = _workspace(tmp_path, paths, contained=True)
+    workspace.manifest.credential_env = ("CONTROL_SECRET",)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock())
+    api = FakeApi(_contract(payload), _execution(payload))
+    export = api.export
+    object_store: Path | None = None
+    before: list[tuple[str, int, int, str]] | None = None
+    packages = 0
+
+    def leak(owner: object, contract_id: str, destination: Path) -> dict[str, object]:
+        nonlocal object_store, before
+        response = export(owner, contract_id, destination)
+        object_store = Path(str(destination) + ".git")
+        destination.joinpath(".git").rename(object_store)
+        destination.joinpath(".git").write_text(f"gitdir: ../{object_store.name}\n")
+        object_store.joinpath("objects/leaked-object").write_text(secret)
+        before = _tree_identity(workspace.manifest.state_dir)
+        return response
+
+    def package(subject: Path, run_dir: Path, iid: str) -> Path:
+        nonlocal packages
+        packages += 1
+        return _package(run_dir, iid)
+
+    api.export = leak  # type: ignore[method-assign]
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease._handle_active = True
+        with pytest.raises(CredentialLeakError):
+            run_procontract(
+                job,
+                store,
+                workspace,
+                model="openai/gpt-5.6-luna",
+                variant="max",
+                limits=_limits(),
+                breaker=CircuitBreaker(),
+                api=api,
+                clock=clock,
+                sleeper=clock.sleep,
+                package=package,
+                preflight=lambda archive, iid: SimpleNamespace(executable_hash="e" * 64, output="ok"),
+            )
+
+    assert packages == 0
+    assert api.attestations == []
+    assert object_store is not None and before is not None
+    assert _tree_identity(workspace.manifest.state_dir) == before
+    assert object_store.joinpath("objects/leaked-object").read_text() == secret
+
+
+def test_export_git_indirection_cannot_escape_owned_writable_roots(tmp_path: Path) -> None:
+    from scripts.campaign_procontract import _git_snapshot_identity
+
+    state = tmp_path / "state"
+    state.mkdir()
+    export = state / "export"
+    _write_git_export(export)
+    outside = tmp_path / "outside.git"
+    export.joinpath(".git").rename(outside)
+    export.joinpath(".git").write_text(f"gitdir: {outside}\n")
+
+    assert _git_snapshot_identity(export, (state,)) is None
+
+
+def test_export_git_objects_symlink_cannot_escape_owned_writable_roots(tmp_path: Path) -> None:
+    from scripts.campaign_procontract import _git_snapshot_identity
+
+    state = tmp_path / "state"
+    state.mkdir()
+    export = state / "export"
+    _write_git_export(export)
+    outside = tmp_path / "outside-objects"
+    export.joinpath(".git/objects").rename(outside)
+    export.joinpath(".git/objects").symlink_to(outside, target_is_directory=True)
+
+    assert _git_snapshot_identity(export, (state,)) is None
+
+
+def test_export_git_config_cannot_execute_fsmonitor_hook(tmp_path: Path) -> None:
+    from scripts.campaign_procontract import _git_snapshot_identity
+
+    export = tmp_path / "export"
+    subject_hash = _write_git_export(export)
+    marker = tmp_path / "executed"
+    hook = tmp_path / "fsmonitor"
+    hook.write_text(f"#!/bin/sh\ntouch {marker}\n")
+    hook.chmod(0o755)
+    subprocess.run(["git", "-C", str(export), "config", "core.fsmonitor", str(hook)], check=True)
+
+    assert _git_snapshot_identity(export) == subject_hash
+    assert not marker.exists()
+
+
+def test_git_snapshot_uses_five_bounded_campaign_process_commands(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts import campaign_process
+    from scripts.campaign_procontract import _git_snapshot_identity
+
+    export = tmp_path / "export"
+    subject_hash = _write_git_export(export)
+    listing = subprocess.run(
+        ["git", "-C", str(export), "ls-tree", "-rz", "-r", "HEAD"], check=True, capture_output=True
+    ).stdout
+    calls: list[tuple[str, ...]] = []
+
+    def bounded(
+        command: tuple[str, ...],
+        cwd: Path | None,
+        timeout: float,
+        grace: float,
+        output_limit: int,
+        environment: dict[str, str],
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append(command)
+        if "rev-parse" in command:
+            stdout = subject_hash + "\n"
+        elif "ls-tree" in command:
+            stdout = listing.decode()
+        else:
+            stdout = ""
+        return subprocess.CompletedProcess(command, 0, stdout, "")
+
+    monkeypatch.setattr(campaign_process, "run_bounded", bounded, raising=False)
+    monkeypatch.setattr(subprocess, "run", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unbounded")))
+
+    assert _git_snapshot_identity(export) == subject_hash
+    assert [
+        next(part for part in call if part in {"rev-parse", "ls-tree", "status", "diff-index", "diff-files"})
+        for call in calls
+    ] == [
+        "rev-parse",
+        "ls-tree",
+        "status",
+        "diff-index",
+        "diff-files",
+    ]
 
 
 def test_issue_response_credential_is_sanitized_before_persistence(
@@ -2710,7 +3190,7 @@ def test_verification_at_exact_runner_limit_continues_native_delivery(tmp_path: 
     assert len(api.attestations) == 1
 
 
-def test_verification_observation_wins_over_wall_deadline_equality(tmp_path: Path) -> None:
+def test_wall_deadline_equality_prevents_verification_delivery(tmp_path: Path) -> None:
     from scripts.campaign_procontract import build_issue_payload, run_procontract
 
     paths = JobPaths(tmp_path / "job")
@@ -2738,8 +3218,106 @@ def test_verification_observation_wins_over_wall_deadline_equality(tmp_path: Pat
             preflight=lambda archive, iid: SimpleNamespace(executable_hash="e" * 64, output="ok"),
         )
 
-    assert result.completion.value == "discharged"
-    assert api.interrupts == []
+    assert result.completion.value == "wall_time"
+    assert api.attestations == []
+
+
+def test_final_verification_poll_observes_new_global_hard_cost_stop_before_export(tmp_path: Path) -> None:
+    from decimal import Decimal
+
+    from scripts.campaign_procontract import build_issue_payload, run_procontract
+    from scripts.campaign_usage import TurnUsage, UsageSummary
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    store = _state(paths)
+    _, workspace = _workspace(tmp_path, paths)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock())
+    breaker = CircuitBreaker(hard_cost_cap=1, clock=clock)
+
+    class FinalCostApi(FakeApi):
+        def messages(self, session_id: str) -> dict[str, object]:
+            breaker.observe(
+                "other-job",
+                0,
+                UsageSummary(
+                    provider_turns=1,
+                    turns_without_cache=1,
+                    cost=Decimal("1"),
+                    turns=(TurnUsage(cost=Decimal("1")),),
+                ),
+                terminal=False,
+            )
+            return {"data": []}
+
+    api = FinalCostApi(_contract(payload), _execution(payload))
+    packages = 0
+
+    def package(subject: Path, run_dir: Path, iid: str) -> Path:
+        nonlocal packages
+        packages += 1
+        return _package(run_dir, iid)
+
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease._handle_active = True
+        result = run_procontract(
+            job,
+            store,
+            workspace,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=_limits(),
+            breaker=breaker,
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+            package=package,
+            preflight=lambda archive, iid: SimpleNamespace(executable_hash="e" * 64, output="ok"),
+        )
+
+    assert result.completion.value == "hard_cost"
+    assert packages == 0
+    assert api.exports == []
+    assert api.attestations == []
+
+
+def test_package_delay_crossing_wall_deadline_prevents_attestation(tmp_path: Path) -> None:
+    from scripts.campaign_procontract import build_issue_payload, run_procontract
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    store = _state(paths)
+    _, workspace = _workspace(tmp_path, paths)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock())
+    api = FakeApi(_contract(payload), _execution(payload))
+
+    def package(subject: Path, run_dir: Path, iid: str) -> Path:
+        clock.now = 21_700
+        return _package(run_dir, iid)
+
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease._handle_active = True
+        result = run_procontract(
+            job,
+            store,
+            workspace,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=_limits(),
+            breaker=CircuitBreaker(clock=clock),
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+            package=package,
+            preflight=lambda archive, iid: SimpleNamespace(executable_hash="e" * 64, output="ok"),
+        )
+
+    assert result.completion.value == "wall_time"
+    assert result.status == "verification"
+    assert api.attestations == []
+    assert not (paths.root / "procontract-attestation-request.json").exists()
 
 
 @pytest.mark.parametrize("native", ["challenge", "escalated"])
@@ -3300,7 +3878,7 @@ def test_message_pagination_accepts_valid_pages_and_empty_cursor() -> None:
         "http://127.0.0.1:4096",
         expected_port=4096,
         password="secret",
-        http_client=SequenceHttpClient([{"data": [], "cursor": {}}]),
+        http_client=SequenceHttpClient([{"data": [], "cursor": {"previous": None, "next": None}}]),
     )
     assert empty.messages("session-custom") == {"data": []}
 

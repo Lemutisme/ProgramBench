@@ -389,6 +389,34 @@ def test_workspace_constructs_redacted_dynamic_loopback_server(tmp_path: Path) -
     assert docker.observed_phases == ["preparing", "launching"]
 
 
+def test_default_health_probe_uses_principal_basic_auth(monkeypatch: pytest.MonkeyPatch) -> None:
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    seen: list[str | None] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            seen.append(self.headers.get("authorization"))
+            self.send_response(200 if seen[-1] == "Basic b3BlbmNvZGU6cHJvYmUtc2VjcmV0" else 401)
+            self.end_headers()
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            return
+
+    monkeypatch.setenv("OPENCODE_SERVER_PASSWORD", "probe-secret")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever)
+    thread.start()
+    try:
+        assert campaign_workspace._probe_health(f"http://127.0.0.1:{server.server_port}/global/health", 1)
+    finally:
+        server.shutdown()
+        thread.join()
+        server.server_close()
+
+    assert seen == ["Basic b3BlbmNvZGU6cHJvYmUtc2VjcmV0"]
+
+
 def test_workspace_claim_accepts_lock_artifacts_from_active_job_lease(tmp_path: Path) -> None:
     value = request(tmp_path, RecordingDocker())
     value.job.root.mkdir(parents=True)
