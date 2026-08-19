@@ -9,7 +9,7 @@ import re
 import tempfile
 import time
 from dataclasses import dataclass, fields, replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Callable, Mapping
 from urllib.error import URLError
 from urllib.request import urlopen
@@ -55,6 +55,50 @@ _HealthProbe = Callable[[str, float], bool]
 
 
 @dataclass(frozen=True)
+class MountSpec:
+    source: Path
+    destination: str
+    type: str
+    read_only: bool
+
+    def __post_init__(self) -> None:
+        source = Path(self.source)
+        if not source.is_absolute() or _canonical_root(source, "mount source") != source:
+            raise WorkspaceError("mount source must be a canonical absolute path")
+        if (
+            not isinstance(self.destination, str)
+            or not self.destination.startswith("/")
+            or str(PurePosixPath(self.destination)) != self.destination
+            or ".." in PurePosixPath(self.destination).parts
+        ):
+            raise WorkspaceError("mount destination must be a canonical absolute container path")
+        if self.type != "bind":
+            raise WorkspaceError("workspace mounts must be bind mounts")
+        if type(self.read_only) is not bool:
+            raise WorkspaceError("mount read_only must be bool")
+        object.__setattr__(self, "source", source)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "source": str(self.source),
+            "destination": self.destination,
+            "type": self.type,
+            "read_only": self.read_only,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: object) -> "MountSpec":
+        if (
+            not isinstance(raw, dict)
+            or set(raw) != {"source", "destination", "type", "read_only"}
+            or not all(isinstance(raw[name], str) for name in ("source", "destination", "type"))
+            or type(raw["read_only"]) is not bool
+        ):
+            raise WorkspaceError("workspace mount specification is invalid")
+        return cls(Path(raw["source"]), raw["destination"], raw["type"], raw["read_only"])
+
+
+@dataclass(frozen=True)
 class WorkspaceManifest:
     campaign: str
     job_id: str
@@ -77,6 +121,7 @@ class WorkspaceManifest:
     platform: str
     binary: Path
     binary_sha256: str
+    mounts: tuple[MountSpec, ...]
     credential_env: tuple[str, ...]
     environment_names: tuple[str, ...]
     container_user: str
@@ -101,6 +146,14 @@ class WorkspaceManifest:
             raise WorkspaceError("workspace job ID is invalid")
         if self.container_id is not None and not _CONTAINER_ID.fullmatch(self.container_id):
             raise WorkspaceError("workspace container ID is invalid")
+        if (
+            not isinstance(self.mounts, tuple)
+            or not self.mounts
+            or not all(isinstance(mount, MountSpec) for mount in self.mounts)
+            or len({mount.source for mount in self.mounts}) != len(self.mounts)
+            or len({mount.destination for mount in self.mounts}) != len(self.mounts)
+        ):
+            raise WorkspaceError("workspace mounts must be a unique immutable tuple")
         if len(set(self.credential_env)) != len(self.credential_env) or not all(
             _ENV.fullmatch(value) for value in self.credential_env
         ):
@@ -130,12 +183,13 @@ class WorkspaceManifest:
             value[name] = str(value[name])
         for name in ("credential_env", "environment_names", "entrypoint", "command"):
             value[name] = list(value[name])
-        return {"version": 2, **value}
+        value["mounts"] = [mount.to_dict() for mount in self.mounts]
+        return {"version": 3, **value}
 
     @classmethod
     def from_dict(cls, raw: object) -> "WorkspaceManifest":
         expected = {field.name for field in fields(cls)}
-        if not isinstance(raw, dict) or set(raw) != {"version", *expected} or raw["version"] != 2:
+        if not isinstance(raw, dict) or set(raw) != {"version", *expected} or raw["version"] != 3:
             raise WorkspaceError("workspace manifest is invalid")
         paths = {
             "job_root",
@@ -153,7 +207,7 @@ class WorkspaceManifest:
         sequences = {"credential_env", "environment_names", "entrypoint", "command"}
         if any(
             not isinstance(raw[name], str)
-            for name in expected - paths - sequences - {"container_id", "port", "container_init"}
+            for name in expected - paths - sequences - {"container_id", "port", "container_init", "mounts"}
         ):
             raise WorkspaceError("workspace manifest has invalid fields")
         if any(not isinstance(raw[name], str) for name in paths):
@@ -169,9 +223,12 @@ class WorkspaceManifest:
             raise WorkspaceError("workspace manifest has invalid port")
         if type(raw["container_init"]) is not bool:
             raise WorkspaceError("workspace manifest has invalid init setting")
+        if not isinstance(raw["mounts"], list):
+            raise WorkspaceError("workspace manifest has invalid mounts")
         value = {name: raw[name] for name in expected}
         value.update({name: Path(raw[name]) for name in paths})
         value.update({name: tuple(raw[name]) for name in sequences})
+        value["mounts"] = tuple(MountSpec.from_dict(mount) for mount in raw["mounts"])
         return cls(**value)
 
 
@@ -342,7 +399,11 @@ def _launch(
     )
     command.extend(value for name in launching.credential_env for value in ("-e", name))
     command.extend(value for item in _FIXED_ENV.items() for value in ("-e", f"{item[0]}={item[1]}"))
-    command.extend(value for mount in _mounts(launching) for value in ("-v", ":".join(mount[:3])))
+    command.extend(
+        value
+        for mount in _mounts(launching)
+        for value in ("-v", f"{mount.source}:{mount.destination}:{'ro' if mount.read_only else 'rw'}")
+    )
     command.extend((launching.image, *launching.command))
     container_id = _docker(runner, tuple(command), 60, "create").strip()
     if not _CONTAINER_ID.fullmatch(container_id):
@@ -395,6 +456,8 @@ def _expected_manifest(
 ) -> WorkspaceManifest:
     job_id = _job_id(request.campaign, request.instance_id, request.arm)
     candidate = request.candidate_root / f"programbench-{job_id[:32]}"
+    state_dir = request.state_root / "opencode-state"
+    cache_dir = request.state_root / "cache"
     return WorkspaceManifest(
         campaign=request.campaign,
         job_id=job_id,
@@ -404,8 +467,8 @@ def _expected_manifest(
         candidate_root=request.candidate_root,
         candidate=candidate,
         state_root=request.state_root,
-        state_dir=request.state_root / "opencode-state",
-        cache_dir=request.state_root / "cache",
+        state_dir=state_dir,
+        cache_dir=cache_dir,
         log_dir=request.log_dir,
         subject_dir=request.job.root / "subject",
         install_dir=request.install.binary.parent,
@@ -417,6 +480,13 @@ def _expected_manifest(
         platform=platform,
         binary=request.install.binary,
         binary_sha256=request.install.binary_sha256,
+        mounts=(
+            MountSpec(candidate, "/candidate", "bind", False),
+            MountSpec(state_dir, "/state", "bind", False),
+            MountSpec(cache_dir, "/cache", "bind", False),
+            MountSpec(request.log_dir, "/logs", "bind", False),
+            MountSpec(request.install.binary, "/opencode", "bind", True),
+        ),
         credential_env=request.credential_env,
         environment_names=tuple(sorted({*image_environment, *request.credential_env, *_FIXED_ENV})),
         container_user="agent",
@@ -533,10 +603,13 @@ def _copy_cleanroom(runner: _DockerRunner, docker: str, manifest: WorkspaceManif
     _prepare_bind_paths(manifest)
     if not preparing_marker.exists():
         _write_json(preparing_marker, _candidate_identity(manifest))
+        preparing_marker.chmod(0o644)
     command = (
         docker,
         "run",
         "--rm",
+        "--platform",
+        manifest.platform,
         "--user",
         "root",
         "--network",
@@ -557,8 +630,7 @@ def _copy_cleanroom(runner: _DockerRunner, docker: str, manifest: WorkspaceManif
         "ln -s /workspace/executable /candidate/reference; "
         "mkdir -p /state/home /state/config /state/data; "
         "mv /candidate/.programbench-preparing.json /candidate/.programbench-cleanroom.json; "
-        "chown -R agent:agent /candidate /state /cache /logs; "
-        "chmod -R a+rwX /candidate /state /cache /logs",
+        "chown -R agent:agent /candidate /state /cache /logs",
     )
     _docker(runner, command, 90, "initialize candidate")
     _require_candidate_ready(manifest)
@@ -617,14 +689,24 @@ def _image_spec(runner: _DockerRunner, docker: str, image: str) -> tuple[str, st
         operating_system = inspected.get("Os") if isinstance(inspected, Mapping) else None
         architecture = inspected.get("Architecture") if isinstance(inspected, Mapping) else None
     except (TypeError, ValueError):
+        values = inspected = config = environment = None
         digest = operating_system = architecture = None
         names = None
+        raw = ""
+    message = None
     if not isinstance(digest, str) or not digest.startswith("sha256:"):
-        raise DockerCommandError("docker image inspect returned an invalid image digest")
-    if not isinstance(operating_system, str) or not isinstance(architecture, str):
-        raise DockerCommandError("docker image inspect returned an invalid platform")
-    if names is None:
-        raise DockerCommandError("docker image inspect returned invalid environment data")
+        message = "docker image inspect returned an invalid image digest"
+    elif not isinstance(operating_system, str) or not isinstance(architecture, str):
+        message = "docker image inspect returned an invalid platform"
+    elif f"{operating_system}/{architecture}" != "linux/amd64":
+        message = "Docker image platform must be linux/amd64"
+    elif names is None:
+        message = "docker image inspect returned invalid environment data"
+    if message:
+        raw = ""
+        values = inspected = config = environment = None
+        digest = operating_system = architecture = names = None
+        raise DockerCommandError(message) from None
     return digest, f"{operating_system}/{architecture}", names
 
 
@@ -635,9 +717,14 @@ def _inspect_container(runner: _DockerRunner, docker: str, name: str) -> Mapping
         return None
     try:
         value = json.loads(raw)
-    except ValueError as error:
-        raise DockerCommandError("docker inspect returned invalid JSON") from error
+    except ValueError:
+        value = None
+        raw = ""
+    if value is None:
+        raise DockerCommandError("docker inspect returned invalid JSON") from None
     if not isinstance(value, list) or len(value) != 1 or not isinstance(value[0], dict):
+        raw = ""
+        value = None
         raise DockerCommandError("docker inspect returned invalid container data")
     return value[0]
 
@@ -682,7 +769,16 @@ def _require_exact_container(inspected: Mapping[str, object], manifest: Workspac
         labels.get(key) != value for key, value in _identity_labels(manifest).items()
     ):
         raise ContainerConflictError("container job identity does not match")
-    expected_mounts = set(_mounts(manifest))
+    expected_mounts = {
+        (
+            str(mount.source),
+            mount.destination,
+            "ro" if mount.read_only else "rw",
+            mount.type,
+            not mount.read_only,
+        )
+        for mount in _mounts(manifest)
+    }
     binds = host.get("Binds")
     if (
         not isinstance(binds, list)
@@ -729,14 +825,8 @@ def _environment_names(raw: object) -> tuple[str, ...] | None:
     return tuple(sorted(environment)) if environment is not None else None
 
 
-def _mounts(manifest: WorkspaceManifest) -> tuple[tuple[str, str, str, str, bool], ...]:
-    return (
-        (str(manifest.candidate), "/candidate", "rw", "bind", True),
-        (str(manifest.state_dir), "/state", "rw", "bind", True),
-        (str(manifest.cache_dir), "/cache", "rw", "bind", True),
-        (str(manifest.log_dir), "/logs", "rw", "bind", True),
-        (str(manifest.binary), "/opencode", "ro", "bind", False),
-    )
+def _mounts(manifest: WorkspaceManifest) -> tuple[MountSpec, ...]:
+    return manifest.mounts
 
 
 def _identity_labels(manifest: WorkspaceManifest) -> dict[str, str]:
@@ -820,6 +910,14 @@ def _require_safe_manifest_paths(manifest: WorkspaceManifest) -> None:
         or manifest.binary.parent != manifest.install_dir
     ):
         raise ContainerConflictError("workspace manifest paths do not match their intended containment")
+    if manifest.mounts != (
+        MountSpec(manifest.candidate, "/candidate", "bind", False),
+        MountSpec(manifest.state_dir, "/state", "bind", False),
+        MountSpec(manifest.cache_dir, "/cache", "bind", False),
+        MountSpec(manifest.log_dir, "/logs", "bind", False),
+        MountSpec(manifest.binary, "/opencode", "bind", True),
+    ):
+        raise ContainerConflictError("workspace manifest mounts do not match its canonical roots")
     independent = (
         manifest.candidate_root,
         manifest.state_root,
@@ -843,9 +941,19 @@ def _load_manifest(path: Path) -> WorkspaceManifest:
     if canonical != path or path.is_symlink():
         raise WorkspaceError("workspace manifest path is unsafe")
     try:
-        manifest = WorkspaceManifest.from_dict(json.loads(path.read_text(), object_pairs_hook=_unique_object))
-    except (OSError, TypeError, ValueError, WorkspaceError) as error:
-        raise WorkspaceError("workspace manifest cannot be safely read") from error
+        raw = json.loads(path.read_text(), object_pairs_hook=_unique_object)
+    except (OSError, TypeError, ValueError):
+        raw = None
+    if raw is None:
+        raise WorkspaceError("workspace manifest cannot be safely read") from None
+    try:
+        manifest = WorkspaceManifest.from_dict(raw)
+    except WorkspaceError as error:
+        message = str(error)
+        manifest = None
+    if manifest is None:
+        raw = None
+        raise WorkspaceError(message) from None
     if manifest.manifest_path != path:
         raise ContainerConflictError("workspace manifest was copied to a different path")
     return manifest
@@ -928,15 +1036,23 @@ def _docker(runner: _DockerRunner, command: tuple[str, ...], timeout: float, act
     except DockerNotFoundError:
         raise
     except Exception as error:
-        raise DockerCommandError(f"docker {action} failed ({type(error).__name__})") from None
+        failure = type(error).__name__
+    raise DockerCommandError(f"docker {action} failed ({failure})") from None
 
 
 def _run_docker(command: tuple[str, ...], timeout: float) -> str:
     from scripts.campaign_docker import DockerProcessError, DockerProcessNotFoundError, run_docker
 
+    missing = None
+    failure = None
     try:
         return run_docker(command, timeout)
     except DockerProcessNotFoundError as error:
-        raise DockerNotFoundError(str(error)) from None
+        missing = str(error)
     except DockerProcessError as error:
-        raise DockerCommandError(str(error)) from None
+        failure = str(error)
+    if missing is not None:
+        raise DockerNotFoundError(missing) from None
+    if failure is not None:
+        raise DockerCommandError(failure) from None
+    raise DockerCommandError("docker command failed")

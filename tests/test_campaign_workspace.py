@@ -4,7 +4,9 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import threading
+import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
@@ -34,6 +36,8 @@ class RecordingDocker:
         self.containers: dict[str, dict[str, object]] = {}
         self.next_port = 48123
         self.image_digest = "sha256:image-digest"
+        self.image_os = "linux"
+        self.image_architecture = "amd64"
         self.observed_phases: list[str] = []
 
     def __call__(self, command: tuple[str, ...], timeout: float):
@@ -43,8 +47,8 @@ class RecordingDocker:
                 [
                     {
                         "Id": self.image_digest,
-                        "Os": "linux",
-                        "Architecture": "amd64",
+                        "Os": self.image_os,
+                        "Architecture": self.image_architecture,
                         "Config": {"Env": ["PATH=/usr/bin", "LANG=C.UTF-8"]},
                     }
                 ]
@@ -219,6 +223,30 @@ def test_workspace_constructs_redacted_dynamic_loopback_server(tmp_path: Path) -
     text = workspace.manifest_path.read_text()
     assert "OPENAI_API_KEY" in text and "secret-value" not in text
     assert docker.observed_phases == ["preparing", "launching"]
+
+
+def test_candidate_init_preserves_workspace_modes_and_pins_platform(tmp_path: Path) -> None:
+    docker = RecordingDocker()
+
+    ensure_workspace(request(tmp_path, docker))
+
+    initialize = next(command for command in docker.commands if command[1] == "run")
+    assert "chmod -R" not in initialize[-1]
+    assert initialize[initialize.index("--platform") + 1] == "linux/amd64"
+
+
+@pytest.mark.parametrize(("operating_system", "architecture"), [("windows", "amd64"), ("linux", "arm64")])
+def test_workspace_rejects_non_linux_amd64_image_before_init(
+    tmp_path: Path, operating_system: str, architecture: str
+) -> None:
+    docker = RecordingDocker()
+    docker.image_os = operating_system
+    docker.image_architecture = architecture
+
+    with pytest.raises(DockerCommandError, match="linux/amd64"):
+        ensure_workspace(request(tmp_path, docker))
+
+    assert not any(command[1] in {"run", "create"} for command in docker.commands)
 
 
 def test_existing_unowned_name_is_never_adopted(tmp_path: Path) -> None:
@@ -537,8 +565,10 @@ def test_docker_wrapper_drops_secret_exception_chain() -> None:
         campaign_workspace._docker(unsafe_runner, ("docker", "info"), 1, "inspect")
 
     assert error.value.__cause__ is None
+    assert error.value.__context__ is None
     assert secret not in str(error.value)
     assert secret not in repr(error.value)
+    assert secret not in _traceback_locals(error.value)
 
 
 def test_image_tag_must_still_resolve_to_persisted_digest(tmp_path: Path) -> None:
@@ -549,6 +579,105 @@ def test_image_tag_must_still_resolve_to_persisted_digest(tmp_path: Path) -> Non
 
     with pytest.raises(ContainerConflictError):
         ensure_workspace(value)
+
+
+def test_manifest_roundtrips_typed_immutable_mount_specs(tmp_path: Path) -> None:
+    workspace = ensure_workspace(request(tmp_path, RecordingDocker()))
+
+    loaded = campaign_workspace.WorkspaceManifest.from_dict(workspace.manifest.to_dict())
+
+    assert loaded == workspace.manifest
+    assert isinstance(loaded.mounts, tuple)
+    assert all(isinstance(mount, campaign_workspace.MountSpec) for mount in loaded.mounts)
+    assert campaign_workspace._mounts(loaded) == loaded.mounts
+
+
+@pytest.mark.parametrize(("field", "value"), [("destination", "/foreign"), ("read_only", True)])
+def test_adoption_rejects_forged_persisted_mount_spec(tmp_path: Path, field: str, value: object) -> None:
+    docker = RecordingDocker()
+    request_value = request(tmp_path, docker)
+    workspace = ensure_workspace(request_value)
+    manifest = json.loads(workspace.manifest_path.read_text())
+    manifest["mounts"][0][field] = value
+    workspace.manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(ContainerConflictError):
+        ensure_workspace(request_value)
+
+
+def test_invalid_docker_inspect_json_drops_secret_document_and_exception_links() -> None:
+    secret = "fake-openai-key-in-invalid-json"
+
+    def docker(_command: tuple[str, ...], _timeout: float) -> str:
+        return f'{{"credential":"{secret}", invalid'
+
+    with pytest.raises(DockerCommandError) as error:
+        campaign_workspace._inspect_container(docker, "docker", "container")
+
+    formatted = "".join(traceback.format_exception(error.value))
+    assert secret not in formatted
+    assert secret not in _traceback_locals(error.value)
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None
+
+
+def test_invalid_docker_image_json_drops_secret_document() -> None:
+    secret = "fake-openai-key-in-invalid-image-json"
+
+    def docker(_command: tuple[str, ...], _timeout: float) -> str:
+        return f'{{"credential":"{secret}", invalid'
+
+    with pytest.raises(DockerCommandError) as error:
+        campaign_workspace._image_spec(docker, "docker", "image")
+
+    assert secret not in "".join(traceback.format_exception(error.value))
+    assert secret not in _traceback_locals(error.value)
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None
+
+
+@pytest.mark.parametrize("kind", ["container", "image"])
+def test_structurally_invalid_docker_inspect_drops_secret_document(kind: str) -> None:
+    secret = "fake-openai-key-in-invalid-inspect-structure"
+
+    def docker(_command: tuple[str, ...], _timeout: float) -> str:
+        return json.dumps({"credential": secret})
+
+    with pytest.raises(DockerCommandError) as error:
+        if kind == "container":
+            campaign_workspace._inspect_container(docker, "docker", "container")
+        if kind == "image":
+            campaign_workspace._image_spec(docker, "docker", "image")
+
+    assert secret not in "".join(traceback.format_exception(error.value))
+    assert secret not in _traceback_locals(error.value)
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None
+
+
+def test_invalid_manifest_json_is_a_sanitized_workspace_error(tmp_path: Path) -> None:
+    secret = "fake-openai-key-in-invalid-manifest"
+    path = tmp_path / "workspace.json"
+    path.write_text(f'{{"credential":"{secret}", invalid')
+
+    with pytest.raises(WorkspaceError) as error:
+        campaign_workspace._load_manifest(path)
+
+    formatted = "".join(traceback.format_exception(error.value))
+    assert secret not in formatted
+    assert secret not in _traceback_locals(error.value)
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None
+
+
+def _traceback_locals(error: BaseException) -> str:
+    values = []
+    current = error.__traceback__
+    while current:
+        if current.tb_frame.f_globals.get("__name__") == campaign_workspace.__name__:
+            values.extend(repr(value) for value in current.tb_frame.f_locals.values())
+        current = current.tb_next
+    return "".join(values)
 
 
 def test_run_opencode_reexports_workspace_api() -> None:
@@ -574,8 +703,13 @@ def test_real_docker_runs_two_exact_isolated_workspaces(tmp_path: Path, monkeypa
         "FROM python:3.11\n"
         "RUN useradd --create-home agent && mkdir -p /workspace && "
         "printf 'fixture workspace\\n' > /workspace/README && "
+        "printf 'non executable\\n' > /workspace/member-data && "
+        "printf '#!/bin/sh\\necho member executable\\n' > /workspace/member-executable && "
         "printf '#!/bin/sh\\necho reference executable\\n' > /workspace/executable && "
-        "chmod 755 /workspace/executable && chown -R agent:agent /workspace\n"
+        "ln -s member-data /workspace/member-link && "
+        "chmod 640 /workspace/README /workspace/member-data && "
+        "chmod 751 /workspace/executable /workspace/member-executable && "
+        "chown -R agent:agent /workspace\n"
     )
     commands: list[tuple[str, ...]] = []
     command_lock = threading.Lock()
@@ -620,7 +754,17 @@ def test_real_docker_runs_two_exact_isolated_workspaces(tmp_path: Path, monkeypa
         assert len({workspace.port for workspace in workspaces}) == 2
         assert all(workspace.manifest.phase == "running" for workspace in workspaces)
         assert all(
-            workspace.candidate.joinpath("README").read_text() == "fixture workspace\n" for workspace in workspaces
+            _run_docker(("docker", "exec", workspace.container_id, "cat", "/candidate/README"), 30)
+            == "fixture workspace\n"
+            for workspace in workspaces
+        )
+        assert all(
+            stat.S_IMODE(workspace.candidate.joinpath("README").stat().st_mode) == 0o640
+            and stat.S_IMODE(workspace.candidate.joinpath("member-data").stat().st_mode) == 0o640
+            and stat.S_IMODE(workspace.candidate.joinpath("member-executable").stat().st_mode) == 0o751
+            and workspace.candidate.joinpath("member-link").is_symlink()
+            and os.readlink(workspace.candidate / "member-link") == "member-data"
+            for workspace in workspaces
         )
         assert all(not workspace.candidate.joinpath("executable").exists() for workspace in workspaces)
         assert all(
@@ -666,13 +810,28 @@ def test_real_docker_runs_two_exact_isolated_workspaces(tmp_path: Path, monkeypa
         assert len([command for command in commands if len(command) > 1 and command[1] == "create"]) == 2
 
         serialized_commands = json.dumps(commands)
-        files = "".join(
-            path.read_text(errors="replace")
-            for path in tmp_path.rglob("*")
-            if path.is_file() and path.stat().st_size < 1024 * 1024
+        monkeypatch.setenv("SCAN_KEY", secret_key)
+        monkeypatch.setenv("SCAN_URL", secret_url)
+        _run_docker(
+            (
+                "docker",
+                "run",
+                "--rm",
+                "-e",
+                "SCAN_KEY",
+                "-e",
+                "SCAN_URL",
+                "-v",
+                f"{tmp_path}:/scan:ro",
+                tag,
+                "/bin/sh",
+                "-ec",
+                '! grep -R -F -e "$SCAN_KEY" -e "$SCAN_URL" /scan',
+            ),
+            60,
         )
-        assert secret_key not in serialized_commands + files
-        assert secret_url not in serialized_commands + files
+        assert secret_key not in serialized_commands
+        assert secret_url not in serialized_commands
         assert all(
             {"OPENAI_API_KEY", "OPENAI_BASE_URL"}.issubset(workspace.manifest.environment_names)
             for workspace in workspaces
@@ -691,4 +850,24 @@ def test_real_docker_runs_two_exact_isolated_workspaces(tmp_path: Path, monkeypa
             if containers:
                 _run_docker(("docker", "rm", "-f", *containers), 60)
         finally:
-            _run_docker(("docker", "rmi", "-f", tag), 60)
+            try:
+                _run_docker(
+                    (
+                        "docker",
+                        "run",
+                        "--rm",
+                        "--user",
+                        "root",
+                        "-v",
+                        f"{tmp_path}:/cleanup",
+                        "--entrypoint",
+                        "chmod",
+                        tag,
+                        "-R",
+                        "a+rwX",
+                        "/cleanup",
+                    ),
+                    60,
+                )
+            finally:
+                _run_docker(("docker", "rmi", "-f", tag), 60)
