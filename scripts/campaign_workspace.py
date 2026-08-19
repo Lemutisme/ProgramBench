@@ -50,6 +50,86 @@ _FIXED_ENV = {
 }
 _ENTRYPOINT = ("/opencode",)
 _COMMAND = ("serve", "--hostname", "0.0.0.0", "--port", "4096")
+_IMAGE_CONFIG_TEMPLATE = "\n".join(("{{json .Id}}", "{{json .Os}}", "{{json .Architecture}}"))
+_ENV_NAMES_TEMPLATE = '{{range .Config.Env}}{{println (index (split . "=") 0)}}{{end}}'
+_FIXED_ENV_TEMPLATE = (
+    '{{range .Config.Env}}{{if eq . "HOME=/state/home"}}{{println "HOME"}}{{end}}'
+    '{{if eq . "XDG_CACHE_HOME=/cache"}}{{println "XDG_CACHE_HOME"}}{{end}}'
+    '{{if eq . "XDG_CONFIG_HOME=/state/config"}}{{println "XDG_CONFIG_HOME"}}{{end}}'
+    '{{if eq . "XDG_DATA_HOME=/state/data"}}{{println "XDG_DATA_HOME"}}{{end}}{{end}}'
+)
+_CONTAINER_CONFIG_TEMPLATE = "\n".join(
+    (
+        "{{json .Id}}",
+        "{{json .Name}}",
+        "{{json .Image}}",
+        "{{json .Platform}}",
+        "{{json .Config.Image}}",
+        "{{json .Config.User}}",
+        "{{json .Config.WorkingDir}}",
+        "{{json .Config.Entrypoint}}",
+        "{{json .Config.Cmd}}",
+        "{{json .HostConfig.Init}}",
+        "{{json .HostConfig.NetworkMode}}",
+        "{{json .HostConfig.PortBindings}}",
+        "{{json .HostConfig.Binds}}",
+        '{{with .Config.Labels}}{{json (index . "programbench.campaign")}}{{else}}null{{end}}',
+        '{{with .Config.Labels}}{{json (index . "programbench.job")}}{{else}}null{{end}}',
+        '{{with .Config.Labels}}{{json (index . "programbench.instance")}}{{else}}null{{end}}',
+        '{{with .Config.Labels}}{{json (index . "programbench.arm")}}{{else}}null{{end}}',
+        '{{with .Config.Labels}}{{json (index . "programbench.job-root")}}{{else}}null{{end}}',
+    )
+)
+_MOUNTS_TEMPLATE = "{{json .Mounts}}"
+_PORTS_TEMPLATE = "{{json .NetworkSettings.Ports}}"
+_STATE_TEMPLATE = "{{json .State.Running}}"
+_IDENTITY_LABEL_NAMES = (
+    "programbench.campaign",
+    "programbench.job",
+    "programbench.instance",
+    "programbench.arm",
+    "programbench.job-root",
+)
+_CANDIDATE_VERIFY_SCRIPT = r"""
+uid=$(id -u agent)
+gid=$(id -g agent)
+for root in /candidate /state /cache /logs; do
+  find "$root" -xdev -exec /bin/sh -ec '
+    expected="$1:$2"
+    shift 2
+    for path do
+      test "$(stat -c "%u:%g" "$path")" = "$expected"
+    done
+  ' verify-owner "$uid" "$gid" {} +
+done
+test ! -e /candidate/executable
+test ! -L /candidate/executable
+test -L /candidate/reference
+test "$(readlink /candidate/reference)" = /workspace/executable
+find /workspace -xdev ! -path /workspace/executable -exec /bin/sh -ec '
+  for source do
+    target="/candidate${source#/workspace}"
+    test -e "$target" || test -L "$target"
+    test "$(stat -c "%F:%a" "$source")" = "$(stat -c "%F:%a" "$target")"
+    if test -L "$source"; then
+      test "$(readlink "$source")" = "$(readlink "$target")"
+    fi
+  done
+' verify-source {} +
+find /candidate -xdev ! -path /candidate/reference ! -path /candidate/.programbench-cleanroom.json -exec /bin/sh -ec '
+  for target do
+    source="/workspace${target#/candidate}"
+    test -e "$source" || test -L "$source"
+    test "$source" != /workspace/executable
+  done
+' verify-candidate {} +
+if test -f /candidate-ready; then
+  cp /candidate-ready /candidate/.programbench-cleanroom.json.pending
+  chown agent:agent /candidate/.programbench-cleanroom.json.pending
+  chmod 644 /candidate/.programbench-cleanroom.json.pending
+  mv -f /candidate/.programbench-cleanroom.json.pending /candidate/.programbench-cleanroom.json
+fi
+""".strip()
 _DockerRunner = Callable[[tuple[str, ...], float], str]
 _HealthProbe = Callable[[str, float], bool]
 
@@ -324,6 +404,7 @@ def ensure_workspace(request: WorkspaceRequest) -> DockerWorkspace:
     _prepare_bind_paths(preparing)
     candidate_ready = replace(preparing, phase="candidate_ready")
     _write_manifest(expected.manifest_path, candidate_ready)
+    _cleanup_candidate_preparation(candidate_ready)
     return _launch(candidate_ready, request, runner, probe, adopted=False)
 
 
@@ -347,6 +428,8 @@ def _resume(
         manifest = replace(preparing, phase="candidate_ready")
         _write_manifest(manifest.manifest_path, manifest)
     _require_candidate_ready(manifest)
+    _verify_candidate(runner, request.docker, manifest, publish=False)
+    _cleanup_candidate_preparation(manifest)
     inspected = _inspect_container(runner, request.docker, manifest.container_name)
     if manifest.container_id is None:
         if inspected is None:
@@ -373,6 +456,8 @@ def _launch(
     adopted: bool,
 ) -> DockerWorkspace:
     _require_binary(manifest)
+    _require_candidate_ready(manifest)
+    _verify_candidate(runner, request.docker, manifest, publish=False)
     launching = replace(manifest, container_id=None, port=None, phase="launching")
     _write_manifest(manifest.manifest_path, launching)
     command = [
@@ -581,29 +666,31 @@ def _job_id(campaign: str, instance_id: str, arm: str) -> str:
 
 def _copy_cleanroom(runner: _DockerRunner, docker: str, manifest: WorkspaceManifest) -> None:
     marker = manifest.candidate / ".programbench-cleanroom.json"
-    preparing_marker = manifest.candidate / ".programbench-preparing.json"
+    preparing_marker = manifest.state_root / ".candidate-preparing.json"
+    ready_source = manifest.state_root / ".candidate-ready.pending.json"
     if manifest.candidate.is_symlink() or marker.is_symlink() or preparing_marker.is_symlink():
         raise WorkspaceError("candidate evidence contains a symlink")
     if manifest.candidate.exists():
         if manifest.phase != "preparing":
             _require_candidate_ready(manifest)
+            _verify_candidate(runner, docker, manifest, publish=False)
             return
+        if _load_candidate_marker(preparing_marker) != _candidate_identity(manifest):
+            raise ContainerConflictError("candidate preparation identity does not match persisted workspace")
         if marker.is_file() and _load_candidate_marker(marker) == _candidate_identity(manifest):
+            _verify_candidate(runner, docker, manifest, publish=False)
+            _sync_candidate_ready(manifest)
             return
         if not manifest.candidate.is_dir():
             raise ContainerConflictError("candidate path is occupied by foreign evidence")
-        if _load_candidate_marker(preparing_marker) != _candidate_identity(manifest):
-            raise ContainerConflictError("candidate preparation identity does not match persisted workspace")
     else:
         manifest.candidate.mkdir(parents=True, mode=0o700)
         _sync_directory(manifest.candidate.parent)
+        _write_json(preparing_marker, _candidate_identity(manifest))
     manifest.state_dir.mkdir(parents=True, exist_ok=True)
     manifest.cache_dir.mkdir(parents=True, exist_ok=True)
     manifest.log_dir.mkdir(parents=True, exist_ok=True)
     _prepare_bind_paths(manifest)
-    if not preparing_marker.exists():
-        _write_json(preparing_marker, _candidate_identity(manifest))
-        preparing_marker.chmod(0o644)
     command = (
         docker,
         "run",
@@ -625,15 +712,62 @@ def _copy_cleanroom(runner: _DockerRunner, docker: str, manifest: WorkspaceManif
         manifest.image,
         "/bin/sh",
         "-ec",
-        "find /candidate -mindepth 1 -maxdepth 1 ! -name .programbench-preparing.json -exec rm -rf -- {} +; "
+        "find /candidate -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +; "
         "cp -a /workspace/. /candidate/; rm -f /candidate/executable; "
         "ln -s /workspace/executable /candidate/reference; "
         "mkdir -p /state/home /state/config /state/data; "
-        "mv /candidate/.programbench-preparing.json /candidate/.programbench-cleanroom.json; "
         "chown -R agent:agent /candidate /state /cache /logs",
     )
     _docker(runner, command, 90, "initialize candidate")
+    _write_json(ready_source, _candidate_identity(manifest))
+    ready_source.chmod(0o644)
+    _verify_candidate(runner, docker, manifest, publish=True)
     _require_candidate_ready(manifest)
+    _sync_candidate_ready(manifest)
+
+
+def _verify_candidate(runner: _DockerRunner, docker: str, manifest: WorkspaceManifest, *, publish: bool) -> None:
+    command = [
+        docker,
+        "run",
+        "--rm",
+        "--platform",
+        manifest.platform,
+        "--user",
+        "root",
+        "--network",
+        "none",
+        "-v",
+        f"{manifest.candidate}:/candidate:{'rw' if publish else 'ro'}",
+        "-v",
+        f"{manifest.state_dir}:/state:ro",
+        "-v",
+        f"{manifest.cache_dir}:/cache:ro",
+        "-v",
+        f"{manifest.log_dir}:/logs:ro",
+    ]
+    if publish:
+        command.extend(("-v", f"{manifest.state_root / '.candidate-ready.pending.json'}:/candidate-ready:ro"))
+    command.extend((manifest.image, "/bin/sh", "-ec", _CANDIDATE_VERIFY_SCRIPT))
+    _docker(runner, tuple(command), 90, "verify candidate")
+
+
+def _cleanup_candidate_preparation(manifest: WorkspaceManifest) -> None:
+    removed = False
+    for path in (
+        manifest.state_root / ".candidate-preparing.json",
+        manifest.state_root / ".candidate-ready.pending.json",
+    ):
+        if path.exists():
+            path.unlink()
+            removed = True
+    if removed:
+        _sync_directory(manifest.state_root)
+
+
+def _sync_candidate_ready(manifest: WorkspaceManifest) -> None:
+    _sync_file(manifest.candidate / ".programbench-cleanroom.json")
+    _sync_directory(manifest.candidate)
 
 
 def _prepare_bind_paths(manifest: WorkspaceManifest) -> None:
@@ -677,22 +811,55 @@ def _load_candidate_marker(path: Path) -> object:
         return None
 
 
-def _image_spec(runner: _DockerRunner, docker: str, image: str) -> tuple[str, str, tuple[str, ...]]:
-    raw = _docker(runner, (docker, "image", "inspect", image), 30, "inspect image")
+def _formatted_json_values(
+    runner: _DockerRunner,
+    command: tuple[str, ...],
+    count: int,
+    action: str,
+) -> tuple[object, ...]:
+    raw = _docker(runner, command, 30, action)
     try:
-        values = json.loads(raw)
-        inspected = values[0] if isinstance(values, list) and len(values) == 1 and isinstance(values[0], dict) else None
-        config = inspected.get("Config") if isinstance(inspected, Mapping) else None
-        environment = config.get("Env") if isinstance(config, Mapping) else None
-        names = _environment_names(environment)
-        digest = inspected.get("Id") if isinstance(inspected, Mapping) else None
-        operating_system = inspected.get("Os") if isinstance(inspected, Mapping) else None
-        architecture = inspected.get("Architecture") if isinstance(inspected, Mapping) else None
+        lines = raw.splitlines()
+        values = tuple(json.loads(line) for line in lines) if len(lines) == count else None
     except (TypeError, ValueError):
-        values = inspected = config = environment = None
-        digest = operating_system = architecture = None
-        names = None
+        values = None
+    if values is None:
         raw = ""
+        lines = None
+        raise DockerCommandError(f"docker {action} returned invalid formatted data") from None
+    return values
+
+
+def _formatted_environment_names(
+    runner: _DockerRunner,
+    command: tuple[str, ...],
+    action: str,
+) -> tuple[str, ...]:
+    raw = _docker(runner, command, 30, action)
+    names = tuple(sorted(line for line in raw.splitlines() if line))
+    if len(set(names)) != len(names) or not all(_ENV.fullmatch(name) for name in names):
+        raw = ""
+        names = ()
+        raise DockerCommandError(f"docker {action} returned invalid formatted data") from None
+    return names
+
+
+def _formatted_fixed_environment(runner: _DockerRunner, command: tuple[str, ...]) -> tuple[str, ...]:
+    return _formatted_environment_names(runner, command, "inspect fixed container environment")
+
+
+def _image_spec(runner: _DockerRunner, docker: str, image: str) -> tuple[str, str, tuple[str, ...]]:
+    digest, operating_system, architecture = _formatted_json_values(
+        runner,
+        (docker, "image", "inspect", "--format", _IMAGE_CONFIG_TEMPLATE, image),
+        3,
+        "inspect image configuration",
+    )
+    names = _formatted_environment_names(
+        runner,
+        (docker, "image", "inspect", "--format", _ENV_NAMES_TEMPLATE, image),
+        "inspect image environment names",
+    )
     message = None
     if not isinstance(digest, str) or not digest.startswith("sha256:"):
         message = "docker image inspect returned an invalid image digest"
@@ -703,8 +870,6 @@ def _image_spec(runner: _DockerRunner, docker: str, image: str) -> tuple[str, st
     elif names is None:
         message = "docker image inspect returned invalid environment data"
     if message:
-        raw = ""
-        values = inspected = config = environment = None
         digest = operating_system = architecture = names = None
         raise DockerCommandError(message) from None
     return digest, f"{operating_system}/{architecture}", names
@@ -712,21 +877,66 @@ def _image_spec(runner: _DockerRunner, docker: str, image: str) -> tuple[str, st
 
 def _inspect_container(runner: _DockerRunner, docker: str, name: str) -> Mapping[str, object] | None:
     try:
-        raw = _docker(runner, (docker, "inspect", name), 30, "inspect container")
+        values = _formatted_json_values(
+            runner,
+            (docker, "inspect", "--format", _CONTAINER_CONFIG_TEMPLATE, name),
+            18,
+            "inspect container configuration",
+        )
     except DockerNotFoundError:
         return None
-    try:
-        value = json.loads(raw)
-    except ValueError:
-        value = None
-        raw = ""
-    if value is None:
-        raise DockerCommandError("docker inspect returned invalid JSON") from None
-    if not isinstance(value, list) or len(value) != 1 or not isinstance(value[0], dict):
-        raw = ""
-        value = None
-        raise DockerCommandError("docker inspect returned invalid container data")
-    return value[0]
+    environment_names = _formatted_environment_names(
+        runner,
+        (docker, "inspect", "--format", _ENV_NAMES_TEMPLATE, name),
+        "inspect container environment names",
+    )
+    fixed_environment = _formatted_fixed_environment(
+        runner,
+        (docker, "inspect", "--format", _FIXED_ENV_TEMPLATE, name),
+    )
+    mounts = _formatted_json_values(
+        runner,
+        (docker, "inspect", "--format", _MOUNTS_TEMPLATE, name),
+        1,
+        "inspect container mounts",
+    )[0]
+    ports = _formatted_json_values(
+        runner,
+        (docker, "inspect", "--format", _PORTS_TEMPLATE, name),
+        1,
+        "inspect container ports",
+    )[0]
+    running = _formatted_json_values(
+        runner,
+        (docker, "inspect", "--format", _STATE_TEMPLATE, name),
+        1,
+        "inspect container state",
+    )[0]
+    return {
+        "Id": values[0],
+        "Name": values[1],
+        "Image": values[2],
+        "Platform": values[3],
+        "Config": {
+            "Image": values[4],
+            "User": values[5],
+            "WorkingDir": values[6],
+            "Entrypoint": values[7],
+            "Cmd": values[8],
+            "EnvironmentNames": environment_names,
+            "MatchingFixedEnvironment": fixed_environment,
+            "Labels": dict(zip(_IDENTITY_LABEL_NAMES, values[13:18], strict=True)),
+        },
+        "HostConfig": {
+            "Init": values[9],
+            "NetworkMode": values[10],
+            "PortBindings": values[11],
+            "Binds": values[12],
+        },
+        "Mounts": mounts,
+        "NetworkSettings": {"Ports": ports},
+        "State": {"Running": running},
+    }
 
 
 def _require_exact_container(inspected: Mapping[str, object], manifest: WorkspaceManifest, *, check_port: bool) -> None:
@@ -753,16 +963,11 @@ def _require_exact_container(inspected: Mapping[str, object], manifest: Workspac
         or host.get("PortBindings") != {"4096/tcp": [{"HostIp": "127.0.0.1", "HostPort": ""}]}
     ):
         raise ContainerConflictError("container runtime configuration does not match")
-    environment = _environment(config.get("Env"))
-    if environment is None or tuple(sorted(environment)) != manifest.environment_names:
+    environment_names = config.get("EnvironmentNames")
+    if environment_names != manifest.environment_names:
         raise ContainerConflictError("container environment names do not match")
-    fixed = {
-        "HOME": manifest.home,
-        "XDG_CACHE_HOME": manifest.xdg_cache_home,
-        "XDG_CONFIG_HOME": manifest.xdg_config_home,
-        "XDG_DATA_HOME": manifest.xdg_data_home,
-    }
-    if any(environment.get(name) != value for name, value in fixed.items()):
+    fixed_environment = config.get("MatchingFixedEnvironment")
+    if fixed_environment != tuple(sorted(_FIXED_ENV)):
         raise ContainerConflictError("container HOME or XDG paths do not match")
     labels = config.get("Labels")
     if not isinstance(labels, Mapping) or any(
@@ -809,20 +1014,6 @@ def _require_exact_container(inspected: Mapping[str, object], manifest: Workspac
         stopped_empty = not _running(inspected) and ports in (None, {}, {"4096/tcp": None})
         if manifest.port is None or (ports != expected_port and not stopped_empty):
             raise ContainerConflictError("container loopback port does not match persisted workspace")
-
-
-def _environment(raw: object) -> dict[str, str] | None:
-    if not isinstance(raw, list) or not all(isinstance(value, str) and "=" in value for value in raw):
-        return None
-    pairs = [value.split("=", 1) for value in raw]
-    if len({pair[0] for pair in pairs}) != len(pairs) or not all(_ENV.fullmatch(pair[0]) for pair in pairs):
-        return None
-    return dict(pairs)
-
-
-def _environment_names(raw: object) -> tuple[str, ...] | None:
-    environment = _environment(raw)
-    return tuple(sorted(environment)) if environment is not None else None
 
 
 def _mounts(manifest: WorkspaceManifest) -> tuple[MountSpec, ...]:
@@ -1024,6 +1215,14 @@ def _overlap(left: Path, right: Path) -> bool:
 
 def _sync_directory(path: Path) -> None:
     descriptor = os.open(str(path), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _sync_file(path: Path) -> None:
+    descriptor = os.open(str(path), os.O_RDONLY)
     try:
         os.fsync(descriptor)
     finally:

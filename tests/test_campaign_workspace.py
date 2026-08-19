@@ -43,17 +43,39 @@ class RecordingDocker:
     def __call__(self, command: tuple[str, ...], timeout: float):
         self.commands.append(command)
         if command[1:3] == ("image", "inspect"):
-            return json.dumps(
-                [
-                    {
-                        "Id": self.image_digest,
-                        "Os": self.image_os,
-                        "Architecture": self.image_architecture,
-                        "Config": {"Env": ["PATH=/usr/bin", "LANG=C.UTF-8"]},
-                    }
-                ]
-            )
+            template = command[command.index("--format") + 1]
+            if template == campaign_workspace._IMAGE_CONFIG_TEMPLATE:
+                return "\n".join(
+                    json.dumps(value) for value in (self.image_digest, self.image_os, self.image_architecture)
+                )
+            if template == campaign_workspace._ENV_NAMES_TEMPLATE:
+                return "PATH\nLANG\n"
+            raise AssertionError(command)
         if command[1] == "run" and "--user" in command and command[command.index("--user") + 1] == "root":
+            if command[-1] == campaign_workspace._CANDIDATE_VERIFY_SCRIPT:
+                candidate = Path(
+                    next(
+                        value
+                        for index, value in enumerate(command)
+                        if command[index - 1] == "-v"
+                        and (value.endswith(":/candidate:rw") or value.endswith(":/candidate:ro"))
+                    ).rsplit(":/candidate:", 1)[0]
+                )
+                if any(
+                    child.name not in {"reference", ".programbench-cleanroom.json"} for child in candidate.iterdir()
+                ):
+                    raise RuntimeError("candidate verification failed")
+                ready = next(
+                    (
+                        Path(value.removesuffix(":/candidate-ready:ro"))
+                        for index, value in enumerate(command)
+                        if command[index - 1] == "-v" and value.endswith(":/candidate-ready:ro")
+                    ),
+                    None,
+                )
+                if ready:
+                    candidate.joinpath(".programbench-cleanroom.json").write_bytes(ready.read_bytes())
+                return ""
             candidate = Path(
                 next(
                     value
@@ -71,12 +93,9 @@ class RecordingDocker:
             self.observed_phases.append(json.loads((state.parent / "workspace.json").read_text())["phase"])
             if candidate.exists():
                 for child in candidate.iterdir():
-                    if child.name == ".programbench-preparing.json":
-                        continue
                     child.unlink() if child.is_symlink() or child.is_file() else shutil.rmtree(child)
             candidate.mkdir(parents=True, exist_ok=True)
             (candidate / "reference").symlink_to("/workspace/executable")
-            candidate.joinpath(".programbench-preparing.json").replace(candidate / ".programbench-cleanroom.json")
             return ""
         if command[1] == "rm":
             return ""
@@ -136,7 +155,46 @@ class RecordingDocker:
             name = command[-1]
             if name not in self.containers:
                 raise DockerNotFoundError("not found")
-            return json.dumps([self.containers[name]])
+            container = self.containers[name]
+            template = command[command.index("--format") + 1]
+            if template == campaign_workspace._CONTAINER_CONFIG_TEMPLATE:
+                config = container["Config"]
+                host = container["HostConfig"]
+                labels = config["Labels"]
+                return "\n".join(
+                    json.dumps(value)
+                    for value in (
+                        container["Id"],
+                        container["Name"],
+                        container["Image"],
+                        container["Platform"],
+                        config["Image"],
+                        config["User"],
+                        config["WorkingDir"],
+                        config["Entrypoint"],
+                        config["Cmd"],
+                        host["Init"],
+                        host["NetworkMode"],
+                        host["PortBindings"],
+                        host["Binds"],
+                        *(labels.get(name) for name in campaign_workspace._IDENTITY_LABEL_NAMES),
+                    )
+                )
+            if template == campaign_workspace._ENV_NAMES_TEMPLATE:
+                return "\n".join(value.split("=", 1)[0] for value in container["Config"]["Env"])
+            if template == campaign_workspace._FIXED_ENV_TEMPLATE:
+                return "\n".join(
+                    value.split("=", 1)[0]
+                    for value in container["Config"]["Env"]
+                    if value in (f"{name}={expected}" for name, expected in campaign_workspace._FIXED_ENV.items())
+                )
+            if template == campaign_workspace._MOUNTS_TEMPLATE:
+                return json.dumps(container["Mounts"])
+            if template == campaign_workspace._PORTS_TEMPLATE:
+                return json.dumps(container["NetworkSettings"]["Ports"])
+            if template == campaign_workspace._STATE_TEMPLATE:
+                return json.dumps(container["State"]["Running"])
+            raise AssertionError(command)
         if command[1] == "port":
             return f"127.0.0.1:{self.next_port}\n"
         if command[1] == "stop":
@@ -157,6 +215,38 @@ class FaultDocker(RecordingDocker):
             self.faulted = True
             raise RuntimeError(f"fault after docker {self.fault}")
         return result
+
+
+class PartialInitDocker(RecordingDocker):
+    def __init__(self, stage: str) -> None:
+        super().__init__()
+        self.stage = stage
+        self.faulted = False
+
+    def __call__(self, command: tuple[str, ...], timeout: float):
+        if not self.faulted and command[1] == "run" and command[-1] != campaign_workspace._CANDIDATE_VERIFY_SCRIPT:
+            self.commands.append(command)
+            candidate = Path(
+                next(
+                    value
+                    for index, value in enumerate(command)
+                    if command[index - 1] == "-v" and value.endswith(":/candidate:rw")
+                ).removesuffix(":/candidate:rw")
+            )
+            state = Path(
+                next(
+                    value
+                    for index, value in enumerate(command)
+                    if command[index - 1] == "-v" and value.endswith(":/state:rw")
+                ).removesuffix(":/state:rw")
+            )
+            self.observed_phases.append(json.loads((state.parent / "workspace.json").read_text())["phase"])
+            candidate.mkdir(parents=True, exist_ok=True)
+            candidate.joinpath("reference").symlink_to("/workspace/executable")
+            candidate.joinpath(f"partial-{self.stage}").write_text("partial")
+            self.faulted = True
+            raise RuntimeError(f"fault {self.stage}")
+        return super().__call__(command, timeout)
 
 
 def install(tmp_path: Path) -> InstallRecord:
@@ -232,7 +322,46 @@ def test_candidate_init_preserves_workspace_modes_and_pins_platform(tmp_path: Pa
 
     initialize = next(command for command in docker.commands if command[1] == "run")
     assert "chmod -R" not in initialize[-1]
+    assert ".programbench-cleanroom.json" not in initialize[-1]
     assert initialize[initialize.index("--platform") + 1] == "linux/amd64"
+
+
+def test_candidate_ready_marker_is_synced_before_phase_commit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    docker = RecordingDocker()
+    events: list[str] = []
+    write = campaign_workspace._write_manifest
+
+    monkeypatch.setattr(
+        campaign_workspace,
+        "_sync_file",
+        lambda path: events.append(f"sync:{path.name}"),
+        raising=False,
+    )
+
+    def write_manifest(path: Path, manifest) -> None:
+        events.append(f"phase:{manifest.phase}")
+        write(path, manifest)
+
+    monkeypatch.setattr(campaign_workspace, "_write_manifest", write_manifest)
+    ensure_workspace(request(tmp_path, docker))
+
+    assert events.index("sync:.programbench-cleanroom.json") < events.index("phase:candidate_ready")
+
+
+def test_docker_inspection_uses_only_secret_free_formatted_queries(tmp_path: Path) -> None:
+    docker = RecordingDocker()
+
+    ensure_workspace(request(tmp_path, docker))
+
+    inspections = [
+        command for command in docker.commands if command[1] == "inspect" or command[1:3] == ("image", "inspect")
+    ]
+    assert inspections
+    assert all("--format" in command for command in inspections)
+    templates = [command[command.index("--format") + 1] for command in inspections]
+    assert all("json .Config.Env" not in template for template in templates)
+    assert all("{{println .}}" not in template for template in templates)
+    assert any(".Config.Env" in template and "split" in template for template in templates)
 
 
 @pytest.mark.parametrize(("operating_system", "architecture"), [("windows", "amd64"), ("linux", "arm64")])
@@ -426,6 +555,33 @@ def test_retry_after_docker_effect_reuses_one_candidate_and_container(tmp_path: 
     assert len(list(value.candidate_root.iterdir())) == 1
     assert sum(command[1] == "create" for command in docker.commands) == 1
     assert workspace.candidate.joinpath(".programbench-cleanroom.json").is_file()
+
+
+@pytest.mark.parametrize("stage", ["after-copy", "during-chown"])
+def test_retry_after_root_init_fault_repairs_unverified_candidate(tmp_path: Path, stage: str) -> None:
+    docker = PartialInitDocker(stage)
+    value = request(tmp_path, docker)
+
+    with pytest.raises(DockerCommandError):
+        ensure_workspace(value)
+    workspace = ensure_workspace(value)
+
+    assert not workspace.candidate.joinpath(f"partial-{stage}").exists()
+    assert sum(command[1] == "create" for command in docker.commands) == 1
+
+
+def test_forged_ready_marker_with_wrong_candidate_mode_never_launches(tmp_path: Path) -> None:
+    docker = RecordingDocker()
+    value = request(tmp_path, docker)
+    workspace = ensure_workspace(value)
+    workspace.stop()
+    workspace.candidate.joinpath("forged-mode").write_text("foreign")
+    starts = sum(command[1] == "start" for command in docker.commands)
+
+    with pytest.raises(DockerCommandError):
+        ensure_workspace(value)
+
+    assert sum(command[1] == "start" for command in docker.commands) == starts
 
 
 @pytest.mark.parametrize(
@@ -794,7 +950,7 @@ def test_real_docker_runs_two_exact_isolated_workspaces(tmp_path: Path, monkeypa
             for workspace in workspaces
         )
         inspected = [
-            json.loads(_run_docker(("docker", "inspect", workspace.container_id), 30))[0] for workspace in workspaces
+            campaign_workspace._inspect_container(docker, "docker", workspace.container_id) for workspace in workspaces
         ]
         sources = [{mount["Source"] for mount in value["Mounts"]} for value in inspected]
         assert sources[0].isdisjoint(sources[1])
@@ -808,6 +964,65 @@ def test_real_docker_runs_two_exact_isolated_workspaces(tmp_path: Path, monkeypa
         )
         assert all(ensure_workspace(value).adopted for value in values)
         assert len([command for command in commands if len(command) > 1 and command[1] == "create"]) == 2
+        inspections = [
+            command for command in commands if command[1] == "inspect" or command[1:3] == ("image", "inspect")
+        ]
+        assert inspections and all("--format" in command for command in inspections)
+        templates = [command[command.index("--format") + 1] for command in inspections]
+        assert all("json .Config.Env" not in template for template in templates)
+        assert all("{{println .}}" not in template for template in templates)
+        assert any(".Config.Env" in template and "split" in template for template in templates)
+
+        workspaces[0].stop()
+        starts = len([command for command in commands if command[1] == "start"])
+        _run_docker(
+            (
+                "docker",
+                "run",
+                "--rm",
+                "--platform",
+                "linux/amd64",
+                "--user",
+                "root",
+                "--network",
+                "none",
+                "-v",
+                f"{workspaces[0].candidate}:/candidate:rw",
+                tag,
+                "/bin/sh",
+                "-ec",
+                "chmod 777 /candidate/member-data; "
+                "chown root:root /candidate/member-executable /candidate/.programbench-cleanroom.json; "
+                "chmod 600 /candidate/.programbench-cleanroom.json",
+            ),
+            60,
+        )
+        with pytest.raises(WorkspaceError):
+            ensure_workspace(values[0])
+        assert len([command for command in commands if command[1] == "start"]) == starts
+        _run_docker(
+            (
+                "docker",
+                "run",
+                "--rm",
+                "--platform",
+                "linux/amd64",
+                "--user",
+                "root",
+                "--network",
+                "none",
+                "-v",
+                f"{workspaces[0].candidate}:/candidate:rw",
+                tag,
+                "/bin/sh",
+                "-ec",
+                "chmod 640 /candidate/member-data; "
+                "chown agent:agent /candidate/member-executable /candidate/.programbench-cleanroom.json; "
+                "chmod 644 /candidate/.programbench-cleanroom.json",
+            ),
+            60,
+        )
+        assert ensure_workspace(values[0]).adopted
 
         serialized_commands = json.dumps(commands)
         monkeypatch.setenv("SCAN_KEY", secret_key)
@@ -841,7 +1056,8 @@ def test_real_docker_runs_two_exact_isolated_workspaces(tmp_path: Path, monkeypa
             workspace.stop()
             workspace.stop()
             assert json.loads(workspace.manifest_path.read_text())["phase"] == "stopped"
-            assert not json.loads(_run_docker(("docker", "inspect", workspace.container_id), 30))[0]["State"]["Running"]
+            current = campaign_workspace._inspect_container(docker, "docker", workspace.container_id)
+            assert current is not None and not campaign_workspace._running(current)
     finally:
         try:
             containers = _run_docker(
