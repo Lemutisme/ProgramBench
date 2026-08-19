@@ -333,6 +333,28 @@ class StatusErrorApi(FakeOpenCodeApi):
         return "idle"
 
 
+class RateStatusApi(FakeOpenCodeApi):
+    def __init__(self) -> None:
+        super().__init__([([user(), assistant()], "idle")])
+        self.status_calls = 0
+
+    def status(self, session_id: str) -> str:
+        self.status_calls += 1
+        if self.status_calls == 1:
+            raise VanillaHttpError("status rate limit", status_code=429, retry_after="2")
+        return super().status(session_id)
+
+
+class PerpetualRateApi(SafetyApi):
+    def __init__(self) -> None:
+        super().__init__([([], "busy")])
+        self.message_calls = 0
+
+    def messages(self, session_id: str) -> dict[str, object]:
+        self.message_calls += 1
+        raise VanillaHttpError("message rate limit", status_code=429, retry_after="1")
+
+
 class MutatingTerminalApi(FakeOpenCodeApi):
     def __init__(self, workspace: FakeWorkspace, failed: dict[str, object]) -> None:
         super().__init__([([user(), failed], "busy")])
@@ -998,7 +1020,9 @@ def test_provider_turn_poll_overshoot_records_exact_absolute_evidence_without_br
     assert result.actions == 4
     assert result.cost == Decimal("10.03")
     assert StateStore(paths.state).read().provider_turns == 1003
-    assert breaker.snapshot()["jobs"][workspace.manifest.job_id]["usage"]["provider_turns"] == 999
+    snapshot = breaker.snapshot()
+    assert snapshot["jobs"][workspace.manifest.job_id]["usage"]["provider_turns"] == 1003
+    assert snapshot["jobs"][workspace.manifest.job_id]["turn_limit_violation"] is True
 
 
 def test_overshoot_resume_restores_previous_safe_breaker_snapshot(tmp_path: Path) -> None:
@@ -1107,9 +1131,60 @@ def test_429_backs_off_then_resumes_the_same_session_and_prompt(tmp_path: Path) 
             sleeper=clock.sleep,
         )
 
-    assert result.completion is VanillaCompletion.PROVIDER_ERROR
+    assert result.completion is VanillaCompletion.IDLE
     assert len(api.sessions) == len(api.prompts) == 1
+    assert clock.now >= 102
+    assert api.interrupts == 0
+
+
+def test_status_429_backs_off_then_retries_same_session_and_prompt(tmp_path: Path) -> None:
+    paths, record, request, workspace = prepared(tmp_path)
+    api = RateStatusApi()
+    clock = FakeClock()
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease.claim_handle(request)
+        result = run_vanilla(
+            job,
+            StateStore(paths.state),
+            workspace,
+            record,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=limits(),
+            breaker=CircuitBreaker(clock=clock, retry_after_default=2),
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+        )
+    assert result.completion is VanillaCompletion.IDLE
+    assert len(api.sessions) == len(api.prompts) == 1
+    assert clock.now >= 102
+    assert api.interrupts == 0
+
+
+def test_perpetual_post_admission_429_stops_at_wall_deadline_with_bounded_calls(tmp_path: Path) -> None:
+    paths, record, request, workspace = prepared(tmp_path)
+    api = PerpetualRateApi()
+    clock = FakeClock()
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease.claim_handle(request)
+        result = run_vanilla(
+            job,
+            StateStore(paths.state),
+            workspace,
+            record,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=limits(wall=2),
+            breaker=CircuitBreaker(clock=clock, retry_after_default=1),
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+        )
+    assert result.completion is VanillaCompletion.WALL_TIME
+    assert api.message_calls == 2
     assert api.interrupts == 1
+    assert len(api.sessions) == len(api.prompts) == 1
 
 
 def test_projected_retry_part_feeds_429_backoff_once_then_allows_success(tmp_path: Path) -> None:

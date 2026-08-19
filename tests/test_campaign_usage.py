@@ -811,3 +811,70 @@ def test_acknowledged_recoverable_pause_round_trips_without_derived_drift() -> N
     snapshot["jobs"]["job"]["generation"] = True
     with pytest.raises(UsageParseError):
         CircuitBreaker.from_snapshot(snapshot)
+
+
+def terminal_overshoot(turns: int = 1003) -> UsageSummary:
+    values = tuple(
+        TurnUsage(
+            input=1,
+            output=2,
+            reasoning=3,
+            cache_read=4,
+            cache_write=0,
+            prompt_total=5,
+            cost=Decimal("0.01"),
+        )
+        for _ in range(turns)
+    )
+    return UsageSummary(
+        provider_turns=turns,
+        input=turns,
+        output=turns * 2,
+        reasoning=turns * 3,
+        cache_read=turns * 4,
+        prompt_total=turns * 5,
+        turns_with_cache=turns,
+        max_prompt_total=5,
+        cost=Decimal("0.01") * turns,
+        telemetry_gap=True,
+        turns=values,
+        allow_large=True,
+    )
+
+
+def test_terminal_overshoot_records_exact_totals_caps_and_round_trips() -> None:
+    summary = terminal_overshoot()
+    breaker = CircuitBreaker(hard_cost_cap="10")
+    with pytest.raises(UsageParseError, match="normal breaker observation"):
+        breaker.observe("job", 1, summary, terminal=True)
+    breaker.observe_terminal_overshoot("job", 1, summary)
+    breaker.observe_terminal_overshoot("job", 1, summary)
+    assert breaker.campaign_usage == summary
+    assert breaker.hard_stopped
+    snapshot = breaker.snapshot()
+    assert snapshot["jobs"]["job"]["turn_limit_violation"] is True
+    restored = CircuitBreaker.from_snapshot(snapshot)
+    assert restored.snapshot() == snapshot
+    assert restored.campaign_usage == summary
+    with pytest.raises(StaleObservationError):
+        breaker.observe_terminal_overshoot("job", 0, summary)
+    with pytest.raises(UsageParseError, match="cannot be replaced"):
+        breaker.observe("job", 2, usage(turns=1), terminal=True)
+
+
+def test_terminal_overshoot_api_rejects_nonviolation_and_absolute_excess() -> None:
+    breaker = CircuitBreaker()
+    with pytest.raises(UsageParseError, match="outside its absolute evidence bound"):
+        breaker.observe_terminal_overshoot("job", 1, usage(turns=1))
+    with pytest.raises(UsageParseError, match="outside its absolute evidence bound"):
+        breaker.observe_terminal_overshoot("job", 1, terminal_overshoot(2001))
+
+
+def test_version_one_snapshot_without_turn_violation_field_migrates_as_normal_job() -> None:
+    breaker = CircuitBreaker()
+    breaker.observe("job", 1, usage(turns=1), terminal=True)
+    legacy = breaker.snapshot()
+    legacy["jobs"]["job"].pop("turn_limit_violation")
+    restored = CircuitBreaker.from_snapshot(legacy)
+    assert restored.campaign_usage == breaker.campaign_usage
+    assert restored.snapshot()["jobs"]["job"]["turn_limit_violation"] is False

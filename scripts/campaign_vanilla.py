@@ -12,7 +12,7 @@ import stat
 import tempfile
 import time
 from dataclasses import dataclass, replace
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, localcontext
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Literal, Mapping, Protocol
@@ -23,12 +23,11 @@ from urllib.request import Request, urlopen
 from scripts.campaign_install import InstallRecord
 from scripts.campaign_state import JobLease, JobState, StateStore
 from scripts.campaign_usage import (
-    MAX_EVIDENCE_MESSAGES,
     CircuitBreaker,
     TurnUsage,
     UsageParseError,
     UsageSummary,
-    summarize_evidence_usage,
+    summarize_usage,
 )
 from scripts.campaign_workspace import DockerWorkspace, WorkspaceError
 
@@ -42,6 +41,7 @@ ORIGINAL_TASK = (
 )
 MAX_WALL_TIME_SECONDS = 21600
 MAX_PROVIDER_TURNS = 1000
+MAX_EVIDENCE_MESSAGES = 2001
 MAX_ARTIFACT_BYTES = 8 * 1024 * 1024
 MAX_FREEZE_FILES = 100_000
 MAX_FREEZE_BYTES = 4 * 1024 * 1024 * 1024
@@ -835,6 +835,36 @@ def run_vanilla(
             break
         except VanillaHttpError as error:
             if execution.get("prompt_may_be_active") is True:
+                if error.status_code == 429:
+                    breaker.observe_error(429, retry_after=error.retry_after, detail=str(error))
+                    if _backoff(breaker, clock, sleeper, poll_interval, wall_deadline):
+                        completion = _safety_completion(breaker, usage, limits, clock, wall_deadline)
+                        if completion is not None:
+                            return _finish_early_stop(
+                                job,
+                                state_store,
+                                state,
+                                workspace,
+                                command_identity,
+                                session_id,
+                                message_id,
+                                session,
+                                execution_path,
+                                execution,
+                                breaker,
+                                api,
+                                max(0.0, clock() - float(started_at)),
+                                clock,
+                                sleeper,
+                                poll_interval,
+                                completion=completion,
+                                error_text=breaker.pause_reason or completion.value,
+                                confirmed=execution.get("session_confirmed") is True,
+                                usage=usage,
+                                actions=actions,
+                                messages=messages,
+                            )
+                    continue
                 if error.status_code in {401, 403}:
                     breaker.observe_error(error.status_code, detail=str(error))
                 return _finish_early_stop(
@@ -1037,6 +1067,10 @@ def run_vanilla(
                 raise VanillaError("sanitized projected messages are invalid")
             messages = sanitized
         except VanillaHttpError as error:
+            if error.status_code == 429:
+                breaker.observe_error(429, retry_after=error.retry_after, detail=str(error))
+                _backoff(breaker, clock, sleeper, poll_interval, wall_deadline)
+                continue
             if error.status_code in {401, 403, 429}:
                 breaker.observe_error(error.status_code, retry_after=error.retry_after, detail=str(error))
             completion = VanillaCompletion.AUTH if error.status_code in {401, 403} else VanillaCompletion.PROVIDER_ERROR
@@ -1140,6 +1174,10 @@ def run_vanilla(
         try:
             status_value = api.status(session_id)
         except VanillaHttpError as error:
+            if error.status_code == 429:
+                breaker.observe_error(429, retry_after=error.retry_after, detail=str(error))
+                _backoff(breaker, clock, sleeper, poll_interval, wall_deadline)
+                continue
             if error.status_code in {401, 403, 429}:
                 breaker.observe_error(error.status_code, retry_after=error.retry_after, detail=str(error))
             completion = VanillaCompletion.AUTH if error.status_code in {401, 403} else VanillaCompletion.PROVIDER_ERROR
@@ -1211,7 +1249,10 @@ def run_vanilla(
             already_stopped=stopped,
         )
     _verify_no_credentials(job.job.root, workspace.manifest.credential_env)
-    breaker.observe(workspace.manifest.job_id, state.generation, breaker_usage, terminal=True)
+    if usage.provider_turns > MAX_PROVIDER_TURNS:
+        breaker.observe_terminal_overshoot(workspace.manifest.job_id, state.generation, usage)
+    else:
+        breaker.observe(workspace.manifest.job_id, state.generation, breaker_usage, terminal=True)
     hashes = {
         name: _sha256(job.job.root / name)
         for name in ("trajectory.json", "usage.json", "workspace-inventory.json", "vanilla-result.json")
@@ -1302,12 +1343,12 @@ def _summarize_usage(messages: Mapping[str, object]) -> UsageSummary:
     if len(data) > MAX_EVIDENCE_MESSAGES:
         raise VanillaError("projected raw message count exceeds absolute evidence limit")
     if not data:
-        return summarize_evidence_usage(messages)
+        return _summarize_evidence(messages)
     legacy = [isinstance(message, Mapping) and "info" in message for message in data]
     if any(legacy):
         if not all(legacy):
             raise VanillaError("projected messages mix legacy and V2 schemas")
-        return summarize_evidence_usage(messages)
+        return _summarize_evidence(messages)
     projected: list[dict[str, object]] = []
     for message in data:
         if not isinstance(message, Mapping) or not isinstance(message.get("type"), str):
@@ -1359,7 +1400,36 @@ def _summarize_usage(messages: Mapping[str, object]) -> UsageSummary:
                 "cost": message.get("cost"),
             }
         )
-    return summarize_evidence_usage({"data": projected})
+    return _summarize_evidence({"data": projected})
+
+
+def _summarize_evidence(messages: Mapping[str, object]) -> UsageSummary:
+    data = messages.get("data")
+    if not isinstance(data, list) or len(data) > MAX_EVIDENCE_MESSAGES:
+        raise VanillaError("projected message count exceeds absolute evidence limit")
+    turns: list[TurnUsage] = []
+    for message in data:
+        turns.extend(summarize_usage({"data": [message]}).turns)
+    values = tuple(turns)
+    with localcontext() as context:
+        context.prec = 200_000
+        cost = sum((turn.cost for turn in values), Decimal(0))
+    return UsageSummary(
+        provider_turns=len(values),
+        input=sum(turn.input for turn in values),
+        output=sum(turn.output for turn in values),
+        reasoning=sum(turn.reasoning for turn in values),
+        cache_read=sum(turn.cache_read for turn in values),
+        cache_write=sum(turn.cache_write for turn in values),
+        prompt_total=sum(turn.prompt_total for turn in values),
+        turns_with_cache=sum(turn.cache_hit for turn in values),
+        turns_without_cache=sum(not turn.cache_hit for turn in values),
+        max_prompt_total=max((turn.prompt_total for turn in values), default=0),
+        cost=cost,
+        telemetry_gap=any(turn.cache_read > 0 and turn.cache_write == 0 for turn in values),
+        turns=values,
+        allow_large=len(values) > MAX_PROVIDER_TURNS,
+    )
 
 
 def _require_monotonic(

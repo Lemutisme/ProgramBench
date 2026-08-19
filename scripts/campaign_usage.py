@@ -22,7 +22,7 @@ MAX_PROJECTED_PAYLOAD_BYTES = 8 * 1024 * 1024
 MAX_SNAPSHOT_BYTES = 64 * 1024 * 1024
 MAX_MESSAGES_PER_JOB = 1001
 MAX_PROVIDER_TURNS = 1000
-MAX_EVIDENCE_MESSAGES = 2001
+MAX_TERMINAL_PROVIDER_TURNS = 2000
 MAX_TOKEN_COUNT = 10**12
 MAX_DECIMAL_DIGITS = 64
 MAX_DECIMAL_EXPONENT_SPAN = 128
@@ -178,21 +178,10 @@ UsageTurn = TurnUsage
 
 def summarize_usage(messages: Mapping[str, object] | bytes | str) -> UsageSummary:
     """Aggregate assistant usage from an OpenCode projected ``{"data": [...]}`` response."""
-    return _summarize_usage(messages, max_messages=MAX_MESSAGES_PER_JOB, allow_large=False)
-
-
-def summarize_evidence_usage(messages: Mapping[str, object] | bytes | str) -> UsageSummary:
-    """Parse bounded absolute evidence without relaxing normal campaign accounting limits."""
-    return _summarize_usage(messages, max_messages=MAX_EVIDENCE_MESSAGES, allow_large=True)
-
-
-def _summarize_usage(
-    messages: Mapping[str, object] | bytes | str, *, max_messages: int, allow_large: bool
-) -> UsageSummary:
     payload = _load_json(messages)
     if not isinstance(payload, Mapping) or set(payload) != {"data"} or not isinstance(payload["data"], list):
         raise UsageParseError("projected messages must contain only a data list")
-    if len(payload["data"]) > max_messages:
+    if len(payload["data"]) > MAX_MESSAGES_PER_JOB:
         raise UsageParseError("projected message count exceeds limit")
 
     turns: list[TurnUsage] = []
@@ -215,7 +204,6 @@ def _summarize_usage(
         cost=_sum_decimals(turn.cost for turn in turns),
         telemetry_gap=any(turn.cache_read > 0 and turn.cache_write == 0 for turn in turns),
         turns=tuple(turns),
-        allow_large=allow_large,
     )
 
 
@@ -427,6 +415,7 @@ class CircuitBreaker:
         self._state_version = 0
         self._materialized_version = 0
         self._jobs: dict[str, tuple[int, UsageSummary, bool]] = {}
+        self._turn_limit_violations: set[str] = set()
         self._terminal_sequence: list[str] = []
         self._cache_failures = 0
         self._pause_causes: set[str] = set()
@@ -515,15 +504,23 @@ class CircuitBreaker:
         *,
         job_id: str | None = None,
         terminal: bool = True,
+        _allow_terminal_overshoot: bool = False,
     ) -> None:
+        supplied = usage if isinstance(observation, str) else observation
+        if (
+            isinstance(supplied, UsageSummary)
+            and supplied.provider_turns > MAX_PROVIDER_TURNS
+            and not _allow_terminal_overshoot
+        ):
+            raise UsageParseError("normal breaker observation exceeds provider-turn limit")
         if isinstance(observation, str):
             if usage is None or not isinstance(generation, int):
                 raise UsageParseError("job observations require generation and usage")
             resolved_job = observation
             resolved_generation = generation
-            resolved_usage = _coerce_summary(usage)
+            resolved_usage = _coerce_summary(usage, allow_large=_allow_terminal_overshoot)
         else:
-            resolved_usage = _coerce_summary(observation)
+            resolved_usage = _coerce_summary(observation, allow_large=_allow_terminal_overshoot)
             resolved_job = job_id or f"__trajectory_{id(resolved_usage)}"
             if generation is None:
                 resolved_generation = 0
@@ -540,7 +537,18 @@ class CircuitBreaker:
             raise UsageParseError("job ID and generation are invalid")
         if type(terminal) is not bool:
             raise UsageParseError("terminal must be boolean")
+        if _allow_terminal_overshoot:
+            if (
+                not terminal
+                or resolved_usage.provider_turns <= MAX_PROVIDER_TURNS
+                or resolved_usage.provider_turns > MAX_TERMINAL_PROVIDER_TURNS
+            ):
+                raise UsageParseError("terminal turn overshoot is outside its absolute evidence bound")
+        elif resolved_usage.provider_turns > MAX_PROVIDER_TURNS:
+            raise UsageParseError("normal breaker observation exceeds provider-turn limit")
         with self._lock:
+            if resolved_job in self._turn_limit_violations and not _allow_terminal_overshoot:
+                raise UsageParseError("terminal turn-limit violation cannot be replaced by normal observation")
             previous = self._jobs.get(resolved_job)
             if previous is not None and resolved_generation < previous[0]:
                 raise StaleObservationError("stale usage generation")
@@ -564,6 +572,8 @@ class CircuitBreaker:
                     self._cache_failures = candidate_failures
                     self._pause_causes = candidate_causes
                     self._state_version += 1
+                if _allow_terminal_overshoot:
+                    self._turn_limit_violations.add(resolved_job)
                 return
             was_terminal = previous[2] if previous is not None else False
             is_terminal = was_terminal or terminal
@@ -608,6 +618,29 @@ class CircuitBreaker:
             self._soft_acknowledged = candidate_soft_acknowledged
             self._usage_version += 1
             self._state_version += 1
+            if _allow_terminal_overshoot:
+                self._turn_limit_violations.add(resolved_job)
+
+    def observe_terminal_overshoot(
+        self,
+        job_id: str,
+        generation: int,
+        summary: UsageSummary,
+    ) -> None:
+        """Record exact bounded terminal evidence above 1,000 turns.
+
+        This dedicated path cannot admit nonterminal work and leaves the normal
+        :meth:`observe` 1,000-turn invariant unchanged.
+        """
+        if not isinstance(summary, UsageSummary):
+            raise UsageParseError("terminal turn overshoot requires a UsageSummary")
+        self.observe(
+            job_id,
+            generation,
+            summary,
+            terminal=True,
+            _allow_terminal_overshoot=True,
+        )
 
     def _recompute_usage(self) -> None:
         self._totals = _CampaignTotals()
@@ -728,6 +761,7 @@ class CircuitBreaker:
         with self._lock:
             self._release_backoff()
             jobs = dict(self._jobs)
+            violations = set(self._turn_limit_violations)
             state = {
                 "version": 1,
                 "cache_warmup_turns": self.cache_warmup_turns,
@@ -746,7 +780,12 @@ class CircuitBreaker:
                 "campaign_usage": self._totals.compact_dict(),
             }
         state["jobs"] = {
-            job: {"generation": generation, "usage": summary.to_dict(), "terminal": terminal}
+            job: {
+                "generation": generation,
+                "usage": summary.to_dict(),
+                "terminal": terminal,
+                "turn_limit_violation": job in violations,
+            }
             for job, (generation, summary, terminal) in sorted(jobs.items())
         }
         return state
@@ -826,7 +865,11 @@ class CircuitBreaker:
             if (
                 not isinstance(job, str)
                 or not isinstance(item, Mapping)
-                or set(item) != {"generation", "usage", "terminal"}
+                or set(item)
+                not in (
+                    {"generation", "usage", "terminal"},
+                    {"generation", "usage", "terminal", "turn_limit_violation"},
+                )
             ):
                 raise UsageParseError("invalid breaker job snapshot")
             generation = item["generation"]
@@ -834,9 +877,21 @@ class CircuitBreaker:
                 raise UsageParseError("invalid breaker job generation")
             if type(item["terminal"]) is not bool:
                 raise UsageParseError("invalid breaker job terminal flag")
+            turn_limit_violation = item.get("turn_limit_violation", False)
+            if type(turn_limit_violation) is not bool:
+                raise UsageParseError("invalid breaker turn-limit violation flag")
             if not job:
                 raise UsageParseError("breaker job ID must be nonempty")
-            restored[job] = (generation, _summary_from_dict(item["usage"], require_turns=True), item["terminal"])
+            summary = _summary_from_dict(
+                item["usage"],
+                require_turns=True,
+                allow_large=turn_limit_violation,
+            )
+            if turn_limit_violation != (
+                item["terminal"] and MAX_PROVIDER_TURNS < summary.provider_turns <= MAX_TERMINAL_PROVIDER_TURNS
+            ):
+                raise UsageParseError("breaker turn-limit violation is inconsistent")
+            restored[job] = (generation, summary, item["terminal"])
         sequence = raw["terminal_sequence"]
         if (
             not isinstance(sequence, list)
@@ -859,6 +914,11 @@ class CircuitBreaker:
             breaker._backoff_until = backoff
             breaker._campaign_usage = UsageSummary()
             breaker._jobs = restored
+            breaker._turn_limit_violations = {
+                job
+                for job, item in jobs.items()
+                if isinstance(item, Mapping) and item.get("turn_limit_violation") is True
+            }
             breaker._terminal_sequence = list(sequence)
             serialized_causes = set(causes)
             expected_usage, expected_cache_failures = CircuitBreaker._derived_from_jobs(breaker)
@@ -1135,7 +1195,7 @@ def _compact_summary_fields(value: object) -> tuple[object, ...]:
     return (*numbers, _decimal(value["cost"]), value["telemetry_gap"])
 
 
-def _coerce_summary(value: UsageSummary | Mapping[str, object]) -> UsageSummary:
+def _coerce_summary(value: UsageSummary | Mapping[str, object], *, allow_large: bool = False) -> UsageSummary:
     if isinstance(value, UsageSummary):
         return UsageSummary(
             provider_turns=value.provider_turns,
@@ -1151,13 +1211,14 @@ def _coerce_summary(value: UsageSummary | Mapping[str, object]) -> UsageSummary:
             cost=value.cost,
             telemetry_gap=value.telemetry_gap,
             turns=value.turns,
+            allow_large=allow_large,
         )
     if isinstance(value, Mapping) and "data" in value:
         return summarize_usage(value)
     return _summary_from_dict(value)
 
 
-def _summary_from_dict(value: object, *, require_turns: bool = False) -> UsageSummary:
+def _summary_from_dict(value: object, *, require_turns: bool = False, allow_large: bool = False) -> UsageSummary:
     if not isinstance(value, Mapping):
         raise UsageParseError("usage summary must be an object")
     required = {
@@ -1217,6 +1278,7 @@ def _summary_from_dict(value: object, *, require_turns: bool = False) -> UsageSu
         cost=_decimal(value["cost"]),
         telemetry_gap=value["telemetry_gap"],
         turns=tuple(turns),
+        allow_large=allow_large,
     )
     if turns and summary.provider_turns != len(turns):
         raise UsageParseError("usage summary turn counts are inconsistent")
@@ -1239,6 +1301,7 @@ def _summary_from_dict(value: object, *, require_turns: bool = False) -> UsageSu
             cost=_sum_decimals(turn.cost for turn in turns),
             telemetry_gap=any(turn.cache_read > 0 and turn.cache_write == 0 for turn in turns),
             turns=tuple(turns),
+            allow_large=allow_large,
         )
         if summary != recomputed:
             raise UsageParseError("usage summary does not match per-turn records")
