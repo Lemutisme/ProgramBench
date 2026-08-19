@@ -473,6 +473,11 @@ class HttpProContractApi:
         self.max_response_bytes = max_response_bytes
         self._authorization = "Basic " + base64.b64encode(f"{resolved_username}:{resolved_password}".encode()).decode()
 
+    def rebind(self, port: int) -> None:
+        if type(port) is not int or not 0 < port < 65536:
+            raise ProContractError("OpenCode rebound port is invalid")
+        self.base_url = f"http://127.0.0.1:{port}"
+
     def issue(self, payload: dict[str, object]) -> Mapping[str, object]:
         return self._mapping(self._request("POST", "/api/contract", payload))
 
@@ -1194,6 +1199,7 @@ def _run_procontract(
             contract,
             execution,
             usage,
+            messages,
             actions,
             issue,
             quiet,
@@ -1270,6 +1276,7 @@ def _deliver(
     contract: Mapping[str, object],
     execution: Mapping[str, object],
     usage: UsageSummary,
+    messages: Mapping[str, object],
     actions: int,
     issue: Mapping[str, object],
     quiet: Mapping[str, object],
@@ -1426,6 +1433,8 @@ def _deliver(
         raise ProContractDeliveryError("exported Contract subject lacks required delivery files")
     if not os.access(subject / "compile.sh", os.X_OK) or not os.access(subject / "executable", os.X_OK):
         raise ProContractDeliveryError("exported Contract delivery files are not executable")
+    if workspace.lease._handle_active:
+        workspace.stop()
     _scan_all_credentials(job.job.root, workspace, export_dir)
     if state.phase == "executing":
         state = state_store.transition(
@@ -1557,6 +1566,19 @@ def _deliver(
     if report_hash == replay["evidenceHash"]:
         raise ProContractDeliveryError("principal evidence hash must be distinct from native replay evidence")
 
+    try:
+        if hasattr(workspace, "restart"):
+            workspace = workspace.restart()
+        if hasattr(api, "rebind"):
+            api.rebind(workspace.port)  # type: ignore[attr-defined]
+    except WorkspaceError:
+        raise ProContractNativeOutcome(
+            ProContractCompletion.LOST_SERVER,
+            contract,
+            execution,
+            "restart_failed",
+        ) from None
+
     current, current_execution = _stage_contract_observation(
         api,
         payload,
@@ -1572,6 +1594,17 @@ def _deliver(
     current_execution = _validate_execution(current_execution, payload, int(current["revision"]))
     if _binding_identity(current_execution) != _binding_identity(execution):
         raise ProContractConflictError("Contract execution binding changed before attestation")
+    if (
+        current_execution["turnsUsed"] != execution["turnsUsed"]
+        or current_execution["actionsUsed"] != execution["actionsUsed"]
+    ):
+        raise ProContractConflictError("Contract execution advanced during delivery restart")
+    restarted_messages = _sanitize_control(
+        api.messages(str(execution["sessionID"])),
+        _all_credential_names(workspace.manifest.credential_env),
+    )
+    if restarted_messages != messages:
+        raise ProContractConflictError("Session messages changed during delivery restart")
     native = _native_outcome_completion(current)
     reconcilable_discharge = (
         current["status"] == "discharged"
@@ -1768,6 +1801,8 @@ def _deliver(
                 "attestationID": final["attestationID"],
             },
         )
+    if workspace.lease._handle_active:
+        workspace.stop()
     _scan_all_credentials(job.job.root, workspace, export_dir)
     result = _result(
         payload,

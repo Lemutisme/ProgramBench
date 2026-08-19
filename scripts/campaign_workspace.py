@@ -473,6 +473,7 @@ class DockerWorkspace:
     health_probe: _HealthProbe
     health_timeout: float
     lease: WorkspaceLease
+    request: WorkspaceRequest
     adopted: bool = False
 
     def __post_init__(self) -> None:
@@ -507,6 +508,11 @@ class DockerWorkspace:
 
     def release(self) -> None:
         self.lease.release_handle()
+
+    def restart(self) -> "DockerWorkspace":
+        if self.lease._handle_active:
+            raise WorkspaceError("running workspace must be stopped before restart")
+        return ensure_workspace(self.request, self.lease)
 
     def stop(self, lease: WorkspaceLease | None = None) -> None:
         active = self.lease if lease is None else lease
@@ -827,6 +833,7 @@ def _activate(
         probe,
         request.health_timeout,
         request.workspace_lease,
+        request,
         adopted,
     )
 
