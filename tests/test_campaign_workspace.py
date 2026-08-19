@@ -21,12 +21,11 @@ class RecordingDocker:
         self.commands.append(command)
         if command[1:3] == ("image", "inspect"):
             return '[{"Id": "sha256:image-digest"}]'
-        if command[1] == "create" and "--name" not in command:
-            return "copy-id"
-        if command[1] == "cp":
-            source = Path(command[-1])
-            source.mkdir(parents=True, exist_ok=True)
-            (source / "executable").write_text("reference")
+        if command[1] == "run" and "--user" in command and command[command.index("--user") + 1] == "root":
+            candidate = Path(next(value for index, value in enumerate(command) if command[index - 1] == "-v" and value.endswith(":/candidate:rw")).removesuffix(":/candidate:rw"))
+            candidate.mkdir(parents=True, exist_ok=True)
+            (candidate / "reference").symlink_to("/workspace/executable")
+            (candidate / ".programbench-cleanroom").touch()
             return ""
         if command[1] == "rm":
             return ""

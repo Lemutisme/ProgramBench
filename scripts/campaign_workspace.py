@@ -9,7 +9,6 @@ import re
 import subprocess
 import tempfile
 import time
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping
@@ -68,7 +67,7 @@ class WorkspaceManifest:
     bridge_network: bool = True
 
     def __post_init__(self) -> None:
-        if self.phase not in {"candidate_prepared", "container_started", "ready", "stopped"}:
+        if self.phase not in {"planned", "candidate_ready", "launching", "running", "stopped"}:
             raise WorkspaceError("workspace manifest has an invalid phase")
         if any(not _NAME.fullmatch(value) for value in (self.campaign, self.instance_id, self.arm)):
             raise WorkspaceError("workspace identity contains unsafe characters")
@@ -182,9 +181,9 @@ class DockerWorkspace:
         inspected = _inspect_container(self.docker_runner, self.docker, self.container_id)
         if inspected is None:
             raise ContainerConflictError("owned container is missing; evidence retained")
-        if str(inspected.get("Id", "")) != self.container_id:
-            raise ContainerConflictError("container identity changed; evidence retained")
+        _require_exact_container(inspected, self.manifest)
         if not isinstance(inspected.get("State"), Mapping) or not inspected["State"].get("Running"):
+            _write_manifest(self.manifest_path, _replace_manifest(self.manifest, phase="stopped", port=None))
             return
         _docker(self.docker_runner, (self.docker, "stop", "--time", "10", self.container_id), 30, "stop")
         _write_manifest(self.manifest_path, _replace_manifest(self.manifest, phase="stopped", port=None))
@@ -205,16 +204,16 @@ def ensure_workspace(request: WorkspaceRequest) -> DockerWorkspace:
     occupied = _inspect_container(runner, request.docker, expected_name)
     if occupied is not None:
         raise ContainerConflictError("container name is occupied without owned persisted evidence")
-    candidate = request.candidate_root / f"{expected_name}-{uuid.uuid4().hex}"
-    _copy_cleanroom(runner, request.docker, request.image, expected_name, candidate)
-    _prepare_bind_paths(candidate, request.state_root, request.log_dir)
-    if request.docker_runner is None:
-        _normalize_bind_ownership(runner, request.docker, request.image, candidate, request.state_root, request.log_dir)
+    candidate = request.candidate_root / expected_name
     manifest = WorkspaceManifest(
         request.campaign, request.instance_id, request.arm, request.job.root, expected_name, None, request.image, image_digest,
         request.install.binary, request.install.binary_sha256, candidate, request.state_root, request.log_dir,
-        request.credential_env, None, "candidate_prepared",
+        request.credential_env, None, "planned",
     )
+    _write_manifest(manifest_path, manifest)
+    _copy_cleanroom(runner, request.docker, request.image, candidate, request.state_root, request.log_dir)
+    _prepare_bind_paths(candidate, request.state_root, request.log_dir)
+    manifest = _replace_manifest(manifest, phase="candidate_ready")
     _write_manifest(manifest_path, manifest)
     return _launch(manifest, manifest_path, request, runner, probe, adopted=False)
 
@@ -225,6 +224,11 @@ def prepare_workspace(request: WorkspaceRequest) -> DockerWorkspace:
 
 
 def _resume(manifest: WorkspaceManifest, path: Path, request: WorkspaceRequest, runner: _DockerRunner, probe: _HealthProbe) -> DockerWorkspace:
+    if manifest.phase == "planned":
+        _copy_cleanroom(runner, request.docker, request.image, manifest.candidate, manifest.state_dir, manifest.log_dir)
+        _prepare_bind_paths(manifest.candidate, manifest.state_dir, manifest.log_dir)
+        manifest = _replace_manifest(manifest, phase="candidate_ready")
+        _write_manifest(path, manifest)
     inspected = _inspect_container(runner, request.docker, manifest.container_name)
     if manifest.container_id is None:
         if inspected is not None:
@@ -236,10 +240,10 @@ def _resume(manifest: WorkspaceManifest, path: Path, request: WorkspaceRequest, 
     if not _running(inspected):
         _docker(runner, (request.docker, "start", manifest.container_id), 30, "start")
     port = _published_port(runner, request.docker, manifest.container_id)
-    ready = _replace_manifest(manifest, port=port, phase="container_started")
+    ready = _replace_manifest(manifest, port=port, phase="launching")
     _write_manifest(path, ready)
     _wait_health(ready, probe, request.health_timeout)
-    ready = _replace_manifest(ready, phase="ready")
+    ready = _replace_manifest(ready, phase="running")
     _write_manifest(path, ready)
     return DockerWorkspace(ready, path, request.docker, runner, probe, request.health_timeout, adopted=True)
 
@@ -251,17 +255,18 @@ def _launch(manifest: WorkspaceManifest, path: Path, request: WorkspaceRequest, 
     command.extend(("-e", "HOME=/state/home", "-e", "XDG_CACHE_HOME=/state/cache", "-e", "XDG_CONFIG_HOME=/state/config", "-e", "XDG_DATA_HOME=/state/data"))
     command.extend(("-v", f"{manifest.candidate}:/candidate:rw", "-v", f"{manifest.state_dir}:/state:rw", "-v", f"{manifest.binary}:/opencode:ro"))
     command.extend((manifest.image, "/opencode", "serve", "--hostname", "0.0.0.0", "--port", "4096"))
+    _write_manifest(path, _replace_manifest(manifest, phase="launching"))
     container_id = _docker(runner, tuple(command), 60, "create").strip()
     if not re.fullmatch(r"[0-9a-f]{12,64}", container_id):
         raise DockerCommandError("docker create returned an invalid container ID")
-    started = _replace_manifest(manifest, container_id=container_id, phase="container_started")
+    started = _replace_manifest(manifest, container_id=container_id, phase="launching")
     _write_manifest(path, started)
     _docker(runner, (request.docker, "start", container_id), 30, "start")
     port = _published_port(runner, request.docker, container_id)
     started = _replace_manifest(started, port=port)
     _write_manifest(path, started)
     _wait_health(started, probe, request.health_timeout)
-    ready = _replace_manifest(started, phase="ready")
+    ready = _replace_manifest(started, phase="running")
     _write_manifest(path, ready)
     return DockerWorkspace(ready, path, request.docker, runner, probe, request.health_timeout, adopted)
 
@@ -285,19 +290,22 @@ def _validate_request(request: WorkspaceRequest) -> WorkspaceRequest:
     return WorkspaceRequest(**{**request.__dict__, "candidate_root": candidate, "state_root": state, "log_dir": logs, "install": request.install.__class__(**{**request.install.__dict__, "binary": binary})})
 
 
-def _copy_cleanroom(runner: _DockerRunner, docker: str, image: str, name: str, candidate: Path) -> None:
-    copy_name = f"{name}-copy-{uuid.uuid4().hex[:12]}"
-    container = _docker(runner, (docker, "create", "--name", copy_name, image), 30, "create").strip()
-    try:
-        candidate.mkdir(parents=True, mode=0o700)
-        _docker(runner, (docker, "cp", f"{container}:/workspace/.", str(candidate)), 60, "copy workspace")
-    finally:
-        _docker(runner, (docker, "rm", "-f", container), 30, "remove copy container")
-    executable = candidate / "executable"
-    if executable.is_dir() and not executable.is_symlink():
-        raise WorkspaceError("cleanroom executable is unexpectedly a directory")
-    executable.unlink(missing_ok=True)
-    (candidate / "reference").symlink_to("/workspace/executable")
+def _copy_cleanroom(runner: _DockerRunner, docker: str, image: str, candidate: Path, state: Path, logs: Path) -> None:
+    if candidate.exists():
+        if (candidate / ".programbench-cleanroom").is_file():
+            return
+        raise ContainerConflictError("candidate path is occupied by foreign evidence")
+    candidate.mkdir(parents=True, mode=0o700)
+    state.mkdir(parents=True, exist_ok=True)
+    logs.mkdir(parents=True, exist_ok=True)
+    # This is intentionally a fixed in-container init command: it never interpolates host or credential values.
+    command = (
+        docker, "run", "--rm", "--user", "root", "--network", "none", "-v", f"{candidate}:/candidate:rw",
+        "-v", f"{state}:/state:rw", "-v", f"{logs}:/logs:rw", image, "/bin/sh", "-ec",
+        "cp -a /workspace/. /candidate/; rm -f /candidate/executable; ln -s /workspace/executable /candidate/reference; "
+        "mkdir -p /state/home /state/cache /state/config /state/data; chown -R agent:agent /candidate /state /logs; touch /candidate/.programbench-cleanroom",
+    )
+    _docker(runner, command, 90, "initialize candidate")
 
 
 def _prepare_bind_paths(candidate: Path, state: Path, logs: Path) -> None:
@@ -309,21 +317,6 @@ def _prepare_bind_paths(candidate: Path, state: Path, logs: Path) -> None:
         path.chmod(path.stat().st_mode | 0o700)
 
 
-def _normalize_bind_ownership(
-    runner: _DockerRunner, docker: str, image: str, candidate: Path, state: Path, logs: Path
-) -> None:
-    uid = _docker(runner, (docker, "run", "--rm", "--user", "agent", "--entrypoint", "id", image, "-u"), 30, "inspect agent user").strip()
-    gid = _docker(runner, (docker, "run", "--rm", "--user", "agent", "--entrypoint", "id", image, "-g"), 30, "inspect agent group").strip()
-    if not uid.isdecimal() or not gid.isdecimal():
-        raise WorkspaceError("image agent user identity is invalid")
-    for root in (candidate, state, logs):
-        for path in (root, *root.rglob("*")):
-            if path.is_symlink():
-                continue
-            try:
-                os.chown(path, int(uid), int(gid))
-            except OSError as error:
-                raise WorkspaceError("could not normalize bind ownership for image agent") from error
 
 
 def _image_digest(runner: _DockerRunner, docker: str, image: str) -> str:
@@ -421,6 +414,8 @@ def _container_name(campaign: str, instance: str, arm: str) -> str:
 def _require_manifest_identity(manifest: WorkspaceManifest, request: WorkspaceRequest, name: str) -> None:
     if (manifest.campaign, manifest.instance_id, manifest.arm, manifest.container_name, manifest.image, manifest.binary, manifest.binary_sha256, manifest.credential_env) != (request.campaign, request.instance_id, request.arm, name, request.image, request.install.binary, request.install.binary_sha256, request.credential_env):
         raise ContainerConflictError("persisted workspace identity does not match this job")
+    if _sha256(request.install.binary) != manifest.binary_sha256:
+        raise ContainerConflictError("installed OpenCode binary changed; evidence retained")
 
 
 def _load_manifest(path: Path) -> WorkspaceManifest:
@@ -466,6 +461,14 @@ def _canonical_existing(path: Path, label: str) -> Path:
     return resolved
 
 
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _canonical_root(path: Path, label: str) -> Path:
     original = Path(path).absolute()
     current = Path(original.anchor)
@@ -499,11 +502,11 @@ def _docker(runner: _DockerRunner, command: tuple[str, ...], timeout: float, act
 
 def _run_docker(command: tuple[str, ...], timeout: float) -> str:
     try:
-        result = subprocess.run(command, check=False, capture_output=True, text=True, timeout=timeout)
+        result = subprocess.run(command, check=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired) as error:
         raise DockerCommandError(f"docker command failed ({type(error).__name__})") from error
-    output = (result.stdout + result.stderr)[:_OUTPUT_LIMIT]
-    if result.returncode != 0 and any(marker in (result.stderr + result.stdout).lower() for marker in ("no such", "not found")):
+    output = (result.stdout or "")[:_OUTPUT_LIMIT]
+    if result.returncode != 0 and any(marker in output.lower() for marker in ("no such", "not found")):
         raise DockerNotFoundError("docker object was not found")
     if result.returncode != 0:
         raise DockerCommandError(f"docker command failed (exit {result.returncode})")
