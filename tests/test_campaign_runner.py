@@ -1170,6 +1170,130 @@ def test_run_job_normalizes_unexpected_error_without_secret(tmp_path: Path, monk
     assert "secret-value" not in (state.exit_class or "")
 
 
+def test_run_job_force_stops_before_unregistering_unexpected_adapter_failure(tmp_path: Path, monkeypatch):
+    from scripts import campaign_runner
+    from scripts.campaign_stop import StopToken
+    from scripts.run_opencode import load_config
+
+    config_path = tmp_path / "campaign.yaml"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config_path.write_text(_config(repo))
+    plan = campaign_runner.CampaignPlan(
+        tmp_path / "out", tmp_path / "out/campaign.json", load_config(config_path), ("one",), (), {}, False
+    )
+    candidate = campaign_runner.CampaignJob("one", "vanilla", "one-image")
+    token = StopToken()
+    workspaces = []
+
+    class Workspace:
+        base_url = "http://127.0.0.1:9999"
+        port = 9999
+
+        def __init__(self, request, lease):
+            self.request = request
+            self.lease = lease
+            self.stops = 0
+            lease.claim_handle(request)
+
+        def stop_for_freeze(self):
+            assert self.lease._lock_context is not None
+            assert self.lease._handle_active
+            assert token.registry.active_jobs() == (candidate,)
+            self.stops += 1
+            self.lease.release_handle()
+
+    def workspace_factory(request, lease):
+        workspace = Workspace(request, lease)
+        workspaces.append(workspace)
+        return workspace
+
+    def adapter(_job, store, *_args, **_kwargs):
+        state = store.read()
+        state = store.transition("preparing", command_identity="adapter", expected_generation=state.generation)
+        store.transition("executing", command_identity="adapter", expected_generation=state.generation)
+        raise RuntimeError("adapter-secret")
+
+    monkeypatch.setattr(campaign_runner, "_install_for", lambda *_: object())
+
+    result = campaign_runner.run_job(
+        plan,
+        candidate,
+        breaker=CircuitBreaker(),
+        stop_token=token,
+        workspace_factory=workspace_factory,
+        vanilla_runner=adapter,
+        vanilla_api_factory=lambda _: object(),
+    )
+
+    state = campaign_runner.StateStore(plan.output / "vanilla/one/state.json").read()
+    assert result.status == "failed"
+    assert state.phase == "failed"
+    assert state.exit_class == "execution_failed"
+    assert "adapter-secret" not in (state.exit_class or "")
+    assert workspaces[0].stops == 1
+    assert not workspaces[0].lease._handle_active
+    assert token.registry.active_jobs() == ()
+
+
+def test_run_job_retains_registered_cleanup_until_scheduler_retries_failed_stop(tmp_path: Path, monkeypatch):
+    from scripts import campaign_runner
+    from scripts.run_opencode import load_config
+
+    config_path = tmp_path / "campaign.yaml"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config_path.write_text(_config(repo))
+    plan = campaign_runner.CampaignPlan(
+        tmp_path / "out", tmp_path / "out/campaign.json", load_config(config_path), ("one",), (), {}, False
+    )
+    candidate = campaign_runner.CampaignJob("one", "vanilla", "one-image")
+    workspaces = []
+
+    class Workspace:
+        base_url = "http://127.0.0.1:9999"
+        port = 9999
+
+        def __init__(self, request, lease):
+            self.lease = lease
+            self.attempts = 0
+            lease.claim_handle(request)
+
+        def stop_for_freeze(self):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise RuntimeError("transient stop failure")
+            self.lease.release_handle()
+
+    def workspace_factory(request, lease):
+        workspace = Workspace(request, lease)
+        workspaces.append(workspace)
+        return workspace
+
+    monkeypatch.setattr(campaign_runner, "_install_for", lambda *_: object())
+    result = campaign_runner.run_campaign(
+        (candidate,),
+        workers=1,
+        interrupt_timeout=0.05,
+        execute=lambda current, stop: campaign_runner.run_job(
+            plan,
+            current,
+            breaker=CircuitBreaker(),
+            stop_token=stop,
+            workspace_factory=workspace_factory,
+            vanilla_runner=lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("adapter failed")),
+            vanilla_api_factory=lambda _: object(),
+        ),
+    )
+
+    state = campaign_runner.StateStore(plan.output / "vanilla/one/state.json").read()
+    assert result.interrupted
+    assert result.failed == 1
+    assert state.phase == "failed"
+    assert workspaces[0].attempts == 2
+    assert not workspaces[0].lease._handle_active
+
+
 def test_retry_infra_restarts_a_normalized_pre_provider_failure(tmp_path: Path, monkeypatch):
     from scripts import campaign_runner
     from scripts.run_opencode import load_config

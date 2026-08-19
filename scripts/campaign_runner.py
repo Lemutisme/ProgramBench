@@ -498,6 +498,22 @@ def run_job(
                         _terminalize(store, "interrupted", "campaign_stop")
                         return JobRunResult(candidate, "interrupted")
                     return JobRunResult(candidate, "completed", result)
+                except BaseException as error:
+                    exit_class, traceback_hash = _exception_metadata(store, error)
+                    interrupted = stop.is_set()
+                    _terminalize(
+                        store,
+                        "interrupted" if interrupted else "failed",
+                        "campaign_stop" if interrupted else exit_class,
+                        traceback_hash=traceback_hash,
+                    )
+                    while workspace_lease._handle_active:
+                        try:
+                            workspace.stop_for_freeze()
+                        except BaseException:
+                            stop.set("workspace_cleanup_failed")
+                            time.sleep(0.01)
+                    return JobRunResult(candidate, "interrupted" if stop.is_set() else "failed")
                 finally:
                     stop.registry.unregister(active)
         except BaseException as error:

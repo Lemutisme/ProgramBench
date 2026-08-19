@@ -1072,6 +1072,7 @@ def test_campaign_stop_freezes_when_ambiguous_issue_reconciliation_is_unavailabl
     assert len(api.issues) == 1
     assert store.read().phase == "interrupted"
     assert workspace.stops == 1
+    assert not workspace.lease._handle_active
 
 
 def test_campaign_stop_during_contract_poll_interrupts_and_terminalizes(tmp_path: Path) -> None:
