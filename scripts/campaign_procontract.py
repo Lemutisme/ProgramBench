@@ -57,6 +57,9 @@ from scripts.campaign_workspace import DockerWorkspace, WorkspaceError
 MAX_WALL_TIME_SECONDS = 21600
 MAX_PROVIDER_TURNS = 1000
 MAX_ACTIONS = 4000
+MAX_MUTATION_ATTEMPTS = 3
+MAX_CREDENTIAL_SCAN_BYTES = 512 * 1024 * 1024
+MAX_CREDENTIAL_SCAN_FILES = 10_000
 MODEL = "openai/gpt-5.6-luna"
 VARIANT = "max"
 LOCATION = "/candidate"
@@ -94,6 +97,10 @@ class ProContractDeliveryError(ProContractError):
     """Raised after native verification when delivery cannot be completed."""
 
 
+class ProContractCredentialScanError(ProContractError):
+    """Raised when credential scanning cannot cover the complete publication surface."""
+
+
 class ProContractHttpError(ProContractError):
     """Bounded failure from a public ProContract or Session endpoint."""
 
@@ -109,6 +116,19 @@ class ProContractHttpError(ProContractError):
         self.retry_after = retry_after
         self.transient = transient
         super().__init__(message[:1000])
+
+
+class ProContractNativeOutcome(ProContractError):
+    def __init__(
+        self,
+        completion: "ProContractCompletion",
+        contract: Mapping[str, object],
+        execution: Mapping[str, object],
+    ) -> None:
+        self.completion = completion
+        self.contract = contract
+        self.execution = execution
+        super().__init__(f"native Contract status preserved: {completion.value}")
 
 
 class ProContractCompletion(str, Enum):
@@ -648,8 +668,9 @@ def _run_procontract(
         result = ProContractResult.from_dict(_read_json(result_path))
         if workspace.lease._handle_active:
             workspace.stop()
+        _scan_terminal_credentials(job.job.root, workspace)
         _verify_terminal_artifacts(job.job.root, state, result)
-        _verify_no_credentials(job.job.root, workspace.manifest.credential_env)
+        _verify_no_credentials(job.job.root, _all_credential_names(workspace.manifest.credential_env))
         return result
 
     issue_path = job.job.root / "procontract-issue.json"
@@ -698,21 +719,48 @@ def _run_procontract(
         raise ProContractError("persisted Contract start time is invalid")
     deadline = float(started_at) + MAX_WALL_TIME_SECONDS
     accepted_path = job.job.root / "procontract-issue-response.json"
+    issue_attempts = 0
     while True:
         try:
-            accepted = _issue_or_reconcile(api, payload, accepted_path, workspace.manifest.credential_env)
+            issue_attempts += 1
+            accepted = _issue_or_reconcile(
+                api,
+                payload,
+                accepted_path,
+                _all_credential_names(workspace.manifest.credential_env),
+            )
             break
-        except ProContractHttpError as error:
-            if error.status_code == 409:
+        except ProContractError as error:
+            status_code = error.status_code if isinstance(error, ProContractHttpError) else None
+            transient = error.transient if isinstance(error, ProContractHttpError) else True
+            try:
+                accepted = _reconcile_ambiguous_issue(
+                    api,
+                    payload,
+                    accepted_path,
+                    _all_credential_names(workspace.manifest.credential_env),
+                )
+            except ProContractConflictError:
+                raise
+            except ProContractError:
+                accepted = None
+            if accepted is not None:
+                break
+            if status_code == 409:
                 raise ProContractConflictError("existing Contract conflicts with frozen issue") from None
-            if error.status_code == 429:
-                _observe_rate_limit(breaker, error.retry_after, str(error), clock, deadline)
+            if status_code == 429:
+                retry_after = error.retry_after if isinstance(error, ProContractHttpError) else None
+                _observe_rate_limit(breaker, retry_after, str(error), clock, deadline)
                 if clock() < deadline and breaker.active_stop_reason is None:
                     _backoff(breaker, clock, sleeper, poll_interval, deadline)
-                    if clock() < deadline:
+                    if clock() < deadline and issue_attempts < MAX_MUTATION_ATTEMPTS:
                         continue
-            if error.status_code in {401, 403}:
-                breaker.observe_error(error.status_code, detail=str(error))
+            if (transient or status_code is None or status_code >= 500) and issue_attempts < MAX_MUTATION_ATTEMPTS:
+                if clock() < deadline:
+                    sleeper(min(poll_interval, deadline - clock()))
+                    continue
+            if status_code in {401, 403}:
+                breaker.observe_error(status_code, detail=str(error))
             _fail_issue_admission(
                 job,
                 state_store,
@@ -720,13 +768,14 @@ def _run_procontract(
                 workspace,
                 command_identity,
                 issue,
-                error.status_code,
+                status_code,
             )
             raise ProContractError("native Contract infrastructure failed before accepted issue") from None
     contract = accepted["data"]
     execution = accepted["execution"]
     if not isinstance(contract, Mapping) or not isinstance(execution, Mapping):
         raise ProContractError("persisted Contract issue response is invalid")
+    _scan_control_credentials(job.job.root, _all_credential_names(workspace.manifest.credential_env))
     bound_execution = execution
     progress_path = job.job.root / "procontract-progress.json"
     usage, actions, messages = _restore_contract_progress(progress_path, state, payload, bound_execution)
@@ -769,7 +818,10 @@ def _run_procontract(
                     raise ProContractConflictError("native Contract execution binding changed after issue")
                 execution = current_execution
                 previous_usage, previous_actions, previous_messages = usage, actions, messages
-                sanitized = _sanitize(api.messages(str(execution["sessionID"])), workspace.manifest.credential_env)
+                sanitized = _sanitize(
+                    api.messages(str(execution["sessionID"])),
+                    _all_credential_names(workspace.manifest.credential_env),
+                )
                 if not isinstance(sanitized, Mapping):
                     raise ProContractError("sanitized Session messages are invalid")
                 messages = sanitized
@@ -831,29 +883,6 @@ def _run_procontract(
                         poll_interval,
                         quiet,
                     )
-                breaker.observe(workspace.manifest.job_id, state.generation, usage, terminal=False)
-                safety = _safety_completion(breaker, limits, turns, actions, clock, deadline)
-                if safety is not None:
-                    return _stop_and_finish(
-                        job,
-                        state_store,
-                        state,
-                        workspace,
-                        command_identity,
-                        payload,
-                        contract,
-                        execution,
-                        usage,
-                        actions,
-                        issue,
-                        api,
-                        safety,
-                        safety.value,
-                        clock,
-                        sleeper,
-                        poll_interval,
-                        quiet,
-                    )
                 if contract.get("challenge") is not None:
                     return _stop_and_finish(
                         job,
@@ -877,24 +906,47 @@ def _run_procontract(
                     )
                 status = str(contract["status"])
                 if status == "verification":
-                    if api.status(str(execution["sessionID"])) != "idle":
-                        sleeper(min(poll_interval, max(0.001, deadline - clock())))
-                        continue
-                    _write_or_verify_json(
-                        job.job.root / "procontract-verification.json",
-                        _sanitize(
-                            {
-                                "version": 1,
-                                "contract": contract,
-                                "execution": execution,
-                                "quiet": quiet,
-                                "messages": messages,
-                            },
-                            workspace.manifest.credential_env,
-                        ),
-                        "native Contract verification observation",
-                    )
-                    break
+                    if api.status(str(execution["sessionID"])) == "idle":
+                        _write_or_verify_json(
+                            job.job.root / "procontract-verification.json",
+                            _sanitize(
+                                {
+                                    "version": 1,
+                                    "contract": contract,
+                                    "execution": execution,
+                                    "quiet": quiet,
+                                    "messages": messages,
+                                },
+                                _all_credential_names(workspace.manifest.credential_env),
+                            ),
+                            "native Contract verification observation",
+                        )
+                        break
+                    breaker.observe(workspace.manifest.job_id, state.generation, usage, terminal=False)
+                    safety = _verification_safety_completion(breaker, clock, deadline)
+                    if safety is not None:
+                        return _stop_and_finish(
+                            job,
+                            state_store,
+                            state,
+                            workspace,
+                            command_identity,
+                            payload,
+                            contract,
+                            execution,
+                            usage,
+                            actions,
+                            issue,
+                            api,
+                            safety,
+                            safety.value,
+                            clock,
+                            sleeper,
+                            poll_interval,
+                            quiet,
+                        )
+                    sleeper(min(poll_interval, max(0.001, deadline - clock())))
+                    continue
                 if status == "discharged":
                     return _resume_discharged(
                         job,
@@ -927,6 +979,29 @@ def _run_procontract(
                         api,
                         ProContractCompletion.ESCALATED if status == "escalated" else ProContractCompletion.RELEASED,
                         f"native Contract status preserved: {status}",
+                        clock,
+                        sleeper,
+                        poll_interval,
+                        quiet,
+                    )
+                breaker.observe(workspace.manifest.job_id, state.generation, usage, terminal=False)
+                safety = _safety_completion(breaker, limits, turns, actions, clock, deadline)
+                if safety is not None:
+                    return _stop_and_finish(
+                        job,
+                        state_store,
+                        state,
+                        workspace,
+                        command_identity,
+                        payload,
+                        contract,
+                        execution,
+                        usage,
+                        actions,
+                        issue,
+                        api,
+                        safety,
+                        safety.value,
                         clock,
                         sleeper,
                         poll_interval,
@@ -1014,7 +1089,42 @@ def _run_procontract(
             api,
             package,
             preflight,
+            breaker,
             clock,
+            sleeper,
+            poll_interval,
+            deadline,
+        )
+    except ProContractNativeOutcome as outcome:
+        _write_or_verify_json(
+            job.job.root / "procontract-native-result.json",
+            _sanitize(
+                {
+                    "version": 1,
+                    "contract": outcome.contract,
+                    "execution": outcome.execution,
+                    "quiet": quiet,
+                },
+                _all_credential_names(workspace.manifest.credential_env),
+            ),
+            "native Contract terminal observation",
+        )
+        return _finish_without_delivery(
+            job,
+            state_store,
+            state_store.read(),
+            workspace,
+            command_identity,
+            payload,
+            outcome.contract,
+            outcome.execution,
+            usage,
+            actions,
+            issue,
+            outcome.completion,
+            str(outcome),
+            clock,
+            quiet=quiet,
         )
     except (CandidateError, CredentialLeakError, ProContractDeliveryError, ProContractHttpError, WorkspaceError):
         return _finish_without_delivery(
@@ -1052,7 +1162,11 @@ def _deliver(
     api: ProContractApi,
     package: Callable[[Path, Path, str], Path],
     preflight: Callable[[Path, str], PreflightResult],
+    breaker: CircuitBreaker,
     clock: Callable[[], float],
+    sleeper: Callable[[float], None],
+    poll_interval: float,
+    deadline: float,
 ) -> ProContractResult:
     contract = _validate_contract(contract, payload)
     execution = _validate_execution(execution, payload, int(contract["revision"]))
@@ -1072,7 +1186,10 @@ def _deliver(
     else:
         exported = api.export(workspace, str(payload["id"]), export_dir)
         _validate_export(exported, payload, handoff, export_dir, workspace)
-        _write_json(export_path, _sanitize(exported, workspace.manifest.credential_env))
+        _write_json(
+            export_path,
+            _sanitize(exported, _all_credential_names(workspace.manifest.credential_env)),
+        )
     _validate_export(exported, payload, handoff, export_dir, workspace)
     try:
         exported_contract = api.get_contract(str(payload["id"]))
@@ -1081,6 +1198,8 @@ def _deliver(
             raise ProContractDeliveryError("Contract coordinates disappeared after export")
         exported_contract = _validate_contract(exported_contract, payload)
         exported_execution = _validate_execution(exported_execution, payload, int(exported_contract["revision"]))
+        if _binding_identity(exported_execution) != _binding_identity(execution):
+            raise ProContractConflictError("Contract execution binding changed while its subject was exported")
         if (
             exported_contract["status"] == "discharged"
             and job.job.root.joinpath("procontract-attestation-request.json").is_file()
@@ -1091,14 +1210,18 @@ def _deliver(
             exported_handoff = exported_contract["handoff"]
             exported_replay = exported_handoff["replay"]
         else:
+            native = _native_outcome_completion(exported_contract)
+            if native is not None:
+                raise ProContractNativeOutcome(native, exported_contract, exported_execution)
             exported_handoff, exported_replay = _verification(exported_contract, payload)
         if (
-            _binding_identity(exported_execution) != _binding_identity(execution)
-            or _attestation_coordinates(exported_contract) != _attestation_coordinates(contract)
+            _attestation_coordinates(exported_contract) != _attestation_coordinates(contract)
             or exported_handoff != handoff
             or exported_replay != replay
         ):
             raise ProContractConflictError("Contract handoff changed while its exact subject was exported")
+    except ProContractNativeOutcome:
+        raise
     except ProContractConflictError:
         if workspace.lease._handle_active:
             workspace.stop()
@@ -1112,7 +1235,12 @@ def _deliver(
     if workspace.lease._handle_active:
         raise ProContractError("workspace writer remained active after stop")
     subject = Path(workspace.manifest.subject_dir)
-    _materialize_subject(export_dir, subject, job.job.root, workspace.manifest.credential_env)
+    _materialize_subject(
+        export_dir,
+        subject,
+        job.job.root,
+        _all_credential_names(workspace.manifest.credential_env),
+    )
     if not subject.joinpath("compile.sh").is_file() or not subject.joinpath("executable").is_file():
         raise ProContractDeliveryError("exported Contract subject lacks required delivery files")
     if not os.access(subject / "compile.sh", os.X_OK) or not os.access(subject / "executable", os.X_OK):
@@ -1205,22 +1333,37 @@ def _deliver(
     report_path = job.job.root / "verifier-report.json"
     report = {
         "version": 1,
-        "contractID": payload["id"],
         "iid": workspace.manifest.instance_id,
-        "revision": contract["revision"],
-        "specHash": contract["specHash"],
-        "subjectHash": handoff["subjectHash"],
+        "issue": {"payloadHash": issue["payloadHash"]},
+        "contract": {
+            "contractID": payload["id"],
+            "revision": contract["revision"],
+            "specHash": contract["specHash"],
+            "subjectHash": handoff["subjectHash"],
+        },
+        "execution": {
+            "sessionID": execution["sessionID"],
+            "promptID": execution["promptID"],
+            "model": execution["model"],
+            "location": execution["location"],
+        },
         "acceptanceHash": issue["acceptanceHash"],
+        "export": {
+            "subjectHash": handoff["subjectHash"],
+            "treeHash": _tree_hash(_semantic_inventory(subject)),
+        },
         "replay": {
             "policyHash": replay["policyHash"],
             "evidenceHash": replay["evidenceHash"],
             "passed": replay["passed"],
         },
-        "package": {"archiveHash": _sha256(archive)},
+        "package": {"command": "package_workspace", "exit": 0, "archiveHash": _sha256(archive)},
         "preflight": {
             "executableHash": preflight_record["executableHash"],
             "commands": preflight_record["commands"],
             "exits": preflight_record["exits"],
+            "outputHash": preflight_record["outputHash"],
+            "reportHash": _sha256(preflight_path),
         },
     }
     if report_path.exists():
@@ -1228,7 +1371,7 @@ def _deliver(
             raise ProContractDeliveryError("persisted verifier report conflicts with current Contract evidence")
     else:
         _write_canonical_report(report_path, report)
-    report_hash = _sha256(report_path)
+    report_hash = _validate_verifier_report(report_path, report)
     if report_hash == replay["evidenceHash"]:
         raise ProContractDeliveryError("principal evidence hash must be distinct from native replay evidence")
 
@@ -1240,8 +1383,18 @@ def _deliver(
     current_execution = _validate_execution(current_execution, payload, int(current["revision"]))
     if _binding_identity(current_execution) != _binding_identity(execution):
         raise ProContractConflictError("Contract execution binding changed before attestation")
+    native = _native_outcome_completion(current)
+    reconcilable_discharge = (
+        current["status"] == "discharged"
+        and job.job.root.joinpath("procontract-attestation-request.json").is_file()
+        and job.job.root.joinpath("verifier-report.json").is_file()
+    )
+    if native is not None and not reconcilable_discharge:
+        raise ProContractNativeOutcome(native, current, current_execution)
     if _attestation_coordinates(current) != _attestation_coordinates(contract):
         raise ProContractConflictError("Contract coordinates changed before attestation")
+    _scan_all_credentials(job.job.root, workspace, export_dir)
+    report_hash = _validate_verifier_report(report_path, report)
     attestation_path = job.job.root / "procontract-attestation.json"
     attestation_request_path = job.job.root / "procontract-attestation-request.json"
     intended = {"version": 1, "contractID": payload["id"], "evidenceHash": report_hash}
@@ -1249,23 +1402,122 @@ def _deliver(
         raise ProContractDeliveryError("persisted attestation request conflicts with verifier report")
     if not attestation_request_path.exists():
         _write_json(attestation_request_path, intended)
+    _scan_all_credentials(job.job.root, workspace, export_dir)
     if current["status"] == "discharged":
         if not isinstance(current.get("attestationID"), str):
             raise ProContractConflictError("discharged Contract has no attestation identity")
     elif current["status"] == "verification":
         if attestation_path.exists():
             raise ProContractConflictError("attestation response exists but Contract remains in verification")
-        response = api.attest(str(payload["id"]), report_hash)
-        _validate_receipt(response, "attestation")
-        _write_json(attestation_path, _sanitize(response, workspace.manifest.credential_env))
+        for attempt in range(MAX_MUTATION_ATTEMPTS):
+            try:
+                response = api.attest(str(payload["id"]), report_hash)
+                _validate_receipt(response, "attestation")
+                _write_json(
+                    attestation_path,
+                    _sanitize(response, _all_credential_names(workspace.manifest.credential_env)),
+                )
+                break
+            except ProContractError as error:
+                status_code = error.status_code if isinstance(error, ProContractHttpError) else None
+                transient = error.transient if isinstance(error, ProContractHttpError) else True
+                try:
+                    observed = api.get_contract(str(payload["id"]))
+                    observed_execution = api.get_execution(str(payload["id"]))
+                except ProContractConflictError:
+                    raise
+                except ProContractError:
+                    observed = None
+                    observed_execution = None
+                if observed is None or observed_execution is None:
+                    if attempt + 1 >= MAX_MUTATION_ATTEMPTS:
+                        raise ProContractNativeOutcome(
+                            ProContractCompletion.LOST_SERVER,
+                            current,
+                            current_execution,
+                        ) from None
+                else:
+                    observed = _validate_contract(observed, payload)
+                    observed_execution = _validate_execution(observed_execution, payload, int(observed["revision"]))
+                    if _binding_identity(observed_execution) != _binding_identity(execution):
+                        raise ProContractConflictError(
+                            "Contract coordinates changed after ambiguous attestation"
+                        ) from None
+                    native = _native_outcome_completion(observed)
+                    if native is not None and observed["status"] != "discharged":
+                        raise ProContractNativeOutcome(native, observed, observed_execution)
+                    if _attestation_coordinates(observed) != _attestation_coordinates(contract):
+                        raise ProContractConflictError(
+                            "Contract coordinates changed after ambiguous attestation"
+                        ) from None
+                    if observed["status"] == "discharged":
+                        if not isinstance(observed.get("attestationID"), str):
+                            raise ProContractConflictError("discharged Contract has no attestation identity") from None
+                        _write_json(
+                            attestation_path,
+                            {
+                                "version": 1,
+                                "reconciled": True,
+                                "contractID": payload["id"],
+                                "attestationID": observed["attestationID"],
+                                "intendedEvidenceHash": report_hash,
+                            },
+                        )
+                        break
+                    if observed["status"] != "verification":
+                        raise ProContractConflictError(
+                            "Contract left verification after ambiguous attestation"
+                        ) from None
+                if status_code in {401, 403}:
+                    breaker.observe_error(status_code, detail=str(error))
+                    raise ProContractNativeOutcome(
+                        ProContractCompletion.AUTH,
+                        observed if isinstance(observed, Mapping) else current,
+                        observed_execution if isinstance(observed_execution, Mapping) else current_execution,
+                    ) from None
+                if status_code == 429:
+                    retry_after = error.retry_after if isinstance(error, ProContractHttpError) else None
+                    _observe_rate_limit(breaker, retry_after, str(error), clock, deadline)
+                    if _backoff(breaker, clock, sleeper, poll_interval, deadline):
+                        raise ProContractNativeOutcome(
+                            _verification_safety_completion(breaker, clock, deadline)
+                            or ProContractCompletion.LOST_SERVER,
+                            observed if isinstance(observed, Mapping) else current,
+                            observed_execution if isinstance(observed_execution, Mapping) else current_execution,
+                        ) from None
+                    if attempt + 1 >= MAX_MUTATION_ATTEMPTS:
+                        raise ProContractNativeOutcome(
+                            ProContractCompletion.LOST_SERVER,
+                            observed if isinstance(observed, Mapping) else current,
+                            observed_execution if isinstance(observed_execution, Mapping) else current_execution,
+                        ) from None
+                    continue
+                if not (transient or status_code is None or status_code >= 500):
+                    raise ProContractNativeOutcome(
+                        ProContractCompletion.LOST_SERVER,
+                        observed if isinstance(observed, Mapping) else current,
+                        observed_execution if isinstance(observed_execution, Mapping) else current_execution,
+                    ) from None
+                if attempt + 1 >= MAX_MUTATION_ATTEMPTS or clock() >= deadline:
+                    raise ProContractNativeOutcome(
+                        ProContractCompletion.LOST_SERVER,
+                        observed if isinstance(observed, Mapping) else current,
+                        observed_execution if isinstance(observed_execution, Mapping) else current_execution,
+                    ) from None
+                sleeper(min(poll_interval, deadline - clock()))
     else:
         raise ProContractConflictError("Contract left verification before attestation")
-    final = api.get_contract(str(payload["id"]))
-    final_execution = api.get_execution(str(payload["id"]))
-    if final is None or final_execution is None:
-        raise ProContractDeliveryError("Contract coordinates disappeared after attestation")
-    final = _validate_contract(final, payload)
-    final_execution = _validate_execution(final_execution, payload, int(final["revision"]))
+    final, final_execution = _observe_after_attestation(
+        api,
+        payload,
+        current,
+        current_execution,
+        breaker,
+        clock,
+        sleeper,
+        poll_interval,
+        deadline,
+    )
     if _binding_identity(final_execution) != _binding_identity(execution):
         raise ProContractConflictError("Contract execution binding changed after attestation")
     if (
@@ -1291,7 +1543,7 @@ def _deliver(
         job.job.root / "procontract-discharge.json",
         _sanitize(
             {"version": 1, "contract": final, "execution": final_execution},
-            workspace.manifest.credential_env,
+            _all_credential_names(workspace.manifest.credential_env),
         ),
         "native Contract discharge observation",
     )
@@ -1299,6 +1551,7 @@ def _deliver(
     if final_quiet["quiet"] is not True or final_quiet["outstanding"] != []:
         raise ProContractDeliveryError("Contract scope did not become quiet after attestation")
     _write_json(job.job.root / "procontract-quiet.json", final_quiet)
+    _scan_all_credentials(job.job.root, workspace, export_dir)
     result = _result(
         payload,
         final,
@@ -1319,7 +1572,7 @@ def _deliver(
         stopped=True,
     )
     _write_json(job.job.root / "procontract-result.json", result.to_dict())
-    _verify_no_credentials(job.job.root, workspace.manifest.credential_env)
+    _verify_no_credentials(job.job.root, _all_credential_names(workspace.manifest.credential_env))
     if state.phase == "preflighted":
         hashes = {
             name: _sha256(job.job.root / name)
@@ -1513,7 +1766,7 @@ def _load_or_create_issue(path: Path, workspace: DockerWorkspace, clock: Callabl
         "acceptanceHash": hashlib.sha256(ACCEPTANCE_POLICY.encode()).hexdigest(),
         "replayPolicyHash": _hash_json(REPLAY_POLICY),
     }
-    if _contains_credential(record, _credential_values(workspace.manifest.credential_env)):
+    if _contains_credential(record, _credential_values(_all_credential_names(workspace.manifest.credential_env))):
         raise ProContractError("Contract issue request contains a provider credential")
     _write_json(path, record)
     return record
@@ -1565,13 +1818,63 @@ def _issue_or_reconcile(
     return validated
 
 
+def _reconcile_ambiguous_issue(
+    api: ProContractApi,
+    payload: Mapping[str, object],
+    path: Path,
+    credential_names: tuple[str, ...],
+) -> Mapping[str, object] | None:
+    contract = api.get_contract(str(payload["id"]))
+    execution = api.get_execution(str(payload["id"]))
+    if contract is None and execution is None:
+        return None
+    if contract is not None and execution is None:
+        _validate_contract(contract, payload)
+        return None
+    if contract is None:
+        raise ProContractConflictError("ambiguous issue left an incomplete native Contract binding")
+    contract = _validate_contract(contract, payload)
+    execution = _validate_execution(execution, payload, int(contract["revision"]))
+    reconciled = {
+        "data": contract,
+        "execution": execution,
+        "receipt": None,
+        "reconciliation": {
+            "version": 1,
+            "payloadHash": _hash_json(payload),
+            "contractHash": _hash_json(contract),
+            "executionHash": _hash_json(execution),
+        },
+    }
+    _write_or_verify_json(path, _sanitize(reconciled, credential_names), "ambiguous Contract issue reconciliation")
+    return _validate_issue_response(reconciled, payload)
+
+
 def _validate_issue_response(raw: object, payload: Mapping[str, object]) -> Mapping[str, object]:
-    if not isinstance(raw, Mapping) or set(raw) != {"data", "execution", "receipt"}:
+    if not isinstance(raw, Mapping) or set(raw) not in (
+        {"data", "execution", "receipt"},
+        {"data", "execution", "receipt", "reconciliation"},
+    ):
         raise ProContractError("Contract issue response has invalid fields")
     contract = _validate_contract(raw["data"], payload)
     execution = _validate_execution(raw["execution"], payload, int(contract["revision"]))
-    _validate_receipt(raw["receipt"], "issue")
-    return {"data": contract, "execution": execution, "receipt": raw["receipt"]}
+    if "reconciliation" not in raw:
+        _validate_receipt(raw["receipt"], "issue")
+        return {"data": contract, "execution": execution, "receipt": raw["receipt"]}
+    reconciliation = raw["reconciliation"]
+    if (
+        raw["receipt"] is not None
+        or not isinstance(reconciliation, Mapping)
+        or reconciliation
+        != {
+            "version": 1,
+            "payloadHash": _hash_json(payload),
+            "contractHash": _hash_json(contract),
+            "executionHash": _hash_json(execution),
+        }
+    ):
+        raise ProContractConflictError("ambiguous issue reconciliation is invalid")
+    return {"data": contract, "execution": execution, "receipt": None, "reconciliation": reconciliation}
 
 
 def _validate_contract(raw: object, payload: Mapping[str, object]) -> Mapping[str, object]:
@@ -1946,6 +2249,92 @@ def _semantic_inventory(root: Path, *, read_only_modes: bool = False) -> list[di
     ]
 
 
+def _scan_all_credentials(job_root: Path, workspace: DockerWorkspace, export: Path) -> None:
+    names = _all_credential_names(workspace.manifest.credential_env)
+    _scan_control_credentials(job_root, names)
+    for root in (
+        Path(workspace.manifest.subject_dir),
+        Path(workspace.candidate),
+        export,
+        Path(log_dir) if (log_dir := getattr(workspace.manifest, "log_dir", None)) is not None else None,
+    ):
+        if root is not None and root.is_dir():
+            _verify_no_credentials(root, names, published_only=False)
+
+
+def _all_credential_names(names: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(dict.fromkeys((*names, "OPENCODE_SERVER_PASSWORD")))
+
+
+def _scan_terminal_credentials(job_root: Path, workspace: DockerWorkspace) -> None:
+    names = _all_credential_names(workspace.manifest.credential_env)
+    _scan_control_credentials(job_root, names)
+    roots = [
+        Path(workspace.manifest.subject_dir),
+        Path(workspace.candidate),
+        *Path(workspace.manifest.state_dir).glob("contract-export-pct_*"),
+    ]
+    if (log_dir := getattr(workspace.manifest, "log_dir", None)) is not None:
+        roots.append(Path(log_dir))
+    for root in roots:
+        if root.is_dir():
+            _verify_no_credentials(root, names, published_only=False)
+
+
+def _scan_control_credentials(job_root: Path, names: tuple[str, ...]) -> None:
+    secrets = tuple(value.encode() for value in _credential_values(names))
+    if not secrets:
+        return
+    total = 0
+    count = 0
+    leaked: list[Path] = []
+    subject = job_root / "subject"
+    for path in sorted(job_root.rglob("*")):
+        if path == subject or subject in path.parents or path.suffix not in {".json", ".log"}:
+            continue
+        count += 1
+        if count > MAX_CREDENTIAL_SCAN_FILES or path.is_symlink() or not path.is_file():
+            raise ProContractCredentialScanError("ProContract control artifact scan exceeded file bounds")
+        if any(secret in str(path.relative_to(job_root)).encode() for secret in secrets):
+            leaked.append(path)
+            continue
+        found, size = _file_contains_credentials(path, secrets, MAX_CREDENTIAL_SCAN_BYTES - total)
+        total += size
+        if found:
+            leaked.append(path)
+    if not leaked:
+        return
+    for path in leaked:
+        path.unlink(missing_ok=True)
+        _sync_directory(path.parent)
+        parent = path.parent
+        while parent != job_root:
+            try:
+                parent.rmdir()
+            except OSError:
+                break
+            _sync_directory(parent.parent)
+            parent = parent.parent
+    raise CredentialLeakError("provider credential appears in a ProContract control artifact")
+
+
+def _file_contains_credentials(path: Path, secrets: tuple[bytes, ...], remaining: int) -> tuple[bool, int]:
+    overlap = max(len(secret) for secret in secrets) - 1
+    pending = b""
+    size = 0
+    with path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            size += len(chunk)
+            if size > remaining:
+                raise ProContractCredentialScanError("ProContract control artifact scan exceeded byte bounds")
+            pending += chunk
+            split = max(0, len(pending) - overlap)
+            if any(secret in pending[: split + overlap] for secret in secrets):
+                return True, size
+            pending = pending[split:]
+    return any(secret in pending for secret in secrets), size
+
+
 def _require_package_record(raw: object, job_root: Path) -> Path:
     if (
         not isinstance(raw, Mapping)
@@ -1979,14 +2368,89 @@ def _sha256_value(value: object) -> bool:
     return isinstance(value, str) and len(value) == 64 and all(character in "0123456789abcdef" for character in value)
 
 
+def _observe_after_attestation(
+    api: ProContractApi,
+    payload: Mapping[str, object],
+    current: Mapping[str, object],
+    current_execution: Mapping[str, object],
+    breaker: CircuitBreaker,
+    clock: Callable[[], float],
+    sleeper: Callable[[float], None],
+    poll_interval: float,
+    deadline: float,
+) -> tuple[Mapping[str, object], Mapping[str, object]]:
+    for attempt in range(MAX_MUTATION_ATTEMPTS):
+        try:
+            contract = api.get_contract(str(payload["id"]))
+            execution = api.get_execution(str(payload["id"]))
+            if contract is not None and execution is not None:
+                contract = _validate_contract(contract, payload)
+                execution = _validate_execution(execution, payload, int(contract["revision"]))
+                if _binding_identity(execution) != _binding_identity(current_execution):
+                    raise ProContractConflictError("Contract execution binding changed after attestation")
+                native = _native_outcome_completion(contract)
+                if native is not None and contract["status"] != "discharged":
+                    raise ProContractNativeOutcome(native, contract, execution)
+                if _attestation_coordinates(contract) != _attestation_coordinates(current):
+                    raise ProContractConflictError("Contract coordinates changed after attestation")
+                if contract["status"] == "discharged":
+                    return contract, execution
+                if contract["status"] != "verification":
+                    raise ProContractNativeOutcome(ProContractCompletion.OUTSTANDING, contract, execution)
+        except ProContractNativeOutcome:
+            raise
+        except ProContractConflictError:
+            raise
+        except ProContractHttpError as error:
+            if error.status_code in {401, 403}:
+                breaker.observe_error(error.status_code, detail=str(error))
+                raise ProContractNativeOutcome(ProContractCompletion.AUTH, current, current_execution) from None
+            if error.status_code == 429:
+                _observe_rate_limit(breaker, error.retry_after, str(error), clock, deadline)
+                if _backoff(breaker, clock, sleeper, poll_interval, deadline):
+                    raise ProContractNativeOutcome(
+                        _verification_safety_completion(breaker, clock, deadline) or ProContractCompletion.LOST_SERVER,
+                        current,
+                        current_execution,
+                    ) from None
+            elif not (error.transient or error.status_code is None or error.status_code >= 500):
+                raise ProContractNativeOutcome(ProContractCompletion.LOST_SERVER, current, current_execution) from None
+        except ProContractError:
+            pass
+        if attempt + 1 >= MAX_MUTATION_ATTEMPTS or clock() >= deadline:
+            break
+        sleeper(min(poll_interval, deadline - clock()))
+    raise ProContractNativeOutcome(ProContractCompletion.LOST_SERVER, current, current_execution)
+
+
 def _attestation_coordinates(contract: Mapping[str, object]) -> tuple[object, ...]:
     handoff = contract.get("handoff")
+    replay = handoff.get("replay") if isinstance(handoff, Mapping) else None
     return (
         contract["id"],
         contract["revision"],
         contract["specHash"],
         handoff.get("subjectHash") if isinstance(handoff, Mapping) else None,
+        replay.get("policyHash") if isinstance(replay, Mapping) else None,
+        replay.get("subjectHash") if isinstance(replay, Mapping) else None,
+        replay.get("evidenceHash") if isinstance(replay, Mapping) else None,
+        replay.get("passed") if isinstance(replay, Mapping) else None,
     )
+
+
+def _native_outcome_completion(contract: Mapping[str, object]) -> ProContractCompletion | None:
+    if contract.get("challenge") is not None:
+        return ProContractCompletion.CHALLENGED
+    status = contract.get("status")
+    if status == "escalated":
+        return ProContractCompletion.ESCALATED
+    if status == "released":
+        return ProContractCompletion.RELEASED
+    if status == "discharged":
+        return ProContractCompletion.DISCHARGED
+    if status in {"dormant", "active"}:
+        return ProContractCompletion.OUTSTANDING
+    return None
 
 
 def _safety_completion(
@@ -2006,6 +2470,21 @@ def _safety_completion(
         return ProContractCompletion.PROVIDER_TURNS
     if actions >= getattr(limits, "procontract_actions"):
         return ProContractCompletion.ACTIONS
+    if clock() >= deadline:
+        return ProContractCompletion.WALL_TIME
+    return None
+
+
+def _verification_safety_completion(
+    breaker: CircuitBreaker,
+    clock: Callable[[], float],
+    deadline: float,
+) -> ProContractCompletion | None:
+    reason = breaker.active_stop_reason
+    if reason == "provider authentication failure":
+        return ProContractCompletion.AUTH
+    if reason is not None:
+        return ProContractCompletion.HARD_COST
     if clock() >= deadline:
         return ProContractCompletion.WALL_TIME
     return None
@@ -2036,7 +2515,7 @@ def _stop_and_finish(
         job.job.root / "procontract-native-result.json",
         _sanitize(
             {"version": 1, "contract": contract, "execution": execution, "quiet": quiet},
-            workspace.manifest.credential_env,
+            _all_credential_names(workspace.manifest.credential_env),
         ),
         "native Contract terminal observation",
     )
@@ -2099,6 +2578,11 @@ def _finish_without_delivery(
 ) -> ProContractResult:
     if workspace.lease._handle_active:
         workspace.stop()
+    try:
+        _scan_terminal_credentials(job.job.root, workspace)
+    except CredentialLeakError:
+        completion = ProContractCompletion.DELIVERY_FAILED
+        error = "credential leak detected before terminal publication"
     discharge_path = job.job.root / "procontract-discharge.json"
     effective_contract = contract
     effective_execution = execution
@@ -2316,6 +2800,16 @@ def _verify_done_delivery(job_root: Path, result: ProContractResult) -> None:
         _validate_preflight(preflight, archive)
         if not isinstance(preflight, Mapping) or result.executable_hash != preflight["executableHash"]:
             raise ProContractConflictError("terminal preflight conflicts with result")
+        issue = _read_json(job_root / "procontract-issue.json")
+        discharge = _read_json(job_root / "procontract-discharge.json")
+        subject_record = _read_json(job_root / "procontract-subject.json")
+        if (
+            not isinstance(issue, Mapping)
+            or not isinstance(discharge, Mapping)
+            or not isinstance(subject_record, Mapping)
+        ):
+            raise ProContractConflictError("terminal delivery coordinates are invalid")
+        execution = discharge.get("execution")
         report_path = job_root / "verifier-report.json"
         report = _read_json(report_path)
         if (
@@ -2323,23 +2817,45 @@ def _verify_done_delivery(job_root: Path, result: ProContractResult) -> None:
             or report_path.read_bytes()
             != json.dumps(report, allow_nan=False, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
             or result.report_hash != _sha256(report_path)
-            or report.get("contractID") != result.contract_id
-            or report.get("revision") != result.revision
-            or report.get("specHash") != result.spec_hash
-            or report.get("subjectHash") != result.subject_hash
+            or report.get("issue") != {"payloadHash": issue.get("payloadHash")}
+            or report.get("contract")
+            != {
+                "contractID": result.contract_id,
+                "revision": result.revision,
+                "specHash": result.spec_hash,
+                "subjectHash": result.subject_hash,
+            }
+            or not isinstance(execution, Mapping)
+            or report.get("execution")
+            != {
+                "sessionID": result.session_id,
+                "promptID": result.prompt_id,
+                "model": execution.get("model"),
+                "location": execution.get("location"),
+            }
             or report.get("acceptanceHash") != result.acceptance_hash
-            or not isinstance(report.get("replay"), Mapping)
-            or report["replay"].get("evidenceHash") != result.replay_evidence_hash
-            or report.get("package") != {"archiveHash": result.package_hash}
+            or report.get("export")
+            != {
+                "subjectHash": result.subject_hash,
+                "treeHash": _tree_hash(subject_record.get("subject")),
+            }
+            or report.get("replay")
+            != {
+                "policyHash": _hash_json(REPLAY_POLICY),
+                "evidenceHash": result.replay_evidence_hash,
+                "passed": True,
+            }
+            or report.get("package") != {"command": "package_workspace", "exit": 0, "archiveHash": result.package_hash}
             or report.get("preflight")
             != {
                 "executableHash": result.executable_hash,
                 "commands": PREFLIGHT_COMMANDS,
                 "exits": [0, 0, 0],
+                "outputHash": preflight["outputHash"],
+                "reportHash": _sha256(job_root / "procontract-preflight.json"),
             }
         ):
             raise ProContractConflictError("terminal verifier report conflicts with result")
-        subject_record = _read_json(job_root / "procontract-subject.json")
         if (
             not isinstance(subject_record, Mapping)
             or set(subject_record) != {"version", "subject"}
@@ -2354,7 +2870,6 @@ def _verify_done_delivery(job_root: Path, result: ProContractResult) -> None:
             "evidenceHash": result.report_hash,
         }:
             raise ProContractConflictError("terminal attestation request conflicts with result")
-        discharge = _read_json(job_root / "procontract-discharge.json")
         if not isinstance(discharge, Mapping) or set(discharge) != {"version", "contract", "execution"}:
             raise ProContractConflictError("terminal discharge observation is invalid")
         contract = discharge["contract"]
@@ -2388,6 +2903,16 @@ def _canonical_bytes(value: object) -> bytes:
         raise ProContractError("ProContract value is not canonical JSON") from error
 
 
+def _validate_verifier_report(path: Path, expected: Mapping[str, object]) -> str:
+    observed = _read_json(path)
+    canonical = json.dumps(
+        expected, allow_nan=False, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode()
+    if observed != expected or path.read_bytes() != canonical:
+        raise ProContractDeliveryError("persisted verifier report conflicts with current delivery evidence")
+    return hashlib.sha256(canonical).hexdigest()
+
+
 def _write_canonical_report(path: Path, value: object) -> None:
     try:
         encoded = json.dumps(value, allow_nan=False, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
@@ -2411,6 +2936,14 @@ def _write_canonical_report(path: Path, value: object) -> None:
 
 def _hash_json(value: object) -> str:
     return hashlib.sha256(_canonical_bytes(value)).hexdigest()
+
+
+def _tree_hash(value: object) -> str:
+    try:
+        encoded = json.dumps(value, allow_nan=False, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    except (TypeError, ValueError) as error:
+        raise ProContractError("exported subject tree is not canonical JSON") from error
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _read_json(path: Path) -> object:
