@@ -42,6 +42,7 @@ _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 _ENV = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _CONTAINER_ID = re.compile(r"[0-9a-f]{12,64}\Z")
 _PHASES = frozenset({"planned", "preparing", "candidate_ready", "launching", "running", "stopped"})
+_CLEANROOM_PHASES = frozenset({"planned", "preparing", "candidate_ready", "launching"})
 _FIXED_ENV = {
     "HOME": "/state/home",
     "XDG_CACHE_HOME": "/cache",
@@ -332,6 +333,12 @@ class WorkspaceRequest:
 
 @dataclass(frozen=True)
 class DockerWorkspace:
+    """Adapter handoff token backed by a durably running workspace manifest.
+
+    Session and Contract adapters must obtain this token from :func:`ensure_workspace`
+    before creating or prompting any model execution.
+    """
+
     manifest: WorkspaceManifest
     manifest_path: Path
     docker: str
@@ -339,6 +346,12 @@ class DockerWorkspace:
     health_probe: _HealthProbe
     health_timeout: float
     adopted: bool = False
+
+    def __post_init__(self) -> None:
+        if self.manifest.phase != "running":
+            raise WorkspaceError("adapter workspace requires a durably running manifest")
+        if _load_manifest(self.manifest_path) != self.manifest:
+            raise ContainerConflictError("adapter workspace does not match its durable running manifest")
 
     @property
     def container_id(self) -> str:
@@ -385,7 +398,11 @@ class DockerWorkspace:
 
 
 def ensure_workspace(request: WorkspaceRequest) -> DockerWorkspace:
-    """Prepare or safely resume exactly one persistent private OpenCode workspace."""
+    """Return only after the exact container has a durably published ``running`` phase.
+
+    Session and Contract adapters must not create or prompt model work before this
+    function returns its :class:`DockerWorkspace` handoff token.
+    """
     request = _validate_request(request)
     runner = request.docker_runner or _run_docker
     probe = request.health_probe or _probe_health
@@ -427,9 +444,10 @@ def _resume(
         _prepare_bind_paths(preparing)
         manifest = replace(preparing, phase="candidate_ready")
         _write_manifest(manifest.manifest_path, manifest)
-    _require_candidate_ready(manifest)
-    _verify_candidate(runner, request.docker, manifest, publish=False)
-    _cleanup_candidate_preparation(manifest)
+    if manifest.phase in _CLEANROOM_PHASES:
+        _require_candidate_ready(manifest)
+        _verify_candidate(runner, request.docker, manifest, publish=False)
+        _cleanup_candidate_preparation(manifest)
     inspected = _inspect_container(runner, request.docker, manifest.container_name)
     if manifest.container_id is None:
         if inspected is None:
@@ -456,6 +474,8 @@ def _launch(
     adopted: bool,
 ) -> DockerWorkspace:
     _require_binary(manifest)
+    if manifest.phase not in {"candidate_ready", "launching"}:
+        raise WorkspaceError("workspace launch requires a verified pre-execution phase")
     _require_candidate_ready(manifest)
     _verify_candidate(runner, request.docker, manifest, publish=False)
     launching = replace(manifest, container_id=None, port=None, phase="launching")
@@ -523,12 +543,17 @@ def _activate(
         raise ContainerConflictError("owned container did not start cleanly")
     _require_exact_container(inspected, manifest, check_port=False)
     port = _published_port(runner, request.docker, manifest.container_id)
-    launching = replace(manifest, port=port, phase="launching")
-    _require_exact_container(inspected, launching, check_port=True)
-    _write_manifest(launching.manifest_path, launching)
-    _wait_health(launching, probe, request.health_timeout)
-    _require_binary(launching)
-    ready = replace(launching, phase="running")
+    activated = replace(
+        manifest,
+        port=port,
+        phase="launching" if manifest.phase in _CLEANROOM_PHASES else manifest.phase,
+    )
+    _require_exact_container(inspected, activated, check_port=True)
+    if activated.phase == "launching":
+        _write_manifest(activated.manifest_path, activated)
+    _wait_health(activated, probe, request.health_timeout)
+    _require_binary(activated)
+    ready = replace(activated, phase="running")
     _write_manifest(ready.manifest_path, ready)
     return DockerWorkspace(ready, ready.manifest_path, request.docker, runner, probe, request.health_timeout, adopted)
 

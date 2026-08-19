@@ -400,6 +400,54 @@ def test_exact_manifest_adopts_and_restarts_a_stopped_container(tmp_path: Path) 
     assert any(command[1] == "start" for command in docker.commands)
 
 
+@pytest.mark.parametrize("phase", ["running", "stopped"])
+def test_running_and_stopped_adoption_allows_mutable_candidate_tree(tmp_path: Path, phase: str) -> None:
+    docker = RecordingDocker()
+    value = request(tmp_path, docker)
+    workspace = ensure_workspace(value)
+    if phase == "stopped":
+        workspace.stop()
+    workspace.candidate.joinpath("created-by-agent").write_text("before")
+    workspace.candidate.joinpath("created-by-agent").write_text("edited")
+    workspace.candidate.joinpath("created-by-agent").chmod(0o600)
+    workspace.candidate.joinpath("reference").unlink()
+    workspace.candidate.joinpath("executable").write_text("submission")
+
+    resumed = ensure_workspace(value)
+
+    assert resumed.adopted
+    assert resumed.manifest.phase == "running"
+    assert resumed.candidate.joinpath("created-by-agent").read_text() == "edited"
+    assert resumed.candidate.joinpath("executable").read_text() == "submission"
+
+
+@pytest.mark.parametrize("phase", ["candidate_ready", "launching"])
+def test_preexecution_phase_rejects_mutated_candidate_before_launch(tmp_path: Path, phase: str) -> None:
+    docker = RecordingDocker()
+    value = request(tmp_path, docker)
+    workspace = ensure_workspace(value)
+    campaign_workspace._write_manifest(
+        workspace.manifest_path,
+        replace(workspace.manifest, phase=phase, port=None if phase == "candidate_ready" else workspace.port),
+    )
+    workspace.candidate.joinpath("mutated-before-agent").write_text("foreign")
+    starts = sum(command[1] == "start" for command in docker.commands)
+
+    with pytest.raises(DockerCommandError):
+        ensure_workspace(value)
+
+    assert sum(command[1] == "start" for command in docker.commands) == starts
+
+
+def test_docker_workspace_is_an_adapter_token_only_after_running_commit(tmp_path: Path) -> None:
+    workspace = ensure_workspace(request(tmp_path, RecordingDocker()))
+
+    with pytest.raises(WorkspaceError, match="adapter.*running"):
+        replace(workspace, manifest=replace(workspace.manifest, phase="candidate_ready"))
+
+    assert json.loads(workspace.manifest_path.read_text())["phase"] == "running"
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -574,7 +622,10 @@ def test_forged_ready_marker_with_wrong_candidate_mode_never_launches(tmp_path: 
     docker = RecordingDocker()
     value = request(tmp_path, docker)
     workspace = ensure_workspace(value)
-    workspace.stop()
+    campaign_workspace._write_manifest(
+        workspace.manifest_path,
+        replace(workspace.manifest, phase="launching"),
+    )
     workspace.candidate.joinpath("forged-mode").write_text("foreign")
     starts = sum(command[1] == "start" for command in docker.commands)
 
@@ -638,6 +689,10 @@ def test_candidate_ready_marker_is_exact_owned_identity(tmp_path: Path) -> None:
     docker = RecordingDocker()
     value = request(tmp_path, docker)
     workspace = ensure_workspace(value)
+    campaign_workspace._write_manifest(
+        workspace.manifest_path,
+        replace(workspace.manifest, phase="candidate_ready", port=None),
+    )
     marker = workspace.candidate / ".programbench-cleanroom.json"
     marker.write_text('{"version":"1","job_id":"foreign"}')
 
@@ -993,36 +1048,19 @@ def test_real_docker_runs_two_exact_isolated_workspaces(tmp_path: Path, monkeypa
                 "-ec",
                 "chmod 777 /candidate/member-data; "
                 "chown root:root /candidate/member-executable /candidate/.programbench-cleanroom.json; "
-                "chmod 600 /candidate/.programbench-cleanroom.json",
-            ),
-            60,
-        )
-        with pytest.raises(WorkspaceError):
-            ensure_workspace(values[0])
-        assert len([command for command in commands if command[1] == "start"]) == starts
-        _run_docker(
-            (
-                "docker",
-                "run",
-                "--rm",
-                "--platform",
-                "linux/amd64",
-                "--user",
-                "root",
-                "--network",
-                "none",
-                "-v",
-                f"{workspaces[0].candidate}:/candidate:rw",
-                tag,
-                "/bin/sh",
-                "-ec",
-                "chmod 640 /candidate/member-data; "
-                "chown agent:agent /candidate/member-executable /candidate/.programbench-cleanroom.json; "
-                "chmod 644 /candidate/.programbench-cleanroom.json",
+                "chmod 600 /candidate/.programbench-cleanroom.json; "
+                "rm /candidate/reference; "
+                "printf edited > /candidate/README; chmod 644 /candidate/README; "
+                "printf submission > /candidate/executable; chmod 744 /candidate/executable",
             ),
             60,
         )
         assert ensure_workspace(values[0]).adopted
+        assert len([command for command in commands if command[1] == "start"]) == starts + 1
+        assert stat.S_IMODE(workspaces[0].candidate.joinpath("member-data").stat().st_mode) == 0o777
+        assert not workspaces[0].candidate.joinpath("reference").exists()
+        assert workspaces[0].candidate.joinpath("README").read_text() == "edited"
+        assert workspaces[0].candidate.joinpath("executable").read_text() == "submission"
 
         serialized_commands = json.dumps(commands)
         monkeypatch.setenv("SCAN_KEY", secret_key)
