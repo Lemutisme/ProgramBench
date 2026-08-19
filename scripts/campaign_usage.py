@@ -8,7 +8,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, localcontext
 from email.utils import parsedate_to_datetime
 from typing import Callable, Mapping
 
@@ -72,6 +72,18 @@ class UsageSummary:
             raise UsageParseError("cost must be a nonnegative finite decimal")
         if type(self.telemetry_gap) is not bool or not isinstance(self.turns, tuple):
             raise UsageParseError("invalid usage summary shape")
+        if self.prompt_total != self.input + self.cache_read + self.cache_write:
+            raise UsageParseError("prompt total is inconsistent with token totals")
+        if self.turns_with_cache + self.turns_without_cache != self.provider_turns:
+            raise UsageParseError("cache hit counts are inconsistent with provider turns")
+        if self.turns and len(self.turns) != self.provider_turns:
+            raise UsageParseError("per-turn records are inconsistent with provider turns")
+        if self.max_prompt_total > self.prompt_total:
+            raise UsageParseError("maximum prompt exceeds prompt total")
+        if self.turns and self.telemetry_gap != any(
+            turn.cache_read > 0 and turn.cache_write == 0 for turn in self.turns
+        ):
+            raise UsageParseError("telemetry gap is inconsistent with per-turn cache totals")
 
     @property
     def prompt_tokens(self) -> int:
@@ -132,48 +144,9 @@ def summarize_usage(messages: Mapping[str, object] | bytes | str) -> UsageSummar
 
     turns: list[TurnUsage] = []
     for message in payload["data"]:
-        if not isinstance(message, Mapping):
-            raise UsageParseError("projected message must be an object")
-        source = message
-        if "info" in message:
-            if not isinstance(message["info"], Mapping):
-                raise UsageParseError("message info must be an object")
-            source = message["info"]
-        role = source.get("role", message.get("role"))
-        if not isinstance(role, str):
-            raise UsageParseError("message role must be a string")
-        if role == "user":
-            continue
-        if role != "assistant":
-            raise UsageParseError(f"unsupported message role: {role}")
-        tokens = source.get("tokens", message.get("tokens"))
-        if tokens is None:
-            tokens = {}
-        if not isinstance(tokens, Mapping):
-            raise UsageParseError("assistant tokens must be an object")
-        cache = tokens.get("cache")
-        if cache is None:
-            cache = {}
-        if not isinstance(cache, Mapping):
-            raise UsageParseError("assistant cache tokens must be an object")
-        input_tokens = _token(tokens.get("input"))
-        output_tokens = _token(tokens.get("output"))
-        reasoning_tokens = _token(tokens.get("reasoning"))
-        cache_read = _token(cache.get("read", tokens.get("cache_read")))
-        cache_write = _token(cache.get("write", tokens.get("cache_write")))
-        cost = _decimal(source.get("cost", message.get("cost")))
-        prompt_total = input_tokens + cache_read + cache_write
-        turns.append(
-            TurnUsage(
-                input=input_tokens,
-                output=output_tokens,
-                reasoning=reasoning_tokens,
-                cache_read=cache_read,
-                cache_write=cache_write,
-                prompt_total=prompt_total,
-                cost=cost,
-            )
-        )
+        turn = _projected_turn(message)
+        if turn is not None:
+            turns.append(turn)
 
     return UsageSummary(
         provider_turns=len(turns),
@@ -186,9 +159,65 @@ def summarize_usage(messages: Mapping[str, object] | bytes | str) -> UsageSummar
         turns_with_cache=sum(turn.cache_hit for turn in turns),
         turns_without_cache=sum(not turn.cache_hit for turn in turns),
         max_prompt_total=max((turn.prompt_total for turn in turns), default=0),
-        cost=sum((turn.cost for turn in turns), Decimal(0)),
+        cost=_sum_decimals(turn.cost for turn in turns),
         telemetry_gap=any(turn.cache_read > 0 and turn.cache_write == 0 for turn in turns),
         turns=tuple(turns),
+    )
+
+
+def _projected_turn(message: object) -> TurnUsage | None:
+    if not isinstance(message, Mapping):
+        raise UsageParseError("projected message must be an object")
+    if "info" in message:
+        if (
+            set(message) - {"info", "parts"}
+            or not isinstance(message.get("info"), Mapping)
+            or not isinstance(message.get("parts"), list)
+        ):
+            raise UsageParseError("mixed or malformed upstream message schema")
+        source = message["info"]
+        role = source.get("role")
+        if role == "user":
+            return None
+        if role != "assistant":
+            raise UsageParseError("upstream message role must be assistant or user")
+        return _turn_from_source(source)
+    if "role" in message or "parts" in message:
+        raise UsageParseError("mixed projected message schema")
+    message_type = message.get("type")
+    if message_type == "user":
+        if not isinstance(message.get("content"), str):
+            raise UsageParseError("flat user message requires content")
+        return None
+    if message_type != "assistant" or not {"type", "cost", "tokens", "content"} <= set(message):
+        raise UsageParseError("flat assistant message requires type, cost, tokens, and content")
+    if not isinstance(message["content"], str):
+        raise UsageParseError("flat assistant content must be a string")
+    return _turn_from_source(message)
+
+
+def _turn_from_source(source: Mapping[str, object]) -> TurnUsage:
+    tokens = source.get("tokens")
+    if not isinstance(tokens, Mapping):
+        raise UsageParseError("assistant tokens must be an object")
+    cache = tokens.get("cache")
+    if not isinstance(cache, Mapping):
+        raise UsageParseError("assistant cache tokens must be an object")
+    input_tokens = _token(tokens.get("input"))
+    output_tokens = _token(tokens.get("output"))
+    reasoning_tokens = _token(tokens.get("reasoning"))
+    cache_read = _token(cache.get("read"))
+    cache_write = _token(cache.get("write"))
+    cost = _usage_cost(source.get("cost"))
+    prompt_total = input_tokens + cache_read + cache_write
+    return TurnUsage(
+        input=input_tokens,
+        output=output_tokens,
+        reasoning=reasoning_tokens,
+        cache_read=cache_read,
+        cache_write=cache_write,
+        prompt_total=prompt_total,
+        cost=cost,
     )
 
 
@@ -248,9 +277,12 @@ class CircuitBreaker:
         self._retry_after_max = retry_after_max
         self._lock = threading.RLock()
         self._campaign_usage = UsageSummary()
-        self._jobs: dict[str, tuple[int, UsageSummary]] = {}
+        self._jobs: dict[str, tuple[int, UsageSummary, bool]] = {}
+        self._terminal_sequence: list[str] = []
         self._cache_failures = 0
         self._pause_causes: set[str] = set()
+        self._cache_acknowledged = False
+        self._soft_acknowledged = False
         self._backoff_until: float | None = None
 
     @classmethod
@@ -362,24 +394,39 @@ class CircuitBreaker:
             if previous is not None and resolved_generation < previous[0]:
                 raise StaleObservationError("stale usage generation")
             if previous is not None and resolved_generation == previous[0]:
-                if resolved_usage != previous[1]:
+                if resolved_usage != previous[1] or terminal != previous[2]:
                     raise StaleObservationError("usage changed without a newer generation")
                 return
-            if previous is not None:
-                _ensure_monotonic(previous[1], resolved_usage)
-                delta = _difference(resolved_usage, previous[1])
-            else:
-                delta = resolved_usage
-            self._jobs[resolved_job] = (resolved_generation, resolved_usage)
-            self._campaign_usage = _add(self._campaign_usage, delta, resolved_usage.max_prompt_total)
+            was_terminal = previous[2] if previous is not None else False
+            is_terminal = was_terminal or terminal
+            self._jobs[resolved_job] = (resolved_generation, resolved_usage, is_terminal)
+            self._soft_acknowledged = False
+            if is_terminal and not was_terminal:
+                self._terminal_sequence.append(resolved_job)
+                self._cache_acknowledged = False
+            self._recompute_usage()
             self._apply_cost_caps()
-            if terminal and resolved_usage.provider_turns >= self.cache_warmup_turns:
-                if resolved_usage.cache_read_ratio < self.minimum_cache_ratio:
-                    self._cache_failures += 1
-                    if self._cache_failures >= self.consecutive_failures:
-                        self._pause_causes.add("cache")
-                else:
-                    self._cache_failures = 0
+            self._recompute_cache()
+
+    def _recompute_usage(self) -> None:
+        total = UsageSummary()
+        for _, summary, _ in self._jobs.values():
+            total = _add(total, summary, summary.max_prompt_total)
+        self._campaign_usage = total
+
+    def _recompute_cache(self) -> None:
+        failures = 0
+        for job in self._terminal_sequence:
+            summary = self._jobs[job][1]
+            if summary.provider_turns < self.cache_warmup_turns:
+                continue
+            if summary.cache_read_ratio < self.minimum_cache_ratio:
+                failures += 1
+            else:
+                failures = 0
+        self._cache_failures = failures
+        if failures >= self.consecutive_failures and not self._cache_acknowledged:
+            self._pause_causes.add("cache")
 
     def observe_error(
         self,
@@ -399,7 +446,7 @@ class CircuitBreaker:
             if status_code != 429:
                 return
             delay = _retry_after_seconds(retry_after, current, self._retry_after_default, self._retry_after_max)
-            self._backoff_until = current + delay
+            self._backoff_until = max(self._backoff_until or current, current + delay)
 
     def observe_usage(
         self,
@@ -416,13 +463,14 @@ class CircuitBreaker:
 
     def acknowledge(self) -> None:
         with self._lock:
-            self._pause_causes.clear()
-            self._cache_failures = 0
+            self._pause_causes.difference_update({"auth", "cache", "soft"})
+            self._cache_acknowledged = True
+            self._soft_acknowledged = True
 
     def acknowledge_cache(self) -> None:
         with self._lock:
             self._pause_causes.discard("cache")
-            self._cache_failures = 0
+            self._cache_acknowledged = True
 
     def acknowledge_auth(self) -> None:
         with self._lock:
@@ -431,10 +479,10 @@ class CircuitBreaker:
     def acknowledge_soft_cap(self) -> None:
         with self._lock:
             self._pause_causes.discard("soft")
+            self._soft_acknowledged = True
 
     def acknowledge_hard_cap(self) -> None:
-        with self._lock:
-            self._pause_causes.discard("hard")
+        return
 
     def snapshot(self) -> dict[str, object]:
         with self._lock:
@@ -447,14 +495,17 @@ class CircuitBreaker:
                 "retry_after_default": self._retry_after_default,
                 "retry_after_max": self._retry_after_max,
                 "cache_failures": self._cache_failures,
+                "cache_acknowledged": self._cache_acknowledged,
+                "soft_acknowledged": self._soft_acknowledged,
                 "pause_causes": sorted(self._pause_causes),
+                "terminal_sequence": list(self._terminal_sequence),
                 "backoff_until": self._backoff_until,
                 "soft_cost_cap": None if self.soft_cost_cap is None else _decimal_string(self.soft_cost_cap),
                 "hard_cost_cap": None if self.hard_cost_cap is None else _decimal_string(self.hard_cost_cap),
                 "campaign_usage": self._campaign_usage.to_dict(),
                 "jobs": {
-                    job: {"generation": generation, "usage": summary.to_dict()}
-                    for job, (generation, summary) in sorted(self._jobs.items())
+                    job: {"generation": generation, "usage": summary.to_dict(), "terminal": terminal}
+                    for job, (generation, summary, terminal) in sorted(self._jobs.items())
                 },
             }
 
@@ -479,7 +530,10 @@ class CircuitBreaker:
                 "retry_after_default",
                 "retry_after_max",
                 "cache_failures",
+                "cache_acknowledged",
+                "soft_acknowledged",
                 "pause_causes",
+                "terminal_sequence",
                 "backoff_until",
                 "soft_cost_cap",
                 "hard_cost_cap",
@@ -516,21 +570,78 @@ class CircuitBreaker:
         jobs = raw["jobs"]
         if not isinstance(jobs, Mapping):
             raise UsageParseError("breaker jobs must be an object")
-        restored: dict[str, tuple[int, UsageSummary]] = {}
+        restored: dict[str, tuple[int, UsageSummary, bool]] = {}
         for job, item in jobs.items():
-            if not isinstance(job, str) or not isinstance(item, Mapping) or set(item) != {"generation", "usage"}:
+            if (
+                not isinstance(job, str)
+                or not isinstance(item, Mapping)
+                or set(item) != {"generation", "usage", "terminal"}
+            ):
                 raise UsageParseError("invalid breaker job snapshot")
             generation = item["generation"]
             if type(generation) is not int or generation < 0:
                 raise UsageParseError("invalid breaker job generation")
-            restored[job] = (generation, _summary_from_dict(item["usage"]))
+            if type(item["terminal"]) is not bool:
+                raise UsageParseError("invalid breaker job terminal flag")
+            restored[job] = (generation, _summary_from_dict(item["usage"]), item["terminal"])
+        sequence = raw["terminal_sequence"]
+        if (
+            not isinstance(sequence, list)
+            or any(not isinstance(job, str) for job in sequence)
+            or len(sequence) != len(set(sequence))
+        ):
+            raise UsageParseError("invalid terminal sequence")
+        if set(sequence) != {job for job, (_, _, terminal) in restored.items() if terminal}:
+            raise UsageParseError("terminal sequence does not match jobs")
+        if type(raw["cache_acknowledged"]) is not bool:
+            raise UsageParseError("invalid cache acknowledgement")
+        if type(raw["soft_acknowledged"]) is not bool:
+            raise UsageParseError("invalid soft-cap acknowledgement")
         with breaker._lock:
             breaker._cache_failures = raw["cache_failures"]
+            breaker._cache_acknowledged = raw["cache_acknowledged"]
+            breaker._soft_acknowledged = raw["soft_acknowledged"]
             breaker._pause_causes = set(causes)
             breaker._backoff_until = backoff
             breaker._campaign_usage = campaign
             breaker._jobs = restored
+            breaker._terminal_sequence = list(sequence)
+            serialized_causes = set(causes)
+            expected = CircuitBreaker._derived_from_jobs(breaker)
+            if expected != (campaign, breaker._cache_failures):
+                raise UsageParseError("breaker snapshot derived state is inconsistent")
+            if breaker._cache_acknowledged and "cache" in serialized_causes:
+                raise UsageParseError("acknowledged cache pause is inconsistent")
+            if (
+                breaker._cache_failures >= breaker.consecutive_failures
+                and not breaker._cache_acknowledged
+                and "cache" not in serialized_causes
+            ):
+                raise UsageParseError("cache pause is missing")
+            if breaker._soft_acknowledged and "soft" in serialized_causes:
+                raise UsageParseError("acknowledged soft pause is inconsistent")
+            if (
+                breaker.soft_cost_cap is not None
+                and campaign.cost >= breaker.soft_cost_cap
+                and breaker.hard_cost_cap is not None
+                and campaign.cost < breaker.hard_cost_cap
+                and not breaker._soft_acknowledged
+                and "soft" not in serialized_causes
+            ):
+                raise UsageParseError("soft cost pause is missing")
+            if (
+                breaker.hard_cost_cap is not None
+                and campaign.cost >= breaker.hard_cost_cap
+                and "hard" not in breaker._pause_causes
+            ):
+                raise UsageParseError("hard cost pause is missing")
         return breaker
+
+    @staticmethod
+    def _derived_from_jobs(breaker: CircuitBreaker) -> tuple[UsageSummary, int]:
+        breaker._recompute_usage()
+        breaker._recompute_cache()
+        return breaker._campaign_usage, breaker._cache_failures
 
     def _release_backoff(self) -> None:
         if self._backoff_until is not None and self._clock() >= self._backoff_until:
@@ -544,7 +655,7 @@ class CircuitBreaker:
         cost = self._campaign_usage.cost
         if self.hard_cost_cap is not None and cost >= self.hard_cost_cap:
             self._pause_causes.add("hard")
-        elif self.soft_cost_cap is not None and cost >= self.soft_cost_cap:
+        elif self.soft_cost_cap is not None and cost >= self.soft_cost_cap and not self._soft_acknowledged:
             self._pause_causes.add("soft")
 
 
@@ -566,7 +677,12 @@ def _load_json(payload: Mapping[str, object] | bytes | str) -> object:
         raise UsageParseError(f"invalid JSON number: {value}")
 
     try:
-        return json.loads(payload, object_pairs_hook=duplicate_keys, parse_constant=reject_constant)
+        return json.loads(
+            payload,
+            object_pairs_hook=duplicate_keys,
+            parse_float=Decimal,
+            parse_constant=reject_constant,
+        )
     except (TypeError, ValueError, json.JSONDecodeError) as error:
         if isinstance(error, UsageParseError):
             raise
@@ -595,11 +711,32 @@ def _decimal(value: object) -> Decimal:
     return result
 
 
+def _usage_cost(value: object) -> Decimal:
+    if value is None or isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
+        raise UsageParseError("projected message cost must be a JSON number")
+    return _decimal(value)
+
+
 def _decimal_string(value: Decimal) -> str:
     result = format(value, "f")
     if "." in result:
         result = result.rstrip("0").rstrip(".")
     return result or "0"
+
+
+def _sum_decimals(values: object) -> Decimal:
+    decimals = tuple(values)
+    precision = (
+        max(
+            (len(value.as_tuple().digits) for value in decimals if isinstance(value, Decimal)),
+            default=1,
+        )
+        + len(decimals)
+        + 8
+    )
+    with localcontext() as context:
+        context.prec = max(context.prec, precision)
+        return sum(decimals, Decimal(0))
 
 
 def _coerce_summary(value: UsageSummary | Mapping[str, object]) -> UsageSummary:
@@ -683,39 +820,6 @@ def _require_keys(value: Mapping[str, object], allowed: set[str]) -> None:
         raise UsageParseError("snapshot contains unknown or missing fields")
 
 
-def _ensure_monotonic(current: UsageSummary, newer: UsageSummary) -> None:
-    fields = (
-        "provider_turns",
-        "input",
-        "output",
-        "reasoning",
-        "cache_read",
-        "cache_write",
-        "prompt_total",
-        "turns_with_cache",
-        "turns_without_cache",
-    )
-    if any(getattr(newer, field) < getattr(current, field) for field in fields) or newer.cost < current.cost:
-        raise StaleObservationError("usage generation regressed")
-
-
-def _difference(newer: UsageSummary, current: UsageSummary) -> UsageSummary:
-    return UsageSummary(
-        provider_turns=newer.provider_turns - current.provider_turns,
-        input=newer.input - current.input,
-        output=newer.output - current.output,
-        reasoning=newer.reasoning - current.reasoning,
-        cache_read=newer.cache_read - current.cache_read,
-        cache_write=newer.cache_write - current.cache_write,
-        prompt_total=newer.prompt_total - current.prompt_total,
-        turns_with_cache=newer.turns_with_cache - current.turns_with_cache,
-        turns_without_cache=newer.turns_without_cache - current.turns_without_cache,
-        max_prompt_total=newer.max_prompt_total,
-        cost=newer.cost - current.cost,
-        telemetry_gap=newer.telemetry_gap,
-    )
-
-
 def _add(total: UsageSummary, delta: UsageSummary, observed_max: int) -> UsageSummary:
     return UsageSummary(
         provider_turns=total.provider_turns + delta.provider_turns,
@@ -728,7 +832,7 @@ def _add(total: UsageSummary, delta: UsageSummary, observed_max: int) -> UsageSu
         turns_with_cache=total.turns_with_cache + delta.turns_with_cache,
         turns_without_cache=total.turns_without_cache + delta.turns_without_cache,
         max_prompt_total=max(total.max_prompt_total, observed_max),
-        cost=total.cost + delta.cost,
+        cost=_sum_decimals((total.cost, delta.cost)),
         telemetry_gap=total.telemetry_gap or delta.telemetry_gap,
     )
 
