@@ -106,10 +106,12 @@ def preflight_candidate(
             env,
             "if [ ! -d .git ]; then "
             "GIT_AUTHOR_DATE='2000-01-01T00:00:00Z' GIT_COMMITTER_DATE='2000-01-01T00:00:00Z' "
-            "git -c init.defaultBranch=gold init -q && "
-            "git -c user.email=gold@local -c user.name=gold -c commit.gpgsign=false add -A && "
+            f"git -c safe.directory={WORKSPACE_DIR} -c init.defaultBranch=gold init -q && "
+            f"git -c safe.directory={WORKSPACE_DIR} -c user.email=gold@local -c user.name=gold "
+            "-c commit.gpgsign=false add -A && "
             "GIT_AUTHOR_DATE='2000-01-01T00:00:00Z' GIT_COMMITTER_DATE='2000-01-01T00:00:00Z' "
-            "git -c user.email=gold@local -c user.name=gold -c commit.gpgsign=false "
+            f"git -c safe.directory={WORKSPACE_DIR} -c user.email=gold@local -c user.name=gold "
+            "-c commit.gpgsign=false "
             "commit -q --allow-empty -m gold; fi",
             output,
         )

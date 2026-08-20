@@ -20,6 +20,7 @@ the runner (for example `~/.bashrc`, followed by `source ~/.bashrc`), export:
 ```bash
 export OPENAI_API_KEY='...'
 export OPENCODE_SERVER_PASSWORD='...'
+export OPENCODE_REPO="$HOME/src/opencode"
 ```
 
 Do not put credential values in YAML, campaign output, shell history, or issue
@@ -29,8 +30,10 @@ cleanroom Docker evaluation happens after inference freezes.
 
 Use [`scripts/opencode_programbench.yaml`](../scripts/opencode_programbench.yaml)
 as the starting configuration: its limits are 6 hours, 1,000 provider turns,
-and 4,000 ProContract actions. Replace its sample `repo` path with your local
-OpenCode clone. On first planning, the runner makes detached arm worktrees
+and 4,000 ProContract actions. Both arm `repo` fields expand the required
+`${OPENCODE_REPO}` path variable. Expansion is limited to config path fields;
+missing, unbraced, unknown, and credential variable references are rejected
+without logging their values. On first planning, the runner makes detached arm worktrees
 under `OUTPUT/installs/`, pins the configured ProContract SHA and resolved
 vanilla `origin/dev` SHA, and records each binary's version and SHA-256 in
 `install.json` and `campaign.json`. A configured `binary:` is copied and
@@ -138,6 +141,38 @@ preflight, cache, settlement, and evaluator evidence for each exact pair.
 Exit status zero means the requested inference and, if requested, evaluation
 completed with no failed or incomplete job. A nonzero status means inspect the
 durable state and artifacts; it never authorizes automatic reruns.
+
+### Local integration verification
+
+The default suite is portable: real ProContract binary cases skip with an
+explicit reason unless `PROGRAMBENCH_PROCONTRACT_BINARY` is set. Run the real
+four-job Docker campaign and calculator evaluator directly with:
+
+```bash
+uv run --frozen pytest \
+  tests/test_campaign_paired_integration.py::test_real_docker_paired_fake_binaries_run_four_jobs_and_resume -v
+
+uv run --frozen pytest \
+  tests/test_campaign_evaluate.py::test_real_calculator_evaluator_scores_two_tiny_submissions_when_docker_available -v
+```
+
+To verify a current native ProContract binary, opt in explicitly. The test
+creates a temporary matching pin from the binary unless both identity
+overrides are supplied; it never edits the tracked fixture.
+
+```bash
+export PROGRAMBENCH_PROCONTRACT_BINARY="$OPENCODE_REPO/packages/opencode/dist/opencode-linux-x64/bin/opencode"
+export PROGRAMBENCH_PROCONTRACT_SHA256="$(sha256sum "$PROGRAMBENCH_PROCONTRACT_BINARY" | cut -d' ' -f1)"
+export PROGRAMBENCH_PROCONTRACT_VERSION="$($PROGRAMBENCH_PROCONTRACT_BINARY --version)"
+
+uv run --frozen pytest \
+  tests/test_campaign_procontract_integration.py::test_pinned_real_binary_completes_native_procontract_lifecycle -v
+```
+
+These tests use real installation, Docker workspace, adapter, scheduler,
+package, preflight, replay/export, attestation, resume, and lease paths. They
+skip only when their explicitly required Docker daemon or opt-in binary is
+unavailable.
 
 ## Inference
 

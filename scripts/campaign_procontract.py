@@ -2095,6 +2095,7 @@ def _deliver(
         }
         _write_json(archive_path, archive_record)
     archive = _require_package_record(archive_record, job.job.root)
+    archive = _publish_submission(archive, job.job.submission)
     if state.phase == "frozen":
         state = state_store.transition(
             "packaged",
@@ -2475,6 +2476,20 @@ def _deliver(
             artifact_hashes=hashes,
         )
     return result
+
+
+def _publish_submission(source: Path, destination: Path) -> Path:
+    if destination.exists():
+        if destination.is_symlink() or not destination.is_file() or _sha256(destination) != _sha256(source):
+            raise ProContractConflictError("published ProgramBench submission conflicts with package evidence")
+        return destination
+    try:
+        os.link(source, destination)
+        _sync_directory(destination.parent)
+    except FileExistsError:
+        if destination.is_symlink() or not destination.is_file() or _sha256(destination) != _sha256(source):
+            raise ProContractConflictError("published ProgramBench submission conflicts with package evidence") from None
+    return destination
 
 
 def _validate_inputs(

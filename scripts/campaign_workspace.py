@@ -1163,6 +1163,7 @@ def _claim_job_root(job: JobPaths, request: WorkspaceRequest) -> None:
         for path in (
             job_root / ".workspace.lock",
             Path(job.lock),
+            Path(job.state),
             Path(job.state).with_name(f"{Path(job.state).name}.lock"),
         )
         if path.exists()

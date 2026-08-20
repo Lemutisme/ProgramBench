@@ -124,11 +124,11 @@ cache:
 
 arms:
   procontract:
-    repo: /home/duozhou/opencode
+    repo: ${OPENCODE_REPO}
     revision: 4c8c79c10
     mode: procontract
   vanilla:
-    repo: /home/duozhou/opencode
+    repo: ${OPENCODE_REPO}
     revision: origin/dev
     mode: vanilla
 ```

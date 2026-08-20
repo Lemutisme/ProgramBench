@@ -28,6 +28,7 @@ from typing import Callable, Mapping, Sequence
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from programbench.candidate import package_workspace, preflight_candidate
 from programbench.utils.load_data import load_all_instances
 from programbench.utils.instance_filters import filter_instances
 from scripts.campaign_install import InstallRecord, prepare_install
@@ -35,7 +36,7 @@ from scripts.campaign_procontract import HttpProContractApi, run_procontract
 from scripts.campaign_state import JobLease, JobPaths, JobState, StateStore
 from scripts.campaign_stop import StopToken
 from scripts.campaign_usage import CircuitBreaker
-from scripts.campaign_vanilla import HttpOpenCodeApi, run_vanilla
+from scripts.campaign_vanilla import HttpOpenCodeApi, VanillaResult, run_vanilla
 from scripts.campaign_workspace import (
     WorkspaceLease,
     WorkspaceRequest,
@@ -562,13 +563,13 @@ def run_job(
         request = WorkspaceRequest(
             job=paths,
             campaign=_campaign_name(plan.output),
-            campaign_root=plan.output,
+            campaign_root=plan.output.parent,
             instance_id=candidate.instance_id,
             arm=candidate.arm,
             image=candidate.image,
             install=install,
-            candidate_root=paths.root / "candidate",
-            state_root=paths.root / "workspace",
+            candidate_root=paths.root / "candidates",
+            state_root=paths.root / "workspace-state",
             log_dir=paths.root / "logs",
             credential_env=tuple(name for name in _CREDENTIAL_ENV if os.environ.get(name)),
         )
@@ -615,6 +616,8 @@ def run_job(
                             api=api,
                             stop_token=stop,
                         )
+                        if isinstance(result, VanillaResult):
+                            _finalize_vanilla_delivery(paths, store, workspace, candidate.instance_id)
                     else:
                         api = (
                             procontract_api_factory(workspace)
@@ -658,8 +661,7 @@ def run_job(
                             _workspace_cleanup_operation(workspace),
                             max(0.0, cleanup_deadline - time.monotonic()),
                         ):
-                            stop.set("workspace_cleanup_failed")
-                            time.sleep(0.01)
+                            continue
                         else:
                             workspace_lease.release_handle()
                     if workspace_lease._handle_active:
@@ -1170,6 +1172,59 @@ def _cleanup_recovery_evidence(paths: JobPaths, workspace: object) -> Mapping[st
         evidence_path.name: hashlib.sha256(evidence_path.read_bytes()).hexdigest(),
         **({"workspace.json": manifest_hash} if manifest_hash is not None else {}),
     }
+
+
+def _finalize_vanilla_delivery(
+    paths: JobPaths,
+    store: StateStore,
+    workspace: object,
+    instance_id: str,
+) -> None:
+    state = store.read()
+    command_identity = state.command_identity or "vanilla-delivery"
+    if state.phase == "frozen":
+        archive = package_workspace(Path(workspace.manifest.subject_dir), paths.root.parent, instance_id)
+        if archive.resolve() != paths.submission.resolve() or not archive.is_file():
+            raise CampaignError("vanilla candidate package was not created at the job submission path")
+        state = store.transition(
+            "packaged",
+            command_identity=command_identity,
+            expected_generation=state.generation,
+            artifact_hashes={
+                **dict(state.artifact_hashes or {}),
+                paths.submission.name: hashlib.sha256(paths.submission.read_bytes()).hexdigest(),
+            },
+        )
+    if state.phase == "packaged":
+        if not paths.submission.is_file():
+            raise CampaignError("packaged vanilla submission is missing")
+        checked = preflight_candidate(paths.submission, instance_id)
+        preflight_path = paths.root / "vanilla-preflight.json"
+        _atomic_json(
+            preflight_path,
+            {
+                "version": 1,
+                "archiveHash": hashlib.sha256(paths.submission.read_bytes()).hexdigest(),
+                "executableHash": checked.executable_hash,
+                "outputHash": hashlib.sha256(checked.output.encode()).hexdigest(),
+            },
+        )
+        state = store.transition(
+            "preflighted",
+            command_identity=command_identity,
+            expected_generation=state.generation,
+            artifact_hashes={
+                **dict(state.artifact_hashes or {}),
+                preflight_path.name: hashlib.sha256(preflight_path.read_bytes()).hexdigest(),
+            },
+        )
+    if state.phase == "preflighted":
+        store.transition(
+            "done",
+            command_identity=command_identity,
+            expected_generation=state.generation,
+            artifact_hashes=dict(state.artifact_hashes or {}),
+        )
 
 
 def _sanitize_shutdown_error(error: CampaignShutdownError) -> str:

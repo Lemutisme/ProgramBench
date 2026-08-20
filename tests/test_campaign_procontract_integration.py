@@ -390,23 +390,29 @@ def test_pinned_real_binary_completes_native_procontract_lifecycle(
         run_procontract,
     )
 
-    binary = Path(
-        os.environ.get(
-            "PROGRAMBENCH_PROCONTRACT_BINARY",
-            "/home/duozhou/opencode/packages/opencode/dist/opencode-linux-x64/bin/opencode",
+    binary_value = os.environ.get("PROGRAMBENCH_PROCONTRACT_BINARY")
+    if not binary_value:
+        pytest.skip("PROGRAMBENCH_PROCONTRACT_BINARY is not set; pinned real ProContract test is opt-in")
+    binary = Path(binary_value)
+    if not binary.is_file() or not os.access(binary, os.X_OK):
+        pytest.fail("PROGRAMBENCH_PROCONTRACT_BINARY must name an executable regular file")
+    actual_sha256 = hashlib.sha256(binary.read_bytes()).hexdigest()
+    actual_version = subprocess.run(
+        [str(binary), "--version"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+    fixture_path = tmp_path / "procontract-binary.json"
+    fixture_path.write_text(
+        json.dumps(
+            {
+                "sha256": os.environ.get("PROGRAMBENCH_PROCONTRACT_SHA256", actual_sha256),
+                "version": os.environ.get("PROGRAMBENCH_PROCONTRACT_VERSION", actual_version),
+            },
+            sort_keys=True,
         )
     )
-    if not binary.is_file() or not os.access(binary, os.X_OK):
-        pytest.skip(f"Pinned ProContract binary unavailable: {binary}")
-    fixture_metadata = json.loads(Path(__file__).with_name("fixtures").joinpath("procontract-binary.json").read_text())
-    fixture_metadata["sha256"] = os.environ.get("PROGRAMBENCH_PROCONTRACT_SHA256", fixture_metadata["sha256"])
-    fixture_metadata["version"] = os.environ.get("PROGRAMBENCH_PROCONTRACT_VERSION", fixture_metadata["version"])
-    tmp_path.joinpath("procontract-binary.json").write_text(json.dumps(fixture_metadata, sort_keys=True))
-    assert hashlib.sha256(binary.read_bytes()).hexdigest() == fixture_metadata["sha256"]
-    assert (
-        subprocess.run([str(binary), "--version"], check=True, capture_output=True, text=True).stdout.strip()
-        == fixture_metadata["version"]
-    )
+    fixture_metadata = json.loads(fixture_path.read_text())
+    assert actual_sha256 == fixture_metadata["sha256"]
+    assert actual_version == fixture_metadata["version"]
     try:
         _run_docker(("docker", "info", "--format", "{{.ServerVersion}}"), 30)
     except DockerCommandError as error:

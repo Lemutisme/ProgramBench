@@ -410,13 +410,63 @@ def test_load_config_resolves_relative_repo_paths(tmp_path: Path):
     assert result.arms[0].repo == repo.resolve()
 
 
-def test_approved_campaign_config_loads():
+def test_load_config_expands_opencode_repo_in_path_fields(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    binary = repo / "opencode"
+    binary.write_text("binary")
+    monkeypatch.setenv("OPENCODE_REPO", str(repo))
+    config = _write_text(
+        tmp_path / "campaign.yaml",
+        campaign_yaml(Path("${OPENCODE_REPO}")).replace(
+            "    revision: abc\n", "    revision: abc\n    binary: ${OPENCODE_REPO}/opencode\n", 1
+        ),
+    )
+
+    result = load_config(config)
+
+    assert {arm.repo for arm in result.arms} == {repo}
+    assert result.arms[0].binary == binary
+
+
+@pytest.mark.parametrize("value", ["${OPENCODE_REPO}", "${UNKNOWN_REPO}", "$OPENCODE_REPO"])
+def test_load_config_rejects_missing_or_unexpanded_path_variables(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str
+):
+    repo = tmp_path / "secret-repo-value"
+    repo.mkdir()
+    monkeypatch.delenv("OPENCODE_REPO", raising=False)
+    config = _write_text(tmp_path / "campaign.yaml", campaign_yaml(Path(value)))
+
+    with pytest.raises(ConfigError, match="environment variable") as failure:
+        load_config(config)
+
+    assert str(repo) not in str(failure.value)
+
+
+def test_load_config_does_not_expand_credentials_in_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    secret = "credential-value-must-not-appear"
+    monkeypatch.setenv("OPENAI_API_KEY", secret)
+    config = _write_text(tmp_path / "campaign.yaml", campaign_yaml(Path("${OPENAI_API_KEY}")))
+
+    with pytest.raises(ConfigError, match="environment variable") as failure:
+        load_config(config)
+
+    assert secret not in str(failure.value)
+
+
+def test_approved_campaign_config_loads(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    repo = tmp_path / "opencode"
+    repo.mkdir()
+    monkeypatch.setenv("OPENCODE_REPO", str(repo))
+
     result = load_config(Path("scripts/opencode_programbench.yaml"))
 
     assert result.model == "openai/gpt-5.6-luna"
     assert result.variant == "max"
     assert result.limits.total_cost_soft == 100.0
     assert result.limits.total_cost_hard == 150.0
+    assert {arm.repo for arm in result.arms} == {repo}
 
 
 def test_load_config_rejects_unusual_yaml_mapping_keys(tmp_path: Path):

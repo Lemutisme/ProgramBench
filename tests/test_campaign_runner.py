@@ -7,6 +7,7 @@ import sys
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -879,14 +880,6 @@ def test_direct_script_cli_help_is_import_safe():
         assert option in result.stdout
 
 
-def test_script_main_accepts_cli_arguments_without_exiting(monkeypatch):
-    from scripts import campaign_runner, run_opencode
-
-    monkeypatch.setattr(campaign_runner, "main", lambda arguments: 7)
-
-    assert run_opencode.main(["--dry-run", "--config", "campaign.yaml"]) == 7
-
-
 def test_plan_dry_run_prepares_each_arm_once_without_workspace(tmp_path: Path):
     from scripts.campaign_runner import plan_campaign
     from scripts.run_opencode import load_config
@@ -1289,6 +1282,110 @@ def test_run_job_dispatches_vanilla_once_and_skips_a_terminal_retry(tmp_path: Pa
     assert calls == ["vanilla"]
 
 
+def test_run_job_packages_and_preflights_a_frozen_vanilla_result(tmp_path: Path, monkeypatch):
+    from programbench.candidate import PreflightResult
+    from scripts import campaign_runner
+    from scripts.campaign_vanilla import VanillaCompletion, VanillaResult
+    from scripts.run_opencode import load_config
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config_path = tmp_path / "campaign.yaml"
+    config_path.write_text(_config(repo))
+    plan = campaign_runner.CampaignPlan(
+        tmp_path / "out", tmp_path / "out/campaign.json", load_config(config_path), ("one",), (), {}, False
+    )
+    candidate = campaign_runner.CampaignJob("one", "vanilla", "one-image")
+    paths = campaign_runner.JobPaths(plan.output / candidate.arm / candidate.instance_id)
+    subject = paths.root / "subject"
+    preflights = []
+
+    class Workspace:
+        base_url = "http://127.0.0.1:9999"
+        port = 9999
+        manifest = SimpleNamespace(subject_dir=subject)
+
+        def __init__(self, lease):
+            self.lease = lease
+
+        def stop_for_freeze(self):
+            self.lease.release_handle()
+
+    def workspace_factory(request, lease):
+        lease.claim_handle(request)
+        return Workspace(lease)
+
+    result = VanillaResult(
+        session_id="ses_test",
+        message_id="msg_test",
+        completion=VanillaCompletion.IDLE,
+        provider_turns=1,
+        actions=0,
+        cost=Decimal(0),
+        elapsed_seconds=1,
+        input_tokens=1,
+        output_tokens=1,
+        reasoning_tokens=0,
+        cache_read=0,
+        cache_write=0,
+        max_prompt_total=1,
+        limit_overshoot=0,
+        workspace_frozen=True,
+        container_stopped_for_freeze=True,
+        interrupt_attempted=False,
+        forced_stop=False,
+        exit_class="idle",
+    )
+
+    def vanilla(_job, store, workspace, *_args, **_kwargs):
+        subject.mkdir(parents=True)
+        subject.joinpath("compile.sh").write_text("#!/bin/sh\nprintf built > executable\nchmod +x executable\n")
+        subject.joinpath("source").write_text("candidate\n")
+        result_path = paths.root / "vanilla-result.json"
+        result_path.write_text(json.dumps(result.to_dict(), sort_keys=True))
+        state = store.read()
+        for phase in ("preparing", "executing"):
+            state = store.transition(phase, command_identity="vanilla", expected_generation=state.generation)
+        store.transition(
+            "frozen",
+            command_identity="vanilla",
+            expected_generation=state.generation,
+            provider_turns=1,
+            exit_class="idle",
+            artifact_hashes={"vanilla-result.json": hashlib.sha256(result_path.read_bytes()).hexdigest()},
+        )
+        workspace.stop_for_freeze()
+        return result
+
+    monkeypatch.setattr(campaign_runner, "_install_for", lambda *_: object())
+    monkeypatch.setattr(
+        campaign_runner,
+        "preflight_candidate",
+        lambda archive, instance_id: (
+            preflights.append((archive, instance_id)),
+            PreflightResult("e" * 64, "preflight-ok"),
+        )[1],
+        raising=False,
+    )
+
+    outcome = campaign_runner.run_job(
+        plan,
+        candidate,
+        breaker=CircuitBreaker(),
+        workspace_factory=workspace_factory,
+        vanilla_runner=vanilla,
+        vanilla_api_factory=lambda _: object(),
+    )
+
+    state = campaign_runner.StateStore(paths.state).read()
+    assert outcome == campaign_runner.JobRunResult(candidate, "completed", result)
+    assert state.phase == "done"
+    assert state.exit_class == "idle"
+    assert paths.submission.is_file()
+    assert preflights == [(paths.submission, "one")]
+    assert paths.root.joinpath("vanilla-preflight.json").is_file()
+
+
 @pytest.mark.parametrize("arm", ["vanilla", "procontract"])
 def test_run_job_passes_campaign_stop_token_to_adapter(tmp_path: Path, monkeypatch, arm: str):
     from scripts import campaign_runner
@@ -1591,7 +1688,7 @@ def test_run_job_force_stops_before_unregistering_unexpected_adapter_failure(tmp
     assert token.registry.active_jobs() == ()
 
 
-def test_run_job_retains_registered_cleanup_until_scheduler_retries_failed_stop(tmp_path: Path, monkeypatch):
+def test_run_job_retries_transient_cleanup_without_stopping_campaign(tmp_path: Path, monkeypatch):
     from scripts import campaign_runner
     from scripts.run_opencode import load_config
 
@@ -1643,9 +1740,10 @@ def test_run_job_retains_registered_cleanup_until_scheduler_retries_failed_stop(
     )
 
     state = campaign_runner.StateStore(plan.output / "vanilla/one/state.json").read()
-    assert result.interrupted
+    assert not result.interrupted
     assert result.failed == 1
     assert state.phase == "failed"
+    assert state.exit_class == "infrastructure_failed_before_provider"
     assert workspaces[0].request.job.root.joinpath("cleanup-attempts").read_text() == "2"
     assert not workspaces[0].lease._handle_active
 
@@ -1675,9 +1773,9 @@ def test_persistent_workspace_cleanup_failure_is_bounded_and_durable(tmp_path: P
             lease.claim_handle(request)
 
         def stop_for_freeze(self):
-            path = self.request.job.root / "cleanup-attempts"
-            attempts = int(path.read_text()) + 1 if path.is_file() else 1
-            path.write_text(str(attempts))
+            attempts = self.request.job.root / "cleanup-attempts"
+            attempts.mkdir(exist_ok=True)
+            attempts.joinpath(str(campaign_runner.os.getpid())).write_text("attempted")
             raise RuntimeError("cleanup-secret")
 
     def workspace_factory(request, lease):
@@ -1706,9 +1804,9 @@ def test_persistent_workspace_cleanup_failure_is_bounded_and_durable(tmp_path: P
     evidence = json.loads((plan.output / "vanilla/one/cleanup-failure.json").read_text())
     state = campaign_runner.StateStore(plan.output / "vanilla/one/state.json").read()
     assert time.monotonic() - started < 0.5
-    assert int(workspaces[0].request.job.root.joinpath("cleanup-attempts").read_text()) == (
-        campaign_runner.JOB_CLEANUP_MAX_ATTEMPTS
-    )
+    attempts = tuple(workspaces[0].request.job.root.joinpath("cleanup-attempts").iterdir())
+    assert len(attempts) == campaign_runner.JOB_CLEANUP_MAX_ATTEMPTS
+    assert str(campaign_runner.os.getpid()) not in {path.name for path in attempts}
     assert evidence == {
         "version": 1,
         "attempts": campaign_runner.JOB_CLEANUP_MAX_ATTEMPTS,
@@ -1732,6 +1830,7 @@ def test_blocking_workspace_stop_hits_cleanup_deadline_without_worker_spin(tmp_p
         tmp_path / "out", tmp_path / "out/campaign.json", load_config(config_path), ("one",), (), {}, False
     )
     candidate = campaign_runner.CampaignJob("one", "vanilla", "one-image")
+    read_descriptor, write_descriptor = campaign_runner.os.pipe()
 
     class Workspace:
         base_url = "http://127.0.0.1:9999"
@@ -1744,37 +1843,52 @@ def test_blocking_workspace_stop_hits_cleanup_deadline_without_worker_spin(tmp_p
             lease.claim_handle(request)
 
         def stop_for_freeze(self):
-            self.request.job.root.joinpath("cleanup-child-pid").write_text(str(campaign_runner.os.getpid()))
-            time.sleep(0.5)
+            pid = campaign_runner.os.getpid()
+            identity = Path(f"/proc/{pid}/stat").read_text().rpartition(")")[2].split()[19]
+            workers = self.request.job.root / "cleanup-workers"
+            workers.mkdir(exist_ok=True)
+            workers.joinpath(str(pid)).write_text(identity)
+            campaign_runner.os.read(read_descriptor, 1)
             self.request.job.root.joinpath("late-cleanup-write").write_text("unsafe")
             raise RuntimeError("blocked stop failed")
 
     monkeypatch.setattr(campaign_runner, "_install_for", lambda *_: object())
     started = time.monotonic()
-    with pytest.raises(campaign_runner.CampaignShutdownError):
-        campaign_runner.run_campaign(
-            (candidate,),
-            workers=1,
-            interrupt_timeout=0.02,
-            execute=lambda current, stop: campaign_runner.run_job(
-                plan,
-                current,
-                breaker=CircuitBreaker(),
-                stop_token=stop,
-                workspace_factory=lambda request, lease: Workspace(request, lease),
-                vanilla_runner=lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("adapter failed")),
-                vanilla_api_factory=lambda _: object(),
-            ),
-        )
+    try:
+        with pytest.raises(campaign_runner.CampaignShutdownError):
+            campaign_runner.run_campaign(
+                (candidate,),
+                workers=1,
+                interrupt_timeout=0.02,
+                execute=lambda current, stop: campaign_runner.run_job(
+                    plan,
+                    current,
+                    breaker=CircuitBreaker(),
+                    stop_token=stop,
+                    workspace_factory=lambda request, lease: Workspace(request, lease),
+                    vanilla_runner=lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("adapter failed")),
+                    vanilla_api_factory=lambda _: object(),
+                ),
+            )
+    finally:
+        campaign_runner.os.write(write_descriptor, b"release")
+        campaign_runner.os.close(write_descriptor)
+        campaign_runner.os.close(read_descriptor)
 
     assert time.monotonic() - started < 0.8
     evidence = json.loads((plan.output / "vanilla/one/cleanup-failure.json").read_text())
     assert evidence["attempts"] == 1
     assert campaign_runner.StateStore(plan.output / "vanilla/one/state.json").read().exit_class == "cleanup_failed"
-    child_pid = int((plan.output / "vanilla/one/cleanup-child-pid").read_text())
-    with pytest.raises(ProcessLookupError):
-        campaign_runner.os.kill(child_pid, 0)
-    time.sleep(0.3)
+    workers = tuple((plan.output / "vanilla/one/cleanup-workers").iterdir())
+    assert len(workers) == 1
+    child_pid = int(workers[0].name)
+    child_identity = workers[0].read_text()
+    assert child_pid != campaign_runner.os.getpid()
+    try:
+        current_identity = Path(f"/proc/{child_pid}/stat").read_text().rpartition(")")[2].split()[19]
+    except FileNotFoundError:
+        current_identity = None
+    assert current_identity != child_identity
     assert not (plan.output / "vanilla/one/late-cleanup-write").exists()
 
 
@@ -1835,7 +1949,7 @@ def test_resume_refuses_an_install_record_that_differs_from_manifest(tmp_path: P
 
 @pytest.mark.parametrize("workers", [2, 8])
 def test_fake_paired_campaign_script_main_resumes_without_adapter_calls(tmp_path: Path, monkeypatch, workers: int):
-    from scripts import campaign_evaluate, campaign_runner, run_opencode
+    from scripts import campaign_evaluate, campaign_runner
 
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -1965,7 +2079,7 @@ def test_fake_paired_campaign_script_main_resumes_without_adapter_calls(tmp_path
     output = tmp_path / "out"
 
     assert (
-        run_opencode.main(
+        campaign_runner.main(
             [
                 "--config",
                 str(config_path),
@@ -2006,7 +2120,7 @@ def test_fake_paired_campaign_script_main_resumes_without_adapter_calls(tmp_path
     calls.clear()
 
     assert (
-        run_opencode.main(
+        campaign_runner.main(
             [
                 "--config",
                 str(config_path),

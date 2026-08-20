@@ -313,11 +313,11 @@ def freeze_campaign_config(config: CampaignConfig, manifest_path: Path) -> None:
             os.unlink(temporary_name)
 
 
-def main(arguments: Sequence[str] | None = None) -> int:
+def main() -> None:
     """Compatibility entrypoint; campaign orchestration lives in campaign_runner."""
     from scripts.campaign_runner import main as campaign_main
 
-    return campaign_main(arguments)
+    raise SystemExit(campaign_main())
 
 
 def _load_limits(raw: object) -> Limits:
@@ -395,6 +395,13 @@ def _path_value(values: Mapping[str, object], name: str, config_dir: Path) -> Pa
     value = values.get(name)
     if not isinstance(value, str) or not value:
         raise ConfigError(f"{name} must be a nonempty path")
+    if "${OPENCODE_REPO}" in value:
+        root = os.environ.get("OPENCODE_REPO")
+        if not root:
+            raise ConfigError("required path environment variable is missing: OPENCODE_REPO")
+        value = value.replace("${OPENCODE_REPO}", root)
+    if "$" in value:
+        raise ConfigError(f"{name} contains an unsupported environment variable")
     candidate = Path(value).expanduser()
     return (config_dir / candidate).resolve() if not candidate.is_absolute() else candidate.resolve()
 
@@ -468,4 +475,4 @@ def _canonical_config(config: CampaignConfig) -> dict[str, object]:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
