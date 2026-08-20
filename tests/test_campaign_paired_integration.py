@@ -65,7 +65,8 @@ def test_real_docker_paired_fake_binaries_run_four_jobs_and_resume(
         pytest.skip(f"Docker daemon unavailable: {error}")
 
     suffix = uuid.uuid4().hex[:12]
-    instance_ids = (f"testorg__calculator-a.{suffix}", f"testorg__calculator-b.{suffix}")
+    fixture_instance_id = "testorg__calculator.abc1234"
+    instance_ids = (f"campaignfixture__calculator-a.{suffix}", f"campaignfixture__calculator-b.{suffix}")
     image_names = tuple(f"programbench/{instance_id.replace('__', '_1776_')}" for instance_id in instance_ids)
     image_tags = tuple(f"{image}:{tag}" for image in image_names for tag in ("task_cleanroom", "task_cleanroom_v6"))
     campaign_root = tmp_path / "paired-campaign"
@@ -82,6 +83,14 @@ def test_real_docker_paired_fake_binaries_run_four_jobs_and_resume(
         }
         for instance_id, image in zip(instance_ids, image_names, strict=True)
     ]
+    instances.append(
+        {
+            "instance_id": fixture_instance_id,
+            "difficulty": "easy",
+            "language": "bash",
+            "image_name": image_names[0],
+        }
+    )
     monkeypatch.setenv("OPENAI_API_KEY", "paired-integration-provider-key")
     monkeypatch.setenv("OPENCODE_SERVER_PASSWORD", "paired-integration-server-password")
     plan = None
@@ -104,6 +113,8 @@ def test_real_docker_paired_fake_binaries_run_four_jobs_and_resume(
         )
 
         assert len(plan.jobs) == 4
+        assert fixture_instance_id not in plan.selected_ids
+        assert set(plan.selected_ids) == set(instance_ids)
         assert {(job.instance_id, job.arm) for job in plan.jobs} == {
             (instance_id, arm) for instance_id in instance_ids for arm in ("procontract", "vanilla")
         }
