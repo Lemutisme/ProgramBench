@@ -1259,6 +1259,12 @@ def test_real_dataset_selection_excludes_fixture_and_freezes_optional_difficulty
     assert json.loads(single_plan.manifest_path.read_text())["selection"]["arm"] == "procontract"
 
 
+def test_campaign_forwards_openai_compatible_gateway_environment() -> None:
+    from scripts.campaign_runner import _CREDENTIAL_ENV
+
+    assert _CREDENTIAL_ENV == ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENCODE_SERVER_PASSWORD")
+
+
 def test_all_selection_counts_only_real_benchmark_instances(tmp_path: Path):
     from scripts.campaign_runner import plan_campaign
     from scripts.run_opencode import load_config

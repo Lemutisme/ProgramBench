@@ -25,6 +25,8 @@ and unit-test portability does not imply that delegation is available. Install
 export OPENAI_API_KEY='...'
 export OPENCODE_SERVER_PASSWORD='...'
 export OPENCODE_REPO="$HOME/src/opencode"
+# Optional for OpenAI-compatible gateways:
+export OPENAI_BASE_URL='https://gateway.example/v1'
 ```
 
 Do not put credential values in YAML, campaign output, shell history, or issue
