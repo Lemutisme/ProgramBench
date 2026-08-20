@@ -1476,6 +1476,15 @@ def _reconcile_partial_quarantine(
             raise CampaignEvaluationError(f"partial quarantine transaction prior artifact identity conflicts for {arm}")
         retained_hashes.pop(name)
         retained_sizes.pop(name)
+    retention_plan = journal.get("retention_plan")
+    pre_retention_paths = (
+        {str(value["path"]) for value in [*retention_plan["candidates"], *retention_plan["retained"]]}
+        if isinstance(retention_plan, Mapping)
+        and isinstance(retention_plan.get("candidates"), list)
+        and isinstance(retention_plan.get("retained"), list)
+        and all(isinstance(value, Mapping) and isinstance(value.get("path"), str) for value in [*retention_plan["candidates"], *retention_plan["retained"]])
+        else None
+    )
     expected_state_after = {
         **state_before,
         "artifact_hashes": retained_hashes,
@@ -1487,13 +1496,38 @@ def _reconcile_partial_quarantine(
             index_path,
             history_after,
             str(journal["history_after_sha256"]),
+            pre_retention_paths,
         ),
         "completion_disposition": "partial_quarantined",
     }
     if dict(state_after) != expected_state_after:
         raise CampaignEvaluationError(f"partial quarantine transaction state conflicts for {arm}")
+    history_state = None
+    retained_state = None
+    planned_pruned_files: set[str] = set()
+    if retention_plan is not None:
+        if not isinstance(retention_plan, Mapping):
+            raise CampaignEvaluationError(f"partial quarantine retention plan conflicts for {arm}")
+        _validate_partial_quarantine_retention_plan(retention_plan, history_after)
+        if hashlib.sha256(_canonical_bytes(retention_plan)).hexdigest() != journal.get("retention_plan_sha256"):
+            raise CampaignEvaluationError(f"partial quarantine retention plan hash conflicts for {arm}")
+        history_state, retained_state = _partial_quarantine_retention_states(
+            state_after,
+            index_path,
+            history_after,
+            str(journal["history_after_sha256"]),
+            retention_plan,
+        )
+        planned_pruned_files = {
+            str(file["path"])
+            for candidate in retention_plan["candidates"]
+            for file in candidate["files"]
+        }
     # A crash may make the file placement one rename newer than the published phase.
-    statuses = [_partial_quarantine_move_done(move, root) for move in moves]
+    statuses = [
+        _partial_quarantine_move_done(move, root, str(move["destination"]) in planned_pruned_files)
+        for move in moves
+    ]
     completed = 0
     for status_value in statuses:
         if not status_value:
@@ -1536,7 +1570,18 @@ def _reconcile_partial_quarantine(
         and str(journal["phase"]).startswith("moved:")
     ) and not history_is_before:
         raise CampaignEvaluationError(f"partial attempt history phase conflicts during recovery for {arm}")
-    if journal.get("phase") in {"history_published", "state_published", "complete"} and not history_is_after:
+    post_history_phases = {
+        "history_published",
+        "state_published",
+        "history_state_published",
+        "retention_pruned",
+        "complete",
+    }
+    if (
+        journal.get("phase") in post_history_phases
+        or isinstance(journal.get("phase"), str)
+        and str(journal["phase"]).startswith("pruning")
+    ) and not history_is_after:
         raise CampaignEvaluationError(f"partial attempt history phase conflicts during recovery for {arm}")
     phase_state = _read_json(state_path, f"evaluator state for {arm}")
     phase_state_sha256 = _sha256(state_path)
@@ -1546,7 +1591,17 @@ def _reconcile_partial_quarantine(
     phase_state_is_after = phase_state_sha256 == journal["state_after_sha256"] and dict(phase_state) == dict(
         state_after
     )
-    if not phase_state_is_before and not phase_state_is_after:
+    phase_state_is_history = (
+        history_state is not None
+        and phase_state_sha256 == hashlib.sha256(_json_bytes(history_state)).hexdigest()
+        and dict(phase_state) == dict(history_state)
+    )
+    phase_state_is_retained = (
+        retained_state is not None
+        and phase_state_sha256 == hashlib.sha256(_json_bytes(retained_state)).hexdigest()
+        and dict(phase_state) == dict(retained_state)
+    )
+    if not any((phase_state_is_before, phase_state_is_after, phase_state_is_history, phase_state_is_retained)):
         raise CampaignEvaluationError(f"evaluator state conflicts during partial quarantine recovery for {arm}")
     if journal.get("phase") in {"prepared", "files_moved"} or (
         isinstance(journal.get("phase"), str) and str(journal["phase"]).startswith("moved:")
@@ -1555,46 +1610,68 @@ def _reconcile_partial_quarantine(
             raise CampaignEvaluationError(
                 f"evaluator state phase conflicts during partial quarantine recovery for {arm}"
             )
-    if journal.get("phase") in {"state_published", "complete"} and not phase_state_is_after:
+    if journal.get("phase") in {"state_published", "complete"} and retention_plan is None and not phase_state_is_after:
         raise CampaignEvaluationError(f"evaluator state phase conflicts during partial quarantine recovery for {arm}")
+    if journal.get("phase") == "history_state_published" and not phase_state_is_history:
+        raise CampaignEvaluationError(f"evaluator retention state phase conflicts during recovery for {arm}")
+    if (
+        isinstance(journal.get("phase"), str)
+        and str(journal["phase"]).startswith("pruning")
+        and not phase_state_is_history
+        and not phase_state_is_retained
+    ):
+        raise CampaignEvaluationError(f"evaluator pruning state phase conflicts during recovery for {arm}")
+    if journal.get("phase") in {"retention_pruned", "complete"} and retention_plan is not None and not phase_state_is_retained:
+        raise CampaignEvaluationError(f"evaluator retained state phase conflicts during recovery for {arm}")
     if history_is_before:
         _append_partial_attempt_record(index_path, record_input)
         actual_history = _load_partial_history(index_path)
         actual_anchor = _partial_history_anchor(index_path, actual_history)
     if actual_anchor != after_anchor or actual_history != dict(history_after):
         raise CampaignEvaluationError(f"partial attempt history conflicts during recovery for {arm}")
-    if journal.get("phase") not in {"history_published", "state_published", "complete"}:
+    if journal.get("phase") not in post_history_phases and not (
+        isinstance(journal.get("phase"), str) and str(journal["phase"]).startswith("pruning")
+    ):
         journal = _write_partial_quarantine_phase(journal_path, journal, "history_published")
+    if journal.get("phase") in {"state_published", "complete"} and retention_plan is None:
+        journal = _write_partial_quarantine_phase(journal_path, journal, "history_published")
+    if retention_plan is None:
+        retention_plan = _plan_partial_quarantine_retention(root, arm, history_after)
+        _validate_partial_quarantine_retention_plan(retention_plan, history_after)
+        journal = {
+            **journal,
+            "retention_plan": retention_plan,
+            "retention_plan_sha256": hashlib.sha256(_canonical_bytes(retention_plan)).hexdigest(),
+        }
+        _atomic_json(journal_path, journal)
+        history_state, retained_state = _partial_quarantine_retention_states(
+            state_after,
+            index_path,
+            history_after,
+            str(journal["history_after_sha256"]),
+            retention_plan,
+        )
+    elif journal.get("phase") == "history_published":
+        if _plan_partial_quarantine_retention(root, arm, history_after) != dict(retention_plan):
+            raise CampaignEvaluationError(f"partial quarantine retention plan changed before publication for {arm}")
+    if history_state is None or retained_state is None:
+        raise CampaignEvaluationError(f"partial quarantine retention state is unavailable for {arm}")
     current_state = _read_json(state_path, f"evaluator state for {arm}")
-    current_state_sha256 = _sha256(state_path)
-    state_is_before = current_state_sha256 == journal["state_before_sha256"] and dict(current_state) == dict(
-        state_before
+    if journal.get("phase") == "history_published":
+        if dict(current_state) not in (dict(state_before), dict(state_after), dict(history_state)):
+            raise CampaignEvaluationError(f"evaluator history state conflicts during retention publication for {arm}")
+        if dict(current_state) != dict(history_state):
+            _atomic_json(state_path, history_state)
+        journal = _write_partial_quarantine_phase(journal_path, journal, "history_state_published")
+    journal, retained_state = _prune_partial_attempts(
+        root,
+        arm,
+        index_path,
+        state_path,
+        journal_path,
+        journal,
     )
-    state_is_after = current_state_sha256 == journal["state_after_sha256"] and dict(current_state) == dict(state_after)
-    if journal.get("phase") in {"state_published", "complete"} and not state_is_after:
-        raise CampaignEvaluationError(f"evaluator state phase conflicts during partial quarantine recovery for {arm}")
-    if not state_is_before and not state_is_after:
-        raise CampaignEvaluationError(f"evaluator state conflicts during partial quarantine recovery for {arm}")
-    if state_is_before:
-        _atomic_json(state_path, state_after)
-        current_state = _read_json(state_path, f"evaluator state for {arm}")
-        current_state_sha256 = _sha256(state_path)
-    if current_state_sha256 != journal["state_after_sha256"] or dict(current_state) != dict(state_after):
-        raise CampaignEvaluationError(f"evaluator state conflicts during partial quarantine recovery for {arm}")
-    if journal.get("phase") not in {"state_published", "complete"}:
-        journal = _write_partial_quarantine_phase(journal_path, journal, "state_published")
-    if journal.get("phase") != "complete":
-        journal = _write_partial_quarantine_phase(journal_path, journal, "complete")
-    journal_path.unlink()
-    _sync_directory(journal_path.parent)
-    _prune_partial_attempts(root, arm, index_path)
-    refreshed = {
-        **state_after,
-        "partial_attempt_history": _partial_history_summary(index_path),
-    }
-    if refreshed != dict(state_after):
-        _atomic_json(state_path, refreshed)
-    return refreshed
+    return retained_state
 
 
 def _write_partial_quarantine_phase(
@@ -1610,7 +1687,16 @@ def _write_partial_quarantine_phase(
 def _partial_quarantine_phase_moves(phase: object, total: int) -> int:
     if phase == "prepared":
         return 0
-    if phase in {"files_moved", "history_published", "state_published", "complete"}:
+    if phase in {
+        "files_moved",
+        "history_published",
+        "state_published",
+        "history_state_published",
+        "retention_pruned",
+        "complete",
+    }:
+        return total
+    if isinstance(phase, str) and phase.startswith("pruning"):
         return total
     if isinstance(phase, str) and phase.startswith("moved:"):
         try:
@@ -1668,7 +1754,11 @@ def _partial_quarantine_file_identity(path: Path, root: Path) -> dict[str, objec
         os.close(directory)
 
 
-def _partial_quarantine_move_done(move: Mapping[str, object], root: Path) -> bool:
+def _partial_quarantine_move_done(
+    move: Mapping[str, object],
+    root: Path,
+    allow_pruned: bool = False,
+) -> bool:
     source = Path(str(move.get("source")))
     destination = Path(str(move.get("destination")))
     expected = {
@@ -1684,6 +1774,8 @@ def _partial_quarantine_move_done(move: Mapping[str, object], root: Path) -> boo
         raise CampaignEvaluationError(f"partial quarantine source identity conflicts: {source}")
     if destination_exists and _partial_quarantine_file_identity(destination, root) != expected:
         raise CampaignEvaluationError(f"partial quarantine destination identity conflicts: {destination}")
+    if not source_exists and not destination_exists and allow_pruned:
+        return True
     if source_exists == destination_exists:
         raise CampaignEvaluationError(f"partial quarantine file location conflicts: {source}")
     return destination_exists
@@ -1732,50 +1824,376 @@ def _extend_partial_history(
     return updated
 
 
+def _plan_partial_quarantine_retention(
+    root: Path,
+    arm: str,
+    history: Mapping[str, object],
+) -> dict[str, object]:
+    snapshots = _partial_quarantine_raw_snapshots(root, arm, history)
+    raw_by_path = {str(value["path"]): value for value in snapshots}
+    candidates: set[str] = {
+        path for path in raw_by_path if not any(record.get("quarantine_path") == path for record in history["records"])
+    }
+    signatures: set[tuple[str, ...]] = set()
+    for record in reversed(history["records"]):
+        path = str(record.get("quarantine_path"))
+        artifacts = record.get("artifacts")
+        signature = (
+            tuple(sorted(str(value.get("eval_sha256")) for value in artifacts if isinstance(value, Mapping)))
+            if isinstance(artifacts, list)
+            else ()
+        )
+        if path in raw_by_path and signature in signatures:
+            candidates.add(path)
+        elif path in raw_by_path:
+            signatures.add(signature)
+    retained = [value for value in snapshots if str(value["path"]) not in candidates]
+    files = sum(len(value["files"]) for value in retained)
+    size = sum(int(file["size"]) for value in retained for file in value["files"])
+    for value in retained.copy():
+        if files <= MAX_PARTIAL_QUARANTINE_FILES and size <= MAX_PARTIAL_QUARANTINE_BYTES:
+            break
+        retained.remove(value)
+        candidates.add(str(value["path"]))
+        files -= len(value["files"])
+        size -= sum(int(file["size"]) for file in value["files"])
+    retained_paths = {str(value["path"]) for value in retained}
+    return {
+        "version": 1,
+        "candidates": [value for value in snapshots if str(value["path"]) in candidates],
+        "retained": retained,
+        "records": [
+            {
+                "record_hash": record.get("record_hash"),
+                "quarantine_path": record.get("quarantine_path"),
+                "raw_retained": str(record.get("quarantine_path")) in retained_paths,
+            }
+            for record in history["records"]
+        ],
+        "target": {
+            "raw_directories": len(retained),
+            "files": files,
+            "bytes": size,
+        },
+    }
+
+
+def _partial_quarantine_raw_snapshots(
+    root: Path,
+    arm: str,
+    history: Mapping[str, object],
+) -> list[dict[str, object]]:
+    parent = root / "evaluation-state" / f"{arm}.partial"
+    if not parent.exists():
+        return []
+    _require_owned_directory(parent, root, f"partial quarantine retention root for {arm}")
+    result = []
+    paths = list(parent.iterdir())
+    if any(re.fullmatch(r"attempt-(\d+)-[a-f0-9]{12}", path.name) is None for path in paths):
+        raise CampaignEvaluationError(f"foreign partial quarantine retention entry for {arm}")
+    for path in sorted(paths, key=lambda value: (int(value.name.split("-", 2)[1]), value.name)):
+        if path.is_symlink() or not path.is_dir():
+            raise CampaignEvaluationError(f"foreign partial quarantine retention entry: {path}")
+        identity = _partial_quarantine_directory_identity(path, root)
+        files = []
+        for file in sorted(path.iterdir()):
+            if file.is_symlink() or not file.is_file():
+                raise CampaignEvaluationError(f"foreign partial quarantine retention artifact: {file}")
+            files.append({"path": str(file), **_partial_quarantine_file_identity(file, root)})
+        record_hashes = [
+            record.get("record_hash")
+            for record in history["records"]
+            if record.get("quarantine_path") == str(path)
+        ]
+        result.append(
+            {
+                "path": str(path),
+                **identity,
+                "record_hashes": record_hashes,
+                "tree_sha256": hashlib.sha256(_canonical_bytes(files)).hexdigest(),
+                "files": files,
+            }
+        )
+    return result
+
+
+def _partial_quarantine_directory_identity(path: Path, root: Path) -> dict[str, object]:
+    _require_owned_directory(path.parent, root, "partial quarantine retention parent")
+    directory = os.open(
+        path.parent,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        metadata = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise CampaignEvaluationError(f"partial quarantine retention path is not a directory: {path}")
+        return {"device": metadata.st_dev, "inode": metadata.st_ino, "mode": metadata.st_mode}
+    finally:
+        os.close(directory)
+
+
+def _validate_partial_quarantine_retention_plan(
+    plan: Mapping[str, object],
+    history: Mapping[str, object],
+) -> None:
+    candidates = plan.get("candidates")
+    retained = plan.get("retained")
+    records = plan.get("records")
+    target = plan.get("target")
+    if (
+        set(plan) != {"version", "candidates", "retained", "records", "target"}
+        or plan.get("version") != 1
+        or not isinstance(candidates, list)
+        or not isinstance(retained, list)
+        or not isinstance(records, list)
+        or not isinstance(target, Mapping)
+        or set(target) != {"raw_directories", "files", "bytes"}
+        or any(type(target.get(name)) is not int or int(target[name]) < 0 for name in target)
+        or int(target["files"]) > MAX_PARTIAL_QUARANTINE_FILES
+        or int(target["bytes"]) > MAX_PARTIAL_QUARANTINE_BYTES
+    ):
+        raise CampaignEvaluationError("partial quarantine retention plan is malformed")
+    raw = [*candidates, *retained]
+    if any(not isinstance(value, Mapping) for value in raw):
+        raise CampaignEvaluationError("partial quarantine retention raw entry is malformed")
+    paths = [value.get("path") for value in raw]
+    if any(not isinstance(path, str) for path in paths) or len(paths) != len(set(paths)):
+        raise CampaignEvaluationError("partial quarantine retention paths conflict")
+    for value in raw:
+        files = value.get("files")
+        if (
+            set(value) != {"path", "device", "inode", "mode", "record_hashes", "tree_sha256", "files"}
+            or any(type(value.get(name)) is not int for name in ("device", "inode", "mode"))
+            or not isinstance(value.get("record_hashes"), list)
+            or not isinstance(value.get("tree_sha256"), str)
+            or not isinstance(files, list)
+            or any(
+                not isinstance(file, Mapping)
+                or set(file) != {"path", "device", "inode", "mode", "sha256", "size"}
+                or any(type(file.get(name)) is not int for name in ("device", "inode", "mode", "size"))
+                or not isinstance(file.get("sha256"), str)
+                for file in files
+            )
+            or value.get("tree_sha256") != hashlib.sha256(_canonical_bytes(files)).hexdigest()
+        ):
+            raise CampaignEvaluationError("partial quarantine retention raw identity conflicts")
+    retained_paths = {str(value["path"]) for value in retained}
+    expected_records = [
+        {
+            "record_hash": record.get("record_hash"),
+            "quarantine_path": record.get("quarantine_path"),
+            "raw_retained": str(record.get("quarantine_path")) in retained_paths,
+        }
+        for record in history["records"]
+    ]
+    expected_target = {
+        "raw_directories": len(retained),
+        "files": sum(len(value["files"]) for value in retained),
+        "bytes": sum(int(file["size"]) for value in retained for file in value["files"]),
+    }
+    if records != expected_records or dict(target) != expected_target:
+        raise CampaignEvaluationError("partial quarantine retention outcome conflicts")
+
+
+def _partial_quarantine_retention_states(
+    state: Mapping[str, object],
+    history_path: Path,
+    history: Mapping[str, object],
+    history_sha256: str,
+    plan: Mapping[str, object],
+) -> tuple[dict[str, object], dict[str, object]]:
+    plan_sha256 = hashlib.sha256(_canonical_bytes(plan)).hexdigest()
+    target = dict(plan["target"])
+    pending = {
+        "status": "pruning",
+        "plan_sha256": plan_sha256,
+        **target,
+    }
+    retained = {**pending, "status": "retained"}
+    retained_paths = {str(value["path"]) for value in plan["retained"]}
+    return (
+        {**state, "partial_quarantine_retention": pending},
+        {
+            **state,
+            "partial_attempt_history": _partial_history_summary_value(
+                history_path,
+                history,
+                history_sha256,
+                retained_paths,
+            ),
+            "partial_quarantine_retention": retained,
+        },
+    )
+
+
 def _prune_partial_attempts(
     root: Path,
     arm: str,
     path: Path,
-) -> list[dict[str, object]]:
-    history = _load_partial_history(path)
-    retained = {str(value.get("quarantine_path")) for value in history["records"]}
+    state_path: Path,
+    journal_path: Path,
+    journal: Mapping[str, object],
+) -> tuple[Mapping[str, object], Mapping[str, object]]:
+    plan = journal.get("retention_plan")
+    state_after = journal.get("state_after")
+    history = journal.get("history_after")
+    if not isinstance(plan, Mapping) or not isinstance(state_after, Mapping) or not isinstance(history, Mapping):
+        raise CampaignEvaluationError(f"partial quarantine retention transaction conflicts for {arm}")
+    _validate_partial_quarantine_retention_plan(plan, history)
+    history_state, retained_state = _partial_quarantine_retention_states(
+        state_after,
+        path,
+        history,
+        str(journal["history_after_sha256"]),
+        plan,
+    )
+    if journal.get("phase") == "history_state_published":
+        journal = _write_partial_quarantine_phase(journal_path, journal, "pruning")
+    _verify_partial_quarantine_retention_layout(root, arm, plan, allow_pruned=True)
+    candidates = plan["candidates"]
+    absent = [not Path(str(value["path"])).exists() for value in candidates]
+    completed = 0
+    for value in absent:
+        if not value:
+            break
+        completed += 1
+    if any(absent[completed:]):
+        raise CampaignEvaluationError(f"partial quarantine retention deletion order conflicts for {arm}")
+    phase_completed = _partial_quarantine_pruning_phase(journal.get("phase"), len(candidates))
+    if completed < phase_completed or completed > min(len(candidates), phase_completed + 1):
+        raise CampaignEvaluationError(f"partial quarantine retention phase conflicts for {arm}")
+    for index in range(completed, len(candidates)):
+        _delete_partial_quarantine_raw(root, candidates[index])
+        journal = _write_partial_quarantine_phase(journal_path, journal, f"pruning:{index + 1}")
+    _verify_partial_quarantine_retention_layout(root, arm, plan, allow_pruned=False)
+    current_state = _read_json(state_path, f"evaluator state for {arm}")
+    if dict(current_state) not in (dict(history_state), dict(retained_state)):
+        raise CampaignEvaluationError(f"evaluator retained state conflicts during pruning for {arm}")
+    if dict(current_state) != dict(retained_state):
+        _atomic_json(state_path, retained_state)
+    if journal.get("phase") not in {"retention_pruned", "complete"}:
+        journal = _write_partial_quarantine_phase(journal_path, journal, "retention_pruned")
+    if journal.get("phase") != "complete":
+        journal = _write_partial_quarantine_phase(journal_path, journal, "complete")
+    journal_path.unlink()
+    _sync_directory(journal_path.parent)
+    return journal, retained_state
+
+
+def _partial_quarantine_pruning_phase(phase: object, total: int) -> int:
+    if phase in {"pruning", "history_state_published"}:
+        return 0
+    if phase in {"retention_pruned", "complete"}:
+        return total
+    if isinstance(phase, str) and phase.startswith("pruning:"):
+        try:
+            completed = int(phase.split(":", 1)[1])
+        except ValueError as error:
+            raise CampaignEvaluationError("partial quarantine pruning phase is malformed") from error
+        if 0 < completed <= total:
+            return completed
+    raise CampaignEvaluationError("partial quarantine pruning phase is malformed")
+
+
+def _verify_partial_quarantine_retention_layout(
+    root: Path,
+    arm: str,
+    plan: Mapping[str, object],
+    *,
+    allow_pruned: bool,
+) -> None:
     parent = root / "evaluation-state" / f"{arm}.partial"
+    expected = {str(value["path"]): value for value in [*plan["candidates"], *plan["retained"]]}
+    actual = set()
     if parent.exists():
-        signatures: set[tuple[str, ...]] = set()
-        for record in reversed(history["records"]):
-            artifacts = record.get("artifacts")
-            signature = (
-                tuple(sorted(str(value.get("eval_sha256")) for value in artifacts if isinstance(value, Mapping)))
-                if isinstance(artifacts, list)
-                else ()
-            )
-            raw = Path(str(record.get("quarantine_path")))
-            if signature in signatures and raw.is_dir():
-                shutil.rmtree(raw)
-                _sync_directory(parent)
-            else:
-                signatures.add(signature)
-        raw_dirs = sorted(path for path in parent.glob("attempt-*") if path.is_dir())
-
-        def usage(paths: Sequence[Path]) -> tuple[int, int]:
-            return (
-                sum(len([entry for entry in raw.rglob("*") if entry.is_file()]) for raw in paths),
-                sum(entry.stat().st_size for raw in paths for entry in raw.rglob("*") if entry.is_file()),
-            )
-
-        files, size = usage(raw_dirs)
-        while raw_dirs and (
-            files > MAX_PARTIAL_QUARANTINE_FILES
+        _require_owned_directory(parent, root, f"partial quarantine retention root for {arm}")
+        actual = {str(value) for value in parent.iterdir()}
+    if not actual.issubset(expected):
+        raise CampaignEvaluationError(f"foreign partial quarantine retention entry for {arm}")
+    candidate_paths = {str(value["path"]) for value in plan["candidates"]}
+    retained_paths = {str(value["path"]) for value in plan["retained"]}
+    if not retained_paths.issubset(actual) or not allow_pruned and actual != retained_paths:
+        raise CampaignEvaluationError(f"partial quarantine retained paths conflict for {arm}")
+    for path in actual:
+        _verify_partial_quarantine_raw(root, expected[path], allow_missing=allow_pruned and path in candidate_paths)
+    if not allow_pruned:
+        files = sum(len(value["files"]) for value in plan["retained"])
+        size = sum(int(file["size"]) for value in plan["retained"] for file in value["files"])
+        target = plan["target"]
+        if (
+            files != target["files"]
+            or size != target["bytes"]
+            or len(actual) != target["raw_directories"]
+            or files > MAX_PARTIAL_QUARANTINE_FILES
             or size > MAX_PARTIAL_QUARANTINE_BYTES
-            or str(raw_dirs[0]) not in retained
         ):
-            raw = raw_dirs.pop(0)
-            shutil.rmtree(raw)
-            _sync_directory(parent)
-            files, size = usage(raw_dirs)
-    return [
-        {**record, "raw_retained": Path(str(record.get("quarantine_path"))).is_dir()} for record in history["records"]
-    ]
+            raise CampaignEvaluationError(f"partial quarantine retention bounds conflict for {arm}")
+
+
+def _verify_partial_quarantine_raw(
+    root: Path,
+    expected: Mapping[str, object],
+    *,
+    allow_missing: bool,
+) -> None:
+    path = Path(str(expected["path"]))
+    if _partial_quarantine_directory_identity(path, root) != {
+        "device": expected.get("device"),
+        "inode": expected.get("inode"),
+        "mode": expected.get("mode"),
+    }:
+        raise CampaignEvaluationError(f"partial quarantine retention directory identity conflicts: {path}")
+    planned = {str(file["path"]): file for file in expected["files"]}
+    actual = {str(file) for file in path.iterdir()}
+    if not actual.issubset(planned) or not allow_missing and actual != set(planned):
+        raise CampaignEvaluationError(f"partial quarantine retention file set conflicts: {path}")
+    for file in actual:
+        identity = _partial_quarantine_file_identity(Path(file), root)
+        expected_identity = {name: planned[file].get(name) for name in ("device", "inode", "mode", "sha256", "size")}
+        if identity != expected_identity:
+            raise CampaignEvaluationError(f"partial quarantine retention file identity conflicts: {file}")
+
+
+def _delete_partial_quarantine_raw(root: Path, expected: Mapping[str, object]) -> None:
+    path = Path(str(expected["path"]))
+    if not path.exists():
+        return
+    _verify_partial_quarantine_raw(root, expected, allow_missing=True)
+    directory = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        for file in expected["files"]:
+            name = Path(str(file["path"])).name
+            try:
+                os.stat(name, dir_fd=directory, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if _partial_quarantine_file_identity(path / name, root) != {
+                key: file.get(key) for key in ("device", "inode", "mode", "sha256", "size")
+            }:
+                raise CampaignEvaluationError(f"partial quarantine retention file changed before deletion: {path / name}")
+            os.unlink(name, dir_fd=directory)
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+    parent = os.open(
+        path.parent,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        identity = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+        if (
+            identity.st_dev != expected.get("device")
+            or identity.st_ino != expected.get("inode")
+            or identity.st_mode != expected.get("mode")
+        ):
+            raise CampaignEvaluationError(f"partial quarantine retention directory changed before deletion: {path}")
+        os.rmdir(path.name, dir_fd=parent)
+        os.fsync(parent)
+    finally:
+        os.close(parent)
 
 
 def _load_partial_history(path: Path) -> dict[str, object]:
@@ -1831,6 +2249,7 @@ def _partial_history_summary_value(
     path: Path,
     history: Mapping[str, object],
     file_sha256: str | None,
+    retained_paths: set[str] | None = None,
 ) -> Mapping[str, object]:
     return {
         "path": str(path),
@@ -1839,7 +2258,12 @@ def _partial_history_summary_value(
         "head_hash": history["head_hash"],
         "checkpoint": history["checkpoint"],
         "recent": [
-            {**record, "raw_retained": Path(str(record.get("quarantine_path"))).is_dir()}
+            {
+                **record,
+                "raw_retained": str(record.get("quarantine_path")) in retained_paths
+                if retained_paths is not None
+                else Path(str(record.get("quarantine_path"))).is_dir(),
+            }
             for record in history["records"]
         ],
     }
@@ -2207,6 +2631,9 @@ def _evaluate_arm(
         else [],
         "partial_attempt_history": dict(existing.get("partial_attempt_history", {}))
         if existing is not None and isinstance(existing.get("partial_attempt_history"), Mapping)
+        else {},
+        "partial_quarantine_retention": dict(existing.get("partial_quarantine_retention", {}))
+        if existing is not None and isinstance(existing.get("partial_quarantine_retention"), Mapping)
         else {},
     }
     if not submitted:

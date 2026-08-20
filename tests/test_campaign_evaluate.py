@@ -1409,7 +1409,11 @@ def test_explicit_retry_recovers_crash_after_partial_files_move_before_history_a
         "history_written",
         "history_published",
         "state_written",
-        "state_published",
+        "history_state_published",
+        "pruning",
+        "pruning_file_deleted",
+        "retention_state_written",
+        "retention_pruned",
         "complete",
     ),
 )
@@ -1428,6 +1432,15 @@ def test_partial_quarantine_transaction_recovers_every_durable_phase(
         raise TimeoutError
 
     campaign_evaluate.evaluate_campaign(root, instances=instances, command_runner=timeout_with_partial)
+    campaign_evaluate.evaluate_campaign(
+        root,
+        instances=instances,
+        retry_evaluator=True,
+        command_runner=timeout_with_partial,
+        process_probe=lambda _pid, _started: False,
+        process_group_probe=lambda _pgid: False,
+        cgroup_probe=lambda _path: False,
+    )
 
     class SimulatedCrash(BaseException):
         pass
@@ -1451,16 +1464,27 @@ def test_partial_quarantine_transaction_recovers_every_durable_phase(
                 raise SimulatedCrash
 
             crash.setattr(campaign_evaluate, "_append_partial_attempt_record", crash_after_history)
-        elif crash_point == "state_written":
+        elif crash_point == "pruning_file_deleted":
+            unlink = campaign_evaluate.os.unlink
+
+            def crash_after_file_delete(path, *args, **kwargs):
+                unlink(path, *args, **kwargs)
+                if kwargs.get("dir_fd") is not None and str(path).endswith(".eval.json"):
+                    raise SimulatedCrash
+
+            crash.setattr(campaign_evaluate.os, "unlink", crash_after_file_delete)
+        elif crash_point in {"state_written", "retention_state_written"}:
             atomic_json = campaign_evaluate._atomic_json
             state_path = root / "evaluation-state/procontract.json"
+            retention_status = "pruning" if crash_point == "state_written" else "retained"
 
             def crash_after_state(path, value):
                 atomic_json(path, value)
                 if (
                     path == state_path
                     and isinstance(value, dict)
-                    and value.get("completion_disposition") == "partial_quarantined"
+                    and isinstance(value.get("partial_quarantine_retention"), dict)
+                    and value["partial_quarantine_retention"].get("status") == retention_status
                 ):
                     raise SimulatedCrash
 
@@ -1508,7 +1532,161 @@ def test_partial_quarantine_transaction_recovers_every_durable_phase(
 
     assert outcome.status == "completed"
     assert not (root / "evaluation-state/procontract.partial-quarantine.json").exists()
-    assert json.loads((root / "evaluation-state/procontract.partial-attempts.json").read_text())["total_count"] == 1
+    assert json.loads((root / "evaluation-state/procontract.partial-attempts.json").read_text())["total_count"] == 2
+
+
+def test_partial_quarantine_recovers_pruning_failure_and_enforces_retention(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import campaign_evaluate
+
+    root, instances = _campaign(tmp_path / "campaign")
+
+    def fail_with_identical_partial(command, _cwd, _timeout, _grace, _limit, _environment, *, on_start):
+        on_start(999999, 999999, "timeout")
+        _write_eval(Path(command[4]) / "one/one.eval.json", statuses=("passed", "failure", "failure"))
+        raise TimeoutError
+
+    campaign_evaluate.evaluate_campaign(root, instances=instances, command_runner=fail_with_identical_partial)
+    campaign_evaluate.evaluate_campaign(
+        root,
+        instances=instances,
+        retry_evaluator=True,
+        command_runner=fail_with_identical_partial,
+        process_probe=lambda _pid, _started: False,
+        process_group_probe=lambda _pgid: False,
+        cgroup_probe=lambda _path: False,
+    )
+
+    class SimulatedCrash(BaseException):
+        pass
+
+    observed_journal = []
+
+    def crash_during_prune(root_path, arm, history_path, *args):
+        observed_journal.append((root_path / "evaluation-state" / f"{arm}.partial-quarantine.json").is_file())
+        raise SimulatedCrash
+
+    with monkeypatch.context() as crash:
+        crash.setattr(campaign_evaluate, "_prune_partial_attempts", crash_during_prune)
+        with pytest.raises(SimulatedCrash):
+            campaign_evaluate.evaluate_campaign(
+                root,
+                instances=instances,
+                retry_evaluator=True,
+                command_runner=lambda *_args, **_kwargs: pytest.fail("pruning crash must precede evaluator retry"),
+                process_probe=lambda _pid, _started: False,
+                process_group_probe=lambda _pgid: False,
+                cgroup_probe=lambda _path: False,
+            )
+
+    transaction_path = root / "evaluation-state/procontract.partial-quarantine.json"
+    assert observed_journal == [True]
+    assert transaction_path.is_file()
+
+    recovered = importlib.reload(campaign_evaluate)
+
+    def retry(command, _cwd, _timeout, _grace, _limit, _environment, *, on_start):
+        on_start(os.getpid(), os.getpid(), "retry")
+        path = Path(command[4]) / "one/one.eval.json"
+        assert not path.exists()
+        _write_eval(path, statuses=("passed", "failure", "failure"))
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    outcome = recovered.evaluate_campaign(
+        root,
+        instances=instances,
+        retry_evaluator=True,
+        command_runner=retry,
+        process_probe=lambda _pid, _started: False,
+        process_group_probe=lambda _pgid: False,
+        cgroup_probe=lambda _path: False,
+    )
+
+    assert outcome.status == "completed"
+    state = json.loads((root / "evaluation-state/procontract.json").read_text())
+    retention = state["partial_quarantine_retention"]
+    raw = list((root / "evaluation-state/procontract.partial").glob("attempt-*"))
+    assert state["partial_attempt_history"]["total_count"] == 2
+    assert [record["raw_retained"] for record in state["partial_attempt_history"]["recent"]] == [False, True]
+    assert len(raw) == retention["raw_directories"] == 1
+    assert sum(len(list(path.iterdir())) for path in raw) == retention["files"] <= recovered.MAX_PARTIAL_QUARANTINE_FILES
+    assert sum(file.stat().st_size for path in raw for file in path.iterdir()) == retention[
+        "bytes"
+    ] <= recovered.MAX_PARTIAL_QUARANTINE_BYTES
+    assert not transaction_path.exists()
+
+
+def test_partial_quarantine_pruning_rejects_changed_raw_file_without_deletion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import campaign_evaluate
+
+    root, instances = _campaign(tmp_path / "campaign")
+
+    def fail_with_identical_partial(command, _cwd, _timeout, _grace, _limit, _environment, *, on_start):
+        on_start(999999, 999999, "timeout")
+        _write_eval(Path(command[4]) / "one/one.eval.json", statuses=("passed", "failure", "failure"))
+        raise TimeoutError
+
+    campaign_evaluate.evaluate_campaign(root, instances=instances, command_runner=fail_with_identical_partial)
+    campaign_evaluate.evaluate_campaign(
+        root,
+        instances=instances,
+        retry_evaluator=True,
+        command_runner=fail_with_identical_partial,
+        process_probe=lambda _pid, _started: False,
+        process_group_probe=lambda _pgid: False,
+        cgroup_probe=lambda _path: False,
+    )
+
+    class SimulatedCrash(BaseException):
+        pass
+
+    write_phase = campaign_evaluate._write_partial_quarantine_phase
+
+    def crash_before_pruning(path, journal, phase):
+        updated = write_phase(path, journal, phase)
+        if phase == "history_state_published":
+            raise SimulatedCrash
+        return updated
+
+    with monkeypatch.context() as crash:
+        crash.setattr(campaign_evaluate, "_write_partial_quarantine_phase", crash_before_pruning)
+        with pytest.raises(SimulatedCrash):
+            campaign_evaluate.evaluate_campaign(
+                root,
+                instances=instances,
+                retry_evaluator=True,
+                command_runner=lambda *_args, **_kwargs: pytest.fail("crash must precede pruning"),
+                process_probe=lambda _pid, _started: False,
+                process_group_probe=lambda _pgid: False,
+                cgroup_probe=lambda _path: False,
+            )
+
+    transaction_path = root / "evaluation-state/procontract.partial-quarantine.json"
+    transaction = json.loads(transaction_path.read_text())
+    candidate = Path(transaction["retention_plan"]["candidates"][0]["path"])
+    foreign = Path(transaction["retention_plan"]["candidates"][0]["files"][0]["path"])
+    foreign.write_bytes(b"foreign-retention-artifact")
+    recovered = importlib.reload(campaign_evaluate)
+
+    with pytest.raises(recovered.CampaignEvaluationError, match="retention file identity conflicts"):
+        recovered.evaluate_campaign(
+            root,
+            instances=instances,
+            retry_evaluator=True,
+            command_runner=lambda *_args, **_kwargs: pytest.fail("foreign raw file must block retry"),
+            process_probe=lambda _pid, _started: False,
+            process_group_probe=lambda _pgid: False,
+            cgroup_probe=lambda _path: False,
+        )
+
+    assert candidate.is_dir()
+    assert foreign.read_bytes() == b"foreign-retention-artifact"
+    assert transaction_path.is_file()
 
 
 def test_partial_quarantine_recovery_handles_subset_of_submitted_outputs(
