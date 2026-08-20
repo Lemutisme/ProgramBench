@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from scripts import campaign_process
 import scripts.campaign_install as installer
 import scripts.run_opencode as runner
 from scripts.run_opencode import ConfigError, Job, expand_jobs, freeze_campaign_config, load_config, select_instances
@@ -583,6 +584,60 @@ def test_prepare_install_reuses_exact_manifest_without_rebuilding(tmp_path: Path
     ]
 
 
+def test_prepare_install_records_bun_toolchain_identity(tmp_path: Path, monkeypatch):
+    repo, _, _ = _fake_opencode_repo(tmp_path)
+    bun = _fake_bun(monkeypatch, tmp_path)
+
+    install = runner.prepare_install(
+        runner.ArmConfig("procontract", repo, "HEAD", "procontract"), tmp_path / "installs"
+    )
+
+    manifest = json.loads((tmp_path / "installs/procontract/install.json").read_text())
+    assert install.bun_path == bun
+    assert install.bun_sha256 == _sha256(bun)
+    assert install.bun_version == "bun-test"
+    assert install.bun_path_dirs[0] == bun.parent
+    assert manifest["bun_path"] == str(bun)
+    assert manifest["bun_sha256"] == _sha256(bun)
+    assert manifest["bun_version"] == "bun-test"
+    assert manifest["bun_path_dirs"][0] == str(bun.parent)
+
+
+def test_prepare_install_rejects_missing_bun_before_install_root_side_effects(tmp_path: Path, monkeypatch):
+    repo, _, _ = _fake_opencode_repo(tmp_path)
+    monkeypatch.setenv("PATH", os.defpath)
+
+    with pytest.raises(runner.InstallError, match="Bun toolchain is unavailable"):
+        runner.prepare_install(runner.ArmConfig("procontract", repo, "HEAD", "procontract"), tmp_path / "installs")
+
+    assert not (tmp_path / "installs/worktrees").exists()
+
+
+def test_prepare_install_fails_closed_when_frozen_bun_changes(tmp_path: Path, monkeypatch):
+    repo, _, _ = _fake_opencode_repo(tmp_path)
+    bun = _fake_bun(monkeypatch, tmp_path)
+    original = installer._binary_sha256
+    hashes = 0
+
+    def mutate_after_freeze(path: Path) -> str:
+        nonlocal hashes
+        digest = original(path)
+        if path == bun:
+            hashes += 1
+            if hashes == 2:
+                bun.write_text("#!/bin/sh\necho changed\n")
+                bun.chmod(0o755)
+        return digest
+
+    monkeypatch.setattr(installer, "_binary_sha256", mutate_after_freeze)
+    root = tmp_path / "installs"
+
+    with pytest.raises(runner.InstallError, match="Bun toolchain hash changed"):
+        runner.prepare_install(runner.ArmConfig("procontract", repo, "HEAD", "procontract"), root)
+
+    assert not (root / "procontract/install.json").exists()
+
+
 def test_prepare_install_reuses_manifest_after_moving_ref(tmp_path: Path, monkeypatch):
     repo, _, second = _fake_opencode_repo(tmp_path)
     _fake_bun(monkeypatch, tmp_path)
@@ -774,7 +829,7 @@ def test_prepare_install_normalizes_each_command_failure(tmp_path: Path, monkeyp
             return subprocess.CompletedProcess(command, 17, "credential=secret", "credential=secret")
         if target == "build" and command[0] == "bun" and "build" in command:
             return subprocess.CompletedProcess(command, 17, "credential=secret", "credential=secret")
-        if target == "smoke" and command[-1:] == ("--version",):
+        if target == "smoke" and command[-1:] == ("--version",) and command[0] != str(tmp_path / "bin/bun"):
             return subprocess.CompletedProcess(command, 17, "credential=secret", "credential=secret")
         return runner.run_checked(command, cwd)
 
@@ -1039,8 +1094,9 @@ def test_prepare_install_surfaces_cleanup_failure_and_reconciles_it_later(tmp_pa
     assert not (root / ".install-state/procontract.json").exists()
 
 
-def test_prepare_install_preserves_install_cleanup_error_identity(tmp_path: Path):
+def test_prepare_install_preserves_install_cleanup_error_identity(tmp_path: Path, monkeypatch):
     repo, _, _ = _fake_opencode_repo(tmp_path)
+    _fake_bun(monkeypatch, tmp_path)
     failure = runner.InstallCleanupError("cleanup failed; retained path=/owned phase=command containment")
 
     def fail_cleanup(command, cwd):
@@ -1272,6 +1328,53 @@ def test_run_checked_fails_closed_when_descendant_containment_is_unavailable(tmp
     assert not marker.exists()
 
 
+def test_run_checked_preserves_only_the_resolved_bun_directory_for_nested_bun(tmp_path: Path, monkeypatch):
+    bin_dir = tmp_path / "parent-only-bin"
+    bin_dir.mkdir()
+    nested_path = tmp_path / "nested-path"
+    environment = tmp_path / "environment"
+    bun = bin_dir / "bun"
+    bun.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = install ]; then exec bun nested-ok; fi\n'
+        'if [ "$1" = nested-ok ]; then\n'
+        f"  printf '%s\\n' \"$0\" > {nested_path}\n"
+        f"  env | sort > {environment}\n"
+        "  exit 0\n"
+        "fi\n"
+        "exit 2\n"
+    )
+    bun.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.defpath}")
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-reach-bun")
+
+    result = installer.run_checked(("bun", "install"), action="nested-bun")
+
+    assert result.returncode == 0
+    assert nested_path.read_text().strip() == str(bun)
+    values = environment.read_text().splitlines()
+    assert {value.partition("=")[0] for value in values} <= {"LANG", "LC_ALL", "PATH", "PWD"}
+    assert "OPENAI_API_KEY=must-not-reach-bun" not in values
+
+
+@pytest.mark.parametrize("command", [("./bun",), ("relative/bun",)])
+def test_resolve_command_rejects_relative_executable_paths(command: tuple[str, ...]):
+    with pytest.raises(campaign_process.ProcessError, match="absolute or a bare name"):
+        campaign_process.resolve_command(command)
+
+
+def test_resolve_command_rejects_symlinked_executable(tmp_path: Path):
+    target = tmp_path / "target"
+    target.write_text("#!/bin/sh\nexit 0\n")
+    target.chmod(0o755)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "bun").symlink_to(target)
+
+    with pytest.raises(campaign_process.ProcessError, match="symlink"):
+        campaign_process.resolve_command(("bun",), {"PATH": str(bin_dir)})
+
+
 def test_cgroup_v2_preflight_reports_actionable_missing_capability(tmp_path: Path):
     membership = tmp_path / "membership"
     membership.write_text("0::/unit\n")
@@ -1332,6 +1435,7 @@ def _fake_bun(monkeypatch, tmp_path: Path) -> Path:
     bun = bin_dir / "bun"
     bun.write_text(
         "#!/bin/sh\n"
+        'if [ "$1" = --version ]; then echo bun-test; exit 0; fi\n'
         'if [ "$1" = install ]; then exit 0; fi\n'
         'if [ "$1" = --cwd ]; then cwd="$2"; cd "$2"; shift 2; fi\n'
         'if [ "$1" = run ] && [ "$2" = build ]; then echo "$cwd $*" >> build.log; exec sh script/build.sh; fi\n'

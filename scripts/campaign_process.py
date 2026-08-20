@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import os
-import shutil
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -12,7 +12,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Mapping, Sequence
+from typing import Callable, Collection, Mapping, Sequence
 
 
 class ProcessError(RuntimeError):
@@ -29,6 +29,12 @@ class ProcessCleanupError(ProcessError):
 
 class ProcessOutputLimitError(ProcessError):
     """Raised after a command exceeds its combined output budget."""
+
+
+@dataclass(frozen=True)
+class ResolvedCommand:
+    executable: Path
+    path_dirs: tuple[Path, ...]
 
 
 @dataclass
@@ -65,12 +71,13 @@ def run_checked(
     create_cgroup: Callable[[], Path | None] | None = None,
     environment: Mapping[str, str] | None = None,
     *,
+    extra_environment_names: Collection[str] = (),
     on_start: Callable[[int, int, str, Path], None] | None = None,
     completion_path: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run with bounded output in delegated cgroup v2, or fail before launch."""
-    executable = shutil.which(command[0])
-    invocation = (executable, *command[1:]) if executable else command
+    resolved = resolve_command(command, environment)
+    invocation = (str(resolved.executable), *command[1:])
     cgroup = create_cgroup() if create_cgroup else create_command_cgroup()
     if cgroup is None:
         raise ProcessContainmentError("subprocess descendant containment is unavailable")
@@ -79,7 +86,7 @@ def run_checked(
         process = subprocess.Popen(
             _gated_invocation(read_descriptor, invocation, completion_path),
             cwd=cwd,
-            env=dict(environment) if environment is not None else {"PATH": os.defpath, "LANG": "C", "LC_ALL": "C"},
+            env=_child_environment(resolved, environment, extra_environment_names),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
@@ -161,11 +168,12 @@ def run_bounded(
     output_limit: int,
     environment: Mapping[str, str] | None = None,
     *,
+    extra_environment_names: Collection[str] = (),
     on_start: Callable[[int, int, str], None] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a non-provider evidence reader with bounded output, time, and descendants."""
-    executable = shutil.which(command[0])
-    invocation = (executable, *command[1:]) if executable else command
+    resolved = resolve_command(command, environment)
+    invocation = (str(resolved.executable), *command[1:])
     read_descriptor, write_descriptor = os.pipe()
     try:
         process = subprocess.Popen(
@@ -178,7 +186,7 @@ def run_bounded(
                 *invocation,
             ),
             cwd=cwd,
-            env=dict(environment) if environment is not None else {"PATH": os.defpath, "LANG": "C", "LC_ALL": "C"},
+            env=_child_environment(resolved, environment, extra_environment_names),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
@@ -235,6 +243,115 @@ def run_bounded(
         output.stdout.decode(errors="replace"),
         output.stderr.decode(errors="replace"),
     )
+
+
+def resolve_command(command: Sequence[str], environment: Mapping[str, str] | None = None) -> ResolvedCommand:
+    """Resolve one safe executable from the caller PATH without inheriting it into a child."""
+    if not command or not isinstance(command[0], str) or not command[0]:
+        raise ProcessError("command executable is required")
+    if any(not isinstance(argument, str) for argument in command):
+        raise ProcessError("command arguments must be strings")
+    if any(character in command[0] for character in ("\x00", "\n", "\r")):
+        raise ProcessError("command executable contains unsafe characters")
+    source = environment if environment is not None else os.environ
+    path = source.get("PATH", os.defpath)
+    if not isinstance(path, str) or any(character in path for character in ("\x00", "\n", "\r")):
+        raise ProcessError("command PATH is unsafe")
+    name = command[0]
+    if os.path.isabs(name):
+        executable = _require_safe_executable(Path(name))
+    else:
+        if os.sep in name or (os.altsep and os.altsep in name):
+            raise ProcessError("command executable must be absolute or a bare name")
+        executable = next(
+            (
+                _require_safe_path_executable(candidate)
+                for directory in path.split(os.pathsep)
+                if _safe_path_directory(directory)
+                for candidate in (Path(directory) / name,)
+                if candidate.exists() or candidate.is_symlink()
+            ),
+            None,
+        )
+        if executable is None:
+            raise ProcessError(f"command executable is unavailable: {name}")
+    path_dirs = tuple(
+        dict.fromkeys(
+            Path(directory).resolve()
+            for directory in (str(executable.parent), *os.defpath.split(os.pathsep))
+            if _safe_path_directory(directory)
+        )
+    )
+    if not path_dirs or path_dirs[0] != executable.parent:
+        raise ProcessError("resolved executable directory is unsafe")
+    return ResolvedCommand(executable, path_dirs)
+
+
+def _child_environment(
+    resolved: ResolvedCommand, environment: Mapping[str, str] | None, extra_environment_names: Collection[str]
+) -> dict[str, str]:
+    source = environment if environment is not None else {}
+    allowed = {"PATH": os.pathsep.join(str(directory) for directory in resolved.path_dirs), "LANG": "C", "LC_ALL": "C"}
+    names = (
+        "LANG",
+        "LC_ALL",
+        "DOCKER_HOST",
+        "HOME",
+        "TMPDIR",
+        "XDG_CACHE_HOME",
+        "PROGRAMBENCH_BLOB_DIR",
+        "PROGRAMBENCH_CONTAINER_PREFIX",
+        "PROGRAMBENCH_DOCKER_ORG",
+        "PROGRAMBENCH_HF_REVISION",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CONFIG_NOSYSTEM",
+        "GIT_OPTIONAL_LOCKS",
+    )
+    if not all(isinstance(name, str) and name.isidentifier() for name in extra_environment_names):
+        raise ProcessError("extra environment name is unsafe")
+    for name in (*names, *extra_environment_names):
+        value = source.get(name)
+        if value is None:
+            continue
+        if not isinstance(value, str) or any(character in value for character in ("\x00", "\n", "\r")):
+            raise ProcessError(f"environment value is unsafe: {name}")
+        allowed[name] = value
+    return allowed
+
+
+def _safe_path_directory(directory: str) -> bool:
+    return (
+        bool(directory)
+        and os.path.isabs(directory)
+        and not any(character in directory for character in ("\x00", "\n", "\r"))
+    )
+
+
+def _require_safe_executable(path: Path) -> Path:
+    if not path.is_absolute():
+        raise ProcessError("command executable is not absolute")
+    try:
+        path = path.resolve(strict=True)
+    except OSError as error:
+        raise ProcessError(f"command executable is unavailable: {path.name}") from error
+    current = Path(path.root)
+    for component in path.parts[1:]:
+        current /= component
+        try:
+            mode = current.lstat().st_mode
+        except OSError as error:
+            raise ProcessError(f"command executable is unavailable: {path.name}") from error
+        if stat.S_ISLNK(mode):
+            raise ProcessError("command executable path contains a symlink")
+    if not stat.S_ISREG(mode) or not os.access(path, os.X_OK):
+        raise ProcessError(f"command executable is not a regular executable: {path.name}")
+    return path
+
+
+def _require_safe_path_executable(path: Path) -> Path:
+    if path.is_symlink():
+        raise ProcessError("command executable path contains a symlink")
+    return _require_safe_executable(path)
 
 
 def _process_start_identity(pid: int) -> str:

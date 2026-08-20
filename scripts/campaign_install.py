@@ -75,6 +75,10 @@ class InstallRecord:
     full_model_catalog_status: Literal["available", "unavailable"]
     owned_paths: tuple[Path, ...]
     publication_phase: Literal["manifest_published"]
+    bun_path: Path | None = None
+    bun_sha256: str | None = None
+    bun_version: str | None = None
+    bun_path_dirs: tuple[Path, ...] = ()
 
     @property
     def catalog_output_sha256(self) -> str | None:
@@ -101,6 +105,10 @@ class _InstallState:
     owned_paths: tuple[Path, ...]
     phase: str
     record: InstallRecord | None
+    bun_path: Path | None = None
+    bun_sha256: str | None = None
+    bun_version: str | None = None
+    bun_path_dirs: tuple[Path, ...] = ()
 
 
 _RunCommand = Callable[[Sequence[str], Path | None], subprocess.CompletedProcess[str]]
@@ -203,6 +211,10 @@ def prepare_install(arm: ArmConfig, root: Path, run_command: _RunCommand = run_c
         if manifest.exists():
             return _reuse_published_install(arm, root, repo, manifest, state_path, run_command)
 
+        bun_path, bun_sha256, bun_version, bun_path_dirs = (
+            (None, None, None, ()) if arm.binary else _freeze_bun_toolchain(run_command)
+        )
+
         state = _load_state(state_path, root, arm.name) if state_path.exists() else None
         if state:
             recovered = _reconcile_state(arm, root, repo, state_path, state, run_command)
@@ -253,6 +265,10 @@ def prepare_install(arm: ArmConfig, root: Path, run_command: _RunCommand = run_c
             owned_paths=tuple(path for path in (staging, final_dir, final_worktree) if path),
             phase="staging_metadata",
             record=None,
+            bun_path=bun_path,
+            bun_sha256=bun_sha256,
+            bun_version=bun_version,
+            bun_path_dirs=bun_path_dirs,
         )
         _write_state(state_path, state)
         _crash_after("staging_metadata")
@@ -323,8 +339,8 @@ def _stage_build(
         None,
         "worktree-add",
     )
-    _run_command(run_command, _INSTALL_COMMAND, temporary_worktree, "install")
-    _run_command(run_command, _BUILD_COMMAND, temporary_worktree, "build")
+    _run_command(run_command, _bun_command(state, _INSTALL_COMMAND, run_command), temporary_worktree, "install")
+    _run_command(run_command, _bun_command(state, _BUILD_COMMAND, run_command), temporary_worktree, "build")
     staged_binary = temporary_worktree / _BUILT_BINARY
     final_binary = state.final_worktree / _BUILT_BINARY
     record = _new_record(
@@ -443,6 +459,10 @@ def _new_record(
         full_model_catalog_status="available" if catalog_output_sha256 else "unavailable",
         owned_paths=tuple(path for path in (state.final_dir, worktree) if path),
         publication_phase="manifest_published",
+        bun_path=state.bun_path,
+        bun_sha256=state.bun_sha256,
+        bun_version=state.bun_version,
+        bun_path_dirs=state.bun_path_dirs,
     )
 
 
@@ -663,6 +683,8 @@ def _require_matching_install(
     if record.worktree is None:
         if record.binary != (root / arm.name / "opencode").resolve() or record.install_command or record.build_command:
             raise InstallError("install manifest identity conflicts with requested arm")
+        if record.bun_path or record.bun_sha256 or record.bun_version or record.bun_path_dirs:
+            raise InstallError("supplied install manifest has a Bun toolchain")
     else:
         expected_worktree = (root / "worktrees" / f"{arm.name}-{record.revision}").resolve()
         if record.worktree != expected_worktree:
@@ -671,6 +693,9 @@ def _require_matching_install(
             raise InstallError("install manifest identity conflicts with requested arm")
         if record.binary != record.worktree / _BUILT_BINARY:
             raise InstallError("install manifest identity conflicts with requested arm")
+        _require_bun_toolchain(
+            record.bun_path, record.bun_sha256, record.bun_version, record.bun_path_dirs, run_command
+        )
         _require_live_worktree(record, repo, root, run_command)
     if record.smoke_command != (str(record.binary), "--version"):
         raise InstallError("install manifest identity conflicts with requested arm")
@@ -837,6 +862,53 @@ def _binary_version(binary: Path, run_command: _RunCommand, cwd: Path | None) ->
     return version.splitlines()[0]
 
 
+def _freeze_bun_toolchain(run_command: _RunCommand) -> tuple[Path, str, str, tuple[Path, ...]]:
+    try:
+        resolved = campaign_process.resolve_command(("bun",))
+    except campaign_process.ProcessError as error:
+        raise InstallError("Bun toolchain is unavailable before worktree creation") from error
+    bun_path = resolved.executable
+    bun_sha256 = _binary_sha256(bun_path)
+    bun_version = _command_text(run_command, (str(bun_path), "--version"), None, "bun-version")
+    if not bun_version:
+        raise InstallError("Bun toolchain did not report a version")
+    if _binary_sha256(bun_path) != bun_sha256:
+        raise InstallError("Bun toolchain changed during identity audit")
+    return bun_path, bun_sha256, bun_version.splitlines()[0], resolved.path_dirs
+
+
+def _bun_command(state: _InstallState, command: tuple[str, ...], run_command: _RunCommand) -> tuple[str, ...]:
+    _require_bun_toolchain(state.bun_path, state.bun_sha256, state.bun_version, state.bun_path_dirs, run_command)
+    if state.bun_path is None:
+        raise InstallError("build installation has no Bun toolchain")
+    if run_command is run_checked:
+        return (str(state.bun_path), *command[1:])
+    return command
+
+
+def _require_bun_toolchain(
+    bun_path: Path | None,
+    bun_sha256: str | None,
+    bun_version: str | None,
+    bun_path_dirs: tuple[Path, ...],
+    run_command: _RunCommand,
+) -> None:
+    if bun_path is None or bun_sha256 is None or bun_version is None or not bun_path_dirs:
+        raise InstallError("built install manifest has no Bun toolchain")
+    try:
+        resolved = campaign_process.resolve_command(("bun",))
+        direct = campaign_process.resolve_command((str(bun_path),))
+    except campaign_process.ProcessError as error:
+        raise InstallError("Bun toolchain is unavailable") from error
+    if resolved.executable != bun_path or resolved.path_dirs != bun_path_dirs or direct.executable != bun_path:
+        raise InstallError("Bun toolchain path changed")
+    if _binary_sha256(bun_path) != bun_sha256:
+        raise InstallError("Bun toolchain hash changed")
+    version = _command_text(run_command, (str(bun_path), "--version"), None, "bun-version")
+    if version.splitlines()[0] != bun_version or _binary_sha256(bun_path) != bun_sha256:
+        raise InstallError("Bun toolchain identity changed")
+
+
 def _run_command(
     run_command: _RunCommand,
     command: Sequence[str],
@@ -910,6 +982,10 @@ def _install_manifest(record: InstallRecord) -> dict[str, object]:
         "full_model_catalog_status": record.full_model_catalog_status,
         "owned_paths": [str(path) for path in record.owned_paths],
         "publication_phase": record.publication_phase,
+        "bun_path": str(record.bun_path) if record.bun_path else None,
+        "bun_sha256": record.bun_sha256,
+        "bun_version": record.bun_version,
+        "bun_path_dirs": [str(path) for path in record.bun_path_dirs],
     }
 
 
@@ -938,6 +1014,10 @@ def _record_from_mapping(raw: object) -> InstallRecord:
         "full_model_catalog_status",
         "owned_paths",
         "publication_phase",
+        "bun_path",
+        "bun_sha256",
+        "bun_version",
+        "bun_path_dirs",
     }
     if not isinstance(raw, dict) or set(raw) != keys:
         raise ValueError("manifest keys")
@@ -951,6 +1031,13 @@ def _record_from_mapping(raw: object) -> InstallRecord:
     binary_sha256 = _mapping_string(raw, "binary_sha256")
     supplied_binary = None if raw["supplied_binary"] is None else _mapping_path(raw, "supplied_binary")
     worktree = None if raw["worktree"] is None else _mapping_path(raw, "worktree")
+    bun_path = None if raw["bun_path"] is None else _mapping_path(raw, "bun_path")
+    bun_sha256 = raw["bun_sha256"]
+    bun_version = raw["bun_version"]
+    bun_path_dirs_raw = raw["bun_path_dirs"]
+    if not isinstance(bun_path_dirs_raw, list):
+        raise ValueError("bun_path_dirs")
+    bun_path_dirs = tuple(_absolute_canonical_path(value) for value in bun_path_dirs_raw)
     repo_url = raw["repo_url"]
     catalog_output = raw["full_model_catalog_output_sha256"]
     catalog_reason = raw["full_model_catalog_unavailable_reason"]
@@ -982,6 +1069,19 @@ def _record_from_mapping(raw: object) -> InstallRecord:
     owned_paths = tuple(_absolute_canonical_path(value) for value in owned)
     if len(owned_paths) != len(set(owned_paths)) or raw["publication_phase"] != "manifest_published":
         raise ValueError("publication")
+    if worktree is None:
+        if bun_path is not None or bun_sha256 is not None or bun_version is not None or bun_path_dirs:
+            raise ValueError("supplied Bun toolchain")
+    elif (
+        bun_path is None
+        or not isinstance(bun_sha256, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", bun_sha256)
+        or not isinstance(bun_version, str)
+        or not bun_version
+        or bun_path_dirs != tuple(dict.fromkeys(bun_path_dirs))
+        or bun_path_dirs[0] != bun_path.parent
+    ):
+        raise ValueError("Bun toolchain")
     return InstallRecord(
         arm=arm,
         repo=repo,
@@ -1006,6 +1106,10 @@ def _record_from_mapping(raw: object) -> InstallRecord:
         full_model_catalog_status=catalog_status,
         owned_paths=owned_paths,
         publication_phase="manifest_published",
+        bun_path=bun_path,
+        bun_sha256=bun_sha256,
+        bun_version=bun_version,
+        bun_path_dirs=bun_path_dirs,
     )
 
 
@@ -1033,6 +1137,10 @@ def _write_state(path: Path, state: _InstallState) -> None:
             "owned_paths": [str(path) for path in state.owned_paths],
             "phase": state.phase,
             "record": _install_manifest(state.record) if state.record else None,
+            "bun_path": str(state.bun_path) if state.bun_path else None,
+            "bun_sha256": state.bun_sha256,
+            "bun_version": state.bun_version,
+            "bun_path_dirs": [str(path) for path in state.bun_path_dirs],
         },
     )
     _fsync_directory(path.parent)
@@ -1057,6 +1165,10 @@ def _load_state(path: Path, root: Path, arm: str) -> _InstallState:
             "owned_paths",
             "phase",
             "record",
+            "bun_path",
+            "bun_sha256",
+            "bun_version",
+            "bun_path_dirs",
         }
         if not isinstance(raw, dict) or set(raw) != keys or raw["schema_version"] != 1:
             raise ValueError("state keys")
@@ -1079,6 +1191,13 @@ def _load_state(path: Path, root: Path, arm: str) -> _InstallState:
             raise ValueError("repo_identity")
         final_worktree = None if raw["final_worktree"] is None else _mapping_path(raw, "final_worktree")
         record = None if raw["record"] is None else _record_from_mapping(raw["record"])
+        bun_path = None if raw["bun_path"] is None else _mapping_path(raw, "bun_path")
+        bun_sha256 = raw["bun_sha256"]
+        bun_version = raw["bun_version"]
+        bun_path_dirs_raw = raw["bun_path_dirs"]
+        if not isinstance(bun_path_dirs_raw, list):
+            raise ValueError("bun_path_dirs")
+        bun_path_dirs = tuple(_absolute_canonical_path(value) for value in bun_path_dirs_raw)
         state = _InstallState(
             arm=state_arm,
             repo=repo,
@@ -1094,6 +1213,10 @@ def _load_state(path: Path, root: Path, arm: str) -> _InstallState:
             owned_paths=tuple(_absolute_canonical_path(value) for value in owned),
             phase=phase,
             record=record,
+            bun_path=bun_path,
+            bun_sha256=bun_sha256,
+            bun_version=bun_version,
+            bun_path_dirs=bun_path_dirs,
         )
         _validate_state_paths(state, root)
         _validate_state_record(state)
@@ -1116,6 +1239,26 @@ def _validate_state_paths(state: _InstallState, root: Path) -> None:
     expected_owned = tuple(path for path in (state.staging, state.final_dir, state.final_worktree) if path)
     if state.owned_paths != expected_owned:
         raise ValueError("owned paths")
+    if state.supplied_binary is not None:
+        if (
+            state.bun_path is not None
+            or state.bun_sha256 is not None
+            or state.bun_version is not None
+            or state.bun_path_dirs
+        ):
+            raise ValueError("supplied Bun toolchain")
+        return
+    if (
+        state.bun_path is None
+        or not isinstance(state.bun_sha256, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", state.bun_sha256)
+        or not isinstance(state.bun_version, str)
+        or not state.bun_version
+        or not state.bun_path_dirs
+        or state.bun_path_dirs != tuple(dict.fromkeys(state.bun_path_dirs))
+        or state.bun_path_dirs[0] != state.bun_path.parent
+    ):
+        raise ValueError("Bun toolchain")
 
 
 def _validate_state_record(state: _InstallState) -> None:
@@ -1135,6 +1278,10 @@ def _validate_state_record(state: _InstallState) -> None:
         or record.supplied_binary != state.supplied_binary
         or (record.worktree is None) != (state.supplied_binary is not None)
         or record.worktree != state.final_worktree
+        or record.bun_path != state.bun_path
+        or record.bun_sha256 != state.bun_sha256
+        or record.bun_version != state.bun_version
+        or record.bun_path_dirs != state.bun_path_dirs
     ):
         raise ValueError("state record identity")
     if record.owned_paths != tuple(path for path in (state.final_dir, state.final_worktree) if path):

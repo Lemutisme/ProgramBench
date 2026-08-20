@@ -103,6 +103,11 @@ def _run_contained(command: tuple[str, ...], timeout: float) -> str | None:
     except campaign_process.ProcessContainmentError:
         return None
     try:
+        credentials = tuple(
+            value
+            for option, value in zip(command, command[1:])
+            if option == "-e" and value.isidentifier() and value in os.environ
+        )
         result = campaign_process.run_checked(
             command,
             None,
@@ -110,7 +115,12 @@ def _run_contained(command: tuple[str, ...], timeout: float) -> str | None:
             _TERMINATION_GRACE,
             _OUTPUT_LIMIT,
             lambda: cgroup,
-            os.environ,
+            {
+                name: value
+                for name in ("PATH", "DOCKER_HOST", "LANG", "LC_ALL", *credentials)
+                if (value := os.environ.get(name))
+            },
+            extra_environment_names=credentials,
         )
     except TimeoutError:
         raise DockerProcessError("docker command timed out") from None
