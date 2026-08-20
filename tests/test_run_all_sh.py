@@ -23,6 +23,7 @@ def fake_runner_env(tmp_path: Path) -> tuple[Path, Path, dict[str, str]]:
         """#!/usr/bin/env bash
 set -euo pipefail
 printf '%s\\n' "$*" >>"$RUN_ALL_TEST_COMMANDS"
+if [[ "$*" == *campaign_prewarm.py* ]]; then exit 0; fi
 output=''
 dry=0
 evaluate=0
@@ -180,15 +181,22 @@ def test_run_all_chains_plan_inference_evaluation_and_writes_summary(tmp_path: P
 
     assert result.returncode == 0, result.stdout + result.stderr
     invocations = commands.read_text().splitlines()
-    assert len(invocations) == 3
+    assert len(invocations) == 4
     assert "--all" in invocations[0] and "--dry-run" in invocations[0]
-    assert "--resume" in invocations[1] and "--evaluate" not in invocations[1]
-    assert "--resume" in invocations[2] and "--evaluate" in invocations[2]
+    assert "campaign_prewarm.py" in invocations[1]
+    assert "--resume" in invocations[2] and "--evaluate" not in invocations[2]
+    assert "--resume" in invocations[3] and "--evaluate" in invocations[3]
     summary = json.loads((output / "RUN_ALL_SUMMARY.json").read_text())
     assert summary["status"] == "completed"
     assert summary["campaign"]["selected_instances"] == 200
     assert summary["campaign"]["trajectories"] == 400
-    assert summary["phase_exit"] == {"evaluation": 0, "inference": 0, "plan": 0, "wrapper": 0}
+    assert summary["phase_exit"] == {
+        "evaluation": 0,
+        "inference": 0,
+        "plan": 0,
+        "prewarm": 0,
+        "wrapper": 0,
+    }
     assert (output / "ARTIFACTS.sha256").is_file()
     assert (output / "RUN_ALL_SUMMARY.sha256").is_file()
     assert (output / "logs/plan.log").is_file()
@@ -211,10 +219,16 @@ def test_run_all_preserves_failure_summary_and_returns_nonzero(tmp_path: Path) -
     )
 
     assert result.returncode == 1
-    assert len(commands.read_text().splitlines()) == 3
+    assert len(commands.read_text().splitlines()) == 4
     summary = json.loads((output / "RUN_ALL_SUMMARY.json").read_text())
     assert summary["status"] == "failed"
-    assert summary["phase_exit"] == {"evaluation": 0, "inference": 1, "plan": 0, "wrapper": 1}
+    assert summary["phase_exit"] == {
+        "evaluation": 0,
+        "inference": 1,
+        "plan": 0,
+        "prewarm": 0,
+        "wrapper": 1,
+    }
     assert (output / "ARTIFACTS.sha256").is_file()
     assert (output / "RUN_ALL_SUMMARY.sha256").is_file()
 
@@ -233,7 +247,10 @@ def test_run_all_supports_single_procontract_arm(tmp_path: Path) -> None:
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert all("--arm procontract" in command for command in commands.read_text().splitlines())
+    runner_commands = [
+        command for command in commands.read_text().splitlines() if "campaign_prewarm.py" not in command
+    ]
+    assert all("--arm procontract" in command for command in runner_commands)
     summary = json.loads((output / "RUN_ALL_SUMMARY.json").read_text())
     assert summary["authorization"]["arm"] == "procontract"
     assert summary["campaign"]["selected_instances"] == 200

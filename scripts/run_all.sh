@@ -19,6 +19,7 @@ STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 PLAN_STATUS="not-run"
 INFERENCE_STATUS="not-run"
 EVALUATION_STATUS="not-run"
+PREWARM_STATUS="not-run"
 
 usage() {
   cat <<'EOF'
@@ -222,8 +223,8 @@ write_summary() {
   local finished_at
   finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   python3 - "$OUTPUT" "$STARTED_AT" "$finished_at" "$PLAN_STATUS" "$INFERENCE_STATUS" \
-    "$EVALUATION_STATUS" "$wrapper_status" "$RUNNER_REVISION" "$CONFIG" "$SCRIPT_DIR/run_all.sh" "$ARM" \
-    "$ALLOW_QUARANTINED_KEY" <<'PY'
+    "$EVALUATION_STATUS" "$PREWARM_STATUS" "$wrapper_status" "$RUNNER_REVISION" "$CONFIG" \
+    "$SCRIPT_DIR/run_all.sh" "$ARM" "$ALLOW_QUARANTINED_KEY" <<'PY'
 from collections import Counter, defaultdict
 from datetime import datetime
 from hashlib import sha256
@@ -240,6 +241,7 @@ import tempfile
     plan_status,
     inference_status,
     evaluation_status,
+    prewarm_status,
     wrapper_status,
     runner_revision,
     config_value,
@@ -308,6 +310,7 @@ summary = {
     "wall_seconds": (finished - started).total_seconds(),
     "phase_exit": {
         "plan": phase_status(plan_status),
+        "prewarm": phase_status(prewarm_status),
         "inference": phase_status(inference_status),
         "evaluation": phase_status(evaluation_status),
         "wrapper": int(wrapper_status),
@@ -432,6 +435,13 @@ if len(jobs) != expected_jobs:
     raise SystemExit(f"run_all: expected {expected_jobs} trajectories, frozen manifest has {len(jobs)}")
 print(f"run_all: manifest verified instances={len(selected)} trajectories={len(jobs)} arm={requested_arm}")
 PY
+
+if run_phase prewarm uv run --frozen python "$SCRIPT_DIR/campaign_prewarm.py" --campaign "$OUTPUT" --workers "$WORKERS"; then
+  PREWARM_STATUS=0
+else
+  PREWARM_STATUS=$?
+  exit "$PREWARM_STATUS"
+fi
 
 if run_phase inference "${RUNNER[@]}" --resume; then
   INFERENCE_STATUS=0
