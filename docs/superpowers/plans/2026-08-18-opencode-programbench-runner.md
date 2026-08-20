@@ -781,9 +781,22 @@ and no prior calibration IDs.
 
 - [ ] **Step 3: Execute inference**
 
-Run the same command without `--dry-run`. Monitor only runner state, provider
-errors, cache/cost gates, and concurrency. Do not inspect or adapt based on
-official scores.
+The dry-run already froze the campaign and install manifest. Run the same
+campaign with `--resume` and without `--dry-run`:
+
+```bash
+uv run python scripts/run_opencode.py \
+  --config scripts/opencode_programbench.yaml \
+  --workers 8 \
+  --limit 8 \
+  --seed 42 \
+  --output /tmp/programbench-opencode-luna-pilot \
+  --resume
+```
+
+Monitor only runner state, provider errors, cache/cost gates, and concurrency.
+Do not inspect or adapt based on official scores. Every later invocation for
+this output root must also use `--resume`.
 
 Expected: no more than eight active trajectories; each job produces one
 terminal state and at most one submission.

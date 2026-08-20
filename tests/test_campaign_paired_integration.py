@@ -11,6 +11,30 @@ from pathlib import Path
 import pytest
 
 
+def test_calculator_fixture_builder_never_uses_root_agent_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands = []
+    context = tmp_path / "image"
+    monkeypatch.setattr(os, "getuid", lambda: 0)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda command, **_kwargs: commands.append(command) or subprocess.CompletedProcess(command, 0),
+    )
+
+    _build_calculator_images(context, ("programbench/root-safe:task_cleanroom",))
+
+    dockerfile = context.joinpath("Dockerfile").read_text()
+    assert "useradd --uid 0" not in dockerfile
+    assert "agent_id=10000" in dockerfile
+    assert "getent passwd" in dockerfile and "getent group" in dockerfile
+    assert 'groupadd --gid "$agent_id" agent' in dockerfile
+    assert 'useradd --uid "$agent_id" --gid "$agent_id"' in dockerfile
+    assert commands == [("docker", "build", "-t", "programbench/root-safe:task_cleanroom", str(context))]
+
+
 @pytest.mark.slow
 def test_real_docker_paired_fake_binaries_run_four_jobs_and_resume(
     tmp_path: Path,
@@ -202,7 +226,27 @@ def test_real_docker_paired_fake_binaries_run_four_jobs_and_resume(
             )
         finally:
             if images_built:
-                _run_docker(("docker", "rmi", "-f", *image_tags), 120)
+                try:
+                    _run_docker(
+                        (
+                            "docker",
+                            "run",
+                            "--rm",
+                            "--user",
+                            "root",
+                            "-v",
+                            f"{tmp_path}:/cleanup",
+                            "--entrypoint",
+                            "chmod",
+                            image_tags[0],
+                            "-R",
+                            "a+rwX",
+                            "/cleanup",
+                        ),
+                        60,
+                    )
+                finally:
+                    _run_docker(("docker", "rmi", "-f", *image_tags), 120)
                 for tag in image_tags:
                     with pytest.raises(DockerCommandError):
                         _run_docker(("docker", "image", "inspect", tag), 30)
@@ -275,7 +319,10 @@ def _build_calculator_images(context: Path, tags: tuple[str, ...]) -> None:
     context.joinpath("reference").write_text(_calculator_source())
     context.joinpath("Dockerfile").write_text(
         fixture.joinpath("Dockerfile").read_text()
-        + f"\nRUN useradd --uid {os.getuid()} --create-home agent\n"
+        + "\nRUN agent_id=10000; "
+        + 'while getent passwd "$agent_id" >/dev/null || getent group "$agent_id" >/dev/null; '
+        + 'do agent_id=$((agent_id + 1)); done; groupadd --gid "$agent_id" agent && '
+        + 'useradd --uid "$agent_id" --gid "$agent_id" --create-home agent\n'
         + "COPY reference /workspace/executable\n"
         + "RUN chmod 755 /workspace/executable && chown -R agent:agent /workspace\n"
     )

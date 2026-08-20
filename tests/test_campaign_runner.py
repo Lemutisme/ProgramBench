@@ -1,5 +1,7 @@
 import hashlib
 import json
+import re
+import shlex
 import threading
 import time
 import subprocess
@@ -878,6 +880,74 @@ def test_direct_script_cli_help_is_import_safe():
         "--dry-run",
     ):
         assert option in result.stdout
+
+
+def test_public_entrypoint_requires_resume_after_documented_dry_run(tmp_path: Path, monkeypatch):
+    from scripts import campaign_runner, run_opencode
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config_path = tmp_path / "campaign.yaml"
+    config_path.write_text(_config(repo))
+    output = tmp_path / "pilot"
+    guide = Path(__file__).parents[1].joinpath("docs/README.md").read_text()
+    pilot = guide.split("### Pilot workflow", 1)[1].split("### Pauses, evaluation, and results", 1)[0]
+    commands = re.findall(r"```bash\n(.*?)```", pilot, re.DOTALL)
+    documented = [_documented_script_arguments(command) for command in commands]
+    dry_run = documented[0]
+    inference = documented[1]
+    assert all("--resume" in arguments for arguments in documented[1:] if "output/luna-pilot" in arguments)
+    for arguments in (dry_run, inference):
+        _replace_argument(arguments, "--config", str(config_path))
+        _replace_argument(arguments, "--output", str(output))
+        _replace_argument(arguments, "--workers", "1")
+        _replace_argument(arguments, "--limit", "1")
+
+    assert "--dry-run" in dry_run
+    assert "--resume" in inference
+
+    instances = [{"instance_id": "one", "difficulty": "easy", "language": "python", "image_name": "one-image"}]
+    prepared = []
+    executed = []
+    original_plan_campaign = campaign_runner.plan_campaign
+
+    def plan_campaign(*args, **kwargs):
+        return original_plan_campaign(
+            *args,
+            **kwargs,
+            prepare_install_fn=lambda arm, root: (
+                prepared.append((arm.name, root))
+                or {"arm": arm.name, "revision": arm.revision, "binary_sha256": arm.name[0] * 64}
+            ),
+        )
+
+    def run_job(_plan, candidate, **_kwargs):
+        executed.append(candidate)
+        return campaign_runner.JobRunResult(candidate, "completed")
+
+    monkeypatch.setattr(campaign_runner, "load_all_instances", lambda **_kwargs: instances)
+    monkeypatch.setattr(campaign_runner, "plan_campaign", plan_campaign)
+    monkeypatch.setattr(campaign_runner, "run_job", run_job)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENCODE_SERVER_PASSWORD", "test-password")
+
+    assert _invoke_public_main(run_opencode, monkeypatch, dry_run) == 0
+    assert output.joinpath("campaign.json").is_file()
+    assert len(prepared) == 2
+    assert executed == []
+
+    without_resume = [argument for argument in inference if argument != "--resume"]
+    monkeypatch.setattr(sys, "argv", ["scripts/run_opencode.py", *without_resume])
+    with pytest.raises(campaign_runner.CampaignError, match="use --resume"):
+        run_opencode.main()
+    assert executed == []
+
+    assert _invoke_public_main(run_opencode, monkeypatch, inference) == 0
+    assert {(candidate.instance_id, candidate.arm) for candidate in executed} == {
+        ("one", "procontract"),
+        ("one", "vanilla"),
+    }
+    assert len(prepared) == 2
 
 
 def test_plan_dry_run_prepares_each_arm_once_without_workspace(tmp_path: Path):
@@ -2339,3 +2409,20 @@ arms:
     mode: vanilla
 excluded: []
 """
+
+
+def _documented_script_arguments(command: str) -> list[str]:
+    values = shlex.split(command.replace("\\\n", " "))
+    assert values[:4] == ["uv", "run", "python", "scripts/run_opencode.py"]
+    return values[4:]
+
+
+def _replace_argument(arguments: list[str], option: str, value: str) -> None:
+    arguments[arguments.index(option) + 1] = value
+
+
+def _invoke_public_main(run_opencode: object, monkeypatch: pytest.MonkeyPatch, arguments: list[str]) -> int:
+    monkeypatch.setattr(sys, "argv", ["scripts/run_opencode.py", *arguments])
+    with pytest.raises(SystemExit) as exited:
+        run_opencode.main()  # type: ignore[attr-defined]
+    return int(exited.value.code)

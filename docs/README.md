@@ -13,9 +13,13 @@ ProContract and an unmodified OpenCode checkout resolved from `origin/dev`.
 ProContract remains inside the pinned OpenCode binary; ProgramBench does not
 reimplement it or add a new ProgramBench CLI command.
 
-Run campaigns on Linux/amd64 with Docker and cgroup-v2 delegation available to
-the invoking user. Install `uv`, Bun, Git, and Docker. In the shell that starts
-the runner (for example `~/.bashrc`, followed by `source ~/.bashrc`), export:
+Run campaigns on Linux/amd64 with Docker. The full installer-backed paths—an
+initial `prepare_install`, the paired real-Docker integration test, and a live
+pilot—also require cgroup v2 mounted with the invoking process delegated a
+writable subtree providing both `cgroup.procs` and `cgroup.kill`. Basic config
+and unit-test portability does not imply that delegation is available. Install
+`uv`, Bun, Git, and Docker. In the shell that starts the runner (for example
+`~/.bashrc`, followed by `source ~/.bashrc`), export:
 
 ```bash
 export OPENAI_API_KEY='...'
@@ -51,18 +55,21 @@ uv run python scripts/run_opencode.py \
   --output output/luna-pilot --dry-run
 ```
 
-Review `output/luna-pilot/campaign.json`, then run actual inference with the
-same arguments:
+This dry-run is a state-changing planning operation: it resolves both arm
+installs and freezes selection, install identities, and campaign arguments in
+`output/luna-pilot/campaign.json`. Review that manifest, then run actual
+inference with the same arguments plus `--resume`:
 
 ```bash
 uv run python scripts/run_opencode.py \
   --config scripts/opencode_programbench.yaml \
   --workers 8 --limit 8 --seed 42 \
-  --output output/luna-pilot
+  --output output/luna-pilot --resume
 ```
 
-`--workers 8` caps all active trajectories, not pairs. Resume only the frozen
-campaign with the same selection:
+`--workers 8` caps all active trajectories, not pairs. Every later invocation
+against `output/luna-pilot` must use `--resume`; rerun the same command after an
+interruption:
 
 ```bash
 uv run python scripts/run_opencode.py \
@@ -172,7 +179,9 @@ uv run --frozen pytest \
 These tests use real installation, Docker workspace, adapter, scheduler,
 package, preflight, replay/export, attestation, resume, and lease paths. They
 skip only when their explicitly required Docker daemon or opt-in binary is
-unavailable.
+unavailable. The paired test intentionally fails rather than skips when Docker
+is available but writable cgroup-v2 delegation is missing, because that is a
+required property of the real installer path.
 
 ## Inference
 
