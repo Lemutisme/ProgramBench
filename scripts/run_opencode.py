@@ -313,11 +313,11 @@ def freeze_campaign_config(config: CampaignConfig, manifest_path: Path) -> None:
             os.unlink(temporary_name)
 
 
-def main() -> None:
+def main(arguments: Sequence[str] | None = None) -> int:
     """Compatibility entrypoint; campaign orchestration lives in campaign_runner."""
     from scripts.campaign_runner import main as campaign_main
 
-    raise SystemExit(campaign_main())
+    return campaign_main(arguments)
 
 
 def _load_limits(raw: object) -> Limits:
@@ -468,4 +468,4 @@ def _canonical_config(config: CampaignConfig) -> dict[str, object]:
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

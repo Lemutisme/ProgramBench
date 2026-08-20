@@ -1,3 +1,4 @@
+import hashlib
 import json
 import threading
 import time
@@ -864,6 +865,26 @@ def test_direct_script_cli_help_is_import_safe():
 
     assert result.returncode == 0
     assert "8 active trajectories" in result.stdout
+    for option in (
+        "--workers",
+        "--limit",
+        "--seed",
+        "--resume",
+        "--acknowledge",
+        "--all",
+        "--evaluate",
+        "--retry-evaluator",
+        "--dry-run",
+    ):
+        assert option in result.stdout
+
+
+def test_script_main_accepts_cli_arguments_without_exiting(monkeypatch):
+    from scripts import campaign_runner, run_opencode
+
+    monkeypatch.setattr(campaign_runner, "main", lambda arguments: 7)
+
+    assert run_opencode.main(["--dry-run", "--config", "campaign.yaml"]) == 7
 
 
 def test_plan_dry_run_prepares_each_arm_once_without_workspace(tmp_path: Path):
@@ -1813,17 +1834,13 @@ def test_resume_refuses_an_install_record_that_differs_from_manifest(tmp_path: P
 
 
 @pytest.mark.parametrize("workers", [2, 8])
-def test_fake_paired_campaign_runs_real_scheduler_paths_and_resumes_without_adapter_calls(
-    tmp_path: Path, monkeypatch, workers: int
-):
-    from scripts import campaign_runner
-    from scripts.run_opencode import load_config
+def test_fake_paired_campaign_script_main_resumes_without_adapter_calls(tmp_path: Path, monkeypatch, workers: int):
+    from scripts import campaign_evaluate, campaign_runner, run_opencode
 
     repo = tmp_path / "repo"
     repo.mkdir()
     config_path = tmp_path / "campaign.yaml"
     config_path.write_text(_config(repo))
-    config = load_config(config_path)
     instances = [
         {"instance_id": "one", "difficulty": "easy", "language": "python", "image_name": "one-image"},
         {"instance_id": "two", "difficulty": "hard", "language": "rust", "image_name": "two-image"},
@@ -1834,14 +1851,16 @@ def test_fake_paired_campaign_runs_real_scheduler_paths_and_resumes_without_adap
         prepared.append((arm.name, arm.revision, root))
         return {"arm": arm.name, "revision": f"frozen-{arm.name}", "binary_sha256": arm.name[0] * 64}
 
-    plan = campaign_runner.plan_campaign(
-        config,
-        instances,
-        output=tmp_path / "out",
-        limit=2,
-        seed=42,
-        prepare_install_fn=prepare,
-    )
+    original_plan_campaign = campaign_runner.plan_campaign
+    plans = []
+
+    def plan_campaign(*args, **kwargs):
+        plan = original_plan_campaign(*args, **kwargs, prepare_install_fn=prepare)
+        plans.append(plan)
+        return plan
+
+    monkeypatch.setattr(campaign_runner, "load_all_instances", lambda **_kwargs: instances)
+    monkeypatch.setattr(campaign_runner, "plan_campaign", plan_campaign)
     monkeypatch.setattr(campaign_runner, "_install_for", lambda frozen, arm: frozen.installs[arm])
     active = 0
     maximum = 0
@@ -1880,34 +1899,91 @@ def test_fake_paired_campaign_runs_real_scheduler_paths_and_resumes_without_adap
                 state = store.transition(phase, command_identity="fake-adapter", expected_generation=state.generation)
             job_lease.job.submission.write_bytes(f"{workspace.request.instance_id}:{workspace.request.arm}".encode())
             job_lease.job.root.joinpath("usage.json").write_text('{"cost":"0"}\n')
-            job_lease.job.root.joinpath(f"{workspace.request.arm}-result.json").write_text('{"terminal":true}\n')
-            store.transition("done", command_identity="fake-adapter", expected_generation=state.generation)
+            result_path = job_lease.job.root / f"{workspace.request.arm}-result.json"
+            result = {
+                "version": 1,
+                "completion": "discharged" if workspace.request.arm == "procontract" else "idle",
+                "provider_turns": 3,
+                "actions": 4,
+                "cost": "1.25",
+                "elapsed_seconds": 12.5,
+                "input_tokens": 2,
+                "cache_read": 6,
+                "cache_write": 2,
+                "exit_class": "discharged" if workspace.request.arm == "procontract" else "idle",
+                "executable_hash": "e" * 64,
+            }
+            if workspace.request.arm == "procontract":
+                result.update(
+                    {
+                        "status": "discharged",
+                        "quiet": True,
+                        "outstanding": [],
+                        "package_hash": hashlib.sha256(job_lease.job.submission.read_bytes()).hexdigest(),
+                    }
+                )
+            result_path.write_text(json.dumps(result, sort_keys=True))
+            store.transition(
+                "done",
+                command_identity="fake-adapter",
+                expected_generation=state.generation,
+                provider_turns=3,
+                actions=4,
+                cost=1.25,
+                exit_class=result["exit_class"],
+                artifact_hashes={
+                    "submission.tar.gz": hashlib.sha256(job_lease.job.submission.read_bytes()).hexdigest(),
+                    result_path.name: hashlib.sha256(result_path.read_bytes()).hexdigest(),
+                },
+            )
             workspace.stop_for_freeze()
         finally:
             with lock:
                 active -= 1
 
-    breaker = CircuitBreaker()
-    result = campaign_runner.run_campaign(
-        plan.jobs,
-        workers=workers,
-        breaker=breaker,
-        state_path=plan.output / "breaker.json",
-        execute=lambda candidate, stop: campaign_runner.run_job(
+    original_run_job = campaign_runner.run_job
+
+    def run_job(plan, candidate, **kwargs):
+        return original_run_job(
             plan,
             candidate,
-            breaker=breaker,
-            stop_token=stop,
-            workspace_factory=workspace_factory,
+            **kwargs,
+            workspace_factory=(
+                (lambda *_: pytest.fail("terminal resume cannot allocate workspace"))
+                if kwargs.get("resume")
+                else workspace_factory
+            ),
             vanilla_runner=adapter,
             procontract_runner=adapter,
             vanilla_api_factory=lambda _: object(),
             procontract_api_factory=lambda _: object(),
-        ),
+        )
+
+    monkeypatch.setattr(campaign_runner, "run_job", run_job)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENCODE_SERVER_PASSWORD", "test-password")
+    output = tmp_path / "out"
+
+    assert (
+        run_opencode.main(
+            [
+                "--config",
+                str(config_path),
+                "--output",
+                str(output),
+                "--workers",
+                str(workers),
+                "--limit",
+                "2",
+                "--seed",
+                "42",
+            ]
+        )
+        == 0
     )
 
-    assert result.completed == 4
-    assert result.failed == 0
+    plan = plans[0]
+
     assert maximum == min(workers, 4)
     assert set(calls) == {(instance, arm) for instance in ("one", "two") for arm in ("vanilla", "procontract")}
     assert len(prepared) == 2
@@ -1921,33 +1997,33 @@ def test_fake_paired_campaign_runs_real_scheduler_paths_and_resumes_without_adap
         assert paths.root.joinpath(f"{candidate.arm}-result.json").is_file()
         assert not tuple(paths.root.glob("*.eval.json"))
 
-    resumed = campaign_runner.plan_campaign(
-        config,
-        instances,
-        output=plan.output,
-        limit=2,
-        seed=42,
-        resume=True,
-        prepare_install_fn=lambda *_: pytest.fail("resume cannot resolve prepared refs"),
-    )
+    manifest = json.loads(plan.manifest_path.read_text())
+    jobs = campaign_evaluate._manifest_jobs(manifest)
+    evidence = campaign_evaluate._prepare_evidence(plan.output, jobs)
+    assert len(evidence) == 4
+    assert all(value["result_error"] is None for value in evidence.values())
+
     calls.clear()
-    resumed_result = campaign_runner.run_campaign(
-        resumed.jobs,
-        workers=workers,
-        execute=lambda candidate, stop: campaign_runner.run_job(
-            resumed,
-            candidate,
-            breaker=CircuitBreaker(),
-            resume=True,
-            stop_token=stop,
-            workspace_factory=lambda *_: pytest.fail("terminal resume cannot allocate workspace"),
-            vanilla_runner=adapter,
-            procontract_runner=adapter,
-        ),
+
+    assert (
+        run_opencode.main(
+            [
+                "--config",
+                str(config_path),
+                "--output",
+                str(output),
+                "--workers",
+                str(workers),
+                "--limit",
+                "2",
+                "--seed",
+                "42",
+                "--resume",
+            ]
+        )
+        == 0
     )
 
-    assert resumed_result.completed == 4
-    assert resumed_result.failed == 0
     assert calls == []
     assert len(prepared) == 2
 

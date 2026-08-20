@@ -5,6 +5,140 @@
 > They will not run natively on macOS or Windows hosts (and emulating them via QEMU is generally slow).
 > Use a Linux x86_64 machine to run inference and evaluation.
 
+## Paired OpenCode campaigns
+
+`scripts/run_opencode.py` is a deliberately thin direct-script runner inspired
+by mini-swe-agent. It runs each selected instance twice: native OpenCode
+ProContract and an unmodified OpenCode checkout resolved from `origin/dev`.
+ProContract remains inside the pinned OpenCode binary; ProgramBench does not
+reimplement it or add a new ProgramBench CLI command.
+
+Run campaigns on Linux/amd64 with Docker and cgroup-v2 delegation available to
+the invoking user. Install `uv`, Bun, Git, and Docker. In the shell that starts
+the runner (for example `~/.bashrc`, followed by `source ~/.bashrc`), export:
+
+```bash
+export OPENAI_API_KEY='...'
+export OPENCODE_SERVER_PASSWORD='...'
+```
+
+Do not put credential values in YAML, campaign output, shell history, or issue
+reports. The inference boundary is cooperative: the model client and candidate
+shell share provider egress. It is not a `--network none` security claim;
+cleanroom Docker evaluation happens after inference freezes.
+
+Use [`scripts/opencode_programbench.yaml`](../scripts/opencode_programbench.yaml)
+as the starting configuration: its limits are 6 hours, 1,000 provider turns,
+and 4,000 ProContract actions. Replace its sample `repo` path with your local
+OpenCode clone. On first planning, the runner makes detached arm worktrees
+under `OUTPUT/installs/`, pins the configured ProContract SHA and resolved
+vanilla `origin/dev` SHA, and records each binary's version and SHA-256 in
+`install.json` and `campaign.json`. A configured `binary:` is copied and
+hashed. A resume reuses those frozen pins and never rebuilds or resolves moving
+refs.
+
+### Pilot workflow
+
+Dry-run the exact eight-instance, sixteen-trajectory pilot first:
+
+```bash
+uv run python scripts/run_opencode.py \
+  --config scripts/opencode_programbench.yaml \
+  --workers 8 --limit 8 --seed 42 \
+  --output output/luna-pilot --dry-run
+```
+
+Review `output/luna-pilot/campaign.json`, then run actual inference with the
+same arguments:
+
+```bash
+uv run python scripts/run_opencode.py \
+  --config scripts/opencode_programbench.yaml \
+  --workers 8 --limit 8 --seed 42 \
+  --output output/luna-pilot
+```
+
+`--workers 8` caps all active trajectories, not pairs. Resume only the frozen
+campaign with the same selection:
+
+```bash
+uv run python scripts/run_opencode.py \
+  --config scripts/opencode_programbench.yaml \
+  --workers 8 --limit 8 --seed 42 \
+  --output output/luna-pilot --resume
+```
+
+The runner stops after the pilot. Use `--all` only after reviewing the paired
+pilot and report; it conflicts with `--limit` and should use a new output root:
+
+```bash
+uv run python scripts/run_opencode.py \
+  --config scripts/opencode_programbench.yaml \
+  --workers 8 --all --seed 42 --output output/luna-full
+```
+
+### Pauses, evaluation, and results
+
+Pauses persist in `breaker.json`; plain `--resume` never clears one. After
+fixing the cause, acknowledge the recorded `cache`, `auth`, or `soft` pause
+explicitly:
+
+```bash
+uv run python scripts/run_opencode.py \
+  --config scripts/opencode_programbench.yaml \
+  --workers 8 --limit 8 --seed 42 \
+  --output output/luna-pilot --resume --acknowledge auth
+```
+
+`--acknowledge all` also clears cache/soft/auth pauses. It cannot clear a hard
+cost stop: that command performs cleanup-only recovery, returns nonzero, and
+leaves the campaign paused for inspection. Cache health pauses after two
+consecutive trajectories remain below the configured 80% read ratio after ten
+turns; the soft cost cap pauses admission, the hard cap stops active work, and
+HTTP 429 backs off without creating a second trajectory.
+
+Inference and evaluation are separate. Once all selected jobs are terminal,
+run the paired evaluator explicitly:
+
+```bash
+uv run python scripts/run_opencode.py \
+  --config scripts/opencode_programbench.yaml \
+  --workers 8 --limit 8 --seed 42 \
+  --output output/luna-pilot --resume --evaluate
+```
+
+The runner evaluates each arm at most once. Retry a persisted interrupted
+evaluator only explicitly; this does not rerun inference:
+
+```bash
+uv run python scripts/run_opencode.py \
+  --config scripts/opencode_programbench.yaml \
+  --workers 8 --limit 8 --seed 42 \
+  --output output/luna-pilot --resume --evaluate --retry-evaluator
+```
+
+Low scores, timeouts, model failures, and native Contract outcomes are results,
+not retry reasons. `--retry-infra` is only for an explicit pre-provider
+infrastructure retry; `--redo` is an explicit rerun and conflicts with it.
+
+Campaign evidence lives under the selected output root:
+
+```text
+output/luna-pilot/
+  campaign.json  breaker.json  campaign.log
+  installs/<arm>/install.json
+  procontract/<instance>/state.json  usage.json  procontract-result.json  submission.tar.gz
+  vanilla/<instance>/state.json      usage.json  vanilla-result.json      submission.tar.gz
+  evaluation/  evaluation-state/  comparison.json  RESULT.md
+```
+
+The evaluator stages each `submission.tar.gz` into the normal ProgramBench
+layout. `comparison.json` and `RESULT.md` preserve invalid, missing, package,
+preflight, cache, settlement, and evaluator evidence for each exact pair.
+Exit status zero means the requested inference and, if requested, evaluation
+completed with no failed or incomplete job. A nonzero status means inspect the
+durable state and artifacts; it never authorizes automatic reruns.
+
 ## Inference
 
 Please use the images with tag `task_cleanroom_v6` from `https://hub.docker.com/orgs/programbench/repositories`.
