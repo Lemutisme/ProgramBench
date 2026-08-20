@@ -304,6 +304,8 @@ def _child_environment(
         "PROGRAMBENCH_DOCKER_ORG",
         "PROGRAMBENCH_HF_REVISION",
         "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_ATTR_NOSYSTEM",
+        "GIT_CONFIG_GLOBAL",
         "GIT_CONFIG_NOSYSTEM",
         "GIT_OPTIONAL_LOCKS",
     )
@@ -315,6 +317,14 @@ def _child_environment(
             continue
         if not isinstance(value, str) or any(character in value for character in ("\x00", "\n", "\r")):
             raise ProcessError(f"environment value is unsafe: {name}")
+        if name == "GIT_CONFIG_GLOBAL" and value != "/dev/null":
+            raise ProcessError("environment value is unsafe: GIT_CONFIG_GLOBAL")
+        if name in {"GIT_ATTR_NOSYSTEM", "GIT_CONFIG_NOSYSTEM", "GIT_OPTIONAL_LOCKS"} and value not in {"0", "1"}:
+            raise ProcessError(f"environment value is unsafe: {name}")
+        if name == "GIT_ALTERNATE_OBJECT_DIRECTORIES" and not all(
+            _safe_path_directory(directory) for directory in value.split(os.pathsep)
+        ):
+            raise ProcessError("environment value is unsafe: GIT_ALTERNATE_OBJECT_DIRECTORIES")
         allowed[name] = value
     return allowed
 

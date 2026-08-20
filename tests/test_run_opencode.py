@@ -593,14 +593,27 @@ def test_prepare_install_records_bun_toolchain_identity(tmp_path: Path, monkeypa
     )
 
     manifest = json.loads((tmp_path / "installs/procontract/install.json").read_text())
-    assert install.bun_path == bun
+    assert install.bun_path == tmp_path / "installs" / ".toolchains" / _sha256(bun) / "bin/bun"
     assert install.bun_sha256 == _sha256(bun)
     assert install.bun_version == "bun-test"
-    assert install.bun_path_dirs[0] == bun.parent
-    assert manifest["bun_path"] == str(bun)
+    assert install.bun_path_dirs[0] == install.bun_path.parent
+    assert manifest["bun_path"] == str(install.bun_path)
     assert manifest["bun_sha256"] == _sha256(bun)
     assert manifest["bun_version"] == "bun-test"
-    assert manifest["bun_path_dirs"][0] == str(bun.parent)
+    assert manifest["bun_path_dirs"][0] == str(install.bun_path.parent)
+
+
+def test_prepare_install_snapshots_bun_before_build(tmp_path: Path, monkeypatch):
+    repo, _, _ = _fake_opencode_repo(tmp_path)
+    bun = _fake_bun(monkeypatch, tmp_path)
+    root = tmp_path / "installs"
+
+    install = runner.prepare_install(runner.ArmConfig("procontract", repo, "HEAD", "procontract"), root)
+
+    assert install.bun_path == root / ".toolchains" / install.bun_sha256 / "bin/bun"
+    assert install.bun_path.read_bytes() == bun.read_bytes()
+    assert install.bun_path.stat().st_mode & 0o777 == 0o555
+    assert install.bun_path_dirs == (install.bun_path.parent,)
 
 
 def test_prepare_install_rejects_missing_bun_before_install_root_side_effects(tmp_path: Path, monkeypatch):
@@ -632,7 +645,7 @@ def test_prepare_install_fails_closed_when_frozen_bun_changes(tmp_path: Path, mo
     monkeypatch.setattr(installer, "_binary_sha256", mutate_after_freeze)
     root = tmp_path / "installs"
 
-    with pytest.raises(runner.InstallError, match="Bun toolchain hash changed"):
+    with pytest.raises(runner.InstallError, match="Bun toolchain changed"):
         runner.prepare_install(runner.ArmConfig("procontract", repo, "HEAD", "procontract"), root)
 
     assert not (root / "procontract/install.json").exists()
@@ -829,7 +842,7 @@ def test_prepare_install_normalizes_each_command_failure(tmp_path: Path, monkeyp
             return subprocess.CompletedProcess(command, 17, "credential=secret", "credential=secret")
         if target == "build" and command[0] == "bun" and "build" in command:
             return subprocess.CompletedProcess(command, 17, "credential=secret", "credential=secret")
-        if target == "smoke" and command[-1:] == ("--version",) and command[0] != str(tmp_path / "bin/bun"):
+        if target == "smoke" and command[-1:] == ("--version",) and not command[0].endswith("/bin/bun"):
             return subprocess.CompletedProcess(command, 17, "credential=secret", "credential=secret")
         return runner.run_checked(command, cwd)
 

@@ -211,15 +211,16 @@ def prepare_install(arm: ArmConfig, root: Path, run_command: _RunCommand = run_c
         if manifest.exists():
             return _reuse_published_install(arm, root, repo, manifest, state_path, run_command)
 
-        bun_path, bun_sha256, bun_version, bun_path_dirs = (
-            (None, None, None, ()) if arm.binary else _freeze_bun_toolchain(run_command)
-        )
-
         state = _load_state(state_path, root, arm.name) if state_path.exists() else None
         if state:
+            _require_state_identity(state, arm, root, repo, run_command)
             recovered = _reconcile_state(arm, root, repo, state_path, state, run_command)
             if recovered:
                 return recovered
+
+        bun_path, bun_sha256, bun_version, bun_path_dirs = (
+            (None, None, None, ()) if arm.binary else _freeze_bun_toolchain(root, run_command)
+        )
 
         _require_clean_source(repo, run_command)
         revision = _command_text(
@@ -862,19 +863,54 @@ def _binary_version(binary: Path, run_command: _RunCommand, cwd: Path | None) ->
     return version.splitlines()[0]
 
 
-def _freeze_bun_toolchain(run_command: _RunCommand) -> tuple[Path, str, str, tuple[Path, ...]]:
+def _freeze_bun_toolchain(root: Path, run_command: _RunCommand) -> tuple[Path, str, str, tuple[Path, ...]]:
     try:
         resolved = campaign_process.resolve_command(("bun",))
     except campaign_process.ProcessError as error:
         raise InstallError("Bun toolchain is unavailable before worktree creation") from error
-    bun_path = resolved.executable
-    bun_sha256 = _binary_sha256(bun_path)
-    bun_version = _command_text(run_command, (str(bun_path), "--version"), None, "bun-version")
+    source = resolved.executable
+    bun_sha256 = _binary_sha256(source)
+    bun_version = _command_text(run_command, (str(source), "--version"), None, "bun-version")
     if not bun_version:
         raise InstallError("Bun toolchain did not report a version")
-    if _binary_sha256(bun_path) != bun_sha256:
+    if _binary_sha256(source) != bun_sha256:
         raise InstallError("Bun toolchain changed during identity audit")
-    return bun_path, bun_sha256, bun_version.splitlines()[0], resolved.path_dirs
+    toolchain = root / ".toolchains" / bun_sha256
+    bun_path = toolchain / "bin/bun"
+    _mkdir_and_sync(toolchain.parent)
+    if not toolchain.exists():
+        staging = toolchain.parent / f".{bun_sha256}-{uuid.uuid4().hex}"
+        try:
+            staging.mkdir(mode=0o700)
+            (staging / "bin").mkdir(mode=0o755)
+            copied = staging / "bin/bun"
+            descriptor = os.open(copied, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o555)
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(source.read_bytes())
+                handle.flush()
+                os.fsync(handle.fileno())
+            if _binary_sha256(copied) != bun_sha256 or _binary_sha256(source) != bun_sha256:
+                raise InstallError("Bun toolchain changed during snapshot")
+            _atomic_write_json(
+                staging / "toolchain.json",
+                {"version": 1, "source": str(source), "sha256": bun_sha256, "bun_version": bun_version.splitlines()[0]},
+            )
+            os.chmod(copied, 0o555)
+            os.chmod(staging / "bin", 0o555)
+            os.chmod(staging, 0o555)
+            _fsync_directory(staging / "bin")
+            _fsync_directory(staging)
+            try:
+                os.replace(staging, toolchain)
+            except FileExistsError:
+                shutil.rmtree(staging)
+            _fsync_directory(toolchain.parent)
+        except OSError as error:
+            if staging.exists():
+                shutil.rmtree(staging)
+            raise InstallError("could not snapshot Bun toolchain") from error
+    _require_owned_bun_toolchain(bun_path, bun_sha256, bun_version.splitlines()[0])
+    return bun_path, bun_sha256, bun_version.splitlines()[0], (bun_path.parent,)
 
 
 def _bun_command(state: _InstallState, command: tuple[str, ...], run_command: _RunCommand) -> tuple[str, ...]:
@@ -895,18 +931,33 @@ def _require_bun_toolchain(
 ) -> None:
     if bun_path is None or bun_sha256 is None or bun_version is None or not bun_path_dirs:
         raise InstallError("built install manifest has no Bun toolchain")
-    try:
-        resolved = campaign_process.resolve_command(("bun",))
-        direct = campaign_process.resolve_command((str(bun_path),))
-    except campaign_process.ProcessError as error:
-        raise InstallError("Bun toolchain is unavailable") from error
-    if resolved.executable != bun_path or resolved.path_dirs != bun_path_dirs or direct.executable != bun_path:
-        raise InstallError("Bun toolchain path changed")
-    if _binary_sha256(bun_path) != bun_sha256:
-        raise InstallError("Bun toolchain hash changed")
+    if bun_path_dirs != (bun_path.parent,):
+        raise InstallError("Bun toolchain path is invalid")
+    _require_owned_bun_toolchain(bun_path, bun_sha256, bun_version)
     version = _command_text(run_command, (str(bun_path), "--version"), None, "bun-version")
     if version.splitlines()[0] != bun_version or _binary_sha256(bun_path) != bun_sha256:
         raise InstallError("Bun toolchain identity changed")
+
+
+def _require_owned_bun_toolchain(bun_path: Path, bun_sha256: str, bun_version: str) -> None:
+    toolchain = bun_path.parent.parent
+    marker = toolchain / "toolchain.json"
+    try:
+        raw = json.loads(marker.read_text(), object_pairs_hook=_unique_json_object)
+        mode = bun_path.lstat().st_mode
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise InstallError("owned Bun toolchain is unavailable") from error
+    if (
+        not stat.S_ISREG(mode)
+        or stat.S_ISLNK(mode)
+        or bun_path.parent.name != "bin"
+        or toolchain.parent.name != ".toolchains"
+        or toolchain.name != bun_sha256
+        or raw != {"version": 1, "source": raw.get("source"), "sha256": bun_sha256, "bun_version": bun_version}
+        or not isinstance(raw.get("source"), str)
+        or _binary_sha256(bun_path) != bun_sha256
+    ):
+        raise InstallError("owned Bun toolchain identity changed")
 
 
 def _run_command(
@@ -1302,6 +1353,13 @@ def _require_state_identity(
         raise InstallRecoveryError("recovery metadata identity conflicts with requested arm; evidence preserved")
     if state.common_dir != _git_common_directory(repo, repo, run_command, "source-common-dir"):
         raise InstallRecoveryError("recovery metadata common directory changed; evidence preserved")
+    if state.supplied_binary is None:
+        try:
+            _require_bun_toolchain(
+                state.bun_path, state.bun_sha256, state.bun_version, state.bun_path_dirs, run_command
+            )
+        except InstallError as error:
+            raise InstallRecoveryError(f"recovery Bun toolchain changed; evidence preserved: {error}") from None
 
 
 def _atomic_write_json(path: Path, value: Mapping[str, object]) -> None:
