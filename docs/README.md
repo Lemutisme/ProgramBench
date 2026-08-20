@@ -44,6 +44,11 @@ vanilla `origin/dev` SHA, and records each binary's version and SHA-256 in
 hashed. A resume reuses those frozen pins and never rebuilds or resolves moving
 refs.
 
+Built installs use the frozen Bun binary in two lockfile-identical stages:
+dependency materialization with lifecycle scripts disabled, followed by the
+normal frozen lifecycle install. This ensures native dependencies use the
+lockfile's local node-gyp instead of fetching an unpinned latest helper.
+
 ### Pilot workflow
 
 Dry-run the exact eight-instance, sixteen-trajectory pilot first:
@@ -92,6 +97,47 @@ uv run python scripts/run_opencode.py \
   --config scripts/opencode_programbench.yaml \
   --workers 8 --all --seed 42 --output output/luna-full
 ```
+
+### One-command full campaign
+
+After rotating any previously exposed provider credential, run the complete
+200-instance paired campaign (400 trajectories), resume it as needed, evaluate
+all terminal submissions, and seal an artifact inventory plus wrapper summary
+with:
+
+```bash
+export OPENAI_API_KEY='...'
+export OPENCODE_SERVER_PASSWORD='...'
+export OPENCODE_REPO="$HOME/src/opencode"
+
+./scripts/run_all.sh
+```
+
+The wrapper uses `scripts/opencode_programbench_all.yaml`, which pins the
+minimal-context ProContract commit and excludes no real task. Override the
+default resumable root with `--output PATH`; use the same path to resume. It
+chains frozen planning, inference, and evaluation without clearing persisted
+cache/auth/cost pauses. A nonzero exit leaves the full state tree available for
+inspection and a later identical invocation.
+
+The wrapper requires Bun and uses the current `PATH`; when Bun is absent there
+but `$HOME/.bun/bin/bun` exists, it prepends that standard installation
+directory without sourcing shell startup files.
+
+The output root is created with mode 0700 and contains all per-job state,
+workspace logs, usage, submissions, evaluator JSON, paired `comparison.json`
+and `RESULT.md`, plus:
+
+- `logs/{run-all,plan,inference,evaluation}.log`;
+- `ARTIFACTS.sha256`, covering stable files in the raw tree;
+- `RUN_ALL_SUMMARY.json`, with frozen coordinates, phase exits, job-state
+  counts, canonical artifact hashes, and artifact size/count;
+- `RUN_ALL_SUMMARY.sha256`.
+
+The raw tree is sensitive and is not a publishable bundle. The wrapper never
+sources startup files or places secrets in argv/output. On this host it also
+fails before planning if `OPENAI_API_KEY` still matches the locally quarantined
+key exposed by the earlier process-list diagnostic.
 
 ### Pauses, evaluation, and results
 
