@@ -2488,7 +2488,9 @@ def _publish_submission(source: Path, destination: Path) -> Path:
         _sync_directory(destination.parent)
     except FileExistsError:
         if destination.is_symlink() or not destination.is_file() or _sha256(destination) != _sha256(source):
-            raise ProContractConflictError("published ProgramBench submission conflicts with package evidence") from None
+            raise ProContractConflictError(
+                "published ProgramBench submission conflicts with package evidence"
+            ) from None
     return destination
 
 

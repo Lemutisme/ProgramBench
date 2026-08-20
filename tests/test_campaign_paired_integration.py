@@ -43,15 +43,10 @@ def test_real_docker_paired_fake_binaries_run_four_jobs_and_resume(
     suffix = uuid.uuid4().hex[:12]
     instance_ids = (f"testorg__calculator-a.{suffix}", f"testorg__calculator-b.{suffix}")
     image_names = tuple(f"programbench/{instance_id.replace('__', '_1776_')}" for instance_id in instance_ids)
-    image_tags = tuple(
-        f"{image}:{tag}" for image in image_names for tag in ("task_cleanroom", "task_cleanroom_v6")
-    )
+    image_tags = tuple(f"{image}:{tag}" for image in image_names for tag in ("task_cleanroom", "task_cleanroom_v6"))
     campaign_root = tmp_path / "paired-campaign"
     campaign_name = campaign_root.name
-    repos = {
-        arm: _fake_repo(tmp_path / arm, arm, f"0.0.0-{arm}-{suffix}")
-        for arm in ("procontract", "vanilla")
-    }
+    repos = {arm: _fake_repo(tmp_path / arm, arm, f"0.0.0-{arm}-{suffix}") for arm in ("procontract", "vanilla")}
     config_path = tmp_path / "campaign.yaml"
     config_path.write_text(_campaign_config(repos))
     instances = [
@@ -225,7 +220,18 @@ def _fake_repo(root: Path, arm: str, version: str) -> tuple[Path, Path]:
     subprocess.run(("git", "init", "-q", str(root)), check=True, timeout=30)
     subprocess.run(("git", "-C", str(root), "add", "opencode"), check=True, timeout=30)
     subprocess.run(
-        ("git", "-C", str(root), "-c", "user.name=fixture", "-c", "user.email=fixture@example.com", "commit", "-qm", arm),
+        (
+            "git",
+            "-C",
+            str(root),
+            "-c",
+            "user.name=fixture",
+            "-c",
+            "user.email=fixture@example.com",
+            "commit",
+            "-qm",
+            arm,
+        ),
         check=True,
         timeout=30,
     )
@@ -249,15 +255,15 @@ def _campaign_config(repos: dict[str, tuple[Path, Path]]) -> str:
           stop_after_consecutive_failures: 2
         arms:
           procontract:
-            repo: {repos['procontract'][0]}
+            repo: {repos["procontract"][0]}
             revision: HEAD
             mode: procontract
-            binary: {repos['procontract'][1]}
+            binary: {repos["procontract"][1]}
           vanilla:
-            repo: {repos['vanilla'][0]}
+            repo: {repos["vanilla"][0]}
             revision: HEAD
             mode: vanilla
-            binary: {repos['vanilla'][1]}
+            binary: {repos["vanilla"][1]}
         excluded: []
         """
     )
@@ -296,7 +302,7 @@ def _calculator_source() -> str:
 
 def _fake_opencode_source(arm: str, version: str) -> str:
     return textwrap.dedent(
-        f'''\
+        f"""\
         #!/usr/bin/env python3
         import base64
         import hashlib
@@ -633,5 +639,5 @@ def _fake_opencode_source(arm: str, version: str) -> str:
 
 
         ThreadingHTTPServer((hostname, port), Handler).serve_forever()
-        '''
+        """
     )

@@ -174,8 +174,7 @@ def validate_evaluation(
         reasons.append("executable_hash_mismatch")
     for branch in sorted(set(result.test_branch_errors) - set(active)):
         reasons.extend(
-            f"foreign_branch_error:{branch}:{error.error_code}"
-            for error in result.test_branch_errors.get(branch, [])
+            f"foreign_branch_error:{branch}:{error.error_code}" for error in result.test_branch_errors.get(branch, [])
         )
     for branch in active:
         reasons.extend(
@@ -371,7 +370,9 @@ def _manifest_jobs(manifest: Mapping[str, object]) -> tuple[tuple[str, str], ...
         not isinstance(images.get(instance_id), Mapping)
         or images[instance_id].get("image")
         != next(job["image"] for job in raw_jobs if job["instance_id"] == instance_id)
-        or any(job["image"] != images[instance_id].get("image") for job in raw_jobs if job["instance_id"] == instance_id)
+        or any(
+            job["image"] != images[instance_id].get("image") for job in raw_jobs if job["instance_id"] == instance_id
+        )
         for instance_id in selected
     ):
         raise CampaignEvaluationError("campaign manifest has conflicting frozen image coordinates")
@@ -417,9 +418,7 @@ def _resolve_evaluator_images(
         digest = None
         if resolve_digest and reference is not None:
             environment = {
-                name: value
-                for name in ("PATH", "DOCKER_HOST", "LANG", "LC_ALL")
-                if (value := os.environ.get(name))
+                name: value for name in ("PATH", "DOCKER_HOST", "LANG", "LC_ALL") if (value := os.environ.get(name))
             }
             inspected = campaign_process.run_checked(
                 ("docker", "image", "inspect", "--format", "{{.Id}}", reference),
@@ -464,9 +463,7 @@ def _prepare_campaign_image_tags(
     # The campaign lock serializes tag creation/verification within this campaign. Docker daemon
     # administrators remain outside this script-only threat boundary, so tags are reverified before
     # every arm launch and after both arms finish.
-    tag = "campaign-" + hashlib.sha256(
-        str(root).encode() + b"\0" + _canonical_bytes(identities)
-    ).hexdigest()[:16]
+    tag = "campaign-" + hashlib.sha256(str(root).encode() + b"\0" + _canonical_bytes(identities)).hexdigest()[:16]
     journal_path = root / "evaluation-image-tags.json"
     prior_owned: set[str] = set()
     if journal_path.exists():
@@ -547,11 +544,7 @@ def _cleanup_campaign_image_tags(plan: Mapping[str, object], cleanup: bool) -> N
 
 
 def _cleanup_owned_image_tags(owned: set[str], images: Mapping[str, object]) -> None:
-    expected = {
-        raw.get("target_reference"): raw.get("digest")
-        for raw in images.values()
-        if isinstance(raw, Mapping)
-    }
+    expected = {raw.get("target_reference"): raw.get("digest") for raw in images.values() if isinstance(raw, Mapping)}
     for target in sorted(owned):
         if _docker_image_id(target) != expected.get(target):
             raise CampaignEvaluationError(f"owned campaign evaluator tag mutated: {target}")
@@ -582,9 +575,7 @@ def _run_docker_evidence(
         2,
         output_limit,
         environment={
-            name: value
-            for name in ("PATH", "DOCKER_HOST", "LANG", "LC_ALL")
-            if (value := os.environ.get(name))
+            name: value for name in ("PATH", "DOCKER_HOST", "LANG", "LC_ALL") if (value := os.environ.get(name))
         },
     )
 
@@ -624,9 +615,7 @@ def _load_or_plan_hf_inputs(
     try:
         configured = os.environ.get("PROGRAMBENCH_BLOB_DIR")
         if configured:
-            blob_root = _materialize_hf_blobs(
-                Path(configured).resolve(), root / "evaluation-blobs", instance_ids
-            )
+            blob_root = _materialize_hf_blobs(Path(configured).resolve(), root / "evaluation-blobs", instance_ids)
             hashes = _blob_hashes(blob_root, instance_ids)
             commit = "local-" + hashlib.sha256(_canonical_bytes(hashes)).hexdigest()
         elif resolver is not None or resolve_remote:
@@ -987,11 +976,7 @@ def _cleanup_evaluator_containers(prefix: str) -> tuple[str, ...]:
     containers = _list_evaluator_containers(prefix)
     if not containers:
         return ()
-    environment = {
-        name: value
-        for name in ("PATH", "DOCKER_HOST", "LANG", "LC_ALL")
-        if (value := os.environ.get(name))
-    }
+    environment = {name: value for name in ("PATH", "DOCKER_HOST", "LANG", "LC_ALL") if (value := os.environ.get(name))}
     removed = campaign_process.run_checked(
         ("docker", "rm", "-f", *containers),
         None,
@@ -1006,11 +991,7 @@ def _cleanup_evaluator_containers(prefix: str) -> tuple[str, ...]:
 
 
 def _list_evaluator_containers(prefix: str) -> tuple[str, ...]:
-    environment = {
-        name: value
-        for name in ("PATH", "DOCKER_HOST", "LANG", "LC_ALL")
-        if (value := os.environ.get(name))
-    }
+    environment = {name: value for name in ("PATH", "DOCKER_HOST", "LANG", "LC_ALL") if (value := os.environ.get(name))}
     listed = campaign_process.run_checked(
         ("docker", "ps", "-aq", "--filter", f"name=^/{prefix}-"),
         None,
@@ -1073,7 +1054,9 @@ def _prepare_evidence(
             if staged.exists():
                 _require_regular_contained(staged, root, f"staged submission for {instance_id}/{arm}")
                 if _sha256(staged) != _sha256(submission):
-                    raise CampaignEvaluationError(f"frozen submission conflicts with evaluator input: {instance_id}/{arm}")
+                    raise CampaignEvaluationError(
+                        f"frozen submission conflicts with evaluator input: {instance_id}/{arm}"
+                    )
             else:
                 try:
                     os.link(submission, staged)
@@ -1433,9 +1416,10 @@ def _reconcile_partial_quarantine(
     expected_move_order = [
         (artifact.get("instance_id"), kind) for artifact in artifacts for kind in ("eval", "provenance")
     ]
-    if set(move_by_key) != expected_move_keys or [
-        (move.get("instance_id"), move.get("kind")) for move in moves
-    ] != expected_move_order:
+    if (
+        set(move_by_key) != expected_move_keys
+        or [(move.get("instance_id"), move.get("kind")) for move in moves] != expected_move_order
+    ):
         raise CampaignEvaluationError(f"partial quarantine move set conflicts for {arm}")
     for instance_id, artifact in artifact_by_instance.items():
         eval_move = move_by_key[(instance_id, "eval")]
@@ -1482,7 +1466,10 @@ def _reconcile_partial_quarantine(
         if isinstance(retention_plan, Mapping)
         and isinstance(retention_plan.get("candidates"), list)
         and isinstance(retention_plan.get("retained"), list)
-        and all(isinstance(value, Mapping) and isinstance(value.get("path"), str) for value in [*retention_plan["candidates"], *retention_plan["retained"]])
+        and all(
+            isinstance(value, Mapping) and isinstance(value.get("path"), str)
+            for value in [*retention_plan["candidates"], *retention_plan["retained"]]
+        )
         else None
     )
     expected_state_after = {
@@ -1519,14 +1506,11 @@ def _reconcile_partial_quarantine(
             retention_plan,
         )
         planned_pruned_files = {
-            str(file["path"])
-            for candidate in retention_plan["candidates"]
-            for file in candidate["files"]
+            str(file["path"]) for candidate in retention_plan["candidates"] for file in candidate["files"]
         }
     # A crash may make the file placement one rename newer than the published phase.
     statuses = [
-        _partial_quarantine_move_done(move, root, str(move["destination"]) in planned_pruned_files)
-        for move in moves
+        _partial_quarantine_move_done(move, root, str(move["destination"]) in planned_pruned_files) for move in moves
     ]
     completed = 0
     for status_value in statuses:
@@ -1621,7 +1605,11 @@ def _reconcile_partial_quarantine(
         and not phase_state_is_retained
     ):
         raise CampaignEvaluationError(f"evaluator pruning state phase conflicts during recovery for {arm}")
-    if journal.get("phase") in {"retention_pruned", "complete"} and retention_plan is not None and not phase_state_is_retained:
+    if (
+        journal.get("phase") in {"retention_pruned", "complete"}
+        and retention_plan is not None
+        and not phase_state_is_retained
+    ):
         raise CampaignEvaluationError(f"evaluator retained state phase conflicts during recovery for {arm}")
     if history_is_before:
         _append_partial_attempt_record(index_path, record_input)
@@ -1901,9 +1889,7 @@ def _partial_quarantine_raw_snapshots(
                 raise CampaignEvaluationError(f"foreign partial quarantine retention artifact: {file}")
             files.append({"path": str(file), **_partial_quarantine_file_identity(file, root)})
         record_hashes = [
-            record.get("record_hash")
-            for record in history["records"]
-            if record.get("quarantine_path") == str(path)
+            record.get("record_hash") for record in history["records"] if record.get("quarantine_path") == str(path)
         ]
         result.append(
             {
@@ -2173,7 +2159,9 @@ def _delete_partial_quarantine_raw(root: Path, expected: Mapping[str, object]) -
             if _partial_quarantine_file_identity(path / name, root) != {
                 key: file.get(key) for key in ("device", "inode", "mode", "sha256", "size")
             }:
-                raise CampaignEvaluationError(f"partial quarantine retention file changed before deletion: {path / name}")
+                raise CampaignEvaluationError(
+                    f"partial quarantine retention file changed before deletion: {path / name}"
+                )
             os.unlink(name, dir_fd=directory)
         os.fsync(directory)
     finally:
@@ -2366,9 +2354,9 @@ def _evaluate_arm(
     cwd = Path(__file__).resolve().parents[1]
     evaluator_identity = _evaluator_identity(cwd)
     campaign_manifest_sha256 = _sha256(root / "campaign.json")
-    container_prefix = "programbench-eval-" + hashlib.sha256(
-        f"{root}:{arm}:{campaign_manifest_sha256}".encode()
-    ).hexdigest()[:12]
+    container_prefix = (
+        "programbench-eval-" + hashlib.sha256(f"{root}:{arm}:{campaign_manifest_sha256}".encode()).hexdigest()[:12]
+    )
     blob_root = hf_inputs.get("blob_root")
     hf_revision = hf_inputs.get("commit")
     docker_org = os.environ.get("PROGRAMBENCH_DOCKER_ORG")
@@ -2385,9 +2373,7 @@ def _evaluate_arm(
     expected_executables = {
         instance_id: evidence[(instance_id, arm)].get("expected_executable_hash") for instance_id in submitted
     }
-    submission_hashes = {
-        instance_id: evidence[(instance_id, arm)]["submission_sha256"] for instance_id in submitted
-    }
+    submission_hashes = {instance_id: evidence[(instance_id, arm)]["submission_sha256"] for instance_id in submitted}
     invocation = {
         "argv": list(argv),
         "cwd": str(cwd),
@@ -2483,8 +2469,10 @@ def _evaluate_arm(
             return existing
         if existing.get("status") == "failed":
             return existing
-        if existing.get("status") == "interrupted" and retry_evaluator and _host_evaluator_ownership_alive(
-            existing, process_probe, process_group_probe, cgroup_probe
+        if (
+            existing.get("status") == "interrupted"
+            and retry_evaluator
+            and _host_evaluator_ownership_alive(existing, process_probe, process_group_probe, cgroup_probe)
         ):
             deadline = time.monotonic() + adoption_timeout
             alive = True
@@ -2526,9 +2514,7 @@ def _evaluate_arm(
                 deadline = time.monotonic() + adoption_timeout
                 while time.monotonic() < deadline and alive:
                     sleeper(min(0.1, max(0, deadline - time.monotonic())))
-                    alive = _host_evaluator_ownership_alive(
-                        existing, process_probe, process_group_probe, cgroup_probe
-                    )
+                    alive = _host_evaluator_ownership_alive(existing, process_probe, process_group_probe, cgroup_probe)
                 if alive:
                     raise CampaignEvaluationError(f"evaluator for {arm} is still running")
             prefix = existing.get("container_prefix")
@@ -2560,9 +2546,7 @@ def _evaluate_arm(
         if existing.get("status") == "interrupted" and not retry_evaluator:
             missing = existing.get("missing_eval_ids")
             detail = f"; missing eval IDs: {', '.join(missing)}" if isinstance(missing, list) and missing else ""
-            raise CampaignEvaluationError(
-                f"evaluator for {arm} was interrupted{detail}; use --retry-evaluator"
-            )
+            raise CampaignEvaluationError(f"evaluator for {arm} was interrupted{detail}; use --retry-evaluator")
 
     retained_artifacts = (
         dict(existing.get("artifact_hashes", {}))
@@ -2753,9 +2737,7 @@ def _evaluate_arm(
             deferred = error_value
     try:
         containers = (
-            _cleanup_evaluator_containers(container_prefix)
-            if command_runner is campaign_process.run_checked
-            else ()
+            _cleanup_evaluator_containers(container_prefix) if command_runner is campaign_process.run_checked else ()
         )
     except BaseException as cleanup_error:
         containers = ()
@@ -2776,11 +2758,7 @@ def _evaluate_arm(
             error = "invalid_output_provenance"
     elif completion_disposition == "exception":
         provenance_hashes = _bind_partial_eval_outputs(base, arm_root, submitted, error)
-    hashes = {
-        path.name: _sha256(path)
-        for path in (stdout_path, stderr_path)
-        if path.is_file()
-    }
+    hashes = {path.name: _sha256(path) for path in (stdout_path, stderr_path) if path.is_file()}
     if completion_path.is_file():
         hashes[completion_path.name] = _sha256(completion_path)
     hashes.update(provenance_hashes)
@@ -2800,9 +2778,7 @@ def _evaluate_arm(
         if identity.unavailable_reason is not None:
             unavailable_hashes[instance_id] = identity.unavailable_reason
     missing = sorted(
-        instance_id
-        for instance_id in submitted
-        if not (arm_root / instance_id / f"{instance_id}.eval.json").is_file()
+        instance_id for instance_id in submitted if not (arm_root / instance_id / f"{instance_id}.eval.json").is_file()
     )
     if missing:
         status = "interrupted"
@@ -3059,9 +3035,7 @@ def _arm_report(
     evaluated = validate_evaluation(
         root / "evaluation" / arm / instance_id / f"{instance_id}.eval.json",
         instance,
-        evidence.get("expected_executable_hash")
-        if isinstance(evidence.get("expected_executable_hash"), str)
-        else None,
+        evidence.get("expected_executable_hash") if isinstance(evidence.get("expected_executable_hash"), str) else None,
     )
     if evidence["submission"] is not None:
         errors.extend(evaluated.reasons)
@@ -3088,8 +3062,7 @@ def _arm_report(
         else None
     )
     hash_unavailable = (
-        evaluated.hash_unavailable_reason
-        or evaluator_unavailable.get(instance_id)
+        evaluated.hash_unavailable_reason or evaluator_unavailable.get(instance_id)
         if isinstance(evaluator_unavailable, Mapping)
         else evaluated.hash_unavailable_reason
     )
@@ -3278,10 +3251,7 @@ def _recorded_artifact_sizes(
     arm_root: Path,
     submitted: Sequence[str],
 ) -> dict[str, int]:
-    return {
-        name: _recorded_artifact_path(name, state_root, arm_root, submitted).stat().st_size
-        for name in hashes
-    }
+    return {name: _recorded_artifact_path(name, state_root, arm_root, submitted).stat().st_size for name in hashes}
 
 
 def _recorded_artifact_path(
@@ -3411,10 +3381,9 @@ def _repair_comparison_bundle(root: Path) -> None:
 
 
 def _verify_published_bundle(root: Path, bundle: Mapping[str, object]) -> None:
-    if (
-        _sha256(root / "comparison.json") != bundle.get("comparison_sha256")
-        or _sha256(root / "RESULT.md") != bundle.get("result_markdown_sha256")
-    ):
+    if _sha256(root / "comparison.json") != bundle.get("comparison_sha256") or _sha256(
+        root / "RESULT.md"
+    ) != bundle.get("result_markdown_sha256"):
         raise CampaignEvaluationError("published comparison bundle conflicts")
 
 
@@ -3426,9 +3395,7 @@ def _result_markdown(report: Mapping[str, object], comparison_sha256: str) -> st
     invocation = first_arm.get("invocation", {}) if isinstance(first_arm, Mapping) else {}
     image_map = invocation.get("evaluator_images", {}) if isinstance(invocation, Mapping) else {}
     image_summary = ", ".join(
-        f"{instance_id}={value.get('digest')}"
-        for instance_id, value in image_map.items()
-        if isinstance(value, Mapping)
+        f"{instance_id}={value.get('digest')}" for instance_id, value in image_map.items() if isinstance(value, Mapping)
     )
     rows = [
         "| Instance | Arm | Valid | Utility | Resolved | Turns | Actions | Wall | Cost | Cache | Completion | "
@@ -3465,28 +3432,32 @@ def _markdown_arm_row(pair: Mapping[str, object], arm: str) -> str:
     value = pair[arm]
     cache = value["cache"]
     contract = value.get("contract")
-    return "| " + " | ".join(
-        str(item).replace("|", "\\|")
-        for item in (
-            pair["instance_id"],
-            arm,
-            value["valid"],
-            _utility_label(value["utility"]),
-            f"{value['resolved']}/{value['total']}",
-            value["turns"],
-            value["actions"],
-            value["wall_time_seconds"],
-            value["cost"],
-            _utility_label(cache.get("ratio")),
-            value["completion"],
-            value["package"],
-            value["preflight"],
-            contract.get("status") if isinstance(contract, Mapping) else "-",
-            contract.get("quiet") if isinstance(contract, Mapping) else "-",
-            ", ".join(value["errors"]) or "-",
-            _utility_label(pair["delta"]),
+    return (
+        "| "
+        + " | ".join(
+            str(item).replace("|", "\\|")
+            for item in (
+                pair["instance_id"],
+                arm,
+                value["valid"],
+                _utility_label(value["utility"]),
+                f"{value['resolved']}/{value['total']}",
+                value["turns"],
+                value["actions"],
+                value["wall_time_seconds"],
+                value["cost"],
+                _utility_label(cache.get("ratio")),
+                value["completion"],
+                value["package"],
+                value["preflight"],
+                contract.get("status") if isinstance(contract, Mapping) else "-",
+                contract.get("quiet") if isinstance(contract, Mapping) else "-",
+                ", ".join(value["errors"]) or "-",
+                _utility_label(pair["delta"]),
+            )
         )
-    ) + " |"
+        + " |"
+    )
 
 
 @contextmanager

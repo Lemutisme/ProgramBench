@@ -47,9 +47,7 @@ def _write_eval(
             executable_hash=executable_hash,
             solution_branch="submission",
             test_branches=["b1"],
-            test_branch_errors={
-                "b1": [TestBranchError(error_code="branch_failed", error_details="details")]
-            }
+            test_branch_errors={"b1": [TestBranchError(error_code="branch_failed", error_details="details")]}
             if branch_error
             else {},
         ).model_dump_json()
@@ -112,9 +110,7 @@ def _campaign(
             "cache_read": 6,
             "cache_write": 2,
             "exit_class": "discharged" if arm == "procontract" else "idle",
-            "executable_hash": executable_hashes.get((instance_id, arm))
-            if executable_hashes is not None
-            else "e" * 64,
+            "executable_hash": executable_hashes.get((instance_id, arm)) if executable_hashes is not None else "e" * 64,
         }
         if arm == "procontract":
             result.update(
@@ -557,9 +553,7 @@ def test_malformed_and_parse_oversize_eval_hashes_survive_state_and_report(tmp_p
         path = arm_root / "one/one.eval.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(
-            b"{malformed"
-            if arm_root.name == "procontract"
-            else b" " * (campaign_evaluate.MAX_EVAL_JSON_BYTES + 1)
+            b"{malformed" if arm_root.name == "procontract" else b" " * (campaign_evaluate.MAX_EVAL_JSON_BYTES + 1)
         )
         return subprocess.CompletedProcess(command, 0, "", "")
 
@@ -1611,10 +1605,14 @@ def test_partial_quarantine_recovers_pruning_failure_and_enforces_retention(
     assert state["partial_attempt_history"]["total_count"] == 2
     assert [record["raw_retained"] for record in state["partial_attempt_history"]["recent"]] == [False, True]
     assert len(raw) == retention["raw_directories"] == 1
-    assert sum(len(list(path.iterdir())) for path in raw) == retention["files"] <= recovered.MAX_PARTIAL_QUARANTINE_FILES
-    assert sum(file.stat().st_size for path in raw for file in path.iterdir()) == retention[
-        "bytes"
-    ] <= recovered.MAX_PARTIAL_QUARANTINE_BYTES
+    assert (
+        sum(len(list(path.iterdir())) for path in raw) == retention["files"] <= recovered.MAX_PARTIAL_QUARANTINE_FILES
+    )
+    assert (
+        sum(file.stat().st_size for path in raw for file in path.iterdir())
+        == retention["bytes"]
+        <= recovered.MAX_PARTIAL_QUARANTINE_BYTES
+    )
     assert not transaction_path.exists()
 
 
@@ -2254,9 +2252,7 @@ def test_done_eval_has_invocation_provenance_sidecar(tmp_path: Path) -> None:
         payload = json.loads(sidecar.read_text())
         assert payload["invocation_hash"] == state["invocation_hash"]
         assert payload["eval_sha256"] == state["artifact_hashes"]["one.eval.json"]
-        assert state["artifact_hashes"]["one.eval.provenance.json"] == hashlib.sha256(
-            sidecar.read_bytes()
-        ).hexdigest()
+        assert state["artifact_hashes"]["one.eval.provenance.json"] == hashlib.sha256(sidecar.read_bytes()).hexdigest()
 
 
 def test_done_state_rejects_local_test_blob_content_change(
@@ -2507,9 +2503,7 @@ def test_canonical_invocation_mutation_and_rehashed_forgery_both_reject(tmp_path
     with pytest.raises(campaign_evaluate.CampaignEvaluationError, match="invocation"):
         campaign_evaluate.evaluate_campaign(root, instances=instances, command_runner=lambda *_a, **_k: None)
 
-    mutated["invocation_hash"] = hashlib.sha256(
-        campaign_evaluate._canonical_bytes(mutated["invocation"])
-    ).hexdigest()
+    mutated["invocation_hash"] = hashlib.sha256(campaign_evaluate._canonical_bytes(mutated["invocation"])).hexdigest()
     _write_json(state_path, mutated)
     with pytest.raises(campaign_evaluate.CampaignEvaluationError, match="invocation"):
         campaign_evaluate.evaluate_campaign(root, instances=instances, command_runner=lambda *_a, **_k: None)
@@ -2905,9 +2899,7 @@ def test_redo_with_evaluate_runs_inference_before_evaluator(
         "evaluate_campaign",
         lambda *_args, **_kwargs: (
             events.append("evaluate"),
-            campaign_evaluate.CampaignEvaluationResult(
-                "completed", 1, 0, root / "comparison.json", root / "RESULT.md"
-            ),
+            campaign_evaluate.CampaignEvaluationResult("completed", 1, 0, root / "comparison.json", root / "RESULT.md"),
         )[1],
     )
 

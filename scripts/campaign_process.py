@@ -178,9 +178,7 @@ def run_bounded(
                 *invocation,
             ),
             cwd=cwd,
-            env=dict(environment)
-            if environment is not None
-            else {"PATH": os.defpath, "LANG": "C", "LC_ALL": "C"},
+            env=dict(environment) if environment is not None else {"PATH": os.defpath, "LANG": "C", "LC_ALL": "C"},
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
