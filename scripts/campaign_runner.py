@@ -768,9 +768,10 @@ def parse_args(arguments: Sequence[str] | None = None) -> argparse.Namespace:
 def main(arguments: Sequence[str] | None = None) -> int:
     args = parse_args(arguments)
     config = load_config(args.config)
+    instances = _instances_for_plan(args)
     plan = plan_campaign(
         config,
-        load_all_instances(include_tests=False),
+        instances,
         output=args.output,
         limit=args.limit,
         seed=args.seed,
@@ -837,6 +838,16 @@ def main(arguments: Sequence[str] | None = None) -> int:
             print(f"campaign evaluation refused: {_sanitize_evaluation_error(error)}", file=sys.stderr, flush=True)
             evaluation_failed = True
     return 0 if not (result.failed or incomplete or evaluation_failed) else 1
+
+
+def _instances_for_plan(args: argparse.Namespace) -> Sequence[Mapping[str, object]]:
+    if not args.resume:
+        return load_all_instances(include_tests=False)
+    manifest_path = Path(args.output).resolve() / "campaign.json"
+    if not manifest_path.is_file():
+        raise CampaignError(f"cannot resume: campaign manifest is missing: {manifest_path}")
+    _read_json(manifest_path)
+    return ()
 
 
 def _plan_from_manifest(

@@ -950,6 +950,37 @@ def test_public_entrypoint_requires_resume_after_documented_dry_run(tmp_path: Pa
     assert len(prepared) == 2
 
 
+def test_cli_resume_requires_existing_manifest_before_loading_dataset(tmp_path: Path, monkeypatch):
+    from scripts import campaign_runner
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config_path = tmp_path / "campaign.yaml"
+    config_path.write_text(_config(repo))
+    monkeypatch.setattr(campaign_runner, "load_all_instances", lambda **_: pytest.fail("resume loaded dataset"))
+
+    with pytest.raises(campaign_runner.CampaignError, match="manifest.*missing"):
+        campaign_runner.main(
+            ["--config", str(config_path), "--output", str(tmp_path / "missing"), "--resume", "--dry-run"]
+        )
+
+
+def test_cli_resume_rejects_corrupt_manifest_before_loading_dataset(tmp_path: Path, monkeypatch):
+    from scripts import campaign_runner
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config_path = tmp_path / "campaign.yaml"
+    config_path.write_text(_config(repo))
+    output = tmp_path / "corrupt"
+    output.mkdir()
+    output.joinpath("campaign.json").write_text("{")
+    monkeypatch.setattr(campaign_runner, "load_all_instances", lambda **_: pytest.fail("resume loaded dataset"))
+
+    with pytest.raises(campaign_runner.CampaignError, match="invalid campaign data"):
+        campaign_runner.main(["--config", str(config_path), "--output", str(output), "--resume", "--dry-run"])
+
+
 def test_plan_dry_run_prepares_each_arm_once_without_workspace(tmp_path: Path):
     from scripts.campaign_runner import plan_campaign
     from scripts.run_opencode import load_config
@@ -2295,7 +2326,15 @@ def test_fake_paired_campaign_script_main_resumes_without_adapter_calls(tmp_path
         plans.append(plan)
         return plan
 
-    monkeypatch.setattr(campaign_runner, "load_all_instances", lambda **_kwargs: instances)
+    load_calls = []
+
+    def load_instances(**_kwargs):
+        load_calls.append(True)
+        if len(load_calls) > 1:
+            raise AssertionError("resume must not reload ProgramBench instances")
+        return instances
+
+    monkeypatch.setattr(campaign_runner, "load_all_instances", load_instances)
     monkeypatch.setattr(campaign_runner, "plan_campaign", plan_campaign)
     monkeypatch.setattr(campaign_runner, "_install_for", lambda frozen, arm: frozen.installs[arm])
     active = 0
@@ -2462,6 +2501,7 @@ def test_fake_paired_campaign_script_main_resumes_without_adapter_calls(tmp_path
 
     assert calls == []
     assert len(prepared) == 2
+    assert len(load_calls) == 1
 
 
 @pytest.mark.parametrize("mode", ["pause", "interrupt"])
@@ -2616,6 +2656,8 @@ def test_cli_dispatches_cleanup_only_before_provider_credential_preflight(tmp_pa
         False,
         cleanup_only=True,
     )
+    plan.output.mkdir()
+    plan.manifest_path.write_text("{}")
     called = []
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENCODE_SERVER_PASSWORD", raising=False)
