@@ -1,6 +1,7 @@
 import json
 import io
 import hashlib
+import importlib
 import os
 import shutil
 import subprocess
@@ -1281,6 +1282,361 @@ def test_explicit_retry_quarantines_exception_partial_eval_and_sidecar(tmp_path:
     assert len(list(quarantine.glob("attempt-*/*.one.eval.partial.provenance.json"))) == 1
 
 
+def test_explicit_retry_recovers_crash_after_partial_files_move_before_history_append(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import campaign_evaluate
+
+    root, instances = _campaign(tmp_path / "campaign")
+
+    def timeout_with_partial(command, _cwd, _timeout, _grace, _limit, _environment, *, on_start):
+        on_start(999999, 999999, "timeout")
+        _write_eval(Path(command[4]) / "one/one.eval.json", statuses=("passed", "failure", "failure"))
+        raise TimeoutError
+
+    campaign_evaluate.evaluate_campaign(root, instances=instances, command_runner=timeout_with_partial)
+    eval_path = root / "evaluation/procontract/one/one.eval.json"
+    sidecar_path = eval_path.with_name("one.eval.partial.provenance.json")
+    eval_sha256 = hashlib.sha256(eval_path.read_bytes()).hexdigest()
+    sidecar_sha256 = hashlib.sha256(sidecar_path.read_bytes()).hexdigest()
+    eval_payload = eval_path.read_text()
+
+    class SimulatedCrash(BaseException):
+        pass
+
+    with monkeypatch.context() as crash:
+        crash.setattr(
+            campaign_evaluate,
+            "_append_partial_attempt_record",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(SimulatedCrash()),
+        )
+        with pytest.raises(SimulatedCrash):
+            campaign_evaluate.evaluate_campaign(
+                root,
+                instances=instances,
+                retry_evaluator=True,
+                command_runner=lambda *_args, **_kwargs: pytest.fail("crash must precede evaluator retry"),
+                process_probe=lambda _pid, _started: False,
+                process_group_probe=lambda _pgid: False,
+                cgroup_probe=lambda _path: False,
+            )
+
+    assert not eval_path.exists()
+    assert not sidecar_path.exists()
+    transaction_path = root / "evaluation-state/procontract.partial-quarantine.json"
+    transaction = json.loads(transaction_path.read_text())
+    assert transaction["phase"] == "files_moved"
+    assert transaction["arm"] == "procontract"
+    assert transaction["attempt"] == 1
+    assert transaction["invocation_hash"] == transaction["state_before"]["invocation_hash"]
+    assert transaction["attempt_record_hash"] == transaction["attempt_record"]["record_hash"]
+    assert transaction["history_before_anchor"] == {
+        "path": str(root / "evaluation-state/procontract.partial-attempts.json"),
+        "sha256": None,
+        "total_count": 0,
+        "head_hash": None,
+        "checkpoint": {"pruned_count": 0, "checkpoint_head_hash": None},
+    }
+    assert (
+        transaction["state_before_sha256"]
+        == hashlib.sha256((root / "evaluation-state/procontract.json").read_bytes()).hexdigest()
+    )
+    for move in transaction["moves"]:
+        destination = Path(move["destination"])
+        metadata = destination.lstat()
+        assert destination.is_relative_to(root)
+        assert Path(move["source"]).is_relative_to(root)
+        assert metadata.st_dev == move["device"]
+        assert metadata.st_ino == move["inode"]
+        assert metadata.st_mode == move["mode"]
+        assert metadata.st_size == move["size"]
+        assert hashlib.sha256(destination.read_bytes()).hexdigest() == move["sha256"]
+
+    retried = subprocess.run(
+        (
+            sys.executable,
+            "-c",
+            "\n".join(
+                (
+                    "import json, os, subprocess, sys",
+                    "from pathlib import Path",
+                    "from scripts import campaign_evaluate",
+                    "root = Path(sys.argv[1])",
+                    "instances = json.loads(sys.argv[2])",
+                    "payload = sys.argv[3]",
+                    "def retry(command, _cwd, _timeout, _grace, _limit, _environment, *, on_start):",
+                    "    on_start(os.getpid(), os.getpid(), 'retry')",
+                    "    arm_root = Path(command[4])",
+                    "    for submission in arm_root.glob('*/submission.tar.gz'):",
+                    "        path = submission.with_name(f'{submission.parent.name}.eval.json')",
+                    "        assert not path.exists()",
+                    "        assert not path.with_name(f'{submission.parent.name}.eval.partial.provenance.json').exists()",
+                    "        path.write_text(payload)",
+                    "    return subprocess.CompletedProcess(command, 0, '', '')",
+                    "outcome = campaign_evaluate.evaluate_campaign(",
+                    "    root, instances=instances, retry_evaluator=True, command_runner=retry,",
+                    "    process_probe=lambda _pid, _started: False,",
+                    "    process_group_probe=lambda _pgid: False, cgroup_probe=lambda _path: False,",
+                    ")",
+                    "print(outcome.status)",
+                )
+            ),
+            str(root),
+            json.dumps(instances),
+            eval_payload,
+        ),
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert retried.stdout.strip() == "completed"
+    state = json.loads((root / "evaluation-state/procontract.json").read_text())
+    artifact = state["partial_attempt_history"]["recent"][0]["artifacts"][0]
+    assert artifact["eval_sha256"] == eval_sha256
+    assert artifact["provenance_sha256"] == sidecar_sha256
+    assert not transaction_path.exists()
+
+
+@pytest.mark.parametrize(
+    "crash_point",
+    (
+        "prepared",
+        "moved:1",
+        "files_moved",
+        "history_written",
+        "history_published",
+        "state_written",
+        "state_published",
+        "complete",
+    ),
+)
+def test_partial_quarantine_transaction_recovers_every_durable_phase(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    crash_point: str,
+) -> None:
+    from scripts import campaign_evaluate
+
+    root, instances = _campaign(tmp_path / "campaign")
+
+    def timeout_with_partial(command, _cwd, _timeout, _grace, _limit, _environment, *, on_start):
+        on_start(999999, 999999, "timeout")
+        _write_eval(Path(command[4]) / "one/one.eval.json", statuses=("passed", "failure", "failure"))
+        raise TimeoutError
+
+    campaign_evaluate.evaluate_campaign(root, instances=instances, command_runner=timeout_with_partial)
+
+    class SimulatedCrash(BaseException):
+        pass
+
+    with monkeypatch.context() as crash:
+        if crash_point == "prepared":
+            reconcile = campaign_evaluate._reconcile_partial_quarantine
+
+            def crash_after_prepare(root_path, arm, arm_root, state_path):
+                transaction = state_path.parent / f"{arm}.partial-quarantine.json"
+                if transaction.exists() and json.loads(transaction.read_text())["phase"] == "prepared":
+                    raise SimulatedCrash
+                return reconcile(root_path, arm, arm_root, state_path)
+
+            crash.setattr(campaign_evaluate, "_reconcile_partial_quarantine", crash_after_prepare)
+        elif crash_point == "history_written":
+            append = campaign_evaluate._append_partial_attempt_record
+
+            def crash_after_history(path, record):
+                append(path, record)
+                raise SimulatedCrash
+
+            crash.setattr(campaign_evaluate, "_append_partial_attempt_record", crash_after_history)
+        elif crash_point == "state_written":
+            atomic_json = campaign_evaluate._atomic_json
+            state_path = root / "evaluation-state/procontract.json"
+
+            def crash_after_state(path, value):
+                atomic_json(path, value)
+                if (
+                    path == state_path
+                    and isinstance(value, dict)
+                    and value.get("completion_disposition") == "partial_quarantined"
+                ):
+                    raise SimulatedCrash
+
+            crash.setattr(campaign_evaluate, "_atomic_json", crash_after_state)
+        else:
+            write_phase = campaign_evaluate._write_partial_quarantine_phase
+
+            def crash_after_phase(path, journal, phase):
+                updated = write_phase(path, journal, phase)
+                if phase == crash_point:
+                    raise SimulatedCrash
+                return updated
+
+            crash.setattr(campaign_evaluate, "_write_partial_quarantine_phase", crash_after_phase)
+        with pytest.raises(SimulatedCrash):
+            campaign_evaluate.evaluate_campaign(
+                root,
+                instances=instances,
+                retry_evaluator=True,
+                command_runner=lambda *_args, **_kwargs: pytest.fail("crash must precede evaluator retry"),
+                process_probe=lambda _pid, _started: False,
+                process_group_probe=lambda _pgid: False,
+                cgroup_probe=lambda _path: False,
+            )
+
+    recovered = importlib.reload(campaign_evaluate)
+
+    def retry(command, _cwd, _timeout, _grace, _limit, _environment, *, on_start):
+        on_start(os.getpid(), os.getpid(), "retry")
+        path = Path(command[4]) / "one/one.eval.json"
+        assert not path.exists()
+        assert not path.with_name("one.eval.partial.provenance.json").exists()
+        _write_eval(path, statuses=("passed", "failure", "failure"))
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    outcome = recovered.evaluate_campaign(
+        root,
+        instances=instances,
+        retry_evaluator=True,
+        command_runner=retry,
+        process_probe=lambda _pid, _started: False,
+        process_group_probe=lambda _pgid: False,
+        cgroup_probe=lambda _path: False,
+    )
+
+    assert outcome.status == "completed"
+    assert not (root / "evaluation-state/procontract.partial-quarantine.json").exists()
+    assert json.loads((root / "evaluation-state/procontract.partial-attempts.json").read_text())["total_count"] == 1
+
+
+def test_partial_quarantine_recovery_handles_subset_of_submitted_outputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import campaign_evaluate
+
+    root, instances = _campaign(tmp_path / "campaign", instance_ids=("one", "two"))
+
+    def timeout_with_one_partial(command, _cwd, _timeout, _grace, _limit, _environment, *, on_start):
+        on_start(999999, 999999, "timeout")
+        _write_eval(Path(command[4]) / "two/two.eval.json", statuses=("passed", "failure", "failure"))
+        raise TimeoutError
+
+    campaign_evaluate.evaluate_campaign(root, instances=instances, command_runner=timeout_with_one_partial)
+
+    class SimulatedCrash(BaseException):
+        pass
+
+    with monkeypatch.context() as crash:
+        crash.setattr(
+            campaign_evaluate,
+            "_append_partial_attempt_record",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(SimulatedCrash()),
+        )
+        with pytest.raises(SimulatedCrash):
+            campaign_evaluate.evaluate_campaign(
+                root,
+                instances=instances,
+                retry_evaluator=True,
+                command_runner=lambda *_args, **_kwargs: pytest.fail("crash must precede evaluator retry"),
+                process_probe=lambda _pid, _started: False,
+                process_group_probe=lambda _pgid: False,
+                cgroup_probe=lambda _path: False,
+            )
+
+    recovered = importlib.reload(campaign_evaluate)
+
+    def retry(command, _cwd, _timeout, _grace, _limit, _environment, *, on_start):
+        on_start(os.getpid(), os.getpid(), "retry")
+        arm_root = Path(command[4])
+        assert not (arm_root / "two/two.eval.json").exists()
+        for submission in arm_root.glob("*/submission.tar.gz"):
+            _write_eval(
+                submission.with_name(f"{submission.parent.name}.eval.json"),
+                statuses=("passed", "failure", "failure"),
+            )
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    outcome = recovered.evaluate_campaign(
+        root,
+        instances=instances,
+        retry_evaluator=True,
+        command_runner=retry,
+        process_probe=lambda _pid, _started: False,
+        process_group_probe=lambda _pgid: False,
+        cgroup_probe=lambda _path: False,
+    )
+
+    assert outcome.status == "completed"
+
+
+def test_partial_quarantine_rejects_rehashed_foreign_journal_without_moving_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import campaign_evaluate
+
+    root, instances = _campaign(tmp_path / "campaign")
+
+    def timeout_with_partial(command, _cwd, _timeout, _grace, _limit, _environment, *, on_start):
+        on_start(999999, 999999, "timeout")
+        _write_eval(Path(command[4]) / "one/one.eval.json", statuses=("passed", "failure", "failure"))
+        raise TimeoutError
+
+    campaign_evaluate.evaluate_campaign(root, instances=instances, command_runner=timeout_with_partial)
+    eval_path = root / "evaluation/procontract/one/one.eval.json"
+    original = eval_path.read_bytes()
+
+    class SimulatedCrash(BaseException):
+        pass
+
+    reconcile = campaign_evaluate._reconcile_partial_quarantine
+
+    def crash_after_prepare(root_path, arm, arm_root, state_path):
+        transaction = state_path.parent / f"{arm}.partial-quarantine.json"
+        if transaction.exists():
+            raise SimulatedCrash
+        return reconcile(root_path, arm, arm_root, state_path)
+
+    with monkeypatch.context() as crash:
+        crash.setattr(campaign_evaluate, "_reconcile_partial_quarantine", crash_after_prepare)
+        with pytest.raises(SimulatedCrash):
+            campaign_evaluate.evaluate_campaign(
+                root,
+                instances=instances,
+                retry_evaluator=True,
+                command_runner=lambda *_args, **_kwargs: pytest.fail("crash must precede evaluator retry"),
+                process_probe=lambda _pid, _started: False,
+                process_group_probe=lambda _pgid: False,
+                cgroup_probe=lambda _path: False,
+            )
+
+    transaction_path = root / "evaluation-state/procontract.partial-quarantine.json"
+    transaction = json.loads(transaction_path.read_text())
+    transaction["state_after"]["status"] = "done"
+    transaction["state_after_sha256"] = hashlib.sha256(
+        (json.dumps(transaction["state_after"], allow_nan=False, indent=2, sort_keys=True) + "\n").encode()
+    ).hexdigest()
+    _write_json(transaction_path, transaction)
+    recovered = importlib.reload(campaign_evaluate)
+
+    with pytest.raises(recovered.CampaignEvaluationError, match="transaction state conflicts"):
+        recovered.evaluate_campaign(
+            root,
+            instances=instances,
+            retry_evaluator=True,
+            command_runner=lambda *_args, **_kwargs: pytest.fail("foreign journal must block retry"),
+            process_probe=lambda _pid, _started: False,
+            process_group_probe=lambda _pgid: False,
+            cgroup_probe=lambda _path: False,
+        )
+
+    assert eval_path.read_bytes() == original
+    assert not Path(transaction["moves"][0]["destination"]).exists()
+
+
 def test_more_than_sixteen_explicit_retries_are_allowed_while_quarantine_is_within_cap(tmp_path: Path) -> None:
     from scripts.campaign_evaluate import evaluate_campaign
 
@@ -1335,6 +1691,62 @@ def test_partial_attempt_history_compacts_one_thousand_records_with_hash_chain(t
     assert len(history["records"]) == 64
     assert len(history["head_hash"]) == 64
     assert path.stat().st_size < 128 * 1024
+
+
+def test_explicit_retry_rejects_self_consistent_rewrite_of_compacted_history(tmp_path: Path) -> None:
+    from scripts import campaign_evaluate
+
+    root, instances = _campaign(tmp_path / "campaign")
+
+    def timeout_with_partial(command, _cwd, _timeout, _grace, _limit, _environment, *, on_start):
+        on_start(999999, 999999, "timeout")
+        _write_eval(Path(command[4]) / "one/one.eval.json", statuses=("passed", "failure", "failure"))
+        raise TimeoutError
+
+    campaign_evaluate.evaluate_campaign(root, instances=instances, command_runner=timeout_with_partial)
+    history_path = root / "evaluation-state/procontract.partial-attempts.json"
+    for attempt in range(100, 165):
+        campaign_evaluate._append_partial_attempt_record(
+            history_path,
+            {
+                "attempt": attempt,
+                "invocation_hash": "a" * 64,
+                "artifacts": [],
+                "quarantine_path": str(root / f"evaluation-state/procontract.partial/attempt-{attempt}"),
+                "raw_retained": False,
+            },
+        )
+    state_path = root / "evaluation-state/procontract.json"
+    state = json.loads(state_path.read_text())
+    state["partial_attempt_history"] = campaign_evaluate._partial_history_summary(history_path)
+    _write_json(state_path, state)
+
+    rewritten = json.loads(history_path.read_text())
+    rewritten["records"][0]["invocation_hash"] = "b" * 64
+    previous = rewritten["checkpoint"]["checkpoint_head_hash"]
+    for record in rewritten["records"]:
+        record["previous_record_hash"] = previous
+        value = {key: item for key, item in record.items() if key != "record_hash"}
+        record["record_hash"] = hashlib.sha256(
+            json.dumps(value, allow_nan=False, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        previous = record["record_hash"]
+    rewritten["head_hash"] = previous
+    _write_json(history_path, rewritten)
+
+    with pytest.raises(campaign_evaluate.CampaignEvaluationError, match="history conflicts with durable arm state"):
+        campaign_evaluate.evaluate_campaign(
+            root,
+            instances=instances,
+            retry_evaluator=True,
+            command_runner=lambda *_args, **_kwargs: pytest.fail("rewritten history must block retry"),
+            process_probe=lambda _pid, _started: False,
+            process_group_probe=lambda _pgid: False,
+            cgroup_probe=lambda _path: False,
+        )
+
+    assert (root / "evaluation/procontract/one/one.eval.json").exists()
+    assert not (root / "evaluation-state/procontract.partial-quarantine.json").exists()
 
 
 def test_keyboard_interrupt_with_eval_file_persists_interrupted_then_reraises(tmp_path: Path) -> None:

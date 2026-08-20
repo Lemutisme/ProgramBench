@@ -1159,22 +1159,21 @@ def _quarantine_partial_eval_outputs(
     sizes = state.get("artifact_sizes")
     if not isinstance(hashes, Mapping) or not isinstance(sizes, Mapping):
         raise CampaignEvaluationError("partial evaluator artifact state is malformed")
-    retained_hashes = dict(hashes)
-    retained_sizes = dict(sizes)
-    quarantined: list[str] = []
     attempt = state.get("attempt")
     invocation_hash = state.get("invocation_hash")
     if type(attempt) is not int or not isinstance(invocation_hash, str):
         raise CampaignEvaluationError("partial evaluator attempt state is malformed")
-    quarantine = (
-        root
-        / "evaluation-state"
-        / f"{arm}.partial"
-        / f"attempt-{attempt:03d}-{invocation_hash[:12]}"
-    )
+    state_root = root / "evaluation-state"
+    index_path = state_root / f"{arm}.partial-attempts.json"
+    history_before = _load_partial_history(index_path)
+    history_anchor = _require_partial_history_anchor(index_path, state.get("partial_attempt_history"))
+    quarantine = state_root / f"{arm}.partial" / f"attempt-{attempt:03d}-{invocation_hash[:12]}"
     _mkdir_contained(quarantine, root)
-    total = 0
+    retained_hashes = dict(hashes)
+    retained_sizes = dict(sizes)
+    quarantined: list[str] = []
     artifact_records: list[dict[str, object]] = []
+    moves: list[dict[str, object]] = []
     for instance_id in submitted:
         path = arm_root / instance_id / f"{instance_id}.eval.json"
         if not path.exists():
@@ -1192,37 +1191,49 @@ def _quarantine_partial_eval_outputs(
             or retained_hashes.get(sidecar.name) != _sha256(sidecar)
         ):
             raise CampaignEvaluationError(f"partial eval provenance conflicts: {instance_id}")
-        total += path.stat().st_size + sidecar.stat().st_size
+        eval_identity = _partial_quarantine_file_identity(path, root)
+        sidecar_identity = _partial_quarantine_file_identity(sidecar, root)
+        eval_target = quarantine / f"{identity.sha256}.{path.name}"
+        sidecar_target = quarantine / f"{identity.sha256}.{sidecar.name}"
         artifact_records.append(
             {
                 "instance_id": instance_id,
                 "eval_path": str(path),
+                "eval_quarantine_path": str(eval_target),
                 "eval_sha256": identity.sha256,
                 "eval_size": path.stat().st_size,
+                "provenance_path": str(sidecar),
+                "provenance_quarantine_path": str(sidecar_target),
                 "provenance_sha256": _sha256(sidecar),
                 "provenance_size": sidecar.stat().st_size,
                 "error": payload.get("error"),
             }
         )
-        for current in (path, sidecar):
-            metadata = current.lstat()
-            target = quarantine / f"{identity.sha256}.{current.name}"
-            _rename_owned_entry(current, target, root, metadata.st_dev, metadata.st_ino)
+        for kind, current, target, current_identity in (
+            ("eval", path, eval_target, eval_identity),
+            ("provenance", sidecar, sidecar_target, sidecar_identity),
+        ):
+            moves.append(
+                {
+                    "instance_id": instance_id,
+                    "kind": kind,
+                    "source": str(current),
+                    "destination": str(target),
+                    **current_identity,
+                }
+            )
             retained_hashes.pop(current.name, None)
             retained_sizes.pop(current.name, None)
         quarantined.append(instance_id)
-    index_path = root / "evaluation-state" / f"{arm}.partial-attempts.json"
-    records = _append_partial_attempt_record(
-        index_path,
-        {
-            "attempt": attempt,
-            "invocation_hash": invocation_hash,
-            "artifacts": artifact_records,
-            "quarantine_path": str(quarantine),
-            "raw_retained": True,
-        },
-    )
-    records = _prune_partial_attempts(root, arm, index_path, records)
+    record = {
+        "attempt": attempt,
+        "invocation_hash": invocation_hash,
+        "artifacts": artifact_records,
+        "quarantine_path": str(quarantine),
+        "raw_retained": True,
+    }
+    history_after = _extend_partial_history(history_before, record)
+    history_after_sha256 = hashlib.sha256(_json_bytes(history_after)).hexdigest()
     updated = {
         **state,
         "artifact_hashes": retained_hashes,
@@ -1230,17 +1241,475 @@ def _quarantine_partial_eval_outputs(
         "eval_artifact_sizes": {},
         "eval_hash_unavailable": {},
         "partial_quarantine": quarantined,
-        "partial_attempt_history": _partial_history_summary(index_path),
+        "partial_attempt_history": _partial_history_summary_value(
+            index_path,
+            history_after,
+            history_after_sha256,
+        ),
         "completion_disposition": "partial_quarantined",
     }
-    _atomic_json(state_path, updated)
+    journal_path = state_root / f"{arm}.partial-quarantine.json"
+    if journal_path.exists():
+        raise CampaignEvaluationError(f"partial quarantine transaction already exists for {arm}")
+    intended = history_after["records"][-1]
+    journal = {
+        "version": 1,
+        "phase": "prepared",
+        "arm": arm,
+        "attempt": attempt,
+        "invocation_hash": invocation_hash,
+        "state_path": str(state_path),
+        "state_before": dict(state),
+        "state_before_sha256": _sha256(state_path),
+        "state_after": updated,
+        "state_after_sha256": hashlib.sha256(_json_bytes(updated)).hexdigest(),
+        "history_path": str(index_path),
+        "history_before": history_before,
+        "history_before_anchor": history_anchor,
+        "history_after": history_after,
+        "history_after_sha256": history_after_sha256,
+        "attempt_record_input": record,
+        "attempt_record": intended,
+        "attempt_record_hash": intended["record_hash"],
+        "quarantine_path": str(quarantine),
+        "moves": moves,
+    }
+    _atomic_json(journal_path, journal)
+    reconciled = _reconcile_partial_quarantine(root, arm, arm_root, state_path)
+    if reconciled is None:
+        raise CampaignEvaluationError(f"partial quarantine transaction disappeared for {arm}")
+    return reconciled
+
+
+def _reconcile_partial_quarantine(
+    root: Path,
+    arm: str,
+    arm_root: Path,
+    state_path: Path,
+) -> Mapping[str, object] | None:
+    journal_path = state_path.parent / f"{arm}.partial-quarantine.json"
+    if not journal_path.exists():
+        return None
+    journal = _read_json(journal_path, f"partial quarantine transaction for {arm}")
+    moves = journal.get("moves")
+    state_before = journal.get("state_before")
+    state_after = journal.get("state_after")
+    history_before = journal.get("history_before")
+    history_after = journal.get("history_after")
+    record_input = journal.get("attempt_record_input")
+    record = journal.get("attempt_record")
+    if (
+        journal.get("version") != 1
+        or journal.get("arm") != arm
+        or journal.get("state_path") != str(state_path)
+        or not isinstance(moves, list)
+        or not isinstance(state_before, Mapping)
+        or not isinstance(state_after, Mapping)
+        or not isinstance(history_before, Mapping)
+        or not isinstance(history_after, Mapping)
+        or not isinstance(record_input, Mapping)
+        or not isinstance(record, Mapping)
+    ):
+        raise CampaignEvaluationError(f"partial quarantine transaction conflicts for {arm}")
+    attempt = journal.get("attempt")
+    invocation_hash = journal.get("invocation_hash")
+    if (
+        type(attempt) is not int
+        or not isinstance(invocation_hash, str)
+        or state_before.get("attempt") != attempt
+        or state_before.get("invocation_hash") != invocation_hash
+        or hashlib.sha256(_json_bytes(state_before)).hexdigest() != journal.get("state_before_sha256")
+        or hashlib.sha256(_json_bytes(state_after)).hexdigest() != journal.get("state_after_sha256")
+        or hashlib.sha256(_json_bytes(history_after)).hexdigest() != journal.get("history_after_sha256")
+        or record.get("record_hash") != journal.get("attempt_record_hash")
+    ):
+        raise CampaignEvaluationError(f"partial quarantine transaction identity conflicts for {arm}")
+    _validate_partial_history(history_before)
+    _validate_partial_history(history_after)
+    index_path = state_path.parent / f"{arm}.partial-attempts.json"
+    quarantine = state_path.parent / f"{arm}.partial" / f"attempt-{attempt:03d}-{invocation_hash[:12]}"
+    if journal.get("history_path") != str(index_path) or journal.get("quarantine_path") != str(quarantine):
+        raise CampaignEvaluationError(f"partial quarantine transaction path conflicts for {arm}")
+    expected_after = _extend_partial_history(history_before, record_input)
+    if dict(history_after) != expected_after or dict(record) != expected_after["records"][-1]:
+        raise CampaignEvaluationError(f"partial quarantine transaction record conflicts for {arm}")
+    before_anchor = _partial_history_anchor_value(
+        index_path,
+        history_before,
+        journal.get("history_before_anchor", {}).get("sha256")
+        if isinstance(journal.get("history_before_anchor"), Mapping)
+        else None,
+    )
+    if before_anchor != journal.get("history_before_anchor"):
+        raise CampaignEvaluationError(f"partial quarantine transaction history anchor conflicts for {arm}")
+    state_history = state_before.get("partial_attempt_history")
+    if state_history == {}:
+        expected_before_anchor = _partial_history_anchor_value(index_path, history_before, None)
+    elif isinstance(state_history, Mapping):
+        expected_before_anchor = {
+            "path": state_history.get("path"),
+            "sha256": state_history.get("sha256"),
+            "total_count": state_history.get("total_count"),
+            "head_hash": state_history.get("head_hash"),
+            "checkpoint": state_history.get("checkpoint"),
+        }
+    else:
+        raise CampaignEvaluationError(f"partial quarantine transaction prior history conflicts for {arm}")
+    history_before_sha256 = before_anchor["sha256"]
+    if (
+        expected_before_anchor != before_anchor
+        or history_before_sha256 is not None
+        and not isinstance(history_before_sha256, str)
+        or history_before_sha256 is None
+        and history_before
+        != {
+            "version": 2,
+            "total_count": 0,
+            "head_hash": None,
+            "checkpoint": {"pruned_count": 0, "checkpoint_head_hash": None},
+            "records": [],
+        }
+        or isinstance(history_before_sha256, str)
+        and hashlib.sha256(_json_bytes(history_before)).hexdigest() != history_before_sha256
+    ):
+        raise CampaignEvaluationError(f"partial quarantine transaction prior history conflicts for {arm}")
+    submitted = state_before.get("submitted_ids")
+    if not isinstance(submitted, list) or any(not isinstance(value, str) for value in submitted):
+        raise CampaignEvaluationError(f"partial quarantine transaction submitted IDs conflict for {arm}")
+    artifacts = record_input.get("artifacts")
+    if not isinstance(artifacts, list) or any(not isinstance(value, Mapping) for value in artifacts):
+        raise CampaignEvaluationError(f"partial quarantine transaction artifacts conflict for {arm}")
+    artifact_by_instance = {value.get("instance_id"): value for value in artifacts}
+    if len(artifact_by_instance) != len(artifacts) or not set(artifact_by_instance).issubset(submitted):
+        raise CampaignEvaluationError(f"partial quarantine transaction artifact IDs conflict for {arm}")
+    missing = state_before.get("missing_eval_ids")
+    if not isinstance(missing, list) or [value.get("instance_id") for value in artifacts] != [
+        instance_id for instance_id in submitted if instance_id not in missing
+    ]:
+        raise CampaignEvaluationError(f"partial quarantine transaction artifact order conflicts for {arm}")
+    if (
+        set(record_input) != {"attempt", "invocation_hash", "artifacts", "quarantine_path", "raw_retained"}
+        or record_input.get("attempt") != attempt
+        or record_input.get("invocation_hash") != invocation_hash
+        or record_input.get("quarantine_path") != str(quarantine)
+        or record_input.get("raw_retained") is not True
+    ):
+        raise CampaignEvaluationError(f"partial quarantine transaction record input conflicts for {arm}")
+    expected_sources = {
+        (instance_id, "eval"): arm_root / instance_id / f"{instance_id}.eval.json" for instance_id in submitted
+    }
+    expected_sources.update(
+        {
+            (instance_id, "provenance"): arm_root / instance_id / f"{instance_id}.eval.partial.provenance.json"
+            for instance_id in submitted
+        }
+    )
+    move_by_key: dict[tuple[object, object], Mapping[str, object]] = {}
+    for move in moves:
+        if (
+            not isinstance(move, Mapping)
+            or set(move)
+            != {"instance_id", "kind", "source", "destination", "device", "inode", "mode", "sha256", "size"}
+            or any(type(move.get(name)) is not int for name in ("device", "inode", "mode", "size"))
+            or not isinstance(move.get("sha256"), str)
+        ):
+            raise CampaignEvaluationError(f"partial quarantine move is malformed for {arm}")
+        key = (move.get("instance_id"), move.get("kind"))
+        if key in move_by_key:
+            raise CampaignEvaluationError(f"partial quarantine move is duplicated for {arm}")
+        move_by_key[key] = move
+        source = expected_sources.get(key)
+        if source is None or move.get("source") != str(source):
+            raise CampaignEvaluationError(f"partial quarantine source path conflicts for {arm}")
+        artifact = artifact_by_instance.get(key[0])
+        if artifact is None or not isinstance(artifact.get("eval_sha256"), str):
+            raise CampaignEvaluationError(f"partial quarantine move artifact conflicts for {arm}")
+        destination = quarantine / f"{artifact['eval_sha256']}.{source.name}"
+        if move.get("destination") != str(destination):
+            raise CampaignEvaluationError(f"partial quarantine destination path conflicts for {arm}")
+    expected_move_keys = {
+        (instance_id, kind) for instance_id in artifact_by_instance for kind in ("eval", "provenance")
+    }
+    expected_move_order = [
+        (artifact.get("instance_id"), kind) for artifact in artifacts for kind in ("eval", "provenance")
+    ]
+    if set(move_by_key) != expected_move_keys or [
+        (move.get("instance_id"), move.get("kind")) for move in moves
+    ] != expected_move_order:
+        raise CampaignEvaluationError(f"partial quarantine move set conflicts for {arm}")
+    for instance_id, artifact in artifact_by_instance.items():
+        eval_move = move_by_key[(instance_id, "eval")]
+        provenance_move = move_by_key[(instance_id, "provenance")]
+        if (
+            set(artifact)
+            != {
+                "instance_id",
+                "eval_path",
+                "eval_quarantine_path",
+                "eval_sha256",
+                "eval_size",
+                "provenance_path",
+                "provenance_quarantine_path",
+                "provenance_sha256",
+                "provenance_size",
+                "error",
+            }
+            or artifact.get("eval_path") != eval_move["source"]
+            or artifact.get("eval_quarantine_path") != eval_move["destination"]
+            or artifact.get("eval_sha256") != eval_move["sha256"]
+            or artifact.get("eval_size") != eval_move["size"]
+            or artifact.get("provenance_path") != provenance_move["source"]
+            or artifact.get("provenance_quarantine_path") != provenance_move["destination"]
+            or artifact.get("provenance_sha256") != provenance_move["sha256"]
+            or artifact.get("provenance_size") != provenance_move["size"]
+        ):
+            raise CampaignEvaluationError(f"partial quarantine artifact record conflicts for {arm}")
+    before_hashes = state_before.get("artifact_hashes")
+    before_sizes = state_before.get("artifact_sizes")
+    if not isinstance(before_hashes, Mapping) or not isinstance(before_sizes, Mapping):
+        raise CampaignEvaluationError(f"partial quarantine transaction prior artifacts conflict for {arm}")
+    retained_hashes = dict(before_hashes)
+    retained_sizes = dict(before_sizes)
+    for move in moves:
+        name = Path(str(move["source"])).name
+        if retained_hashes.get(name) != move["sha256"] or retained_sizes.get(name) != move["size"]:
+            raise CampaignEvaluationError(f"partial quarantine transaction prior artifact identity conflicts for {arm}")
+        retained_hashes.pop(name)
+        retained_sizes.pop(name)
+    expected_state_after = {
+        **state_before,
+        "artifact_hashes": retained_hashes,
+        "artifact_sizes": retained_sizes,
+        "eval_artifact_sizes": {},
+        "eval_hash_unavailable": {},
+        "partial_quarantine": [value.get("instance_id") for value in artifacts],
+        "partial_attempt_history": _partial_history_summary_value(
+            index_path,
+            history_after,
+            str(journal["history_after_sha256"]),
+        ),
+        "completion_disposition": "partial_quarantined",
+    }
+    if dict(state_after) != expected_state_after:
+        raise CampaignEvaluationError(f"partial quarantine transaction state conflicts for {arm}")
+    # A crash may make the file placement one rename newer than the published phase.
+    statuses = [_partial_quarantine_move_done(move, root) for move in moves]
+    completed = 0
+    for status_value in statuses:
+        if not status_value:
+            break
+        completed += 1
+    if any(statuses[completed:]):
+        raise CampaignEvaluationError(f"partial quarantine move order conflicts for {arm}")
+    phase = journal.get("phase")
+    phase_moves = _partial_quarantine_phase_moves(phase, len(moves))
+    if completed < phase_moves or completed > min(len(moves), phase_moves + 1):
+        raise CampaignEvaluationError(f"partial quarantine phase conflicts for {arm}")
+    for index in range(completed, len(moves)):
+        move = moves[index]
+        _rename_owned_entry(
+            Path(str(move["source"])),
+            Path(str(move["destination"])),
+            root,
+            int(move["device"]),
+            int(move["inode"]),
+        )
+        _sync_directory(Path(str(move["source"])).parent)
+        _sync_directory(Path(str(move["destination"])).parent)
+        journal = _write_partial_quarantine_phase(
+            journal_path,
+            journal,
+            "files_moved" if index + 1 == len(moves) else f"moved:{index + 1}",
+        )
+    if not moves and phase == "prepared":
+        journal = _write_partial_quarantine_phase(journal_path, journal, "files_moved")
+    actual_history = _load_partial_history(index_path)
+    actual_anchor = _partial_history_anchor(index_path, actual_history)
+    after_anchor = _partial_history_anchor_value(index_path, history_after, str(journal["history_after_sha256"]))
+    history_is_before = actual_anchor == journal["history_before_anchor"] and actual_history == dict(history_before)
+    history_is_after = actual_anchor == after_anchor and actual_history == dict(history_after)
+    if not history_is_before and not history_is_after:
+        raise CampaignEvaluationError(f"partial attempt history phase conflicts during recovery for {arm}")
+    if (
+        journal.get("phase") == "prepared"
+        or isinstance(journal.get("phase"), str)
+        and str(journal["phase"]).startswith("moved:")
+    ) and not history_is_before:
+        raise CampaignEvaluationError(f"partial attempt history phase conflicts during recovery for {arm}")
+    if journal.get("phase") in {"history_published", "state_published", "complete"} and not history_is_after:
+        raise CampaignEvaluationError(f"partial attempt history phase conflicts during recovery for {arm}")
+    phase_state = _read_json(state_path, f"evaluator state for {arm}")
+    phase_state_sha256 = _sha256(state_path)
+    phase_state_is_before = phase_state_sha256 == journal["state_before_sha256"] and dict(phase_state) == dict(
+        state_before
+    )
+    phase_state_is_after = phase_state_sha256 == journal["state_after_sha256"] and dict(phase_state) == dict(
+        state_after
+    )
+    if not phase_state_is_before and not phase_state_is_after:
+        raise CampaignEvaluationError(f"evaluator state conflicts during partial quarantine recovery for {arm}")
+    if journal.get("phase") in {"prepared", "files_moved"} or (
+        isinstance(journal.get("phase"), str) and str(journal["phase"]).startswith("moved:")
+    ):
+        if not phase_state_is_before:
+            raise CampaignEvaluationError(
+                f"evaluator state phase conflicts during partial quarantine recovery for {arm}"
+            )
+    if journal.get("phase") in {"state_published", "complete"} and not phase_state_is_after:
+        raise CampaignEvaluationError(f"evaluator state phase conflicts during partial quarantine recovery for {arm}")
+    if history_is_before:
+        _append_partial_attempt_record(index_path, record_input)
+        actual_history = _load_partial_history(index_path)
+        actual_anchor = _partial_history_anchor(index_path, actual_history)
+    if actual_anchor != after_anchor or actual_history != dict(history_after):
+        raise CampaignEvaluationError(f"partial attempt history conflicts during recovery for {arm}")
+    if journal.get("phase") not in {"history_published", "state_published", "complete"}:
+        journal = _write_partial_quarantine_phase(journal_path, journal, "history_published")
+    current_state = _read_json(state_path, f"evaluator state for {arm}")
+    current_state_sha256 = _sha256(state_path)
+    state_is_before = current_state_sha256 == journal["state_before_sha256"] and dict(current_state) == dict(
+        state_before
+    )
+    state_is_after = current_state_sha256 == journal["state_after_sha256"] and dict(current_state) == dict(state_after)
+    if journal.get("phase") in {"state_published", "complete"} and not state_is_after:
+        raise CampaignEvaluationError(f"evaluator state phase conflicts during partial quarantine recovery for {arm}")
+    if not state_is_before and not state_is_after:
+        raise CampaignEvaluationError(f"evaluator state conflicts during partial quarantine recovery for {arm}")
+    if state_is_before:
+        _atomic_json(state_path, state_after)
+        current_state = _read_json(state_path, f"evaluator state for {arm}")
+        current_state_sha256 = _sha256(state_path)
+    if current_state_sha256 != journal["state_after_sha256"] or dict(current_state) != dict(state_after):
+        raise CampaignEvaluationError(f"evaluator state conflicts during partial quarantine recovery for {arm}")
+    if journal.get("phase") not in {"state_published", "complete"}:
+        journal = _write_partial_quarantine_phase(journal_path, journal, "state_published")
+    if journal.get("phase") != "complete":
+        journal = _write_partial_quarantine_phase(journal_path, journal, "complete")
+    journal_path.unlink()
+    _sync_directory(journal_path.parent)
+    _prune_partial_attempts(root, arm, index_path)
+    refreshed = {
+        **state_after,
+        "partial_attempt_history": _partial_history_summary(index_path),
+    }
+    if refreshed != dict(state_after):
+        _atomic_json(state_path, refreshed)
+    return refreshed
+
+
+def _write_partial_quarantine_phase(
+    path: Path,
+    journal: Mapping[str, object],
+    phase: str,
+) -> Mapping[str, object]:
+    updated = {**journal, "phase": phase}
+    _atomic_json(path, updated)
     return updated
+
+
+def _partial_quarantine_phase_moves(phase: object, total: int) -> int:
+    if phase == "prepared":
+        return 0
+    if phase in {"files_moved", "history_published", "state_published", "complete"}:
+        return total
+    if isinstance(phase, str) and phase.startswith("moved:"):
+        try:
+            moved = int(phase.split(":", 1)[1])
+        except ValueError as error:
+            raise CampaignEvaluationError("partial quarantine move phase is malformed") from error
+        if 0 < moved < total:
+            return moved
+    raise CampaignEvaluationError("partial quarantine phase is malformed")
+
+
+def _partial_quarantine_file_identity(path: Path, root: Path) -> dict[str, object]:
+    _require_owned_directory(path.parent, root, "partial quarantine file parent")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    directory = os.open(
+        path.parent,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        metadata = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise CampaignEvaluationError(f"partial quarantine source is not a regular file: {path}")
+        descriptor = os.open(path.name, flags, dir_fd=directory)
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                opened.st_dev != metadata.st_dev
+                or opened.st_ino != metadata.st_ino
+                or opened.st_mode != metadata.st_mode
+                or opened.st_size != metadata.st_size
+            ):
+                raise CampaignEvaluationError(f"partial quarantine source changed before hashing: {path}")
+            digest = hashlib.sha256()
+            with os.fdopen(os.dup(descriptor), "rb") as source:
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            current = os.fstat(descriptor)
+            if (
+                current.st_dev != metadata.st_dev
+                or current.st_ino != metadata.st_ino
+                or current.st_mode != metadata.st_mode
+                or current.st_size != metadata.st_size
+            ):
+                raise CampaignEvaluationError(f"partial quarantine source changed while hashing: {path}")
+            return {
+                "device": metadata.st_dev,
+                "inode": metadata.st_ino,
+                "mode": metadata.st_mode,
+                "sha256": digest.hexdigest(),
+                "size": metadata.st_size,
+            }
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(directory)
+
+
+def _partial_quarantine_move_done(move: Mapping[str, object], root: Path) -> bool:
+    source = Path(str(move.get("source")))
+    destination = Path(str(move.get("destination")))
+    expected = {
+        "device": move.get("device"),
+        "inode": move.get("inode"),
+        "mode": move.get("mode"),
+        "sha256": move.get("sha256"),
+        "size": move.get("size"),
+    }
+    source_exists = source.exists() or source.is_symlink()
+    destination_exists = destination.exists() or destination.is_symlink()
+    if source_exists and _partial_quarantine_file_identity(source, root) != expected:
+        raise CampaignEvaluationError(f"partial quarantine source identity conflicts: {source}")
+    if destination_exists and _partial_quarantine_file_identity(destination, root) != expected:
+        raise CampaignEvaluationError(f"partial quarantine destination identity conflicts: {destination}")
+    if source_exists == destination_exists:
+        raise CampaignEvaluationError(f"partial quarantine file location conflicts: {source}")
+    return destination_exists
 
 
 def _append_partial_attempt_record(path: Path, record: Mapping[str, object]) -> list[dict[str, object]]:
     history = _load_partial_history(path)
-    if any(value.get("attempt") == record.get("attempt") for value in history["records"]):
+    updated = _extend_partial_history(history, record)
+    if updated == history:
         return list(history["records"])
+    _atomic_json(path, updated)
+    return list(updated["records"])
+
+
+def _extend_partial_history(
+    history: Mapping[str, object],
+    record: Mapping[str, object],
+) -> dict[str, object]:
+    existing = [value for value in history["records"] if value.get("attempt") == record.get("attempt")]
+    if existing:
+        value = dict(record)
+        value["previous_record_hash"] = existing[0]["previous_record_hash"]
+        value["record_hash"] = hashlib.sha256(_canonical_bytes(value)).hexdigest()
+        if value != existing[0]:
+            raise CampaignEvaluationError("partial attempt retry record conflicts")
+        return dict(history)
     value = dict(record)
     value["previous_record_hash"] = history["head_hash"]
     value["record_hash"] = hashlib.sha256(_canonical_bytes(value)).hexdigest()
@@ -1260,15 +1729,13 @@ def _append_partial_attempt_record(path: Path, record: Mapping[str, object]) -> 
         "checkpoint": checkpoint,
         "records": records,
     }
-    _atomic_json(path, updated)
-    return list(records)
+    return updated
 
 
 def _prune_partial_attempts(
     root: Path,
     arm: str,
     path: Path,
-    records: list[dict[str, object]],
 ) -> list[dict[str, object]]:
     history = _load_partial_history(path)
     retained = {str(value.get("quarantine_path")) for value in history["records"]}
@@ -1277,13 +1744,11 @@ def _prune_partial_attempts(
         signatures: set[tuple[str, ...]] = set()
         for record in reversed(history["records"]):
             artifacts = record.get("artifacts")
-            signature = tuple(
-                sorted(
-                    str(value.get("eval_sha256"))
-                    for value in artifacts
-                    if isinstance(value, Mapping)
-                )
-            ) if isinstance(artifacts, list) else ()
+            signature = (
+                tuple(sorted(str(value.get("eval_sha256")) for value in artifacts if isinstance(value, Mapping)))
+                if isinstance(artifacts, list)
+                else ()
+            )
             raw = Path(str(record.get("quarantine_path")))
             if signature in signatures and raw.is_dir():
                 shutil.rmtree(raw)
@@ -1291,6 +1756,7 @@ def _prune_partial_attempts(
             else:
                 signatures.add(signature)
         raw_dirs = sorted(path for path in parent.glob("attempt-*") if path.is_dir())
+
         def usage(paths: Sequence[Path]) -> tuple[int, int]:
             return (
                 sum(len([entry for entry in raw.rglob("*") if entry.is_file()]) for raw in paths),
@@ -1308,8 +1774,7 @@ def _prune_partial_attempts(
             _sync_directory(parent)
             files, size = usage(raw_dirs)
     return [
-        {**record, "raw_retained": Path(str(record.get("quarantine_path"))).is_dir()}
-        for record in history["records"]
+        {**record, "raw_retained": Path(str(record.get("quarantine_path"))).is_dir()} for record in history["records"]
     ]
 
 
@@ -1322,14 +1787,24 @@ def _load_partial_history(path: Path) -> dict[str, object]:
             "checkpoint": {"pruned_count": 0, "checkpoint_head_hash": None},
             "records": [],
         }
-    raw = _read_json(path, "partial attempt history")
+    return _validate_partial_history(_read_json(path, "partial attempt history"))
+
+
+def _validate_partial_history(raw: Mapping[str, object]) -> dict[str, object]:
     records = raw.get("records")
     checkpoint = raw.get("checkpoint")
     if (
-        raw.get("version") != 2
+        set(raw) != {"version", "total_count", "head_hash", "checkpoint", "records"}
+        or raw.get("version") != 2
         or type(raw.get("total_count")) is not int
+        or raw.get("total_count", -1) < 0
         or not isinstance(records, list)
         or not isinstance(checkpoint, Mapping)
+        or set(checkpoint) != {"pruned_count", "checkpoint_head_hash"}
+        or type(checkpoint.get("pruned_count")) is not int
+        or int(checkpoint["pruned_count"]) < 0
+        or checkpoint.get("checkpoint_head_hash") is not None
+        and not isinstance(checkpoint.get("checkpoint_head_hash"), str)
         or raw.get("total_count") != int(checkpoint.get("pruned_count", -1)) + len(records)
     ):
         raise CampaignEvaluationError("partial attempt history is malformed")
@@ -1349,9 +1824,17 @@ def _load_partial_history(path: Path) -> dict[str, object]:
 
 def _partial_history_summary(path: Path) -> Mapping[str, object]:
     history = _load_partial_history(path)
+    return _partial_history_summary_value(path, history, _sha256(path) if path.exists() else None)
+
+
+def _partial_history_summary_value(
+    path: Path,
+    history: Mapping[str, object],
+    file_sha256: str | None,
+) -> Mapping[str, object]:
     return {
         "path": str(path),
-        "sha256": _sha256(path) if path.exists() else None,
+        "sha256": file_sha256,
         "total_count": history["total_count"],
         "head_hash": history["head_hash"],
         "checkpoint": history["checkpoint"],
@@ -1360,6 +1843,54 @@ def _partial_history_summary(path: Path) -> Mapping[str, object]:
             for record in history["records"]
         ],
     }
+
+
+def _partial_history_anchor(path: Path, history: Mapping[str, object]) -> Mapping[str, object]:
+    return _partial_history_anchor_value(path, history, _sha256(path) if path.exists() else None)
+
+
+def _partial_history_anchor_value(
+    path: Path,
+    history: Mapping[str, object],
+    file_sha256: str | None,
+) -> Mapping[str, object]:
+    return {
+        "path": str(path),
+        "sha256": file_sha256,
+        "total_count": history["total_count"],
+        "head_hash": history["head_hash"],
+        "checkpoint": history["checkpoint"],
+    }
+
+
+def _require_partial_history_anchor(path: Path, summary: object) -> Mapping[str, object]:
+    history = _load_partial_history(path)
+    actual = _partial_history_anchor(path, history)
+    if summary == {}:
+        empty = _validate_partial_history(
+            {
+                "version": 2,
+                "total_count": 0,
+                "head_hash": None,
+                "checkpoint": {"pruned_count": 0, "checkpoint_head_hash": None},
+                "records": [],
+            }
+        )
+        if path.exists() or history != empty:
+            raise CampaignEvaluationError("partial attempt history conflicts with initial arm state")
+        return actual
+    if not isinstance(summary, Mapping):
+        raise CampaignEvaluationError("partial attempt history arm-state anchor is malformed")
+    expected = {
+        "path": summary.get("path"),
+        "sha256": summary.get("sha256"),
+        "total_count": summary.get("total_count"),
+        "head_hash": summary.get("head_hash"),
+        "checkpoint": summary.get("checkpoint"),
+    }
+    if actual != expected:
+        raise CampaignEvaluationError("partial attempt history conflicts with durable arm state")
+    return actual
 
 
 def _evaluate_arm(
@@ -1464,6 +1995,14 @@ def _evaluate_arm(
     }
     invocation_hash = hashlib.sha256(_canonical_bytes(invocation)).hexdigest()
     existing = _read_optional_json(state_path)
+    recovered = _reconcile_partial_quarantine(root, arm, arm_root, state_path)
+    if recovered is not None:
+        existing = recovered
+    if existing is not None:
+        _require_partial_history_anchor(
+            state_root / f"{arm}.partial-attempts.json",
+            existing.get("partial_attempt_history"),
+        )
     if existing is None:
         foreign = [
             arm_root / instance_id / f"{instance_id}.eval.json"
