@@ -60,6 +60,11 @@ installs and freezes selection, install identities, and campaign arguments in
 `output/luna-pilot/campaign.json`. Review that manifest, then run actual
 inference with the same arguments plus `--resume`:
 
+Selection uses real benchmark tasks only; the bundled `testorg__` calculator
+fixture is excluded. Missing task difficulty is recorded as the explicit
+`unspecified` stratum and frozen in the manifest. Use `--all` to plan all 200
+real tasks.
+
 ```bash
 uv run python scripts/run_opencode.py \
   --config scripts/opencode_programbench.yaml \

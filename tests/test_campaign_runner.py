@@ -983,6 +983,123 @@ def test_plan_dry_run_prepares_each_arm_once_without_workspace(tmp_path: Path):
     assert not (tmp_path / "out" / "vanilla").exists()
 
 
+def test_selection_instance_normalizes_missing_difficulty_without_inventing_metadata():
+    from scripts.campaign_runner import _selection_instance
+
+    assert _selection_instance({"instance_id": "one", "language": "python"}) == {
+        "instance_id": "one",
+        "difficulty": "unspecified",
+        "language": "python",
+    }
+    assert _selection_instance(
+        {"instance_id": "two", "difficulty": "  custom  ", "language": "rust"}
+    ) == {"instance_id": "two", "difficulty": "  custom  ", "language": "rust"}
+
+
+@pytest.mark.parametrize("difficulty", [[], True, 1])
+def test_selection_instance_rejects_wrong_difficulty_types(difficulty):
+    from scripts.campaign_runner import CampaignError, _selection_instance
+
+    with pytest.raises(CampaignError, match="difficulty"):
+        _selection_instance({"instance_id": "one", "difficulty": difficulty, "language": "python"})
+
+
+@pytest.mark.parametrize("language", [None, "", "  ", [], True, 1])
+def test_selection_instance_requires_nonempty_string_language(language):
+    from scripts.campaign_runner import CampaignError, _selection_instance
+
+    with pytest.raises(CampaignError, match="language"):
+        _selection_instance({"instance_id": "one", "difficulty": "easy", "language": language})
+
+
+def test_real_dataset_selection_excludes_fixture_and_freezes_optional_difficulty(tmp_path: Path):
+    from programbench.utils.load_data import load_all_instances
+    from scripts.campaign_runner import plan_campaign
+    from scripts.run_opencode import load_config
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config_path = tmp_path / "campaign.yaml"
+    config_path.write_text(_config(repo))
+    instances = load_all_instances(include_tests=False)
+    assert len(instances) == 201
+    assert sum(instance.get("difficulty") in (None, "") for instance in instances) == 35
+    assert sum(instance["instance_id"].startswith("testorg__") for instance in instances) == 1
+
+    plan = plan_campaign(
+        load_config(config_path),
+        instances,
+        output=tmp_path / "out",
+        limit=8,
+        seed=42,
+        dry_run=True,
+        prepare_install_fn=lambda arm, _root: {"arm": arm.name},
+    )
+
+    assert len(plan.selected_ids) == 8
+    assert len(plan.jobs) == 16
+    assert not any(instance_id.startswith("testorg__") for instance_id in plan.selected_ids)
+    manifest = json.loads(plan.manifest_path.read_text())
+    assert len(manifest["selected_instances"]) == 8
+    assert {item["difficulty"] for item in manifest["selected_instances"]} >= {"unspecified"}
+
+    changed = [
+        {**instance, "difficulty": "changed", "language": "changed"}
+        for instance in instances
+        if instance["instance_id"] in plan.selected_ids
+    ]
+    resumed = plan_campaign(
+        load_config(config_path),
+        changed,
+        output=tmp_path / "out",
+        limit=8,
+        seed=42,
+        dry_run=True,
+        resume=True,
+        prepare_install_fn=lambda *_: pytest.fail("resume must use frozen campaign metadata"),
+    )
+    assert resumed.selected_ids == plan.selected_ids
+    assert json.loads(plan.manifest_path.read_text())["selected_instances"] == manifest["selected_instances"]
+
+    all_plan = plan_campaign(
+        load_config(config_path),
+        instances,
+        output=tmp_path / "all-out",
+        all_instances=True,
+        dry_run=True,
+        prepare_install_fn=lambda arm, _root: {"arm": arm.name},
+    )
+    assert len(all_plan.selected_ids) == 200
+    assert len(all_plan.jobs) == 400
+    assert not any(instance_id.startswith("testorg__") for instance_id in all_plan.selected_ids)
+
+
+def test_all_selection_counts_only_real_benchmark_instances(tmp_path: Path):
+    from scripts.campaign_runner import plan_campaign
+    from scripts.run_opencode import load_config
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config_path = tmp_path / "campaign.yaml"
+    config_path.write_text(_config(repo))
+    instances = [
+        {"instance_id": "real__one", "language": "python", "image_name": "one"},
+        {"instance_id": "real__two", "difficulty": "easy", "language": "rust", "image_name": "two"},
+        {"instance_id": "testorg__calculator.abc1234", "language": "python", "image_name": "fixture"},
+    ]
+
+    plan = plan_campaign(
+        load_config(config_path),
+        instances,
+        output=tmp_path / "out",
+        all_instances=True,
+        dry_run=True,
+        prepare_install_fn=lambda arm, _root: {"arm": arm.name},
+    )
+
+    assert set(plan.selected_ids) == {"real__one", "real__two"}
+
+
 def test_plan_uses_programbench_regex_filter_and_all_after_exclusions(tmp_path: Path):
     from scripts.campaign_runner import plan_campaign
     from scripts.run_opencode import load_config

@@ -29,6 +29,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from programbench.candidate import package_workspace, preflight_candidate
+from programbench.submission import FIXTURE_PREFIX
 from programbench.utils.load_data import load_all_instances
 from programbench.utils.instance_filters import filter_instances
 from scripts.campaign_install import InstallRecord, prepare_install
@@ -255,12 +256,13 @@ def plan_campaign(
         return _plan_from_manifest(config, root, manifest_path, frozen, dry_run, cleanup_only)
 
     filtered = tuple(filter_instances([dict(instance) for instance in instances], filter_spec=instance_filter or ""))
-    eligible = tuple(instance for instance in filtered if str(instance.get("instance_id", "")) not in config.excluded)
+    real = tuple(instance for instance in filtered if _is_real_instance(instance))
+    eligible = tuple(instance for instance in real if str(instance.get("instance_id", "")) not in config.excluded)
     selection_limit = len(eligible) if all_instances else limit
     if selection_limit <= 0:
         raise CampaignError("no eligible ProgramBench instances match selection")
     selected = select_instances(
-        tuple(_selection_instance(instance) for instance in filtered),
+        tuple(_selection_instance(instance) for instance in real),
         seed=str(seed),
         limit=selection_limit,
         excluded=config.excluded,
@@ -268,7 +270,7 @@ def plan_campaign(
     selected_ids = tuple(str(instance["instance_id"]) for instance in selected)
     images = {
         str(instance["instance_id"]): _image_name(instance)
-        for instance in filtered
+        for instance in real
         if str(instance.get("instance_id", "")) in set(selected_ids)
     }
     jobs = expand_campaign_jobs(selected_ids, images, seed=seed)
@@ -278,6 +280,14 @@ def plan_campaign(
         "version": 1,
         "config": canonical,
         "selected_ids": list(selected_ids),
+        "selected_instances": [
+            {
+                "instance_id": instance["instance_id"],
+                "difficulty": instance["difficulty"],
+                "language": instance["language"],
+            }
+            for instance in selected
+        ],
         "jobs": [{"instance_id": job.instance_id, "arm": job.arm, "image": job.image} for job in jobs],
         "installs": {name: _json_value(record) for name, record in installs.items()},
         "programbench": _programbench_metadata(),
@@ -866,10 +876,27 @@ def _selected_jobs_terminal(plan: CampaignPlan) -> bool:
 
 
 def _selection_instance(instance: Mapping[str, object]) -> Mapping[str, str]:
-    required = ("instance_id", "difficulty", "language")
-    if any(not isinstance(instance.get(name), str) for name in required):
-        raise CampaignError("ProgramBench instance is missing selection metadata")
-    return {name: str(instance[name]) for name in required}
+    instance_id = instance.get("instance_id")
+    if not isinstance(instance_id, str):
+        raise CampaignError("ProgramBench instance has invalid instance_id selection metadata")
+    difficulty = instance.get("difficulty")
+    if difficulty is None:
+        normalized_difficulty = "unspecified"
+    elif not isinstance(difficulty, str):
+        raise CampaignError("ProgramBench instance has invalid difficulty selection metadata")
+    elif not difficulty.strip():
+        normalized_difficulty = "unspecified"
+    else:
+        normalized_difficulty = difficulty
+    language = instance.get("language")
+    if not isinstance(language, str) or not language.strip():
+        raise CampaignError("ProgramBench instance has invalid language selection metadata")
+    return {"instance_id": instance_id, "difficulty": normalized_difficulty, "language": language}
+
+
+def _is_real_instance(instance: Mapping[str, object]) -> bool:
+    instance_id = instance.get("instance_id")
+    return isinstance(instance_id, str) and not instance_id.startswith(FIXTURE_PREFIX)
 
 
 def _image_name(instance: Mapping[str, object]) -> str:

@@ -163,14 +163,17 @@ SHA. Neither source checkout used by the developer is repurposed or cleaned.
 The pilot excludes all previously used Tparse, Hostctl, and Diffr instances.
 Selection is deterministic:
 
-1. Load non-test ProgramBench instances.
+1. Load non-test ProgramBench instances, excluding the bundled `testorg__` fixture.
 2. Apply any explicit filter.
-3. Group eligible instances by `(difficulty, language)`.
-4. Sort members within each group by SHA-256 of `seed + "\0" + instance_id`.
-5. Sort groups by SHA-256 of `seed + "\0" + difficulty + "\0" + language`.
-6. Round-robin one instance per group until eight are selected, then continue
+3. Require a nonempty language and normalize missing, null, or empty difficulty to
+   the exact `unspecified` sentinel; preserve present nonempty difficulty strings.
+4. Group eligible instances by `(normalized difficulty, language)`.
+5. Sort members within each group by SHA-256 of `seed + "\0" + instance_id`.
+6. Sort groups by SHA-256 of `seed + "\0" + difficulty + "\0" + language`.
+7. Round-robin one instance per group until eight are selected, then continue
    round-robin if a group supplies more than one.
-7. Freeze the exact ordered selection in `campaign.json` before execution.
+8. Freeze the exact ordered selection and normalized metadata in `campaign.json`
+   before execution; resume uses these frozen records rather than re-reading metadata.
 
 Each selected instance expands into two jobs. Job order is deterministically
 shuffled by `seed`, instance ID, and arm name. The executor allows at most eight
