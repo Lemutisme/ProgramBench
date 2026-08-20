@@ -249,11 +249,12 @@ def evaluate_campaign(
     sleeper: Callable[[float], None] = time.sleep,
     adoption_timeout: float = 60,
 ) -> CampaignEvaluationResult:
-    """Evaluate both frozen arms at most once and write an exact paired report."""
+    """Evaluate every frozen arm at most once and write an exact report."""
     root = _canonical_campaign_root(campaign_root)
     manifest_path = root / "campaign.json"
     manifest = _read_json(manifest_path, "campaign manifest")
     jobs = _manifest_jobs(manifest)
+    active_arms = _job_arms(jobs)
     lookup = {
         str(instance.get("instance_id")): dict(instance)
         for instance in (instances if instances is not None else load_all_instances())
@@ -288,7 +289,7 @@ def evaluate_campaign(
             if retry_evaluator and not any(
                 (state := _read_optional_json(root / "evaluation-state" / f"{arm}.json")) is not None
                 and state.get("status") == "interrupted"
-                for arm in ARMS
+                for arm in active_arms
             ):
                 raise CampaignEvaluationError("--retry-evaluator requires an explicit interrupted state")
             evidence = _prepare_evidence(root, jobs)
@@ -315,7 +316,7 @@ def evaluate_campaign(
                     sleeper,
                     adoption_timeout,
                 )
-                for arm in ARMS
+                for arm in active_arms
             }
             _verify_campaign_image_tags(image_plan, command_runner is None)
             _repair_comparison_bundle(root)
@@ -325,10 +326,12 @@ def evaluate_campaign(
             if image_plan is not None:
                 _cleanup_campaign_image_tags(image_plan, command_runner is None)
     aggregate = report["aggregate"]
+    valid = aggregate.get("valid_pairs", aggregate.get("valid_instances", 0))
+    invalid = aggregate.get("invalid_pairs", aggregate.get("invalid_instances", 0))
     return CampaignEvaluationResult(
         str(report["status"]),
-        int(aggregate["valid_pairs"]),
-        int(aggregate["invalid_pairs"]),
+        int(valid),
+        int(invalid),
         comparison_path,
         root / "RESULT.md",
     )
@@ -344,12 +347,7 @@ def _manifest_jobs(manifest: Mapping[str, object]) -> tuple[tuple[str, str], ...
         raise CampaignEvaluationError("campaign manifest has invalid selected IDs")
     if len(selected) != len(set(selected)) or not isinstance(raw_jobs, list):
         raise CampaignEvaluationError("campaign manifest has invalid frozen jobs")
-    if (
-        not isinstance(installs, Mapping)
-        or set(installs) != set(ARMS)
-        or not all(isinstance(installs.get(arm), Mapping) for arm in ARMS)
-        or not isinstance(programbench, Mapping)
-    ):
+    if not isinstance(installs, Mapping) or not isinstance(programbench, Mapping):
         raise CampaignEvaluationError("campaign manifest has invalid frozen evaluator coordinates")
     try:
         if not all(
@@ -363,7 +361,10 @@ def _manifest_jobs(manifest: Mapping[str, object]) -> tuple[tuple[str, str], ...
         jobs = tuple((job["instance_id"], job["arm"]) for job in raw_jobs)
     except KeyError as error:
         raise CampaignEvaluationError("campaign manifest has malformed frozen jobs") from error
-    expected = {(instance_id, arm) for instance_id in selected for arm in ARMS}
+    active_arms = _job_arms(jobs)
+    if set(installs) != set(active_arms) or not all(isinstance(installs.get(arm), Mapping) for arm in active_arms):
+        raise CampaignEvaluationError("campaign manifest has invalid frozen evaluator coordinates")
+    expected = {(instance_id, arm) for instance_id in selected for arm in active_arms}
     if len(jobs) != len(raw_jobs) or len(jobs) != len(set(jobs)) or set(jobs) != expected:
         raise CampaignEvaluationError("campaign manifest does not contain one frozen job per paired arm")
     if not isinstance(images, Mapping) or any(
@@ -377,6 +378,14 @@ def _manifest_jobs(manifest: Mapping[str, object]) -> tuple[tuple[str, str], ...
     ):
         raise CampaignEvaluationError("campaign manifest has conflicting frozen image coordinates")
     return jobs
+
+
+def _job_arms(jobs: Sequence[tuple[str, str]]) -> tuple[str, ...]:
+    values = {arm for _instance_id, arm in jobs}
+    arms = tuple(arm for arm in ARMS if arm in values)
+    if not arms or values != set(arms):
+        raise CampaignEvaluationError("campaign manifest has invalid frozen arms")
+    return arms
 
 
 def _scoring_metadata(instance: Mapping[str, object]) -> dict[str, object]:
@@ -1094,8 +1103,9 @@ def _prepare_evidence(
 
 def _preflight_foreign_eval_artifacts(root: Path, jobs: Sequence[tuple[str, str]]) -> None:
     foreign: list[tuple[str, Path, int, int]] = []
-    expected = {arm: {instance_id for instance_id, job_arm in jobs if job_arm == arm} for arm in ARMS}
-    for arm in ARMS:
+    active_arms = _job_arms(jobs)
+    expected = {arm: {instance_id for instance_id, job_arm in jobs if job_arm == arm} for arm in active_arms}
+    for arm in active_arms:
         arm_root = root / "evaluation" / arm
         if not arm_root.exists():
             continue
@@ -2944,8 +2954,11 @@ def _comparison(
     arm_states: Mapping[str, Mapping[str, object]],
 ) -> dict[str, object]:
     selected = tuple(str(value) for value in manifest["selected_ids"])
+    active_arms = _job_arms(jobs)
+    paired = len(active_arms) == 2
     pairs: list[dict[str, object]] = []
     deltas: list[Fraction] = []
+    utilities: list[Fraction] = []
     for instance_id in selected:
         arms = {
             arm: _arm_report(
@@ -2956,34 +2969,45 @@ def _comparison(
                 instances[instance_id],
                 arm_states[arm],
             )
-            for arm in ARMS
+            for arm in active_arms
         }
-        valid = all(bool(arms[arm]["valid"]) for arm in ARMS)
+        valid = all(bool(arms[arm]["valid"]) for arm in active_arms)
         delta = None
-        if valid:
+        if valid and paired:
             exact = arms["procontract"]["_utility"] - arms["vanilla"]["_utility"]
             deltas.append(exact)
             delta = _fraction(exact)
-        for arm in ARMS:
+        if valid and not paired:
+            utilities.append(arms[active_arms[0]]["_utility"])
+        for arm in active_arms:
             arms[arm].pop("_utility")
         pairs.append(
             {
                 "instance_id": instance_id,
-                "procontract": arms["procontract"],
-                "vanilla": arms["vanilla"],
+                **arms,
                 "delta": delta,
-                "pair_valid": valid,
+                ("pair_valid" if paired else "instance_valid"): valid,
             }
         )
-    invalid_pairs = sum(not pair["pair_valid"] for pair in pairs)
+    validity_key = "pair_valid" if paired else "instance_valid"
+    invalid_entries = sum(not pair[validity_key] for pair in pairs)
     evaluator_failed = any(state.get("status") != "done" for state in arm_states.values())
-    status = "evaluator_failed" if evaluator_failed else "invalid_protocol" if invalid_pairs else "completed"
-    aggregate = {
-        "valid_pairs": len(deltas),
-        "invalid_pairs": invalid_pairs,
-        "mean_delta": _fraction(sum(deltas, Fraction()) / len(deltas)) if deltas else None,
-        "worst_delta": _fraction(min(deltas)) if deltas else None,
-    }
+    status = "evaluator_failed" if evaluator_failed else "invalid_protocol" if invalid_entries else "completed"
+    aggregate = (
+        {
+            "valid_pairs": len(deltas),
+            "invalid_pairs": invalid_entries,
+            "mean_delta": _fraction(sum(deltas, Fraction()) / len(deltas)) if deltas else None,
+            "worst_delta": _fraction(min(deltas)) if deltas else None,
+        }
+        if paired
+        else {
+            "valid_instances": len(utilities),
+            "invalid_instances": invalid_entries,
+            "mean_utility": _fraction(sum(utilities, Fraction()) / len(utilities)) if utilities else None,
+            "worst_utility": _fraction(min(utilities)) if utilities else None,
+        }
+    )
     state_root = root / "evaluation-state"
     identities = {json.dumps(state.get("evaluator_identity"), sort_keys=True) for state in arm_states.values()}
     if len(identities) != 1:
@@ -3012,6 +3036,8 @@ def _comparison(
     }
     report = {
         "version": 1,
+        "mode": "paired" if paired else "single",
+        "arms": list(active_arms),
         "status": status,
         "coordinates": coordinates,
         "pairs": pairs,
@@ -3389,6 +3415,8 @@ def _verify_published_bundle(root: Path, bundle: Mapping[str, object]) -> None:
 
 def _result_markdown(report: Mapping[str, object], comparison_sha256: str) -> str:
     aggregate = report["aggregate"]
+    active_arms = tuple(str(arm) for arm in report.get("arms", ARMS))
+    paired = report.get("mode", "paired") == "paired"
     evaluator = report.get("coordinates", {}).get("evaluator", {})
     arms = evaluator.get("arms", {}) if isinstance(evaluator, Mapping) else {}
     first_arm = next(iter(arms.values()), {}) if isinstance(arms, Mapping) else {}
@@ -3403,14 +3431,21 @@ def _result_markdown(report: Mapping[str, object], comparison_sha256: str) -> st
         "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|---|---|---|---|---:|",
     ]
     for pair in report["pairs"]:
-        rows.extend(_markdown_arm_row(pair, arm) for arm in ARMS)
+        rows.extend(_markdown_arm_row(pair, arm) for arm in active_arms)
+    count_lines = (
+        (f"Valid pairs: {aggregate['valid_pairs']}", f"Invalid pairs: {aggregate['invalid_pairs']}")
+        if paired
+        else (
+            f"Valid instances: {aggregate['valid_instances']}",
+            f"Invalid instances: {aggregate['invalid_instances']}",
+        )
+    )
     return "\n".join(
         (
             "# Campaign result",
             "",
             f"Status: {report['status']}",
-            f"Valid pairs: {aggregate['valid_pairs']}",
-            f"Invalid pairs: {aggregate['invalid_pairs']}",
+            *count_lines,
             f"Comparison SHA-256: {comparison_sha256}",
             f"HF repository: {invocation.get('hf_repository') if isinstance(invocation, Mapping) else None}",
             f"HF commit: {invocation.get('hf_commit') if isinstance(invocation, Mapping) else None}",
@@ -3453,7 +3488,7 @@ def _markdown_arm_row(pair: Mapping[str, object], arm: str) -> str:
                 contract.get("status") if isinstance(contract, Mapping) else "-",
                 contract.get("quiet") if isinstance(contract, Mapping) else "-",
                 ", ".join(value["errors"]) or "-",
-                _utility_label(pair["delta"]),
+                _utility_label(pair["delta"]) if pair.get("delta") is not None else "-",
             )
         )
         + " |"

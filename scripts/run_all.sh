@@ -10,6 +10,8 @@ OUTPUT="${RUN_ALL_OUTPUT:-$REPO_ROOT/output/luna-all}"
 WORKERS="${RUN_ALL_WORKERS:-8}"
 SEED="${RUN_ALL_SEED:-42}"
 EXPECTED_INSTANCES="${RUN_ALL_EXPECTED_INSTANCES:-200}"
+ARM="${RUN_ALL_ARM:-paired}"
+ALLOW_QUARANTINED_KEY=0
 QUARANTINE="${RUN_ALL_COMPROMISED_KEY_QUARANTINE:-/tmp/procontract-sensitive-quarantine-20260819}"
 OUTPUT_CREATED=0
 FINALIZED=0
@@ -31,6 +33,8 @@ Options:
   --workers N                Active inference trajectories, 1-8 (default: 8)
   --seed N                   Frozen selection/job-order seed (default: 42)
   --expected-instances N     Fail before inference unless exactly N are frozen (default: 200)
+  --arm MODE                 paired, procontract, or vanilla (default: paired)
+  --allow-quarantined-key    Explicitly authorize the locally known exposed key
   -h, --help                 Show this help
 
 Required environment:
@@ -89,6 +93,15 @@ while (($#)); do
       EXPECTED_INSTANCES="$2"
       shift 2
       ;;
+    --arm)
+      (($# >= 2)) || die "--arm requires a value"
+      ARM="$2"
+      shift 2
+      ;;
+    --allow-quarantined-key)
+      ALLOW_QUARANTINED_KEY=1
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -103,6 +116,7 @@ positive_integer "$WORKERS" || die "--workers must be a positive integer"
 ((WORKERS <= 8)) || die "--workers must not exceed 8"
 [[ "$SEED" =~ ^-?[0-9]+$ ]] || die "--seed must be an integer"
 positive_integer "$EXPECTED_INSTANCES" || die "--expected-instances must be a positive integer"
+[[ "$ARM" == paired || "$ARM" == procontract || "$ARM" == vanilla ]] || die "--arm must be paired, procontract, or vanilla"
 
 if ! command -v bun >/dev/null && [[ -x "$HOME/.bun/bin/bun" ]]; then
   export PATH="$HOME/.bun/bin:$PATH"
@@ -124,6 +138,7 @@ OUTPUT="$(absolute_path "$OUTPUT")"
 # argv. Compare through inherited environment bytes only; never put the secret
 # in argv, command output, YAML, or the artifact tree.
 if [[ -d "$QUARANTINE" ]]; then
+  export RUN_ALL_ALLOW_QUARANTINED_KEY="$ALLOW_QUARANTINED_KEY"
   set +e
   python3 - "$QUARANTINE" <<'PY'
 from pathlib import Path
@@ -139,6 +154,9 @@ for path in root.rglob("*"):
         with path.open("rb") as source:
             while chunk := source.read(1024 * 1024):
                 if needle in chunk:
+                    if os.environ.get("RUN_ALL_ALLOW_QUARANTINED_KEY") == "1":
+                        print("run_all: warning: explicitly authorized locally quarantined exposed key")
+                        raise SystemExit(0)
                     print("run_all: OPENAI_API_KEY matches the locally quarantined exposed key; revoke and rotate it")
                     raise SystemExit(86)
     except OSError as error:
@@ -163,6 +181,7 @@ RUNNER=(
   --config "$CONFIG"
   --workers "$WORKERS"
   --all
+  --arm "$ARM"
   --seed "$SEED"
   --output "$OUTPUT"
 )
@@ -203,7 +222,8 @@ write_summary() {
   local finished_at
   finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   python3 - "$OUTPUT" "$STARTED_AT" "$finished_at" "$PLAN_STATUS" "$INFERENCE_STATUS" \
-    "$EVALUATION_STATUS" "$wrapper_status" "$RUNNER_REVISION" "$CONFIG" "$SCRIPT_DIR/run_all.sh" <<'PY'
+    "$EVALUATION_STATUS" "$wrapper_status" "$RUNNER_REVISION" "$CONFIG" "$SCRIPT_DIR/run_all.sh" "$ARM" \
+    "$ALLOW_QUARANTINED_KEY" <<'PY'
 from collections import Counter, defaultdict
 from datetime import datetime
 from hashlib import sha256
@@ -224,6 +244,8 @@ import tempfile
     runner_revision,
     config_value,
     wrapper_value,
+    requested_arm,
+    allow_quarantined_key,
 ) = sys.argv[1:]
 output = Path(output_value)
 config = Path(config_value)
@@ -259,14 +281,14 @@ breaker = read_json(output / "breaker.json")
 comparison = read_json(output / "comparison.json")
 states = defaultdict(Counter)
 exit_classes = defaultdict(Counter)
-for arm in ("procontract", "vanilla"):
-    for path in (output / arm).glob("*/state.json"):
+for job_arm in ("procontract", "vanilla"):
+    for path in (output / job_arm).glob("*/state.json"):
         state = read_json(path)
         if not isinstance(state, dict):
-            states[arm]["invalid"] += 1
+            states[job_arm]["invalid"] += 1
             continue
-        states[arm][str(state.get("phase") or "unknown")] += 1
-        exit_classes[arm][str(state.get("exit_class") or "none")] += 1
+        states[job_arm][str(state.get("phase") or "unknown")] += 1
+        exit_classes[job_arm][str(state.get("exit_class") or "none")] += 1
 
 files = [path for path in output.rglob("*") if path.is_file() and not path.is_symlink()]
 started = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
@@ -295,6 +317,10 @@ summary = {
         "wrapper_sha256": digest(wrapper),
         "config": str(config),
         "config_sha256": digest(config),
+    },
+    "authorization": {
+        "arm": requested_arm,
+        "quarantined_key_override": allow_quarantined_key == "1",
     },
     "campaign": {
         "model": (campaign.get("config") or {}).get("model"),
@@ -363,8 +389,8 @@ on_exit() {
 }
 trap on_exit EXIT
 
-printf 'run_all: output=%s workers=%s seed=%s expected_instances=%s\n' \
-  "$OUTPUT" "$WORKERS" "$SEED" "$EXPECTED_INSTANCES"
+printf 'run_all: output=%s workers=%s seed=%s expected_instances=%s arm=%s\n' \
+  "$OUTPUT" "$WORKERS" "$SEED" "$EXPECTED_INSTANCES" "$ARM"
 printf 'run_all: runner_revision=%s config=%s\n' "$RUNNER_REVISION" "$CONFIG"
 
 if [[ ! -f "$OUTPUT/campaign.json" ]]; then
@@ -378,13 +404,14 @@ else
   PLAN_STATUS="reused"
 fi
 
-python3 - "$OUTPUT/campaign.json" "$EXPECTED_INSTANCES" <<'PY'
+python3 - "$OUTPUT/campaign.json" "$EXPECTED_INSTANCES" "$ARM" <<'PY'
 from pathlib import Path
 import json
 import sys
 
 manifest = json.loads(Path(sys.argv[1]).read_text())
 expected = int(sys.argv[2])
+requested_arm = sys.argv[3]
 selected = manifest.get("selected_ids") or []
 jobs = manifest.get("jobs") or []
 selection = manifest.get("selection") or {}
@@ -394,9 +421,16 @@ if len(selected) != expected:
     raise SystemExit(f"run_all: expected {expected} instances, frozen manifest has {len(selected)}")
 if len(set(selected)) != expected:
     raise SystemExit("run_all: frozen selection contains duplicate instance IDs")
-if len(jobs) != expected * 2:
-    raise SystemExit(f"run_all: expected {expected * 2} paired trajectories, frozen manifest has {len(jobs)}")
-print(f"run_all: manifest verified instances={len(selected)} trajectories={len(jobs)}")
+frozen_arm = selection.get("arm", "paired")
+if frozen_arm != requested_arm:
+    raise SystemExit(f"run_all: requested arm {requested_arm}, frozen manifest has {frozen_arm}")
+expected_arms = {"procontract", "vanilla"} if requested_arm == "paired" else {requested_arm}
+if {job.get("arm") for job in jobs} != expected_arms:
+    raise SystemExit("run_all: frozen jobs do not match the requested arm selection")
+expected_jobs = expected * len(expected_arms)
+if len(jobs) != expected_jobs:
+    raise SystemExit(f"run_all: expected {expected_jobs} trajectories, frozen manifest has {len(jobs)}")
+print(f"run_all: manifest verified instances={len(selected)} trajectories={len(jobs)} arm={requested_arm}")
 PY
 
 if run_phase inference "${RUNNER[@]}" --resume; then

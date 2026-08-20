@@ -63,6 +63,7 @@ def _campaign(
     root: Path,
     *,
     instance_ids: tuple[str, ...] = ("one",),
+    arms: tuple[str, ...] = ("procontract", "vanilla"),
     missing: frozenset[tuple[str, str]] = frozenset(),
     submissions: dict[tuple[str, str], bytes] | None = None,
     executable_hashes: dict[tuple[str, str], str] | None = None,
@@ -71,7 +72,7 @@ def _campaign(
     jobs = [
         {"instance_id": instance_id, "arm": arm, "image": f"{instance_id}-image"}
         for instance_id in instance_ids
-        for arm in ("procontract", "vanilla")
+        for arm in arms
     ]
     _write_json(
         root / "campaign.json",
@@ -80,11 +81,20 @@ def _campaign(
             "selected_ids": list(instance_ids),
             "jobs": jobs,
             "installs": {
-                "procontract": {"revision": "pro-rev", "binary_sha256": "a" * 64},
-                "vanilla": {"revision": "van-rev", "binary_sha256": "b" * 64},
+                arm: {
+                    "revision": "pro-rev" if arm == "procontract" else "van-rev",
+                    "binary_sha256": ("a" if arm == "procontract" else "b") * 64,
+                }
+                for arm in arms
             },
             "programbench": {"sha": "c" * 40, "dirty": False},
-            "selection": {"limit": len(instance_ids), "seed": 42, "filter": None, "all": False},
+            "selection": {
+                "limit": len(instance_ids),
+                "seed": 42,
+                "filter": None,
+                "all": False,
+                "arm": "paired" if len(arms) == 2 else arms[0],
+            },
             "seed": 42,
             "images": {instance_id: {"image": f"{instance_id}-image"} for instance_id in instance_ids},
             "config": {"model": "test-model", "variant": "test-variant"},
@@ -472,6 +482,32 @@ def test_invalid_pair_is_excluded_from_exact_aggregate(tmp_path: Path) -> None:
     assert report["pairs"][0]["delta"]["numerator"] == 1
     assert report["pairs"][1]["delta"] is None
     assert report["pairs"][1]["vanilla"]["errors"] == ["missing_submission"]
+
+
+def test_single_procontract_arm_evaluates_and_reports_instances_without_pair_delta(tmp_path: Path) -> None:
+    from scripts.campaign_evaluate import evaluate_campaign
+
+    root, instances = _campaign(tmp_path / "campaign", arms=("procontract",))
+    calls: list[tuple[tuple[str, ...], Path, dict[str, str]]] = []
+
+    outcome = evaluate_campaign(root, instances=instances, command_runner=_runner(calls))
+    report = json.loads(outcome.comparison_path.read_text())
+
+    assert outcome.status == "completed"
+    assert outcome.valid_pairs == 1
+    assert outcome.invalid_pairs == 0
+    assert len(calls) == 1
+    assert report["mode"] == "single"
+    assert report["arms"] == ["procontract"]
+    assert report["aggregate"] == {
+        "valid_instances": 1,
+        "invalid_instances": 0,
+        "mean_utility": {"decimal": "0.3333333333333333333333333333", "denominator": 3, "numerator": 1},
+        "worst_utility": {"decimal": "0.3333333333333333333333333333", "denominator": 3, "numerator": 1},
+    }
+    assert report["pairs"][0]["delta"] is None
+    assert report["pairs"][0]["instance_valid"] is True
+    assert "Valid instances: 1" in outcome.result_path.read_text()
 
 
 def test_outputs_are_atomic_deterministic_and_sanitized(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

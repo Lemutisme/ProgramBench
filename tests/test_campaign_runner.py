@@ -892,7 +892,11 @@ def test_public_entrypoint_requires_resume_after_documented_dry_run(tmp_path: Pa
     output = tmp_path / "pilot"
     guide = Path(__file__).parents[1].joinpath("docs/README.md").read_text()
     pilot = guide.split("### Pilot workflow", 1)[1].split("### Pauses, evaluation, and results", 1)[0]
-    commands = re.findall(r"```bash\n(.*?)```", pilot, re.DOTALL)
+    commands = [
+        command
+        for command in re.findall(r"```bash\n(.*?)```", pilot, re.DOTALL)
+        if "scripts/run_opencode.py" in command
+    ]
     documented = [_documented_script_arguments(command) for command in commands]
     dry_run = documented[0]
     inference = documented[1]
@@ -1238,6 +1242,21 @@ def test_real_dataset_selection_excludes_fixture_and_freezes_optional_difficulty
     assert len(all_plan.selected_ids) == 200
     assert len(all_plan.jobs) == 400
     assert not any(instance_id.startswith("testorg__") for instance_id in all_plan.selected_ids)
+
+    single_plan = plan_campaign(
+        load_config(config_path),
+        instances,
+        output=tmp_path / "single-out",
+        all_instances=True,
+        arm_selection="procontract",
+        dry_run=True,
+        prepare_install_fn=lambda arm, _root: {"arm": arm.name},
+    )
+    assert len(single_plan.selected_ids) == 200
+    assert len(single_plan.jobs) == 200
+    assert {job.arm for job in single_plan.jobs} == {"procontract"}
+    assert set(single_plan.installs) == {"procontract"}
+    assert json.loads(single_plan.manifest_path.read_text())["selection"]["arm"] == "procontract"
 
 
 def test_all_selection_counts_only_real_benchmark_instances(tmp_path: Path):

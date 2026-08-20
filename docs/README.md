@@ -113,6 +113,19 @@ export OPENCODE_REPO="$HOME/src/opencode"
 ./scripts/run_all.sh
 ```
 
+For a ProContract-only 200-instance campaign, use the dedicated higher cost
+guardrail and select one arm explicitly:
+
+```bash
+./scripts/run_all.sh \
+  --config scripts/opencode_programbench_procontract_all.yaml \
+  --arm procontract \
+  --output output/luna-procontract-200
+```
+
+`--allow-quarantined-key` is available only as an explicit incident override;
+it records the override in `RUN_ALL_SUMMARY.json` and never prints the key.
+
 The wrapper uses `scripts/opencode_programbench_all.yaml`, which pins the
 minimal-context ProContract commit and excludes no real task. Override the
 default resumable root with `--output PATH`; use the same path to resume. It

@@ -44,10 +44,11 @@ from scripts.campaign_workspace import (
     ensure_workspace,
     reconcile_workspace_for_cleanup,
 )
-from scripts.run_opencode import CampaignConfig, ConfigError, expand_jobs, load_config, select_instances
+from scripts.run_opencode import CampaignConfig, ConfigError, Job, expand_jobs, load_config, select_instances
 
 
 MAX_ACTIVE_JOBS = 8
+ARM_SELECTIONS = ("paired", "procontract", "vanilla")
 JOB_CLEANUP_MAX_ATTEMPTS = 3
 JOB_CLEANUP_TIMEOUT_SECONDS = 0.25
 DRY_RUN_OUTPUT = Path("campaign-dry-run")
@@ -204,10 +205,23 @@ class _DaemonWorkerPool:
 
 
 def expand_campaign_jobs(
-    selected_ids: Sequence[str], images: Mapping[str, str], *, seed: int
+    selected_ids: Sequence[str],
+    images: Mapping[str, str],
+    *,
+    seed: int,
+    arms: Sequence[str] = ("procontract", "vanilla"),
 ) -> tuple[CampaignJob, ...]:
-    """Expand selected task IDs to two hash-ordered, image-pinned trajectories."""
-    jobs = expand_jobs(tuple(selected_ids), ("procontract", "vanilla"), str(seed))
+    """Expand selected task IDs to hash-ordered, image-pinned trajectories."""
+    if not arms or len(arms) != len(set(arms)) or any(arm not in {"procontract", "vanilla"} for arm in arms):
+        raise CampaignError("campaign arms must be a nonempty unique subset of procontract and vanilla")
+    jobs = (
+        expand_jobs(tuple(selected_ids), tuple(arms), str(seed))
+        if len(arms) == 2
+        else sorted(
+            (Job(instance_id, arms[0]) for instance_id in selected_ids),
+            key=lambda job: hashlib.sha256(f"{seed}\0{job.instance_id}\0{job.arm}".encode()).hexdigest(),
+        )
+    )
     try:
         return tuple(CampaignJob(job.instance_id, job.arm, images[job.instance_id]) for job in jobs)
     except KeyError as error:
@@ -223,6 +237,7 @@ def plan_campaign(
     seed: int = 42,
     instance_filter: str | None = None,
     all_instances: bool = False,
+    arm_selection: str = "paired",
     dry_run: bool = False,
     resume: bool = False,
     acknowledge: str | None = None,
@@ -231,6 +246,7 @@ def plan_campaign(
     """Freeze exact selection and arm installs before any workspace can start."""
     if limit <= 0:
         raise CampaignError("limit must be positive")
+    arm_names = _selected_arm_names(arm_selection)
     root = Path(output).resolve()
     manifest_path = root / "campaign.json"
     canonical = _config_manifest(config)
@@ -261,8 +277,12 @@ def plan_campaign(
             "seed": seed,
             "filter": instance_filter,
             "all": all_instances,
+            "arm": arm_selection,
         }
-        if frozen.get("selection") != expected_selection:
+        frozen_selection = frozen.get("selection")
+        if isinstance(frozen_selection, Mapping) and "arm" not in frozen_selection:
+            frozen_selection = {**frozen_selection, "arm": "paired"}
+        if frozen_selection != expected_selection:
             raise CampaignError("campaign manifest conflicts with requested selection")
         return _plan_from_manifest(config, root, manifest_path, frozen, dry_run, cleanup_only)
 
@@ -283,9 +303,9 @@ def plan_campaign(
     selected_instances = tuple(_campaign_instance(instance) for instance in selected)
     selected_ids = tuple(instance.instance_id for instance in selected_instances)
     images = {instance.instance_id: instance.image_name for instance in selected_instances}
-    jobs = expand_campaign_jobs(selected_ids, images, seed=seed)
+    jobs = expand_campaign_jobs(selected_ids, images, seed=seed, arms=arm_names)
     root.mkdir(parents=True, exist_ok=True)
-    installs = {arm.name: prepare_install_fn(arm, root / "installs") for arm in config.arms}
+    installs = {arm.name: prepare_install_fn(arm, root / "installs") for arm in config.arms if arm.name in arm_names}
     manifest = {
         "version": 2,
         "config": canonical,
@@ -294,12 +314,20 @@ def plan_campaign(
         "jobs": [{"instance_id": job.instance_id, "arm": job.arm, "image": job.image} for job in jobs],
         "installs": {name: _json_value(record) for name, record in installs.items()},
         "programbench": _programbench_metadata(),
-        "selection": {"limit": limit, "seed": seed, "filter": instance_filter, "all": all_instances},
+        "selection": {
+            "limit": limit,
+            "seed": seed,
+            "filter": instance_filter,
+            "all": all_instances,
+            "arm": arm_selection,
+        },
         "seed": seed,
         "images": {identifier: {"image": image} for identifier, image in sorted(images.items())},
     }
     _atomic_json(manifest_path, manifest)
-    return CampaignPlan(root, manifest_path, config, selected_ids, jobs, installs, dry_run, selected_instances=selected_instances)
+    return CampaignPlan(
+        root, manifest_path, config, selected_ids, jobs, installs, dry_run, selected_instances=selected_instances
+    )
 
 
 def run_campaign(
@@ -733,6 +761,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--redo", action="store_true")
     parser.add_argument("--acknowledge", choices=("cache", "auth", "soft", "all"))
     parser.add_argument("--all", action="store_true")
+    parser.add_argument("--arm", choices=ARM_SELECTIONS, default="paired")
     parser.add_argument("--evaluate", action="store_true", help="evaluate both arms and write the paired report")
     parser.add_argument(
         "--retry-evaluator",
@@ -777,6 +806,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
         seed=args.seed,
         instance_filter=args.filter,
         all_instances=args.all,
+        arm_selection=args.arm,
         dry_run=args.dry_run,
         resume=args.resume,
         acknowledge=args.acknowledge,
@@ -872,9 +902,7 @@ def _plan_from_manifest(
         raise CampaignError("campaign manifest has invalid jobs or installs")
     try:
         frozen_jobs = tuple(
-            CampaignJob(item["instance_id"], item["arm"], item["image"])
-            for item in jobs
-            if isinstance(item, Mapping)
+            CampaignJob(item["instance_id"], item["arm"], item["image"]) for item in jobs if isinstance(item, Mapping)
         )
     except (KeyError, TypeError) as error:
         raise CampaignError("campaign manifest has malformed job") from error
@@ -892,15 +920,15 @@ def _plan_from_manifest(
     if not isinstance(frozen_images, Mapping) or set(frozen_images) != set(images):
         raise CampaignError("campaign manifest has invalid frozen image coordinates")
     if any(
-        not isinstance(value, Mapping)
-        or set(value) != {"image"}
-        or value.get("image") != image
+        not isinstance(value, Mapping) or set(value) != {"image"} or value.get("image") != image
         for instance_id, image in images.items()
         for value in (frozen_images[instance_id],)
     ):
         raise CampaignError("campaign manifest has invalid frozen image coordinates")
     try:
-        expected_jobs = expand_campaign_jobs(tuple(selected), images, seed=_manifest_seed(raw))
+        expected_jobs = expand_campaign_jobs(
+            tuple(selected), images, seed=_manifest_seed(raw), arms=_selected_arm_names(_manifest_arm(raw))
+        )
     except (CampaignError, TypeError, ValueError) as error:
         raise CampaignError("campaign manifest has malformed jobs") from error
     if frozen_jobs != expected_jobs:
@@ -1015,7 +1043,10 @@ def _manifest_selected_instances(raw: object) -> tuple[CampaignInstance, ...]:
             "language",
         }:
             raise CampaignError("campaign manifest has malformed selected instance record")
-        if any(not isinstance(item[field], str) or not item[field].strip() for field in ("instance_id", "image_name", "repository", "commit", "language")):
+        if any(
+            not isinstance(item[field], str) or not item[field].strip()
+            for field in ("instance_id", "image_name", "repository", "commit", "language")
+        ):
             raise CampaignError("campaign manifest has malformed selected instance record")
         try:
             selection = _selection_instance(item)
@@ -1034,6 +1065,25 @@ def _manifest_seed(raw: Mapping[str, object]) -> int:
     if type(seed) is not int:
         raise CampaignError("campaign manifest has invalid seed")
     return seed
+
+
+def _manifest_arm(raw: Mapping[str, object]) -> str:
+    selection = raw.get("selection")
+    if not isinstance(selection, Mapping):
+        raise CampaignError("campaign manifest has invalid arm selection")
+    value = selection.get("arm", "paired")
+    if not isinstance(value, str):
+        raise CampaignError("campaign manifest has invalid arm selection")
+    _selected_arm_names(value)
+    return value
+
+
+def _selected_arm_names(selection: str) -> tuple[str, ...]:
+    if selection == "paired":
+        return ("procontract", "vanilla")
+    if selection in {"procontract", "vanilla"}:
+        return (selection,)
+    raise CampaignError(f"unknown campaign arm selection: {selection}")
 
 
 def _image_name(instance: Mapping[str, object]) -> str:

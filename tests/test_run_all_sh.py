@@ -26,23 +26,27 @@ printf '%s\\n' "$*" >>"$RUN_ALL_TEST_COMMANDS"
 output=''
 dry=0
 evaluate=0
+arm='paired'
 while (($#)); do
   case "$1" in
     --output) output="$2"; shift 2 ;;
     --dry-run) dry=1; shift ;;
     --evaluate) evaluate=1; shift ;;
+    --arm) arm="$2"; shift 2 ;;
     *) shift ;;
   esac
 done
 mkdir -p "$output"
 if ((dry)); then
-  python3 - "$output" <<'PY'
+  RUN_ALL_TEST_ARM="$arm" python3 - "$output" <<'PY'
 from pathlib import Path
-import json, sys
+import json, os, sys
 root=Path(sys.argv[1])
 ids=[f'owner__task.{index:07d}' for index in range(200)]
-jobs=[{'instance_id': identifier, 'arm': arm, 'image': 'image'} for identifier in ids for arm in ('procontract','vanilla')]
-(root/'campaign.json').write_text(json.dumps({'config': {'model': 'openai/gpt-5.6-luna', 'variant': 'max'}, 'selected_ids': ids, 'jobs': jobs, 'selection': {'all': True}, 'programbench': {}, 'installs': {}}))
+selection=os.environ['RUN_ALL_TEST_ARM']
+arms=('procontract','vanilla') if selection == 'paired' else (selection,)
+jobs=[{'instance_id': identifier, 'arm': arm, 'image': 'image'} for identifier in ids for arm in arms]
+(root/'campaign.json').write_text(json.dumps({'config': {'model': 'openai/gpt-5.6-luna', 'variant': 'max'}, 'selected_ids': ids, 'jobs': jobs, 'selection': {'all': True, 'arm': selection}, 'programbench': {}, 'installs': {}}))
 PY
   exit 0
 fi
@@ -119,6 +123,15 @@ def test_all_config_pins_current_treatment_and_excludes_nothing() -> None:
         "total_cost_soft": 100,
         "total_cost_hard": 150,
     }
+
+
+def test_procontract_all_config_has_full_run_cost_guardrail() -> None:
+    config = yaml.safe_load((ROOT / "scripts/opencode_programbench_procontract_all.yaml").read_text())
+
+    assert config["arms"]["procontract"]["revision"] == "fa6d7d1a9"
+    assert config["excluded"] == []
+    assert config["limits"]["total_cost_soft"] == 200
+    assert config["limits"]["total_cost_hard"] == 225
 
 
 def test_run_all_rejects_quarantined_key_without_creating_output(tmp_path: Path) -> None:
@@ -204,3 +217,24 @@ def test_run_all_preserves_failure_summary_and_returns_nonzero(tmp_path: Path) -
     assert summary["phase_exit"] == {"evaluation": 0, "inference": 1, "plan": 0, "wrapper": 1}
     assert (output / "ARTIFACTS.sha256").is_file()
     assert (output / "RUN_ALL_SUMMARY.sha256").is_file()
+
+
+def test_run_all_supports_single_procontract_arm(tmp_path: Path) -> None:
+    output, commands, env = fake_runner_env(tmp_path)
+
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "--output", str(output), "--arm", "procontract"],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert all("--arm procontract" in command for command in commands.read_text().splitlines())
+    summary = json.loads((output / "RUN_ALL_SUMMARY.json").read_text())
+    assert summary["authorization"]["arm"] == "procontract"
+    assert summary["campaign"]["selected_instances"] == 200
+    assert summary["campaign"]["trajectories"] == 200
