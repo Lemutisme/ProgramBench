@@ -113,12 +113,13 @@ class _InstallState:
 
 _RunCommand = Callable[[Sequence[str], Path | None], subprocess.CompletedProcess[str]]
 _SUPPORTED_ARMS = frozenset({"procontract", "vanilla"})
+_MATERIALIZE_COMMAND = ("bun", "install", "--frozen-lockfile", "--ignore-scripts")
 _INSTALL_COMMAND = ("bun", "install", "--frozen-lockfile")
 _BUILD_COMMAND = (
     "bun",
+    "run",
     "--cwd",
     "packages/opencode",
-    "run",
     "build",
     "--single",
     "--skip-install",
@@ -340,6 +341,9 @@ def _stage_build(
         None,
         "worktree-add",
     )
+    # Materialize the lockfile before lifecycle scripts so native dependencies
+    # use the pinned local node-gyp instead of downloading node-gyp@latest.
+    _run_command(run_command, _bun_command(state, _MATERIALIZE_COMMAND, run_command), temporary_worktree, "install")
     _run_command(run_command, _bun_command(state, _INSTALL_COMMAND, run_command), temporary_worktree, "install")
     _run_command(run_command, _bun_command(state, _BUILD_COMMAND, run_command), temporary_worktree, "build")
     staged_binary = temporary_worktree / _BUILT_BINARY

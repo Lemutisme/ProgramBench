@@ -538,9 +538,9 @@ def test_prepare_install_pins_detached_worktree_and_records_auditable_binary(tmp
     assert install.install_command == ("bun", "install", "--frozen-lockfile")
     assert install.build_command == (
         "bun",
+        "run",
         "--cwd",
         "packages/opencode",
-        "run",
         "build",
         "--single",
         "--skip-install",
@@ -614,6 +614,23 @@ def test_prepare_install_snapshots_bun_before_build(tmp_path: Path, monkeypatch)
     assert install.bun_path.read_bytes() == bun.read_bytes()
     assert install.bun_path.stat().st_mode & 0o777 == 0o555
     assert install.bun_path_dirs == (install.bun_path.parent,)
+
+
+def test_prepare_install_materializes_frozen_dependencies_before_lifecycle_scripts(tmp_path: Path, monkeypatch):
+    repo, _, _ = _fake_opencode_repo(tmp_path)
+    _fake_bun(monkeypatch, tmp_path)
+    calls: list[tuple[str, ...]] = []
+
+    def record(command, cwd):
+        calls.append(tuple(command))
+        return runner.run_checked(command, cwd)
+
+    runner.prepare_install(runner.ArmConfig("procontract", repo, "HEAD", "procontract"), tmp_path / "installs", record)
+
+    assert [command for command in calls if command[:2] == ("bun", "install")] == [
+        ("bun", "install", "--frozen-lockfile", "--ignore-scripts"),
+        ("bun", "install", "--frozen-lockfile"),
+    ]
 
 
 def test_prepare_install_rejects_missing_bun_before_install_root_side_effects(tmp_path: Path, monkeypatch):
@@ -1450,8 +1467,8 @@ def _fake_bun(monkeypatch, tmp_path: Path) -> Path:
         "#!/bin/sh\n"
         'if [ "$1" = --version ]; then echo bun-test; exit 0; fi\n'
         'if [ "$1" = install ]; then exit 0; fi\n'
-        'if [ "$1" = --cwd ]; then cwd="$2"; cd "$2"; shift 2; fi\n'
-        'if [ "$1" = run ] && [ "$2" = build ]; then echo "$cwd $*" >> build.log; exec sh script/build.sh; fi\n'
+        'if [ "$1" = run ] && [ "$2" = --cwd ]; then cwd="$3"; cd "$3"; shift 3; fi\n'
+        'if [ "$1" = build ]; then echo "$cwd run $*" >> build.log; exec sh script/build.sh; fi\n'
         "exit 2\n"
     )
     bun.chmod(0o755)
