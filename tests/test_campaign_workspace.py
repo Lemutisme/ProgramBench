@@ -760,7 +760,9 @@ def test_candidate_init_preserves_workspace_modes_and_pins_platform(tmp_path: Pa
     ensure_workspace(request(tmp_path, docker))
 
     initialize = next(command for command in docker.commands if command[1] == "run")
-    assert "chmod -R" not in initialize[-1]
+    assert "chmod -R" in initialize[-1]
+    assert "chmod -R u+rwX,g+rwX,o-rwx /state /cache /logs" in initialize[-1]
+    assert "chmod -R u+rwX,g+rwX,o-rwx /candidate" not in initialize[-1]
     assert ".programbench-cleanroom.json" not in initialize[-1]
     assert initialize[initialize.index("--platform") + 1] == "linux/amd64"
 
@@ -1621,25 +1623,24 @@ def test_real_docker_runs_two_exact_isolated_workspaces(tmp_path: Path, monkeypa
             _run_docker(("docker", "exec", workspace.container_id, "id", "-un"), 30).strip() == "agent"
             for workspace in workspaces
         )
-        assert all(
-            _run_docker(
+        for workspace in workspaces:
+            agent_uid = _run_docker(("docker", "exec", workspace.container_id, "id", "-u", "agent"), 30).strip()
+            agent_gid = _run_docker(("docker", "exec", workspace.container_id, "id", "-g", "agent"), 30).strip()
+            assert _run_docker(
                 (
                     "docker",
                     "exec",
                     workspace.container_id,
                     "stat",
                     "-c",
-                    "%U",
+                    "%u:%g",
                     "/candidate",
                     "/state",
                     "/cache",
                     "/logs",
                 ),
                 30,
-            ).splitlines()
-            == ["agent"] * 4
-            for workspace in workspaces
-        )
+            ).splitlines() == [f"{agent_uid}:{agent_gid}", *[f"{os.getuid()}:{agent_gid}"] * 3]
         sources = [{str(mount.source) for mount in workspace.manifest.mounts} for workspace in workspaces]
         assert sources[0].isdisjoint(sources[1])
         assert all(

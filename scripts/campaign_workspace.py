@@ -116,7 +116,8 @@ _IDENTITY_LABEL_NAMES = (
 _CANDIDATE_VERIFY_SCRIPT = r"""
 uid=$(id -u agent)
 gid=$(id -g agent)
-for root in /candidate /state /cache /logs; do
+test -n "${PROGRAMBENCH_HOST_UID:-}"
+for root in /candidate; do
   find "$root" -xdev -exec /bin/sh -ec '
     expected="$1:$2"
     shift 2
@@ -124,6 +125,15 @@ for root in /candidate /state /cache /logs; do
       test "$(stat -c "%u:%g" "$path")" = "$expected"
     done
   ' verify-owner "$uid" "$gid" {} +
+done
+for root in /state /cache /logs; do
+  find "$root" -xdev -exec /bin/sh -ec '
+    expected="$1:$2"
+    shift 2
+    for path do
+      test "$(stat -c "%u:%g" "$path")" = "$expected"
+    done
+  ' verify-control-owner "$PROGRAMBENCH_HOST_UID" "$gid" {} +
 done
 test ! -e /candidate/executable
 test ! -L /candidate/executable
@@ -1274,7 +1284,9 @@ def _copy_cleanroom(runner: _DockerRunner, docker: str, manifest: WorkspaceManif
         "cp -a /workspace/. /candidate/; rm -f /candidate/executable; "
         "ln -s /workspace/executable /candidate/reference; "
         "mkdir -p /state/home /state/config /state/data; "
-        "chown -R agent:agent /candidate /state /cache /logs",
+        "chown -R agent:agent /candidate; "
+        f"chown -R {os.getuid()}:$(id -g agent) /state /cache /logs; "
+        "chmod -R u+rwX,g+rwX,o-rwx /state /cache /logs",
     )
     try:
         target_identity.verify()
@@ -1307,6 +1319,8 @@ def _verify_candidate(runner: _DockerRunner, docker: str, manifest: WorkspaceMan
         "root",
         "--network",
         "none",
+        "-e",
+        f"PROGRAMBENCH_HOST_UID={os.getuid()}",
         "-v",
         f"{manifest.candidate}:/candidate:{'rw' if publish else 'ro'}",
         "-v",
