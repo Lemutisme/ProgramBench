@@ -103,6 +103,17 @@ class CampaignPlan:
     installs: Mapping[str, object]
     dry_run: bool
     cleanup_only: bool = False
+    selected_instances: tuple["CampaignInstance", ...] = ()
+
+
+@dataclass(frozen=True)
+class CampaignInstance:
+    instance_id: str
+    image_name: str
+    repository: str
+    commit: str
+    difficulty: str
+    language: str
 
 
 @dataclass(frozen=True)
@@ -255,39 +266,31 @@ def plan_campaign(
             raise CampaignError("campaign manifest conflicts with requested selection")
         return _plan_from_manifest(config, root, manifest_path, frozen, dry_run, cleanup_only)
 
-    filtered = tuple(filter_instances([dict(instance) for instance in instances], filter_spec=instance_filter or ""))
-    real = tuple(instance for instance in filtered if _is_real_instance(instance))
-    eligible = tuple(instance for instance in real if str(instance.get("instance_id", "")) not in config.excluded)
+    validated = tuple(_validate_instance_row(instance) for instance in instances)
+    real = tuple(instance for instance in validated if _is_real_instance(instance))
+    filtered = tuple(filter_instances([dict(instance) for instance in real], filter_spec=instance_filter or ""))
+    normalized = tuple(_selection_record(instance) for instance in filtered)
+    eligible = tuple(instance for instance in normalized if instance["instance_id"] not in config.excluded)
     selection_limit = len(eligible) if all_instances else limit
     if selection_limit <= 0:
         raise CampaignError("no eligible ProgramBench instances match selection")
     selected = select_instances(
-        tuple(_selection_instance(instance) for instance in real),
+        normalized,
         seed=str(seed),
         limit=selection_limit,
         excluded=config.excluded,
     )
-    selected_ids = tuple(str(instance["instance_id"]) for instance in selected)
-    images = {
-        str(instance["instance_id"]): _image_name(instance)
-        for instance in real
-        if str(instance.get("instance_id", "")) in set(selected_ids)
-    }
+    selected_instances = tuple(_campaign_instance(instance) for instance in selected)
+    selected_ids = tuple(instance.instance_id for instance in selected_instances)
+    images = {instance.instance_id: instance.image_name for instance in selected_instances}
     jobs = expand_campaign_jobs(selected_ids, images, seed=seed)
     root.mkdir(parents=True, exist_ok=True)
     installs = {arm.name: prepare_install_fn(arm, root / "installs") for arm in config.arms}
     manifest = {
-        "version": 1,
+        "version": 2,
         "config": canonical,
         "selected_ids": list(selected_ids),
-        "selected_instances": [
-            {
-                "instance_id": instance["instance_id"],
-                "difficulty": instance["difficulty"],
-                "language": instance["language"],
-            }
-            for instance in selected
-        ],
+        "selected_instances": [_campaign_instance_json(instance) for instance in selected_instances],
         "jobs": [{"instance_id": job.instance_id, "arm": job.arm, "image": job.image} for job in jobs],
         "installs": {name: _json_value(record) for name, record in installs.items()},
         "programbench": _programbench_metadata(),
@@ -296,7 +299,7 @@ def plan_campaign(
         "images": {identifier: {"image": image} for identifier, image in sorted(images.items())},
     }
     _atomic_json(manifest_path, manifest)
-    return CampaignPlan(root, manifest_path, config, selected_ids, jobs, installs, dry_run)
+    return CampaignPlan(root, manifest_path, config, selected_ids, jobs, installs, dry_run, selected_instances=selected_instances)
 
 
 def run_campaign(
@@ -844,23 +847,63 @@ def _plan_from_manifest(
     dry_run: bool,
     cleanup_only: bool = False,
 ) -> CampaignPlan:
+    if raw.get("version") != 2:
+        raise CampaignError("campaign manifest has unsupported version")
     selected = raw.get("selected_ids")
+    selected_instances = _manifest_selected_instances(raw.get("selected_instances"))
     jobs = raw.get("jobs")
     installs = raw.get("installs")
     if not isinstance(selected, list) or not all(isinstance(value, str) for value in selected):
         raise CampaignError("campaign manifest has invalid selected IDs")
+    if tuple(selected) != tuple(instance.instance_id for instance in selected_instances):
+        raise CampaignError("campaign manifest selected instance IDs do not match selected IDs")
     if not isinstance(jobs, list) or not isinstance(installs, Mapping):
         raise CampaignError("campaign manifest has invalid jobs or installs")
     try:
         frozen_jobs = tuple(
-            CampaignJob(item["instance_id"], item["arm"], item["image"]) for item in jobs if isinstance(item, Mapping)
+            CampaignJob(item["instance_id"], item["arm"], item["image"])
+            for item in jobs
+            if isinstance(item, Mapping)
         )
     except (KeyError, TypeError) as error:
         raise CampaignError("campaign manifest has malformed job") from error
     if len(frozen_jobs) != len(jobs):
         raise CampaignError("campaign manifest has malformed jobs")
+    if any(
+        not isinstance(item, Mapping)
+        or set(item) != {"instance_id", "arm", "image"}
+        or any(not isinstance(item[key], str) or not item[key] for key in ("instance_id", "arm", "image"))
+        for item in jobs
+    ):
+        raise CampaignError("campaign manifest has malformed jobs")
+    images = {instance.instance_id: instance.image_name for instance in selected_instances}
+    frozen_images = raw.get("images")
+    if not isinstance(frozen_images, Mapping) or set(frozen_images) != set(images):
+        raise CampaignError("campaign manifest has invalid frozen image coordinates")
+    if any(
+        not isinstance(value, Mapping)
+        or set(value) != {"image"}
+        or value.get("image") != image
+        for instance_id, image in images.items()
+        for value in (frozen_images[instance_id],)
+    ):
+        raise CampaignError("campaign manifest has invalid frozen image coordinates")
+    try:
+        expected_jobs = expand_campaign_jobs(tuple(selected), images, seed=_manifest_seed(raw))
+    except (CampaignError, TypeError, ValueError) as error:
+        raise CampaignError("campaign manifest has malformed jobs") from error
+    if frozen_jobs != expected_jobs:
+        raise CampaignError("campaign manifest jobs do not match frozen selected instances")
     return CampaignPlan(
-        root, manifest_path, config, tuple(selected), frozen_jobs, dict(installs), dry_run, cleanup_only
+        root,
+        manifest_path,
+        config,
+        tuple(selected),
+        frozen_jobs,
+        dict(installs),
+        dry_run,
+        cleanup_only,
+        selected_instances,
     )
 
 
@@ -873,6 +916,15 @@ def _selected_jobs_terminal(plan: CampaignPlan) -> bool:
         )
     except (OSError, ValueError):
         return False
+
+
+def _validate_instance_row(instance: Mapping[str, object]) -> dict[str, object]:
+    if not isinstance(instance, Mapping):
+        raise CampaignError("ProgramBench instance has invalid instance_id selection metadata")
+    instance_id = instance.get("instance_id")
+    if not isinstance(instance_id, str) or not instance_id.strip():
+        raise CampaignError("ProgramBench instance has invalid instance_id selection metadata")
+    return dict(instance)
 
 
 def _selection_instance(instance: Mapping[str, object]) -> Mapping[str, str]:
@@ -896,7 +948,81 @@ def _selection_instance(instance: Mapping[str, object]) -> Mapping[str, str]:
 
 def _is_real_instance(instance: Mapping[str, object]) -> bool:
     instance_id = instance.get("instance_id")
-    return isinstance(instance_id, str) and not instance_id.startswith(FIXTURE_PREFIX)
+    return not instance_id.startswith(FIXTURE_PREFIX)
+
+
+def _selection_record(instance: Mapping[str, object]) -> dict[str, str]:
+    selection = _selection_instance(instance)
+    return {
+        **selection,
+        "image_name": _image_name(instance),
+        "repository": _required_instance_string(instance, "repository"),
+        "commit": _required_instance_string(instance, "commit"),
+    }
+
+
+def _required_instance_string(instance: Mapping[str, object], field: str) -> str:
+    value = instance.get(field)
+    if not isinstance(value, str) or not value.strip():
+        raise CampaignError(f"ProgramBench instance has invalid {field} selection metadata")
+    return value
+
+
+def _campaign_instance(instance: Mapping[str, str]) -> CampaignInstance:
+    return CampaignInstance(
+        instance_id=instance["instance_id"],
+        image_name=instance["image_name"],
+        repository=instance["repository"],
+        commit=instance["commit"],
+        difficulty=instance["difficulty"],
+        language=instance["language"],
+    )
+
+
+def _campaign_instance_json(instance: CampaignInstance) -> dict[str, str]:
+    return {
+        "instance_id": instance.instance_id,
+        "image_name": instance.image_name,
+        "repository": instance.repository,
+        "commit": instance.commit,
+        "difficulty": instance.difficulty,
+        "language": instance.language,
+    }
+
+
+def _manifest_selected_instances(raw: object) -> tuple[CampaignInstance, ...]:
+    if not isinstance(raw, list):
+        raise CampaignError("campaign manifest has invalid selected instance records")
+    records: list[CampaignInstance] = []
+    for item in raw:
+        if not isinstance(item, Mapping) or set(item) != {
+            "instance_id",
+            "image_name",
+            "repository",
+            "commit",
+            "difficulty",
+            "language",
+        }:
+            raise CampaignError("campaign manifest has malformed selected instance record")
+        if any(not isinstance(item[field], str) or not item[field].strip() for field in ("instance_id", "image_name", "repository", "commit", "language")):
+            raise CampaignError("campaign manifest has malformed selected instance record")
+        try:
+            selection = _selection_instance(item)
+        except CampaignError as error:
+            raise CampaignError("campaign manifest has malformed selected instance record") from error
+        if selection["difficulty"] != item["difficulty"]:
+            raise CampaignError("campaign manifest has malformed selected instance record")
+        records.append(_campaign_instance(item))
+    if len({instance.instance_id for instance in records}) != len(records):
+        raise CampaignError("campaign manifest has duplicate selected instance records")
+    return tuple(records)
+
+
+def _manifest_seed(raw: Mapping[str, object]) -> int:
+    seed = raw.get("seed")
+    if type(seed) is not int:
+        raise CampaignError("campaign manifest has invalid seed")
+    return seed
 
 
 def _image_name(instance: Mapping[str, object]) -> str:

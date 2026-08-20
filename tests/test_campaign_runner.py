@@ -906,7 +906,7 @@ def test_public_entrypoint_requires_resume_after_documented_dry_run(tmp_path: Pa
     assert "--dry-run" in dry_run
     assert "--resume" in inference
 
-    instances = [{"instance_id": "one", "difficulty": "easy", "language": "python", "image_name": "one-image"}]
+    instances = [{"instance_id": "one", "difficulty": "easy", "language": "python", "image_name": "one-image", "repository": "owner/one", "commit": "a" * 40}]
     prepared = []
     executed = []
     original_plan_campaign = campaign_runner.plan_campaign
@@ -967,8 +967,8 @@ def test_plan_dry_run_prepares_each_arm_once_without_workspace(tmp_path: Path):
     plan = plan_campaign(
         load_config(config_path),
         [
-            {"instance_id": "one", "difficulty": "easy", "language": "python", "image_name": "one-image"},
-            {"instance_id": "two", "difficulty": "hard", "language": "rust", "image_name": "two-image"},
+            {"instance_id": "one", "difficulty": "easy", "language": "python", "image_name": "one-image", "repository": "owner/one", "commit": "a" * 40},
+            {"instance_id": "two", "difficulty": "hard", "language": "rust", "image_name": "two-image", "repository": "owner/two", "commit": "b" * 40},
         ],
         output=tmp_path / "out",
         limit=2,
@@ -1010,6 +1010,141 @@ def test_selection_instance_requires_nonempty_string_language(language):
 
     with pytest.raises(CampaignError, match="language"):
         _selection_instance({"instance_id": "one", "difficulty": "easy", "language": language})
+
+
+@pytest.mark.parametrize("instance_id", [None, True, 1, "", "  "])
+def test_plan_rejects_malformed_instance_id_before_fixture_or_filter(instance_id, tmp_path: Path):
+    from scripts.campaign_runner import CampaignError, plan_campaign
+    from scripts.run_opencode import load_config
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config_path = tmp_path / "campaign.yaml"
+    config_path.write_text(_config(repo))
+
+    with pytest.raises(CampaignError, match="instance_id"):
+        plan_campaign(
+            load_config(config_path),
+            [{"instance_id": instance_id, "difficulty": "easy", "language": "python"}],
+            output=tmp_path / "out",
+            instance_filter="does-not-match",
+            dry_run=True,
+        )
+
+
+def test_manifest_freezes_complete_selected_instance_records_and_resume_ignores_dataset(
+    tmp_path: Path,
+):
+    from scripts.campaign_runner import plan_campaign
+    from scripts.run_opencode import load_config
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config_path = tmp_path / "campaign.yaml"
+    config_path.write_text(_config(repo))
+    instance = {
+        "instance_id": "owner__one.abc1234",
+        "image_name": "owner-image",
+        "repository": "owner/repo",
+        "commit": "a" * 40,
+        "difficulty": "",
+        "language": "python",
+    }
+    plan = plan_campaign(
+        load_config(config_path),
+        [instance],
+        output=tmp_path / "out",
+        limit=1,
+        seed=42,
+        dry_run=True,
+        prepare_install_fn=lambda arm, _root: {"arm": arm.name},
+    )
+
+    manifest = json.loads(plan.manifest_path.read_text())
+    assert manifest["version"] == 2
+    assert manifest["selected_instances"] == [
+        {
+            "instance_id": instance["instance_id"],
+            "image_name": instance["image_name"],
+            "repository": instance["repository"],
+            "commit": instance["commit"],
+            "difficulty": "unspecified",
+            "language": instance["language"],
+        }
+    ]
+
+    resumed = plan_campaign(
+        load_config(config_path),
+        [],
+        output=tmp_path / "out",
+        limit=1,
+        seed=42,
+        dry_run=True,
+        resume=True,
+        prepare_install_fn=lambda *_: pytest.fail("resume must not resolve installs"),
+    )
+    assert resumed.selected_instances == plan.selected_instances
+    assert resumed.jobs == plan.jobs
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["missing", "none", "extra", "duplicate", "id_mismatch", "bad_type", "job_missing", "job_extra"],
+)
+def test_resume_rejects_malformed_selected_instance_records(tmp_path: Path, mutation: str):
+    from scripts.campaign_runner import CampaignError, plan_campaign
+    from scripts.run_opencode import load_config
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config_path = tmp_path / "campaign.yaml"
+    config_path.write_text(_config(repo))
+    instance = {
+        "instance_id": "owner__one.abc1234",
+        "image_name": "owner-image",
+        "repository": "owner/repo",
+        "commit": "a" * 40,
+        "difficulty": "easy",
+        "language": "python",
+    }
+    plan_campaign(
+        load_config(config_path),
+        [instance],
+        output=tmp_path / "out",
+        limit=1,
+        dry_run=True,
+        prepare_install_fn=lambda arm, _root: {"arm": arm.name},
+    )
+    manifest_path = tmp_path / "out" / "campaign.json"
+    manifest = json.loads(manifest_path.read_text())
+    if mutation == "missing":
+        del manifest["selected_instances"]
+    elif mutation == "none":
+        manifest["selected_instances"] = None
+    elif mutation == "extra":
+        manifest["selected_instances"][0]["extra"] = "nope"
+    elif mutation == "duplicate":
+        manifest["selected_instances"].append(dict(manifest["selected_instances"][0]))
+    elif mutation == "id_mismatch":
+        manifest["selected_instances"][0]["instance_id"] = "owner__other.abc1234"
+    elif mutation == "bad_type":
+        manifest["selected_instances"][0]["commit"] = None
+    elif mutation == "job_missing":
+        manifest["jobs"] = manifest["jobs"][:-1]
+    else:
+        manifest["jobs"][0]["extra"] = "nope"
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(CampaignError, match="manifest"):
+        plan_campaign(
+            load_config(config_path),
+            [],
+            output=tmp_path / "out",
+            limit=1,
+            dry_run=True,
+            resume=True,
+            prepare_install_fn=lambda *_: pytest.fail("malformed resume must fail before installs"),
+        )
 
 
 def test_real_dataset_selection_excludes_fixture_and_freezes_optional_difficulty(tmp_path: Path):
@@ -1083,9 +1218,9 @@ def test_all_selection_counts_only_real_benchmark_instances(tmp_path: Path):
     config_path = tmp_path / "campaign.yaml"
     config_path.write_text(_config(repo))
     instances = [
-        {"instance_id": "real__one", "language": "python", "image_name": "one"},
-        {"instance_id": "real__two", "difficulty": "easy", "language": "rust", "image_name": "two"},
-        {"instance_id": "testorg__calculator.abc1234", "language": "python", "image_name": "fixture"},
+        {"instance_id": "real__one", "language": "python", "image_name": "one", "repository": "owner/one", "commit": "a" * 40},
+        {"instance_id": "real__two", "difficulty": "easy", "language": "rust", "image_name": "two", "repository": "owner/two", "commit": "b" * 40},
+        {"instance_id": "testorg__calculator.abc1234", "language": "python", "image_name": "fixture", "repository": "testorg/calculator", "commit": "c" * 40},
     ]
 
     plan = plan_campaign(
@@ -1111,9 +1246,9 @@ def test_plan_uses_programbench_regex_filter_and_all_after_exclusions(tmp_path: 
     plan = plan_campaign(
         load_config(config_path),
         [
-            {"instance_id": "keep__one", "difficulty": "easy", "language": "python", "image_name": "one"},
-            {"instance_id": "keep__two", "difficulty": "hard", "language": "rust", "image_name": "two"},
-            {"instance_id": "skip__three", "difficulty": "hard", "language": "rust", "image_name": "three"},
+            {"instance_id": "keep__one", "difficulty": "easy", "language": "python", "image_name": "one", "repository": "owner/one", "commit": "a" * 40},
+            {"instance_id": "keep__two", "difficulty": "hard", "language": "rust", "image_name": "two", "repository": "owner/two", "commit": "b" * 40},
+            {"instance_id": "skip__three", "difficulty": "hard", "language": "rust", "image_name": "three", "repository": "owner/three", "commit": "c" * 40},
         ],
         output=tmp_path / "out",
         instance_filter="keep__.*",
@@ -1133,7 +1268,7 @@ def test_resume_uses_frozen_install_data_without_resolving_moving_refs(tmp_path:
     repo.mkdir()
     config_path = tmp_path / "campaign.yaml"
     config_path.write_text(_config(repo))
-    instances = [{"instance_id": "one", "difficulty": "easy", "language": "python", "image_name": "one-image"}]
+    instances = [{"instance_id": "one", "difficulty": "easy", "language": "python", "image_name": "one-image", "repository": "owner/one", "commit": "a" * 40}]
     plan_campaign(
         load_config(config_path),
         instances,
@@ -1165,8 +1300,8 @@ def test_resume_rejects_changed_frozen_selection_options(tmp_path: Path):
     config_path = tmp_path / "campaign.yaml"
     config_path.write_text(_config(repo))
     instances = [
-        {"instance_id": "one", "difficulty": "easy", "language": "python", "image_name": "one-image"},
-        {"instance_id": "two", "difficulty": "hard", "language": "rust", "image_name": "two-image"},
+        {"instance_id": "one", "difficulty": "easy", "language": "python", "image_name": "one-image", "repository": "owner/one", "commit": "a" * 40},
+        {"instance_id": "two", "difficulty": "hard", "language": "rust", "image_name": "two-image", "repository": "owner/two", "commit": "b" * 40},
     ]
     plan_campaign(
         load_config(config_path),
@@ -1200,7 +1335,7 @@ def test_resume_acknowledges_recoverable_breaker_pause_but_not_hard_stop(tmp_pat
     repo.mkdir()
     config_path = tmp_path / "campaign.yaml"
     config_path.write_text(_config(repo))
-    instances = [{"instance_id": "one", "difficulty": "easy", "language": "python", "image_name": "one"}]
+    instances = [{"instance_id": "one", "difficulty": "easy", "language": "python", "image_name": "one", "repository": "owner/one", "commit": "a" * 40}]
     config = load_config(config_path)
     plan_campaign(
         config,
@@ -1264,7 +1399,7 @@ def test_persisted_hard_stop_resume_runs_cleanup_only_without_admission(tmp_path
     config_path = tmp_path / "campaign.yaml"
     config_path.write_text(_config(repo))
     config = load_config(config_path)
-    instances = [{"instance_id": "one", "difficulty": "easy", "language": "python", "image_name": "one"}]
+    instances = [{"instance_id": "one", "difficulty": "easy", "language": "python", "image_name": "one", "repository": "owner/one", "commit": "a" * 40}]
     plan = campaign_runner.plan_campaign(
         config,
         instances,
@@ -2143,8 +2278,8 @@ def test_fake_paired_campaign_script_main_resumes_without_adapter_calls(tmp_path
     config_path = tmp_path / "campaign.yaml"
     config_path.write_text(_config(repo))
     instances = [
-        {"instance_id": "one", "difficulty": "easy", "language": "python", "image_name": "one-image"},
-        {"instance_id": "two", "difficulty": "hard", "language": "rust", "image_name": "two-image"},
+        {"instance_id": "one", "difficulty": "easy", "language": "python", "image_name": "one-image", "repository": "owner/one", "commit": "a" * 40},
+        {"instance_id": "two", "difficulty": "hard", "language": "rust", "image_name": "two-image", "repository": "owner/two", "commit": "b" * 40},
     ]
     prepared = []
 
@@ -2341,8 +2476,8 @@ def test_fake_paired_campaign_pause_and_interrupt_drain_real_active_job_paths(tm
     plan = campaign_runner.plan_campaign(
         load_config(config_path),
         [
-            {"instance_id": "one", "difficulty": "easy", "language": "python", "image_name": "one-image"},
-            {"instance_id": "two", "difficulty": "hard", "language": "rust", "image_name": "two-image"},
+            {"instance_id": "one", "difficulty": "easy", "language": "python", "image_name": "one-image", "repository": "owner/one", "commit": "a" * 40},
+            {"instance_id": "two", "difficulty": "hard", "language": "rust", "image_name": "two-image", "repository": "owner/two", "commit": "b" * 40},
         ],
         output=tmp_path / "out",
         limit=2,

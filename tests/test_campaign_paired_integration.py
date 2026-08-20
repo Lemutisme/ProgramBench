@@ -80,6 +80,8 @@ def test_real_docker_paired_fake_binaries_run_four_jobs_and_resume(
             "difficulty": "easy",
             "language": "bash",
             "image_name": f"{image}:task_cleanroom",
+            "repository": "campaignfixture/calculator",
+            "commit": "a" * 40,
         }
         for instance_id, image in zip(instance_ids, image_names, strict=True)
     ]
@@ -89,6 +91,8 @@ def test_real_docker_paired_fake_binaries_run_four_jobs_and_resume(
             "difficulty": "easy",
             "language": "bash",
             "image_name": image_names[0],
+            "repository": "testorg/calculator",
+            "commit": "b" * 40,
         }
     )
     monkeypatch.setenv("OPENAI_API_KEY", "paired-integration-provider-key")
