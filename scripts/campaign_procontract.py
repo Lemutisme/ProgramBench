@@ -3545,9 +3545,10 @@ def _credential_paths(
 
 
 def _scan_credential_roots(paths: ProContractCredentialPaths, names: tuple[str, ...]) -> None:
-    roots = tuple(
-        dict.fromkeys((paths.candidate, paths.subject, paths.state_dir, paths.cache_dir, paths.log_dir, paths.git_dir))
-    )
+    # Raw state, cache, and logs are sensitive control-plane evidence and may
+    # legitimately retain provider coordinates. Only publication surfaces must
+    # be credential-free.
+    roots = tuple(dict.fromkeys((paths.candidate, paths.subject, paths.export, paths.git_dir)))
     for root in roots:
         if root is not None and root.is_dir():
             _verify_no_credentials(root, names, published_only=False)

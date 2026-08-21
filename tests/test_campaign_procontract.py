@@ -3046,12 +3046,11 @@ def test_credential_in_export_fails_closed_without_package_or_attestation(
     assert not paths.root.joinpath("procontract-result.json").exists()
 
 
-@pytest.mark.parametrize("surface", ["state", "cache"])
-def test_credential_in_owned_persisted_surface_fails_closed_without_mutation(
+@pytest.mark.parametrize("surface", ["state", "cache", "log"])
+def test_credential_in_sensitive_telemetry_does_not_block_clean_publication(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, surface: str
 ) -> None:
-    from scripts.campaign_freeze import CredentialLeakError
-    from scripts.campaign_procontract import build_issue_payload, run_procontract
+    from scripts.campaign_procontract import ProContractCompletion, build_issue_payload, run_procontract
 
     secret = f"{surface}-surface-secret"
     monkeypatch.setenv("CONTROL_SECRET", secret)
@@ -3071,8 +3070,16 @@ def test_credential_in_owned_persisted_surface_fails_closed_without_mutation(
     def leak(owner: object, contract_id: str, destination: Path) -> dict[str, object]:
         nonlocal leaked, before
         response = export(owner, contract_id, destination)
-        root = workspace.manifest.state_dir if surface == "state" else workspace.manifest.cache_dir
-        leaked = root / ("opencode.db-wal" if surface == "state" else "provider-cache.log")
+        root = (
+            workspace.manifest.state_dir
+            if surface == "state"
+            else workspace.manifest.cache_dir
+            if surface == "cache"
+            else workspace.manifest.log_dir
+        )
+        leaked = root / (
+            "opencode.db-wal" if surface == "state" else "provider-cache.log" if surface == "cache" else "trace.log"
+        )
         leaked.write_text(secret)
         before = _tree_identity(root)
         return response
@@ -3085,25 +3092,24 @@ def test_credential_in_owned_persisted_surface_fails_closed_without_mutation(
     api.export = leak  # type: ignore[method-assign]
     with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
         workspace.lease._handle_active = True
-        with pytest.raises(CredentialLeakError) as error:
-            run_procontract(
-                job,
-                store,
-                workspace,
-                model="openai/gpt-5.6-luna",
-                variant="max",
-                limits=_limits(),
-                breaker=CircuitBreaker(),
-                api=api,
-                clock=clock,
-                sleeper=clock.sleep,
-                package=package,
-                preflight=lambda archive, iid: SimpleNamespace(executable_hash="e" * 64, output="ok"),
-            )
+        result = run_procontract(
+            job,
+            store,
+            workspace,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=_limits(),
+            breaker=CircuitBreaker(),
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+            package=package,
+            preflight=lambda archive, iid: SimpleNamespace(executable_hash="e" * 64, output="ok"),
+        )
 
-    assert secret not in str(error.value)
-    assert packages == 0
-    assert api.attestations == []
+    assert result.completion is ProContractCompletion.DISCHARGED
+    assert packages == 1
+    assert len(api.attestations) == 1
     assert leaked is not None and before is not None
     assert _tree_identity(leaked.parent) == before
     assert leaked.read_text() == secret
@@ -3426,7 +3432,7 @@ def test_typed_control_scan_excludes_unknown_bulk_paths(tmp_path: Path, monkeypa
     assert "unsafe.json" not in store.read().artifact_hashes
 
 
-@pytest.mark.parametrize("name", ["verifier-report.json", "provider-trace.log"])
+@pytest.mark.parametrize("name", ["verifier-report.json"])
 def test_control_artifact_credential_is_immutable_and_fails_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
 ) -> None:

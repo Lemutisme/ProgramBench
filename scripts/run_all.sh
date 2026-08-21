@@ -209,6 +209,12 @@ write_artifact_manifest() {
       ! -path './RUN_ALL_SUMMARY.json' \
       ! -path './RUN_ALL_SUMMARY.sha256' \
       ! -path './logs/run-all.log' \
+      ! -path './procontract/*/workspace-state/*' \
+      ! -path './procontract/*/candidates/*' \
+      ! -path './procontract/*/.binary/*' \
+      ! -path './vanilla/*/workspace-state/*' \
+      ! -path './vanilla/*/candidates/*' \
+      ! -path './vanilla/*/.binary/*' \
       ! -name '.ARTIFACTS.sha256.*.tmp' \
       -print0 \
       | sort -z \
@@ -292,7 +298,15 @@ for job_arm in ("procontract", "vanilla"):
         states[job_arm][str(state.get("phase") or "unknown")] += 1
         exit_classes[job_arm][str(state.get("exit_class") or "none")] += 1
 
-files = [path for path in output.rglob("*") if path.is_file() and not path.is_symlink()]
+files = []
+for directory, names, filenames in os.walk(output):
+    names[:] = [name for name in names if name not in {"workspace-state", "candidates", ".binary"}]
+    files.extend(
+        path
+        for name in filenames
+        for path in (Path(directory) / name,)
+        if path.is_file() and not path.is_symlink()
+    )
 started = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
 finished = datetime.fromisoformat(finished_at.replace("Z", "+00:00"))
 canonical = {
@@ -347,6 +361,7 @@ summary = {
     "artifacts": {
         "root": str(output),
         "raw_tree_is_sensitive": True,
+        "raw_excluded_from_hashes": ["workspace-state", "candidates", ".binary"],
         "file_count": len(files),
         "bytes": sum(path.stat().st_size for path in files),
         "sha256_manifest": str(output / "ARTIFACTS.sha256"),

@@ -2638,6 +2638,24 @@ def test_credential_value_in_published_result_blocks_evaluation(
         evaluate_campaign(root, instances=instances, command_runner=lambda *_a, **_k: pytest.fail("must not run"))
 
 
+def test_credential_value_in_raw_state_does_not_block_clean_submission_evaluation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts.campaign_evaluate import evaluate_campaign
+
+    root, instances = _campaign(tmp_path / "campaign", arms=("procontract",))
+    secret = "credential-inside-sensitive-state"
+    monkeypatch.setenv("OPENAI_API_KEY", secret)
+    raw = root / "procontract/one/workspace-state/opencode-state/opencode.db"
+    raw.parent.mkdir(parents=True)
+    raw.write_text(secret)
+
+    outcome = evaluate_campaign(root, instances=instances, command_runner=_runner([]))
+
+    assert outcome.status == "completed"
+
+
 def test_submission_symlink_is_refused_before_evaluator_launch(tmp_path: Path) -> None:
     from scripts.campaign_evaluate import CampaignEvaluationError, evaluate_campaign
 

@@ -1035,11 +1035,7 @@ def _prepare_evidence(
             raise CampaignEvaluationError(f"selected inference job is nonterminal: {instance_id}/{arm}")
         if state.exit_class == "credential_leak":
             raise CampaignEvaluationError(f"credential leak blocks evaluation: {instance_id}/{arm}")
-        if secrets and any(
-            _file_contains_secret(path, secrets)
-            for path in job_root.rglob("*")
-            if path.is_file() and not path.is_symlink()
-        ):
+        if secrets and any(_file_contains_secret(path, secrets) for path in _published_credential_paths(job_root)):
             raise CampaignEvaluationError(f"credential leak blocks evaluation: {instance_id}/{arm}")
         for name, digest in (state.artifact_hashes or {}).items():
             artifact = job_root / name
@@ -1099,6 +1095,14 @@ def _prepare_evidence(
             "expected_executable_hash": result.get("executable_hash"),
         }
     return evidence
+
+
+def _published_credential_paths(job_root: Path) -> tuple[Path, ...]:
+    paths = [path for path in job_root.iterdir() if path.is_file() and not path.is_symlink()]
+    subject = job_root / "subject"
+    if subject.is_dir() and not subject.is_symlink():
+        paths.extend(path for path in subject.rglob("*") if path.is_file() and not path.is_symlink())
+    return tuple(paths)
 
 
 def _preflight_foreign_eval_artifacts(root: Path, jobs: Sequence[tuple[str, str]]) -> None:
