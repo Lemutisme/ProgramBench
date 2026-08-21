@@ -711,6 +711,23 @@ def test_prepare_install_uses_supplied_binary_without_worktree_or_build(tmp_path
     assert not (tmp_path / "installs/worktrees").exists()
 
 
+def test_prepare_install_uses_supplied_binary_without_requiring_clean_source(tmp_path: Path, monkeypatch):
+    repo, first, _ = _fake_opencode_repo(tmp_path)
+    _fake_bun(monkeypatch, tmp_path)
+    (repo / "untracked-user-work").write_text("preserve\n")
+    binary = tmp_path / "opencode"
+    binary.write_text("#!/bin/sh\necho supplied-v1\n")
+    binary.chmod(0o755)
+
+    install = runner.prepare_install(
+        runner.ArmConfig("procontract", repo, "HEAD", "procontract", binary), tmp_path / "installs"
+    )
+
+    assert install.revision == first
+    assert install.supplied_binary == binary
+    assert (repo / "untracked-user-work").read_text() == "preserve\n"
+
+
 def test_prepare_install_failure_preserves_prior_install_and_publishes_nothing_partial(tmp_path: Path, monkeypatch):
     repo, _, _ = _fake_opencode_repo(tmp_path)
     fake_bun = _fake_bun(monkeypatch, tmp_path)

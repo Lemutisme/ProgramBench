@@ -223,7 +223,8 @@ def prepare_install(arm: ArmConfig, root: Path, run_command: _RunCommand = run_c
             (None, None, None, ()) if arm.binary else _freeze_bun_toolchain(root, run_command)
         )
 
-        _require_clean_source(repo, run_command)
+        if arm.binary is None:
+            _require_clean_source(repo, run_command)
         revision = _command_text(
             run_command,
             ("git", "-C", str(repo), "rev-parse", "--verify", "--end-of-options", f"{arm.revision}^{{commit}}"),
