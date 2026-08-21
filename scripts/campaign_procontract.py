@@ -729,8 +729,9 @@ def build_issue_payload(workspace: DockerWorkspace, *, now: float) -> dict[str, 
             "ProgramBench native delivery Contract. Complete this exact benchmark task:\n\n"
             f"{ORIGINAL_TASK}\n\n"
             "Work only in /candidate with the delegated filesystem and process authority. Produce a relocatable "
-            "compile.sh and executable. The native replay below establishes delivery readiness only; official "
-            "benchmark evaluation is performed externally by ProgramBench after discharge."
+            "compile.sh and executable. This Contract's complete obligation and validation end in this Session when "
+            "the native replay below establishes delivery readiness. Later ProgramBench scoring is an out-of-scope "
+            "observation; it creates no future obligation and is not a reason to revise these delivery terms."
         ),
     ).to_dict()
 

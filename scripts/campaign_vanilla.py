@@ -1422,6 +1422,10 @@ def _message_ids(messages: Mapping[str, object]) -> tuple[str, ...]:
 
 
 def _monotonic_message_value(previous: object, current: object, key: str | None = None) -> bool:
+    if previous is None:
+        return True
+    if key == "providerMetadata":
+        return True
     if isinstance(previous, Mapping):
         if not isinstance(current, Mapping):
             return False

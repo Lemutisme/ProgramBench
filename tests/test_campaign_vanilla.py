@@ -2438,6 +2438,21 @@ def test_live_poll_regression_interrupts_and_freezes_without_decreasing_breaker_
     assert state.generation == 4
 
 
+def test_live_message_allows_unset_fields_to_be_filled_once_without_allowing_regression() -> None:
+    before = {"id": "msg", "finish": None, "cost": None, "tokens": None}
+    after = {"id": "msg", "finish": "tool-calls", "cost": 0.25, "tokens": {"input": 10}}
+
+    assert vanilla_module._monotonic_message_value(before, after)
+    assert not vanilla_module._monotonic_message_value(after, before)
+
+
+def test_live_message_ignores_opaque_provider_metadata_replacement() -> None:
+    before = {"content": [{"text": "stable", "providerMetadata": {"openai": {"encrypted": "first"}}}]}
+    after = {"content": [{"text": "stable", "providerMetadata": {"openai": {"encrypted": "second"}}}]}
+
+    assert vanilla_module._monotonic_message_value(before, after)
+
+
 def test_hard_cost_cap_interrupts_active_session(tmp_path: Path) -> None:
     paths, record, request, workspace = prepared(tmp_path)
     api = SafetyApi([([user(), assistant(cost=0.25)], "busy")])

@@ -889,6 +889,20 @@ def _challenged(contract: dict[str, object]) -> dict[str, object]:
     }
 
 
+def test_issue_brief_keeps_external_scoring_outside_the_session_obligation(tmp_path: Path) -> None:
+    from scripts.campaign_procontract import build_issue_payload
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    _request, workspace = _workspace(tmp_path, paths)
+
+    brief = build_issue_payload(workspace, now=100.0)["brief"]
+
+    assert "complete obligation and validation end in this Session" in brief
+    assert "creates no future obligation" in brief
+    assert "not a reason to revise" in brief
+
+
 def test_campaign_stop_before_contract_admission_freezes_without_issue(tmp_path: Path) -> None:
     from scripts.campaign_procontract import ProContractCompletion, build_issue_payload, run_procontract
     from scripts.campaign_stop import StopToken
