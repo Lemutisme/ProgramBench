@@ -21,6 +21,7 @@ from programbench.container import ContainerEnvironment
 from programbench.utils.internet_control import block_build_internet_dns, restore_build_internet_dns
 
 DEFAULT_IMAGE_TAG = "task_cleanroom_v6"
+PORTABLE_ARCHIVE_MTIME = 315532800
 _EXCLUDED_NAMES = {".git", ".programbench", "executable", "reference", "reference-bin", "submission.tar.gz"}
 
 
@@ -59,7 +60,8 @@ def package_workspace(workspace: Path, run_dir: Path, instance_id: str) -> Path:
                         info.gid = 0
                         info.uname = ""
                         info.gname = ""
-                        info.mtime = 0
+                        # ZIP-based build tools reject the Unix epoch; 1980 is deterministic and portable.
+                        info.mtime = PORTABLE_ARCHIVE_MTIME
                         if path.is_file() and not path.is_symlink():
                             with path.open("rb") as source:
                                 archive.addfile(info, source)
@@ -118,6 +120,7 @@ def preflight_candidate(
         try:
             block_build_internet_dns(env)
             _step(env, "chmod +x ./compile.sh && ./compile.sh", output)
+            _step(env, "if [ -f ./validate.sh ]; then chmod +x ./validate.sh && ./validate.sh; fi", output)
         finally:
             restore_build_internet_dns(env)
         result = _step(env, "test -x ./executable && sha256sum ./executable", output)

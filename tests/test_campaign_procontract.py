@@ -21,7 +21,7 @@ ORIGINAL_TASK = (
     "Implement the documented program in this cleanroom. Produce source, a relocatable compile.sh, and "
     "./executable. Use the reference only for black-box experiments."
 )
-DEFAULT_SUBJECT_HASH = "d3e72673fb616c6b6676409ca333ac2e360820c0"
+DEFAULT_SUBJECT_HASH = "0e196dc2e28408ae39f4bf52e8d94577a75595bd"
 
 
 class FakeClock:
@@ -875,7 +875,7 @@ def _settlement_messages(*, terminal: bool) -> dict[str, object]:
     return {"data": [assistant]}
 
 
-def _challenged(contract: dict[str, object]) -> dict[str, object]:
+def _challenged(contract: dict[str, object], *, retriable: bool = False) -> dict[str, object]:
     return {
         **{key: value for key, value in contract.items() if key != "handoff"},
         "status": "dormant",
@@ -883,7 +883,8 @@ def _challenged(contract: dict[str, object]) -> dict[str, object]:
             "revision": 1,
             "subjectHash": contract["handoff"]["subjectHash"],
             "evidenceHash": "native-challenge",
-            "disclosure": "executor",
+            "disclosure": "executor" if retriable else "sealed",
+            **({"summary": "Replay failed; repair the candidate"} if retriable else {}),
             "time": 100003,
         },
     }
@@ -901,6 +902,87 @@ def test_issue_brief_keeps_external_scoring_outside_the_session_obligation(tmp_p
     assert "complete obligation and validation end in this Session" in brief
     assert "creates no future obligation" in brief
     assert "not a reason to revise" in brief
+
+
+@pytest.mark.parametrize(
+    ("model", "variant", "expected"),
+    [
+        ("openai/gpt-5.6-luna", "max", {"providerID": "openai", "id": "gpt-5.6-luna", "variant": "max"}),
+        ("openai/gpt-5.6-sol", "xhigh", {"providerID": "openai", "id": "gpt-5.6-sol", "variant": "xhigh"}),
+    ],
+)
+def test_issue_payload_records_supported_model_identity(
+    tmp_path: Path,
+    model: str,
+    variant: str,
+    expected: dict[str, str],
+) -> None:
+    from scripts.campaign_procontract import build_issue_payload
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    _, workspace = _workspace(tmp_path, paths)
+
+    payload = build_issue_payload(workspace, now=100.0, model=model, variant=variant)
+
+    assert payload["model"] == expected
+
+
+@pytest.mark.parametrize(
+    ("model", "variant"),
+    [
+        ("openai/gpt-5.6-luna", "xhigh"),
+        ("openai/gpt-5.6-sol", "max"),
+        ("openai/gpt-5.5", "xhigh"),
+    ],
+)
+def test_unsupported_model_variant_combinations_fail_closed(
+    tmp_path: Path,
+    model: str,
+    variant: str,
+) -> None:
+    from scripts.campaign_procontract import ProContractError, build_issue_payload, run_procontract
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    store = _state(paths)
+    _, workspace = _workspace(tmp_path, paths)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock())
+    api = FakeApi(_contract(payload), _execution(payload))
+
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease._handle_active = True
+        with pytest.raises(ProContractError, match="unsupported"):
+            run_procontract(
+                job,
+                store,
+                workspace,
+                model=model,
+                variant=variant,
+                limits=_limits(),
+                breaker=CircuitBreaker(),
+                api=api,
+                clock=clock,
+                sleeper=clock.sleep,
+            )
+
+    assert api.issues == []
+    assert not paths.root.joinpath("procontract-issue.json").exists()
+
+
+def test_persisted_issue_rejects_conflicting_model_identity(tmp_path: Path) -> None:
+    from scripts.campaign_procontract import ProContractConflictError, _load_or_create_issue
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    _, workspace = _workspace(tmp_path, paths)
+    issue_path = paths.root / "procontract-issue.json"
+
+    _load_or_create_issue(issue_path, workspace, "openai/gpt-5.6-sol", "xhigh", FakeClock())
+
+    with pytest.raises(ProContractConflictError, match="conflicts"):
+        _load_or_create_issue(issue_path, workspace, "openai/gpt-5.6-luna", "max", FakeClock())
 
 
 def test_campaign_stop_before_contract_admission_freezes_without_issue(tmp_path: Path) -> None:
@@ -1384,7 +1466,19 @@ def test_campaign_stop_does_not_replace_observed_native_contract_terminal_status
     assert workspace.stops == 1
 
 
-def test_happy_lifecycle_uses_native_scheduler_and_exact_delivery(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("model", "variant", "expected_model"),
+    [
+        ("openai/gpt-5.6-luna", "max", {"providerID": "openai", "id": "gpt-5.6-luna", "variant": "max"}),
+        ("openai/gpt-5.6-sol", "xhigh", {"providerID": "openai", "id": "gpt-5.6-sol", "variant": "xhigh"}),
+    ],
+)
+def test_happy_lifecycle_uses_native_scheduler_and_exact_delivery(
+    tmp_path: Path,
+    model: str,
+    variant: str,
+    expected_model: dict[str, str],
+) -> None:
     from scripts.campaign_procontract import build_issue_payload, run_procontract
 
     paths = JobPaths(tmp_path / "job")
@@ -1392,7 +1486,7 @@ def test_happy_lifecycle_uses_native_scheduler_and_exact_delivery(tmp_path: Path
     store = _state(paths)
     request, workspace = _workspace(tmp_path, paths)
     clock = FakeClock()
-    payload = build_issue_payload(workspace, now=clock())
+    payload = build_issue_payload(workspace, now=clock(), model=model, variant=variant)
     contract = _contract(payload)
     api = FakeApi(contract, _execution(payload))
     package_calls: list[tuple[Path, Path, str]] = []
@@ -1415,8 +1509,8 @@ def test_happy_lifecycle_uses_native_scheduler_and_exact_delivery(tmp_path: Path
             job,
             store,
             workspace,
-            model="openai/gpt-5.6-luna",
-            variant="max",
+            model=model,
+            variant=variant,
             limits=_limits(),
             breaker=CircuitBreaker(),
             api=api,
@@ -1435,8 +1529,8 @@ def test_happy_lifecycle_uses_native_scheduler_and_exact_delivery(tmp_path: Path
     assert issue["trigger"] == {"type": "immediate"}
     assert issue["authority"] == ["filesystem.read", "filesystem.write", "process.execute"]
     assert issue["location"] == {"directory": "/candidate"}
-    assert issue["model"] == {"providerID": "openai", "id": "gpt-5.6-luna", "variant": "max"}
-    assert issue["resolution"] == {"maxAttempts": 1, "retryDelay": 0}
+    assert issue["model"] == expected_model
+    assert issue["resolution"] == {"maxAttempts": 3, "retryDelay": 0}
     assert ORIGINAL_TASK in issue["brief"]
     assert workspace.stops == 2
     assert workspace.restarts == 1
@@ -1464,7 +1558,7 @@ def test_happy_lifecycle_uses_native_scheduler_and_exact_delivery(tmp_path: Path
     assert report["execution"] == {
         "sessionID": result.session_id,
         "promptID": result.prompt_id,
-        "model": {"providerID": "openai", "id": "gpt-5.6-luna", "variant": "max"},
+        "model": expected_model,
         "location": {"directory": "/candidate"},
     }
     assert len(report["export"]["treeHash"]) == 64
@@ -1474,6 +1568,65 @@ def test_happy_lifecycle_uses_native_scheduler_and_exact_delivery(tmp_path: Path
         report["preflight"]["reportHash"]
         == __import__("hashlib").sha256((paths.root / "procontract-preflight.json").read_bytes()).hexdigest()
     )
+
+
+def test_executor_visible_challenge_rotates_session_and_completes_next_attempt(tmp_path: Path) -> None:
+    from scripts.campaign_procontract import build_issue_payload, run_procontract
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    store = _state(paths)
+    _, workspace = _workspace(tmp_path, paths)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock())
+    challenged = _challenged(_contract(payload), retriable=True)
+
+    class RetryingApi(FakeApi):
+        def __init__(self) -> None:
+            super().__init__(challenged, _execution(payload))
+            self.polls = 0
+
+        def get_contract(self, contract_id: str) -> dict[str, object] | None:
+            if self.contract["status"] == "discharged":
+                return self.contract
+            self.polls += 1
+            if self.polls == 1:
+                return self.contract
+            if self.polls == 2:
+                self.contract = {**self.contract, "status": "active"}
+                self.execution = {
+                    **self.execution,
+                    "attempts": 2,
+                    "sessionID": "ses_contract_retry",
+                    "promptID": "msg_contract_retry",
+                    "turnsUsed": 2,
+                    "actionsUsed": 3,
+                }
+                return self.contract
+            self.contract = _contract(payload)
+            return self.contract
+
+    api = RetryingApi()
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease._handle_active = True
+        result = run_procontract(
+            job,
+            store,
+            workspace,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=_limits(),
+            breaker=CircuitBreaker(),
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+            package=lambda subject, run_dir, iid: _package(run_dir, iid),
+            preflight=lambda archive, iid: SimpleNamespace(executable_hash="e" * 64, output="ok"),
+        )
+
+    assert result.completion.value == "discharged"
+    assert result.session_id == "ses_contract_retry"
+    assert api.polls >= 3
 
 
 def test_requires_active_job_and_workspace_leases_before_issue(tmp_path: Path) -> None:
@@ -2955,6 +3108,69 @@ def test_resume_after_usage_state_commit_reuses_durable_progress(tmp_path: Path)
     assert result.completion.value == "discharged"
 
 
+def test_progress_compacts_ignored_provider_metadata_before_double_buffering(tmp_path: Path) -> None:
+    from scripts.campaign_procontract import _write_contract_progress
+    from scripts.campaign_vanilla import MAX_ARTIFACT_BYTES, _summarize_usage
+
+    messages = {
+        "data": [
+            {
+                "id": "msg_assistant",
+                "type": "assistant",
+                "content": [
+                    {
+                        "type": "reasoning",
+                        "text": "working",
+                        "providerMetadata": {"openai": {"reasoningEncryptedContent": "x" * MAX_ARTIFACT_BYTES}},
+                    },
+                    {
+                        "type": "tool",
+                        "id": "tool_large",
+                        "state": {"status": "completed", "output": "y" * MAX_ARTIFACT_BYTES},
+                    },
+                ],
+                "tokens": {"input": 10, "output": 3, "reasoning": 2, "cache": {"read": 4, "write": 0}},
+                "cost": 1,
+            }
+        ]
+    }
+    usage = _summarize_usage(messages)
+    path = tmp_path / "procontract-progress.json"
+
+    _write_contract_progress(path, 1, {"id": "pct_contract"}, {"sessionID": "ses_contract"}, messages, 1, 0, usage)
+    _write_contract_progress(path, 2, {"id": "pct_contract"}, {"sessionID": "ses_contract"}, messages, 1, 0, usage)
+
+    raw = json.loads(path.read_text())
+    assert path.stat().st_size < MAX_ARTIFACT_BYTES
+    assert "providerMetadata" not in path.read_text()
+    assert raw["current"]["messages"]["data"][0]["content"] == [
+        {"type": "reasoning", "text": ""},
+        {"type": "tool", "id": "tool_large", "state": {"status": "completed"}},
+    ]
+    assert raw["previous"]["messages"] == raw["current"]["messages"]
+
+
+def test_attempt_message_merge_replaces_live_suffix_and_appends_rotated_session() -> None:
+    from scripts.campaign_procontract import _merge_attempt_messages
+
+    first = {"data": [{"id": "msg_one", "value": "done"}, {"id": "msg_two", "value": "partial"}]}
+    continued = {"data": [{"id": "msg_two", "value": "partial-complete"}, {"id": "msg_three"}]}
+    rotated = {"data": [{"id": "msg_four"}, {"id": "msg_five"}]}
+
+    merged = _merge_attempt_messages(first, continued)
+
+    assert merged == {
+        "data": [
+            {"id": "msg_one", "value": "done"},
+            {"id": "msg_two", "value": "partial-complete"},
+            {"id": "msg_three"},
+        ]
+    }
+    assert _merge_attempt_messages(merged, rotated) == {
+        "data": [*merged["data"], {"id": "msg_four"}, {"id": "msg_five"}]
+    }
+
+
 def test_state_cas_conflict_stops_native_writer_before_propagating(tmp_path: Path) -> None:
     from scripts.campaign_procontract import build_issue_payload, run_procontract
 
@@ -4144,7 +4360,7 @@ def test_native_terminal_status_wins_over_runner_limit_equality(tmp_path: Path, 
             "revision": 1,
             "subjectHash": "snapshot",
             "evidenceHash": "native-replay",
-            "disclosure": "executor",
+            "disclosure": "sealed",
             "time": 100002,
         }
     execution = _execution(payload)
@@ -4894,11 +5110,23 @@ def _write_git_export(root: Path, *, ignored: bool = False) -> str:
     root.joinpath("compile.sh").chmod(0o755)
     root.joinpath("executable").write_text("binary")
     root.joinpath("executable").chmod(0o755)
+    root.joinpath("validate.sh").write_text("#!/bin/sh\nexit 0\n")
+    root.joinpath("validate.sh").chmod(0o755)
     if ignored:
         root.joinpath(".gitignore").write_text("ignored.bin\n")
     subprocess.run(["git", "init", "-q", str(root)], check=True)
     subprocess.run(
-        ["git", "-C", str(root), "add", "compile.sh", "executable", *([".gitignore"] if ignored else [])], check=True
+        [
+            "git",
+            "-C",
+            str(root),
+            "add",
+            "compile.sh",
+            "executable",
+            "validate.sh",
+            *([".gitignore"] if ignored else []),
+        ],
+        check=True,
     )
     environment = {
         **__import__("os").environ,

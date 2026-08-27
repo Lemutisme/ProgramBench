@@ -140,8 +140,8 @@ class Limits:
     wall_time_seconds: int
     provider_turns: int
     procontract_actions: int
-    total_cost_soft: float
-    total_cost_hard: float
+    total_cost_soft: float | None
+    total_cost_hard: float | None
 
     def __post_init__(self) -> None:
         integer_values = (self.wall_time_seconds, self.provider_turns, self.procontract_actions)
@@ -150,15 +150,28 @@ class Limits:
         if any(value <= 0 for value in integer_values):
             raise ConfigError("all limits must be positive")
         costs = (self.total_cost_soft, self.total_cost_hard)
-        if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in costs):
-            raise ConfigError("cost limits must be numeric")
-        object.__setattr__(self, "total_cost_soft", float(self.total_cost_soft))
-        object.__setattr__(self, "total_cost_hard", float(self.total_cost_hard))
-        if not all(math.isfinite(value) for value in costs):
+        if any(value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))) for value in costs):
+            raise ConfigError("cost limits must be numeric or null")
+        object.__setattr__(
+            self,
+            "total_cost_soft",
+            None if self.total_cost_soft is None else float(self.total_cost_soft),
+        )
+        object.__setattr__(
+            self,
+            "total_cost_hard",
+            None if self.total_cost_hard is None else float(self.total_cost_hard),
+        )
+        enabled = tuple(value for value in costs if value is not None)
+        if not all(math.isfinite(value) for value in enabled):
             raise ConfigError("cost limits must be finite")
-        if any(value <= 0 for value in costs):
+        if any(value <= 0 for value in enabled):
             raise ConfigError("cost limits must be positive")
-        if self.total_cost_soft > self.total_cost_hard:
+        if (
+            self.total_cost_soft is not None
+            and self.total_cost_hard is not None
+            and self.total_cost_soft > self.total_cost_hard
+        ):
             raise ConfigError("soft cost limit must not exceed hard cost limit")
 
 
@@ -327,12 +340,15 @@ def _load_limits(raw: object) -> Limits:
     try:
         integer_values = {name: raw[name] for name in ("wall_time_seconds", "provider_turns", "procontract_actions")}
         costs = {name: raw[name] for name in ("total_cost_soft", "total_cost_hard")}
-        if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in costs.values()):
-            raise ConfigError("cost limits must be numeric")
+        if any(
+            value is not None and (isinstance(value, bool) or not isinstance(value, (int, float)))
+            for value in costs.values()
+        ):
+            raise ConfigError("cost limits must be numeric or null")
         return Limits(
             **integer_values,
-            total_cost_soft=float(costs["total_cost_soft"]),
-            total_cost_hard=float(costs["total_cost_hard"]),
+            total_cost_soft=None if costs["total_cost_soft"] is None else float(costs["total_cost_soft"]),
+            total_cost_hard=None if costs["total_cost_hard"] is None else float(costs["total_cost_hard"]),
         )
     except KeyError as error:
         raise ConfigError(f"missing limit: {error.args[0]}") from error

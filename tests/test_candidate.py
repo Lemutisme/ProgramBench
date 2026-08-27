@@ -32,7 +32,12 @@ def test_package_is_deterministic_and_excludes_runtime_artifacts(tmp_path: Path)
     assert first.read_bytes()[4:8] == b"\x00\x00\x00\x00"
     with tarfile.open(first, "r:gz") as archive:
         assert archive.getnames() == ["compile.sh", "source"]
-        assert all(member.uid == 0 and member.gid == 0 and member.mtime == 0 for member in archive.getmembers())
+        assert all(
+            member.uid == 0
+            and member.gid == 0
+            and member.mtime == candidate_module.PORTABLE_ARCHIVE_MTIME
+            for member in archive.getmembers()
+        )
 
 
 def test_package_requires_compile_script(tmp_path: Path):

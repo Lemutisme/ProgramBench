@@ -11,6 +11,7 @@ WORKERS="${RUN_ALL_WORKERS:-8}"
 SEED="${RUN_ALL_SEED:-42}"
 EXPECTED_INSTANCES="${RUN_ALL_EXPECTED_INSTANCES:-200}"
 ARM="${RUN_ALL_ARM:-paired}"
+FILTER="${RUN_ALL_FILTER:-}"
 ALLOW_QUARANTINED_KEY=0
 QUARANTINE="${RUN_ALL_COMPROMISED_KEY_QUARANTINE:-/tmp/procontract-sensitive-quarantine-20260819}"
 OUTPUT_CREATED=0
@@ -35,6 +36,7 @@ Options:
   --seed N                   Frozen selection/job-order seed (default: 42)
   --expected-instances N     Fail before inference unless exactly N are frozen (default: 200)
   --arm MODE                 paired, procontract, or vanilla (default: paired)
+  --filter REGEX             Run only instance IDs matching this regex
   --allow-quarantined-key    Explicitly authorize the locally known exposed key
   -h, --help                 Show this help
 
@@ -99,6 +101,11 @@ while (($#)); do
       ARM="$2"
       shift 2
       ;;
+    --filter)
+      (($# >= 2)) || die "--filter requires a regex"
+      FILTER="$2"
+      shift 2
+      ;;
     --allow-quarantined-key)
       ALLOW_QUARANTINED_KEY=1
       shift
@@ -134,6 +141,20 @@ done
 CONFIG="$(absolute_path "$CONFIG")"
 OUTPUT="$(absolute_path "$OUTPUT")"
 [[ -f "$CONFIG" ]] || die "campaign config does not exist: $CONFIG"
+if [[ -z "$FILTER" && -f "$OUTPUT/campaign.json" ]]; then
+  FILTER="$(python3 - "$OUTPUT/campaign.json" <<'PY'
+from pathlib import Path
+import json
+import sys
+
+manifest = json.loads(Path(sys.argv[1]).read_text())
+value = (manifest.get("selection") or {}).get("filter")
+if value is not None and not isinstance(value, str):
+    raise SystemExit("run_all: frozen campaign filter is invalid")
+print(value or "")
+PY
+)"
+fi
 
 # The old key was printed by a process-list diagnostic after it entered grep's
 # argv. Compare through inherited environment bytes only; never put the secret
@@ -186,6 +207,9 @@ RUNNER=(
   --seed "$SEED"
   --output "$OUTPUT"
 )
+if [[ -n "$FILTER" ]]; then
+  RUNNER+=(--filter "$FILTER")
+fi
 
 run_phase() {
   local name="$1"
@@ -409,6 +433,7 @@ trap on_exit EXIT
 
 printf 'run_all: output=%s workers=%s seed=%s expected_instances=%s arm=%s\n' \
   "$OUTPUT" "$WORKERS" "$SEED" "$EXPECTED_INSTANCES" "$ARM"
+printf 'run_all: filter=%s\n' "${FILTER:-<none>}"
 printf 'run_all: runner_revision=%s config=%s\n' "$RUNNER_REVISION" "$CONFIG"
 
 if [[ ! -f "$OUTPUT/campaign.json" ]]; then

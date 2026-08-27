@@ -1686,6 +1686,72 @@ def _write_partial_quarantine_phase(
     return updated
 
 
+def _stage_lost_evaluator_outputs(
+    root: Path,
+    arm: str,
+    arm_root: Path,
+    state_path: Path,
+    submitted: Sequence[str],
+    state: Mapping[str, object],
+) -> Mapping[str, object]:
+    if (
+        state.get("status") != "interrupted"
+        or state.get("error") != "evaluator_process_lost"
+        or state.get("completion_disposition") != "running"
+    ):
+        return state
+    hashes = state.get("artifact_hashes")
+    sizes = state.get("artifact_sizes")
+    attempt = state.get("attempt")
+    invocation_hash = state.get("invocation_hash")
+    if (
+        not isinstance(hashes, Mapping)
+        or not isinstance(sizes, Mapping)
+        or type(attempt) is not int
+        or not isinstance(invocation_hash, str)
+    ):
+        raise CampaignEvaluationError(f"lost evaluator state is malformed for {arm}")
+    staged_hashes = dict(hashes)
+    staged_sizes = dict(sizes)
+    changed = False
+    for instance_id in submitted:
+        path = arm_root / instance_id / f"{instance_id}.eval.json"
+        if not path.exists() or path.name in staged_hashes:
+            continue
+        identity = _eval_artifact_identity(path)
+        if identity.sha256 is None:
+            raise CampaignEvaluationError(f"lost evaluator artifact hash is unavailable for {arm}: {instance_id}")
+        sidecar = path.with_name(f"{instance_id}.eval.partial.provenance.json")
+        payload = {
+            "version": 1,
+            "state": "partial",
+            "invocation_hash": invocation_hash,
+            "attempt": attempt,
+            "eval_sha256": identity.sha256,
+            "error": "evaluator_process_lost",
+        }
+        if sidecar.exists():
+            if _read_json(sidecar, f"lost evaluator provenance for {instance_id}") != payload:
+                raise CampaignEvaluationError(f"lost evaluator provenance conflicts for {arm}: {instance_id}")
+        else:
+            _atomic_json(sidecar, payload)
+        staged_hashes[path.name] = identity.sha256
+        staged_sizes[path.name] = path.stat().st_size
+        staged_hashes[sidecar.name] = _sha256(sidecar)
+        staged_sizes[sidecar.name] = sidecar.stat().st_size
+        changed = True
+    if not changed:
+        return state
+    staged = {
+        **state,
+        "artifact_hashes": staged_hashes,
+        "artifact_sizes": staged_sizes,
+        "completion_disposition": "exception",
+    }
+    _atomic_json(state_path, staged)
+    return staged
+
+
 def _partial_quarantine_phase_moves(phase: object, total: int) -> int:
     if phase == "prepared":
         return 0
@@ -2476,6 +2542,8 @@ def _evaluate_arm(
             or not math.isfinite(float(existing["started_at"]))
         ):
             raise CampaignEvaluationError(f"evaluator invocation conflicts with durable state for {arm}")
+        if existing.get("status") == "interrupted" and retry_evaluator:
+            existing = _stage_lost_evaluator_outputs(root, arm, arm_root, state_path, submitted, existing)
         if existing.get("status") in {"planned", "done", "failed", "interrupted"}:
             _verify_recorded_evaluator_artifacts(existing, state_root, arm_root, submitted, arm)
         if existing.get("status") == "done":

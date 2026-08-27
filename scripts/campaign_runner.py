@@ -1511,6 +1511,24 @@ def _exception_metadata(store: StateStore, error: BaseException) -> tuple[str, s
         if state is None or state.phase in {"planned", "preparing"}
         else "execution_failed"
     )
+    if os.environ.get("PROGRAMBENCH_EXCEPTION_FRAMES") == "1":
+        print(
+            json.dumps(
+                {
+                    "event": "campaign_exception",
+                    "type": type(error).__name__,
+                    "phase": state.phase if state is not None else None,
+                    "traceback_sha256": digest,
+                    "frames": [
+                        {"file": Path(frame.filename).name, "line": frame.lineno, "function": frame.name}
+                        for frame in traceback.extract_tb(error.__traceback__)[-12:]
+                    ],
+                },
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+            flush=True,
+        )
     return prefix, digest
 
 

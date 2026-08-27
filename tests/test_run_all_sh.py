@@ -89,6 +89,7 @@ def test_run_all_help_has_no_runtime_side_effect(tmp_path: Path) -> None:
 
     assert result.returncode == 0
     assert "--expected-instances" in result.stdout
+    assert "--filter" in result.stdout
     assert not (tmp_path / "output").exists()
 
 
@@ -202,6 +203,25 @@ def test_run_all_chains_plan_inference_evaluation_and_writes_summary(tmp_path: P
     assert (output / "logs/plan.log").is_file()
     assert (output / "logs/inference.log").is_file()
     assert (output / "logs/evaluation.log").is_file()
+
+
+def test_run_all_forwards_instance_filter_to_every_runner_phase(tmp_path: Path) -> None:
+    output, commands, env = fake_runner_env(tmp_path)
+
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "--output", str(output), "--filter", "^(owner__task)"],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    runner = [line for line in commands.read_text().splitlines() if "run_opencode.py" in line]
+    assert len(runner) == 3
+    assert all("--filter ^(owner__task)" in line for line in runner)
 
 
 def test_run_all_preserves_failure_summary_and_returns_nonzero(tmp_path: Path) -> None:

@@ -63,27 +63,53 @@ MAX_WALL_TIME_SECONDS = 21600
 MAX_PROVIDER_TURNS = 1000
 MAX_ACTIONS = 4000
 MAX_MUTATION_ATTEMPTS = 3
+MAX_CONTRACT_ATTEMPTS = 3
 MAX_CREDENTIAL_SCAN_BYTES = 512 * 1024 * 1024
 MODEL = "openai/gpt-5.6-luna"
 VARIANT = "max"
+SUPPORTED_MODEL_VARIANTS = frozenset(
+    {
+        (MODEL, VARIANT),
+        ("openai/gpt-5.6-sol", "xhigh"),
+    }
+)
 LOCATION = "/candidate"
 ACCEPTANCE_POLICY = (
-    "ProgramBench delivery policy v1: hand off one exact frozen candidate snapshot containing compile.sh and "
-    "executable after the native replay './compile.sh' exits 0 within 600 seconds. The ProgramBench harness "
+    "ProgramBench delivery policy v2: hand off one exact frozen candidate snapshot containing compile.sh, "
+    "executable, and a self-contained validate.sh regression suite after the native replay runs compile.sh with "
+    "common package-manager network access disabled and then validate.sh, with both exiting 0 within 600 seconds. "
+    "validate.sh must encode behavioral evidence learned from black-box reference experiments and must not access "
+    "the reference, network, or ambient package caches during replay. The ProgramBench harness "
     "performs packaging and preflight only; official benchmark evaluation remains external."
 )
 PRINCIPAL_CLAIM = (
     "The exact native Contract handoff is the candidate delivered for external ProgramBench evaluation, and its "
-    "declared compile replay passed for that same frozen subject."
+    "declared hermetic compile and self-contained behavioral regression replay passed for that same frozen subject."
 )
 REPLAY_POLICY = {
-    "checks": [{"argv": ["./compile.sh"], "cwd": ".", "timeout": 600_000, "exit": 0}],
+    "checks": [
+        {
+            "argv": [
+                "/usr/bin/env",
+                "CARGO_NET_OFFLINE=true",
+                "GOPROXY=off",
+                "npm_config_offline=true",
+                "PIP_NO_INDEX=1",
+                "./compile.sh",
+            ],
+            "cwd": ".",
+            "timeout": 600_000,
+            "exit": 0,
+        },
+        {"argv": ["./validate.sh"], "cwd": ".", "timeout": 600_000, "exit": 0},
+    ],
     "protected": [],
-    "artifacts": ["compile.sh", "executable"],
+    "artifacts": ["compile.sh", "executable", "validate.sh"],
 }
 PREFLIGHT_COMMANDS = [
     "extract submission.tar.gz",
     "chmod +x ./compile.sh && ./compile.sh",
+    "chmod +x ./validate.sh && ./validate.sh",
     "test -x ./executable && sha256sum ./executable",
 ]
 CONTROL_ARTIFACT_NAMES = (
@@ -420,6 +446,8 @@ class ProContractIssueRequest:
     scope: str
     deadline: int
     brief: str
+    model: str
+    variant: str
 
     def __post_init__(self) -> None:
         if (
@@ -428,11 +456,13 @@ class ProContractIssueRequest:
             or type(self.deadline) is not int
             or self.deadline <= 0
             or ORIGINAL_TASK not in self.brief
+            or (self.model, self.variant) not in SUPPORTED_MODEL_VARIANTS
         ):
             raise ProContractError("native Contract issue request is invalid")
         _canonical_bytes(self.to_dict())
 
     def to_dict(self) -> dict[str, object]:
+        provider_id, model_id = self.model.split("/", 1)
         return {
             "id": self.contract_id,
             "scope": self.scope,
@@ -441,12 +471,12 @@ class ProContractIssueRequest:
             "brief": self.brief,
             "requires": [],
             "location": {"directory": LOCATION},
-            "model": {"providerID": "openai", "id": "gpt-5.6-luna", "variant": VARIANT},
+            "model": {"providerID": provider_id, "id": model_id, "variant": self.variant},
             "trigger": {"type": "immediate"},
             "authority": ["filesystem.read", "filesystem.write", "process.execute"],
             "budget": {"turns": MAX_PROVIDER_TURNS, "actions": MAX_ACTIONS, "deadline": self.deadline},
             "evidence": {"type": "principal", "claim": PRINCIPAL_CLAIM, "replay": REPLAY_POLICY},
-            "resolution": {"maxAttempts": 1, "retryDelay": 0},
+            "resolution": {"maxAttempts": MAX_CONTRACT_ATTEMPTS, "retryDelay": 0},
         }
 
     @property
@@ -713,7 +743,13 @@ class HttpProContractApi:
         return raw
 
 
-def build_issue_payload(workspace: DockerWorkspace, *, now: float) -> dict[str, object]:
+def build_issue_payload(
+    workspace: DockerWorkspace,
+    *,
+    now: float,
+    model: str = MODEL,
+    variant: str = VARIANT,
+) -> dict[str, object]:
     """Build the exact issue request. Callers must persist it before issuing."""
     if isinstance(now, bool) or not isinstance(now, (int, float)) or not math.isfinite(now) or now < 0:
         raise ProContractError("Contract issue time is invalid")
@@ -725,13 +761,22 @@ def build_issue_payload(workspace: DockerWorkspace, *, now: float) -> dict[str, 
         contract_id=contract_id,
         scope=scope,
         deadline=int(now * 1000) + MAX_WALL_TIME_SECONDS * 1000,
+        model=model,
+        variant=variant,
         brief=(
             "ProgramBench native delivery Contract. Complete this exact benchmark task:\n\n"
             f"{ORIGINAL_TASK}\n\n"
             "Work only in /candidate with the delegated filesystem and process authority. Produce a relocatable "
-            "compile.sh and executable. This Contract's complete obligation and validation end in this Session when "
+            "compile.sh and executable. Also produce executable validate.sh containing self-contained regression "
+            "tests derived from reference experiments; it must run without the reference, network, or ambient "
+            "package caches and must cover every applicable documented command, flag, error, boundary class, and "
+            "state transition. This Contract's complete obligation and validation end in this Session when "
             "the native replay below establishes delivery readiness. Later ProgramBench scoring is an out-of-scope "
             "observation; it creates no future obligation and is not a reason to revise these delivery terms."
+            " Do not report ready merely because the program compiles. Before handoff, use the reference for broad "
+            "black-box differential experiments covering documented commands, flags, errors, boundary cases, and "
+            "stateful behavior; preserve discoveries as regression tests and continue until no material behavioral "
+            "gap remains or the shared Contract budget is exhausted."
         ),
     ).to_dict()
 
@@ -767,10 +812,12 @@ def run_procontract(
     stop_token: StopToken | None = None,
 ) -> ProContractResult:
     """Fail closed around the durable native Contract orchestration."""
+    _validate_model_variant(model, variant)
     stop = stop_token or StopToken()
     state = state_store.read()
     guarded_api = StopAwareApi(api, stop)
     if stop.is_set() and state.phase not in {"done", "failed", "interrupted"}:
+        _load_or_create_issue(job.job.root / "procontract-issue.json", workspace, model, variant, clock)
         if job.job.root.joinpath("procontract-issue-response.json").is_file() or _issue_may_be_active(
             job.job.root / "procontract-issue-active.json"
         ):
@@ -785,7 +832,7 @@ def run_procontract(
                 sleeper,
                 poll_interval,
             )
-        return _finish_unadmitted_campaign_stop(job, state_store, state, workspace, clock)
+        return _finish_unadmitted_campaign_stop(job, state_store, state, workspace, model, variant, clock)
 
     def guarded_package(subject: Path, run_dir: Path, instance_id: str) -> Path:
         stop.checkpoint()
@@ -843,9 +890,11 @@ def _finish_unadmitted_campaign_stop(
     state_store: StateStore,
     state: JobState,
     workspace: DockerWorkspace,
+    model: str,
+    variant: str,
     clock: Callable[[], float],
 ) -> ProContractResult:
-    issue = _load_or_create_issue(job.job.root / "procontract-issue.json", workspace, clock)
+    issue = _load_or_create_issue(job.job.root / "procontract-issue.json", workspace, model, variant, clock)
     payload = issue["payload"]
     if not isinstance(payload, Mapping):
         raise ProContractError("persisted Contract issue payload is invalid")
@@ -1084,6 +1133,8 @@ def _run_procontract(
     _validate_inputs(job, state_store, workspace, model, variant, limits, poll_interval)
     state = state_store.read()
     result_path = job.job.root / "procontract-result.json"
+    issue_path = job.job.root / "procontract-issue.json"
+    issue = _load_or_create_issue(issue_path, workspace, model, variant, clock)
     if state.phase in {"done", "failed", "interrupted"} and result_path.is_file():
         result = ProContractResult.from_dict(_read_json(result_path))
         if workspace.lease._handle_active:
@@ -1092,8 +1143,6 @@ def _run_procontract(
         _verify_terminal_artifacts(job.job.root, state, result, workspace)
         return result
 
-    issue_path = job.job.root / "procontract-issue.json"
-    issue = _load_or_create_issue(issue_path, workspace, clock)
     payload = issue["payload"]
     if not isinstance(payload, dict):
         raise ProContractError("persisted Contract issue payload is invalid")
@@ -1325,11 +1374,19 @@ def _run_procontract(
                         poll_interval,
                     )
                 native = _native_outcome_completion(contract)
+                challenge = contract.get("challenge")
+                retriable_challenge = (
+                    native is ProContractCompletion.CHALLENGED
+                    and contract["status"] in {"dormant", "active"}
+                    and isinstance(challenge, Mapping)
+                    and challenge.get("disclosure") == "executor"
+                    and current_execution is not None
+                )
                 if native in {
                     ProContractCompletion.CHALLENGED,
                     ProContractCompletion.ESCALATED,
                     ProContractCompletion.RELEASED,
-                }:
+                } and not retriable_challenge:
                     return _finish_native_state(
                         job,
                         state_store,
@@ -1385,7 +1442,14 @@ def _run_procontract(
                         clock,
                     )
                 if _binding_identity(current_execution) != _binding_identity(bound_execution):
-                    raise ProContractConflictError("native Contract execution binding changed after issue")
+                    if (
+                        _binding_contract_identity(current_execution) != _binding_contract_identity(bound_execution)
+                        or int(current_execution["attempts"]) <= int(bound_execution["attempts"])
+                        or int(current_execution["turnsUsed"]) < int(bound_execution["turnsUsed"])
+                        or int(current_execution["actionsUsed"]) < int(bound_execution["actionsUsed"])
+                    ):
+                        raise ProContractConflictError("native Contract execution binding changed after issue")
+                    bound_execution = current_execution
                 execution = current_execution
                 if execution["dispatched"] is False:
                     safety = _verification_safety_completion(breaker, clock, deadline)
@@ -1423,7 +1487,7 @@ def _run_procontract(
                 sanitized = _sanitize_control(projected, _all_credential_names(workspace.manifest.credential_env))
                 if not isinstance(sanitized, Mapping):
                     raise ProContractError("sanitized Session messages are invalid")
-                messages = sanitized
+                messages = _merge_attempt_messages(previous_messages, sanitized)
                 usage = _summarize_usage(messages)
                 actions = max(_actions(messages), int(execution["actionsUsed"]))
                 turns = max(usage.provider_turns, int(execution["turnsUsed"]))
@@ -1514,7 +1578,7 @@ def _run_procontract(
                         poll_interval,
                         quiet,
                     )
-                if contract.get("challenge") is not None:
+                if contract.get("challenge") is not None and not retriable_challenge:
                     return _stop_and_finish(
                         job,
                         state_store,
@@ -1572,6 +1636,7 @@ def _run_procontract(
                             )
                             if not isinstance(latest, Mapping):
                                 raise ProContractError("sanitized settled Session messages are invalid")
+                            latest = _merge_attempt_messages(messages, latest)
                             latest_usage = _summarize_usage(latest)
                             latest_actions = max(_actions(latest), int(execution["actionsUsed"]))
                             _require_monotonic(
@@ -2035,9 +2100,9 @@ def _deliver(
         job.job.root,
         _all_credential_names(workspace.manifest.credential_env),
     )
-    if not subject.joinpath("compile.sh").is_file() or not subject.joinpath("executable").is_file():
+    if any(not subject.joinpath(name).is_file() for name in ("compile.sh", "executable", "validate.sh")):
         raise ProContractDeliveryError("exported Contract subject lacks required delivery files")
-    if not os.access(subject / "compile.sh", os.X_OK) or not os.access(subject / "executable", os.X_OK):
+    if any(not os.access(subject / name, os.X_OK) for name in ("compile.sh", "executable", "validate.sh")):
         raise ProContractDeliveryError("exported Contract delivery files are not executable")
     if workspace.lease._handle_active:
         workspace.stop_for_freeze()
@@ -2096,7 +2161,6 @@ def _deliver(
         }
         _write_json(archive_path, archive_record)
     archive = _require_package_record(archive_record, job.job.root)
-    archive = _publish_submission(archive, job.job.submission)
     if state.phase == "frozen":
         state = state_store.transition(
             "packaged",
@@ -2115,11 +2179,12 @@ def _deliver(
             "archiveHash": _sha256(archive),
             "executableHash": checked.executable_hash,
             "commands": PREFLIGHT_COMMANDS,
-            "exits": [0, 0, 0],
+            "exits": [0, 0, 0, 0],
             "outputHash": hashlib.sha256(checked.output.encode()).hexdigest(),
         }
         _write_json(preflight_path, preflight_record)
     _validate_preflight(preflight_record, archive)
+    archive = _publish_submission(archive, job.job.submission)
     if state.phase == "packaged":
         state = state_store.transition(
             "preflighted",
@@ -2523,8 +2588,7 @@ def _validate_inputs(
         raise ProContractError("ProContract requires the exact mutable running workspace")
     if workspace.manifest.job_root != job.job.root or workspace.manifest.arm != "procontract":
         raise ProContractError("ProContract workspace does not match the active job")
-    if model != MODEL or variant != VARIANT:
-        raise ProContractError("ProContract model must be openai/gpt-5.6-luna variant max")
+    _validate_model_variant(model, variant)
     if (
         getattr(limits, "wall_time_seconds", None) != MAX_WALL_TIME_SECONDS
         or getattr(limits, "provider_turns", None) != MAX_PROVIDER_TURNS
@@ -2616,7 +2680,7 @@ def _write_contract_progress(
         raw = _read_json(path)
         if not isinstance(raw, Mapping) or set(raw) != {"version", "current", "previous"} or raw["version"] != 1:
             raise ProContractError("persisted Contract progress is invalid")
-        previous = raw["current"]
+        previous = _compact_progress_messages(raw["current"])
     _write_json(
         path,
         {
@@ -2625,7 +2689,7 @@ def _write_contract_progress(
                 "generation": generation,
                 "contractID": payload["id"],
                 "sessionID": execution["sessionID"],
-                "messages": messages,
+                "messages": _compact_progress_messages(messages),
                 "turns": turns,
                 "actions": actions,
                 "cost": str(usage.cost),
@@ -2635,15 +2699,80 @@ def _write_contract_progress(
     )
 
 
-def _load_or_create_issue(path: Path, workspace: DockerWorkspace, clock: Callable[[], float]) -> Mapping[str, object]:
+def _compact_progress_messages(value: object) -> object:
+    if isinstance(value, Mapping):
+        value_type = value.get("type")
+        if value_type == "tool" and isinstance(value.get("id"), str) and isinstance(value.get("state"), Mapping):
+            status = value["state"].get("status")
+            if isinstance(status, str):
+                return {"type": "tool", "id": value["id"], "state": {"status": status}}
+        return {
+            key: ""
+            if key == "text" and value_type in {"user", "text", "reasoning"}
+            else _compact_progress_messages(item)
+            for key, item in value.items()
+            if key not in {"providerMetadata", "metadata"}
+        }
+    if isinstance(value, list):
+        return [_compact_progress_messages(item) for item in value]
+    return value
+
+
+def _merge_attempt_messages(previous: Mapping[str, object], current: Mapping[str, object]) -> Mapping[str, object]:
+    if set(previous) != {"data"} or set(current) != {"data"}:
+        raise ProContractError("attempt messages have an invalid schema")
+    before = previous["data"]
+    after = current["data"]
+    if not isinstance(before, list) or not isinstance(after, list):
+        raise ProContractError("attempt messages have an invalid schema")
+    if not before:
+        return current
+    if not after:
+        return previous
+
+    def message_id(value: object) -> str:
+        if not isinstance(value, Mapping):
+            raise ProContractError("attempt message identity is invalid")
+        info = value.get("info")
+        identity = info.get("id") if isinstance(info, Mapping) else value.get("id")
+        if not isinstance(identity, str) or not identity:
+            raise ProContractError("attempt message identity is invalid")
+        return identity
+
+    before_ids = [message_id(message) for message in before]
+    after_ids = [message_id(message) for message in after]
+    if len(before_ids) != len(set(before_ids)) or len(after_ids) != len(set(after_ids)):
+        raise ProContractError("attempt message identity is duplicated")
+    try:
+        overlap = before_ids.index(after_ids[0])
+    except ValueError:
+        return {"data": [*before, *after]}
+    shared = min(len(before_ids) - overlap, len(after_ids))
+    if before_ids[overlap : overlap + shared] != after_ids[:shared]:
+        raise ProContractConflictError("attempt message histories conflict")
+    return {"data": [*before[:overlap], *after]}
+
+
+def _validate_model_variant(model: str, variant: str) -> None:
+    if (model, variant) not in SUPPORTED_MODEL_VARIANTS:
+        raise ProContractError("ProContract model and variant combination is unsupported")
+
+
+def _load_or_create_issue(
+    path: Path,
+    workspace: DockerWorkspace,
+    model: str,
+    variant: str,
+    clock: Callable[[], float],
+) -> Mapping[str, object]:
     if path.exists():
         raw = _read_json(path)
         if not isinstance(raw, Mapping):
             raise ProContractError("persisted Contract issue is invalid")
-        _validate_issue_record(raw, workspace)
+        _validate_issue_record(raw, workspace, model, variant)
         return raw
     now = clock()
-    payload = build_issue_payload(workspace, now=now)
+    payload = build_issue_payload(workspace, now=now, model=model, variant=variant)
     record = {
         "version": 1,
         "contractID": payload["id"],
@@ -2700,7 +2829,12 @@ def _set_issue_marker(
     )
 
 
-def _validate_issue_record(raw: Mapping[str, object], workspace: DockerWorkspace) -> None:
+def _validate_issue_record(
+    raw: Mapping[str, object],
+    workspace: DockerWorkspace,
+    model: str,
+    variant: str,
+) -> None:
     if (
         set(raw)
         != {
@@ -2719,7 +2853,7 @@ def _validate_issue_record(raw: Mapping[str, object], workspace: DockerWorkspace
     started = raw["startedAt"]
     if isinstance(started, bool) or not isinstance(started, (int, float)) or not math.isfinite(started):
         raise ProContractError("persisted Contract issue time is invalid")
-    expected = build_issue_payload(workspace, now=float(started))
+    expected = build_issue_payload(workspace, now=float(started), model=model, variant=variant)
     if (
         raw["contractID"] != expected["id"]
         or raw["payload"] != expected
@@ -2849,7 +2983,7 @@ def _expected_spec(payload: Mapping[str, object]) -> dict[str, object]:
         "authority": ["filesystem.read", "filesystem.write", "process.execute"],
         "budget": {"turns": budget.get("turns"), "actions": budget.get("actions"), "deadline": budget.get("deadline")},
         "evidence": {"type": "principal", "claim": PRINCIPAL_CLAIM, "replay": REPLAY_POLICY},
-        "resolution": {"maxAttempts": 1, "retryDelay": 0},
+        "resolution": {"maxAttempts": MAX_CONTRACT_ATTEMPTS, "retryDelay": 0},
     }
 
 
@@ -3063,7 +3197,7 @@ def _validate_execution(raw: object, payload: Mapping[str, object], revision: in
             type(raw[key]) is not int or raw[key] < 0
             for key in ("attempts", "nextActionAt", "turnsUsed", "actionsUsed")
         )
-        or raw["attempts"] > 1
+        or raw["attempts"] > int(payload["resolution"]["maxAttempts"])  # type: ignore[index]
         or "leaseOwner" in raw
         and (not isinstance(raw["leaseOwner"], str) or not raw["leaseOwner"])
         or "leaseExpiresAt" in raw
@@ -3081,6 +3215,15 @@ def _binding_identity(execution: Mapping[str, object]) -> tuple[object, ...]:
         execution["model"],
         execution["sessionID"],
         execution["promptID"],
+    )
+
+
+def _binding_contract_identity(execution: Mapping[str, object]) -> tuple[object, ...]:
+    return (
+        execution["contractID"],
+        execution["revision"],
+        execution["location"],
+        execution["model"],
     )
 
 
@@ -3623,7 +3766,7 @@ def _validate_preflight(raw: object, archive: Path) -> None:
         or raw["archiveHash"] != _sha256(archive)
         or not _sha256_value(raw["executableHash"])
         or raw["commands"] != PREFLIGHT_COMMANDS
-        or raw["exits"] != [0, 0, 0]
+        or raw["exits"] != [0, 0, 0, 0]
         or not _sha256_value(raw["outputHash"])
     ):
         raise ProContractDeliveryError("persisted candidate preflight is invalid")
@@ -3763,8 +3906,6 @@ def _attestation_coordinates(contract: Mapping[str, object]) -> tuple[object, ..
 def _native_outcome_completion(contract: Mapping[str, object]) -> ProContractCompletion | None:
     if contract.get("pendingRevision") is not None:
         return ProContractCompletion.PENDING_REVISION
-    if contract.get("challenge") is not None:
-        return ProContractCompletion.CHALLENGED
     status = contract.get("status")
     if status == "escalated":
         return ProContractCompletion.ESCALATED
@@ -3772,6 +3913,8 @@ def _native_outcome_completion(contract: Mapping[str, object]) -> ProContractCom
         return ProContractCompletion.RELEASED
     if status == "discharged":
         return ProContractCompletion.DISCHARGED
+    if contract.get("challenge") is not None:
+        return ProContractCompletion.CHALLENGED
     if status in {"dormant", "active"}:
         return ProContractCompletion.OUTSTANDING
     return None
@@ -3955,6 +4098,7 @@ def _settle_native_outcome(
                 raise ProContractError("native outcome Session messages are invalid")
             terminal = _messages_have_terminal_usage(projected, current_execution)
             if terminal:
+                projected = _merge_attempt_messages(current_messages, projected)
                 next_usage = _summarize_usage(projected)
                 next_actions = max(_actions(projected), int(current_execution["actionsUsed"]))
                 _require_monotonic(
@@ -3997,6 +4141,7 @@ def _settle_native_outcome(
                 _all_credential_names(workspace.manifest.credential_env),
             )
             if isinstance(projected, Mapping) and _messages_have_terminal_usage(projected, current_execution):
+                projected = _merge_attempt_messages(current_messages, projected)
                 next_usage = _summarize_usage(projected)
                 next_actions = max(_actions(projected), int(current_execution["actionsUsed"]))
                 _require_monotonic(
@@ -4030,6 +4175,7 @@ def _settle_native_outcome(
             )
             if not isinstance(projected, Mapping) or not _messages_have_terminal_usage(projected, current_execution):
                 raise ProContractError("rotated native outcome Session messages are incomplete")
+            projected = _merge_attempt_messages(current_messages, projected)
             next_usage = _summarize_usage(projected)
             next_actions = max(_actions(projected), int(current_execution["actionsUsed"]))
             _require_monotonic(
@@ -4535,7 +4681,7 @@ def _verify_done_delivery(job_root: Path, result: ProContractResult, workspace: 
             != {
                 "executableHash": result.executable_hash,
                 "commands": PREFLIGHT_COMMANDS,
-                "exits": [0, 0, 0],
+                "exits": [0, 0, 0, 0],
                 "outputHash": preflight["outputHash"],
                 "reportHash": _sha256(job_root / "procontract-preflight.json"),
             }

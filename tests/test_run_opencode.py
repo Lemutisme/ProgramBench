@@ -141,6 +141,33 @@ excluded:
     assert result.excluded == frozenset({"old.instance"})
 
 
+def test_load_config_allows_cost_caps_to_be_disabled(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config = load_config(
+        _write_text(
+            tmp_path / "campaign.yaml",
+            campaign_yaml(repo).replace(
+                "total_cost_soft: 1\n  total_cost_hard: 2",
+                "total_cost_soft: null\n  total_cost_hard: null",
+            ),
+        )
+    )
+    manifest = tmp_path / "campaign.json"
+
+    freeze_campaign_config(config, manifest)
+
+    assert config.limits.total_cost_soft is None
+    assert config.limits.total_cost_hard is None
+    assert json.loads(manifest.read_text())["limits"] == {
+        "wall_time_seconds": 60,
+        "provider_turns": 10,
+        "procontract_actions": 20,
+        "total_cost_soft": None,
+        "total_cost_hard": None,
+    }
+
+
 def test_freeze_campaign_config_reuses_identical_manifest_and_rejects_change(tmp_path: Path):
     repo = tmp_path / "repo"
     repo.mkdir()
