@@ -2711,7 +2711,7 @@ def _compact_progress_messages(value: object) -> object:
             if key == "text" and value_type in {"user", "text", "reasoning"}
             else _compact_progress_messages(item)
             for key, item in value.items()
-            if key not in {"providerMetadata", "metadata"}
+            if key not in {"providerMetadata", "metadata", "snapshot"}
         }
     if isinstance(value, list):
         return [_compact_progress_messages(item) for item in value]

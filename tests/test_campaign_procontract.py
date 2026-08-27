@@ -3131,6 +3131,7 @@ def test_progress_compacts_ignored_provider_metadata_before_double_buffering(tmp
                 ],
                 "tokens": {"input": 10, "output": 3, "reasoning": 2, "cache": {"read": 4, "write": 0}},
                 "cost": 1,
+                "snapshot": "z" * MAX_ARTIFACT_BYTES,
             }
         ]
     }
