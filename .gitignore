@@ -170,6 +170,9 @@ poetry.toml
 # ruff
 .ruff_cache/
 
+# Local benchmark campaigns
+output/
+
 # LSP config files
 pyrightconfig.json
 
