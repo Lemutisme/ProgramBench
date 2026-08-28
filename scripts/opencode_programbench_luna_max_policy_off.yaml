@@ -19,6 +19,7 @@ arms:
     revision: 7054140b61e5cdeceef61f6bc6e6520eefe7ac79
     mode: procontract
     execution_policy: none
+    binary: /home/duozhou/.config/superpowers/worktrees/ProgramBench/policy-split/output/policy-split-on-luna2-20260828-v1/installs/worktrees/procontract-7054140b61e5cdeceef61f6bc6e6520eefe7ac79/packages/opencode/dist/opencode-linux-x64/bin/opencode
   vanilla:
     repo: ${OPENCODE_REPO}
     revision: origin/dev
