@@ -14,7 +14,7 @@ from dataclasses import dataclass, replace
 from decimal import Decimal
 from enum import Enum
 from pathlib import Path, PurePosixPath
-from typing import Callable, Mapping, Protocol
+from typing import Callable, Literal, Mapping, Protocol
 from urllib.parse import quote, urlencode, urlparse
 
 from programbench.candidate import CandidateError, PreflightResult, package_workspace, preflight_candidate
@@ -65,6 +65,8 @@ MAX_ACTIONS = 4000
 MAX_MUTATION_ATTEMPTS = 3
 MAX_CONTRACT_ATTEMPTS = 3
 MAX_CREDENTIAL_SCAN_BYTES = 512 * 1024 * 1024
+SEMANTIC_ATTEMPTS_REVISION = "ed8bd2b7992485264335a541b40c1c03a4b35619"
+ProContractProtocol = Literal["current", "semantic-v0"]
 MODEL = "openai/gpt-5.6-luna"
 VARIANT = "max"
 SUPPORTED_MODEL_VARIANTS = frozenset(
@@ -81,6 +83,11 @@ ACCEPTANCE_POLICY = (
     "validate.sh must encode behavioral evidence learned from black-box reference experiments and must not access "
     "the reference, network, or ambient package caches during replay. The ProgramBench harness "
     "performs packaging and preflight only; official benchmark evaluation remains external."
+)
+LEGACY_ACCEPTANCE_POLICY = (
+    "ProgramBench semantic-v0 delivery policy: materialize the exact institution-captured handoff tree, package "
+    "that frozen subject, and require the standard ProgramBench compile, validation, and executable preflight "
+    "before principal attestation. Official benchmark evaluation remains external."
 )
 PRINCIPAL_CLAIM = (
     "The exact native Contract handoff is the candidate delivered for external ProgramBench evaluation, and its "
@@ -134,6 +141,20 @@ CONTROL_ARTIFACT_NAMES = (
     "procontract-interrupt.json",
     "procontract-admission-error.json",
 )
+
+
+def _acceptance_policy(protocol: ProContractProtocol) -> str:
+    if protocol == "current":
+        return ACCEPTANCE_POLICY
+    if protocol == "semantic-v0":
+        return LEGACY_ACCEPTANCE_POLICY
+    raise ProContractError("unknown ProContract protocol")
+
+
+def protocol_for_revision(revision: str) -> ProContractProtocol:
+    return "semantic-v0" if revision == SEMANTIC_ATTEMPTS_REVISION else "current"
+
+
 _CONTRACT_STATUSES = {"dormant", "active", "verification", "escalated", "discharged", "released"}
 _EXPECTED_PORT_UNSET = object()
 
@@ -749,6 +770,7 @@ def build_issue_payload(
     now: float,
     model: str = MODEL,
     variant: str = VARIANT,
+    protocol: ProContractProtocol = "current",
 ) -> dict[str, object]:
     """Build the exact issue request. Callers must persist it before issuing."""
     if isinstance(now, bool) or not isinstance(now, (int, float)) or not math.isfinite(now) or now < 0:
@@ -757,7 +779,7 @@ def build_issue_payload(
     identity = f"{manifest.campaign}\0{manifest.job_id}".encode()
     contract_id = "pct_" + hashlib.sha256(identity).hexdigest()
     scope = "programbench-" + hashlib.sha256(b"scope\0" + identity).hexdigest()
-    return ProContractIssueRequest(
+    payload = ProContractIssueRequest(
         contract_id=contract_id,
         scope=scope,
         deadline=int(now * 1000) + MAX_WALL_TIME_SECONDS * 1000,
@@ -779,6 +801,13 @@ def build_issue_payload(
             "gap remains or the shared Contract budget is exhausted."
         ),
     ).to_dict()
+    if protocol == "current":
+        return payload
+    if protocol != "semantic-v0":
+        raise ProContractError("unknown ProContract protocol")
+    payload.pop("policy")
+    payload["evidence"] = {"type": "principal"}
+    return payload
 
 
 def restart_delivery_workspace(
@@ -810,6 +839,7 @@ def run_procontract(
     package: Callable[[Path, Path, str], Path] = package_workspace,
     preflight: Callable[[Path, str], PreflightResult] = preflight_candidate,
     stop_token: StopToken | None = None,
+    protocol: ProContractProtocol = "current",
 ) -> ProContractResult:
     """Fail closed around the durable native Contract orchestration."""
     _validate_model_variant(model, variant)
@@ -817,7 +847,7 @@ def run_procontract(
     state = state_store.read()
     guarded_api = StopAwareApi(api, stop)
     if stop.is_set() and state.phase not in {"done", "failed", "interrupted"}:
-        _load_or_create_issue(job.job.root / "procontract-issue.json", workspace, model, variant, clock)
+        _load_or_create_issue(job.job.root / "procontract-issue.json", workspace, model, variant, clock, protocol)
         if job.job.root.joinpath("procontract-issue-response.json").is_file() or _issue_may_be_active(
             job.job.root / "procontract-issue-active.json"
         ):
@@ -831,8 +861,9 @@ def run_procontract(
                 clock,
                 sleeper,
                 poll_interval,
+                protocol,
             )
-        return _finish_unadmitted_campaign_stop(job, state_store, state, workspace, model, variant, clock)
+        return _finish_unadmitted_campaign_stop(job, state_store, state, workspace, model, variant, clock, protocol)
 
     def guarded_package(subject: Path, run_dir: Path, instance_id: str) -> Path:
         stop.checkpoint()
@@ -857,6 +888,7 @@ def run_procontract(
             poll_interval=poll_interval,
             package=guarded_package,
             preflight=guarded_preflight,
+            protocol=protocol,
         )
         state = state_store.read()
         if state.phase in {"done", "failed", "interrupted"}:
@@ -878,6 +910,7 @@ def run_procontract(
             clock,
             sleeper,
             poll_interval,
+            protocol,
         )
     except (VanillaError, UsageParseError, StateError):
         if workspace.lease._handle_active:
@@ -893,8 +926,9 @@ def _finish_unadmitted_campaign_stop(
     model: str,
     variant: str,
     clock: Callable[[], float],
+    protocol: ProContractProtocol,
 ) -> ProContractResult:
-    issue = _load_or_create_issue(job.job.root / "procontract-issue.json", workspace, model, variant, clock)
+    issue = _load_or_create_issue(job.job.root / "procontract-issue.json", workspace, model, variant, clock, protocol)
     payload = issue["payload"]
     if not isinstance(payload, Mapping):
         raise ProContractError("persisted Contract issue payload is invalid")
@@ -905,22 +939,7 @@ def _finish_unadmitted_campaign_stop(
         session_id="ses_unadmitted",
         prompt_id="msg_unadmitted",
         revision=1,
-        spec_hash=_hash_json(
-            {
-                key: payload[key]
-                for key in (
-                    "trigger",
-                    "goal",
-                    "policy",
-                    "brief",
-                    "requires",
-                    "authority",
-                    "budget",
-                    "evidence",
-                    "resolution",
-                )
-            }
-        ),
+        spec_hash=_hash_json(_expected_spec(payload)),
         status="dormant",
         completion=ProContractCompletion.INTERRUPTED,
         provider_turns=state.provider_turns,
@@ -968,6 +987,7 @@ def _finish_active_campaign_stop(
     clock: Callable[[], float],
     sleeper: Callable[[float], None],
     poll_interval: float,
+    protocol: ProContractProtocol,
 ) -> ProContractResult:
     state = state_store.read()
     if state.phase in {"done", "failed", "interrupted"}:
@@ -991,7 +1011,19 @@ def _finish_active_campaign_stop(
         if accepted is None:
             if _issue_may_be_active(marker_path):
                 state = _set_issue_marker(marker_path, state_store, state, str(issue["payloadHash"]), False, "absent")
-            return _finish_unadmitted_campaign_stop(job, state_store, state, workspace, clock)
+            model = payload["model"]
+            if not isinstance(model, Mapping):
+                raise ProContractError("persisted Contract model is invalid")
+            return _finish_unadmitted_campaign_stop(
+                job,
+                state_store,
+                state,
+                workspace,
+                f"{model['providerID']}/{model['id']}",
+                str(model["variant"]),
+                clock,
+                protocol,
+            )
     else:
         accepted = _validate_issue_response(_read_json(response_path), payload)
     if _issue_may_be_active(marker_path):
@@ -1128,13 +1160,14 @@ def _run_procontract(
     poll_interval: float,
     package: Callable[[Path, Path, str], Path],
     preflight: Callable[[Path, str], PreflightResult],
+    protocol: ProContractProtocol,
 ) -> ProContractResult:
     """Issue or adopt one native scheduler-owned Contract and deliver its exact handoff."""
     _validate_inputs(job, state_store, workspace, model, variant, limits, poll_interval)
     state = state_store.read()
     result_path = job.job.root / "procontract-result.json"
     issue_path = job.job.root / "procontract-issue.json"
-    issue = _load_or_create_issue(issue_path, workspace, model, variant, clock)
+    issue = _load_or_create_issue(issue_path, workspace, model, variant, clock, protocol)
     if state.phase in {"done", "failed", "interrupted"} and result_path.is_file():
         result = ProContractResult.from_dict(_read_json(result_path))
         if workspace.lease._handle_active:
@@ -1382,11 +1415,15 @@ def _run_procontract(
                     and challenge.get("disclosure") == "executor"
                     and current_execution is not None
                 )
-                if native in {
-                    ProContractCompletion.CHALLENGED,
-                    ProContractCompletion.ESCALATED,
-                    ProContractCompletion.RELEASED,
-                } and not retriable_challenge:
+                if (
+                    native
+                    in {
+                        ProContractCompletion.CHALLENGED,
+                        ProContractCompletion.ESCALATED,
+                        ProContractCompletion.RELEASED,
+                    }
+                    and not retriable_challenge
+                ):
                     return _finish_native_state(
                         job,
                         state_store,
@@ -1970,22 +2007,33 @@ def _deliver(
             "directory": str(export_dir),
         }
     else:
-        try:
-            exported = api.export(workspace, str(payload["id"]), export_dir)
-        except WorkspaceError:
-            ambiguous_invocation = True
-            exported = {
-                "contractID": payload["id"],
-                "subjectHash": handoff["subjectHash"],
-                "directory": str(export_dir),
-            }
-        else:
+        if replay is None:
+            exported = _materialize_legacy_snapshot(
+                workspace, str(payload["id"]), str(handoff["subjectHash"]), export_dir
+            )
             direct_success = True
             _validate_export(exported, payload, handoff, export_dir, workspace)
             _write_json(
                 export_path,
                 _sanitize_control(exported, _all_credential_names(workspace.manifest.credential_env)),
             )
+        else:
+            try:
+                exported = api.export(workspace, str(payload["id"]), export_dir)
+            except WorkspaceError:
+                ambiguous_invocation = True
+                exported = {
+                    "contractID": payload["id"],
+                    "subjectHash": handoff["subjectHash"],
+                    "directory": str(export_dir),
+                }
+            else:
+                direct_success = True
+                _validate_export(exported, payload, handoff, export_dir, workspace)
+                _write_json(
+                    export_path,
+                    _sanitize_control(exported, _all_credential_names(workspace.manifest.credential_env)),
+                )
     if direct_success:
         _validate_export(exported, payload, handoff, export_dir, workspace)
     try:
@@ -2215,7 +2263,9 @@ def _deliver(
             "subjectHash": handoff["subjectHash"],
             "treeHash": _tree_hash(_semantic_inventory(subject)),
         },
-        "replay": {
+        "replay": None
+        if replay is None
+        else {
             "policyHash": replay["policyHash"],
             "evidenceHash": replay["evidenceHash"],
             "passed": replay["passed"],
@@ -2235,7 +2285,7 @@ def _deliver(
     else:
         _write_canonical_report(report_path, report)
     report_hash = _validate_verifier_report(report_path, report)
-    if report_hash == replay["evidenceHash"]:
+    if replay is not None and report_hash == replay["evidenceHash"]:
         raise ProContractDeliveryError("principal evidence hash must be distinct from native replay evidence")
 
     try:
@@ -2499,7 +2549,7 @@ def _deliver(
         ProContractCompletion.DISCHARGED,
         quiet=final_quiet,
         subject_hash=str(handoff["subjectHash"]),
-        replay_evidence_hash=str(replay["evidenceHash"]),
+        replay_evidence_hash=str(replay["evidenceHash"]) if replay is not None else None,
         report_hash=report_hash,
         package_hash=_sha256(archive),
         executable_hash=str(preflight_record["executableHash"]),
@@ -2764,24 +2814,26 @@ def _load_or_create_issue(
     model: str,
     variant: str,
     clock: Callable[[], float],
+    protocol: ProContractProtocol = "current",
 ) -> Mapping[str, object]:
     if path.exists():
         raw = _read_json(path)
         if not isinstance(raw, Mapping):
             raise ProContractError("persisted Contract issue is invalid")
-        _validate_issue_record(raw, workspace, model, variant)
+        _validate_issue_record(raw, workspace, model, variant, protocol)
         return raw
     now = clock()
-    payload = build_issue_payload(workspace, now=now, model=model, variant=variant)
+    payload = build_issue_payload(workspace, now=now, model=model, variant=variant, protocol=protocol)
+    acceptance_policy = _acceptance_policy(protocol)
     record = {
         "version": 1,
         "contractID": payload["id"],
         "startedAt": now,
         "payload": payload,
         "payloadHash": _hash_json(payload),
-        "acceptancePolicyUTF8": base64.b64encode(ACCEPTANCE_POLICY.encode()).decode(),
-        "acceptanceHash": hashlib.sha256(ACCEPTANCE_POLICY.encode()).hexdigest(),
-        "replayPolicyHash": _hash_json(REPLAY_POLICY),
+        "acceptancePolicyUTF8": base64.b64encode(acceptance_policy.encode()).decode(),
+        "acceptanceHash": hashlib.sha256(acceptance_policy.encode()).hexdigest(),
+        "replayPolicyHash": _hash_json(REPLAY_POLICY) if protocol == "current" else None,
     }
     if _contains_credential(record, _credential_values(_all_credential_names(workspace.manifest.credential_env))):
         raise ProContractError("Contract issue request contains a provider credential")
@@ -2834,6 +2886,7 @@ def _validate_issue_record(
     workspace: DockerWorkspace,
     model: str,
     variant: str,
+    protocol: ProContractProtocol,
 ) -> None:
     if (
         set(raw)
@@ -2853,14 +2906,15 @@ def _validate_issue_record(
     started = raw["startedAt"]
     if isinstance(started, bool) or not isinstance(started, (int, float)) or not math.isfinite(started):
         raise ProContractError("persisted Contract issue time is invalid")
-    expected = build_issue_payload(workspace, now=float(started), model=model, variant=variant)
+    expected = build_issue_payload(workspace, now=float(started), model=model, variant=variant, protocol=protocol)
+    acceptance_policy = _acceptance_policy(protocol)
     if (
         raw["contractID"] != expected["id"]
         or raw["payload"] != expected
         or raw["payloadHash"] != _hash_json(expected)
-        or raw["acceptancePolicyUTF8"] != base64.b64encode(ACCEPTANCE_POLICY.encode()).decode()
-        or raw["acceptanceHash"] != hashlib.sha256(ACCEPTANCE_POLICY.encode()).hexdigest()
-        or raw["replayPolicyHash"] != _hash_json(REPLAY_POLICY)
+        or raw["acceptancePolicyUTF8"] != base64.b64encode(acceptance_policy.encode()).decode()
+        or raw["acceptanceHash"] != hashlib.sha256(acceptance_policy.encode()).hexdigest()
+        or raw["replayPolicyHash"] != (_hash_json(REPLAY_POLICY) if protocol == "current" else None)
     ):
         raise ProContractConflictError("persisted Contract issue conflicts with this job")
 
@@ -2923,6 +2977,7 @@ def _reconcile_ambiguous_issue(
 def _validate_issue_response(raw: object, payload: Mapping[str, object]) -> Mapping[str, object]:
     if not isinstance(raw, Mapping) or set(raw) not in (
         {"data", "execution", "receipt"},
+        {"data", "execution", "receipt", "formationHash"},
         {"data", "execution", "receipt", "reconciliation"},
     ):
         raise ProContractError("Contract issue response has invalid fields")
@@ -2930,7 +2985,14 @@ def _validate_issue_response(raw: object, payload: Mapping[str, object]) -> Mapp
     execution = _validate_execution(raw["execution"], payload, int(contract["revision"]))
     if "reconciliation" not in raw:
         _validate_receipt(raw["receipt"], "issue")
-        return {"data": contract, "execution": execution, "receipt": raw["receipt"]}
+        if "formationHash" in raw and raw["formationHash"] != _formation_hash(payload, str(contract["specHash"])):
+            raise ProContractConflictError("Contract formation hash conflicts with frozen issue")
+        return {
+            "data": contract,
+            "execution": execution,
+            "receipt": raw["receipt"],
+            **({"formationHash": raw["formationHash"]} if "formationHash" in raw else {}),
+        }
     reconciliation = raw["reconciliation"]
     if (
         raw["receipt"] is not None
@@ -2945,6 +3007,34 @@ def _validate_issue_response(raw: object, payload: Mapping[str, object]) -> Mapp
     ):
         raise ProContractConflictError("ambiguous issue reconciliation is invalid")
     return {"data": contract, "execution": execution, "receipt": None, "reconciliation": reconciliation}
+
+
+def _formation_hash(payload: Mapping[str, object], spec_hash: str) -> str:
+    location = payload["location"]
+    model = payload["model"]
+    if not isinstance(location, Mapping) or not isinstance(model, Mapping):
+        raise ProContractError("Contract formation context is invalid")
+    context_hash = _hash_json(
+        {
+            "version": 1,
+            "location": {
+                "directory": location["directory"],
+                **({"workspaceID": location["workspaceID"]} if "workspaceID" in location else {}),
+            },
+            "model": {
+                "providerID": model["providerID"],
+                "id": model["id"],
+                **({"variant": model["variant"]} if "variant" in model else {}),
+            },
+        }
+    )
+    return _hash_json(
+        {
+            "version": 1,
+            "contextHash": context_hash,
+            "components": [{"contractID": payload["id"], "specHash": spec_hash}],
+        }
+    )
 
 
 def _validate_contract(raw: object, payload: Mapping[str, object]) -> Mapping[str, object]:
@@ -2977,12 +3067,14 @@ def _expected_spec(payload: Mapping[str, object]) -> dict[str, object]:
     return {
         "trigger": {"type": "immediate"},
         "goal": payload["goal"],
-        "policy": payload["policy"],
+        **({"policy": payload["policy"]} if "policy" in payload else {}),
         "brief": payload["brief"],
         "requires": [],
         "authority": ["filesystem.read", "filesystem.write", "process.execute"],
         "budget": {"turns": budget.get("turns"), "actions": budget.get("actions"), "deadline": budget.get("deadline")},
-        "evidence": {"type": "principal", "claim": PRINCIPAL_CLAIM, "replay": REPLAY_POLICY},
+        "evidence": {"type": "principal"}
+        if payload["evidence"] == {"type": "principal"}
+        else {"type": "principal", "claim": PRINCIPAL_CLAIM, "replay": REPLAY_POLICY},
         "resolution": {"maxAttempts": MAX_CONTRACT_ATTEMPTS, "retryDelay": 0},
     }
 
@@ -3266,11 +3358,15 @@ def _validate_receipt(raw: object, label: str) -> None:
 
 def _verification(
     contract: Mapping[str, object], payload: Mapping[str, object]
-) -> tuple[Mapping[str, object], Mapping[str, object]]:
+) -> tuple[Mapping[str, object], Mapping[str, object] | None]:
     if contract["status"] != "verification" or not isinstance(contract.get("handoff"), Mapping):
         raise ProContractConflictError("Contract is not in native verification")
     handoff = contract["handoff"]
     replay = handoff.get("replay")
+    if payload["evidence"] == {"type": "principal"}:
+        if replay is not None:
+            raise ProContractDeliveryError("semantic-v0 Contract returned unexpected replay evidence")
+        return handoff, None
     if not isinstance(replay, Mapping):
         raise ProContractDeliveryError("native Contract handoff has no replay evidence")
     if (
@@ -3345,6 +3441,103 @@ def _validate_export_complete(
     }:
         raise ProContractConflictError("persisted complete Contract export evidence is invalid")
     return True
+
+
+def _materialize_legacy_snapshot(
+    workspace: DockerWorkspace,
+    contract_id: str,
+    subject_hash: str,
+    destination: Path,
+) -> Mapping[str, object]:
+    if len(subject_hash) not in {40, 64} or any(character not in "0123456789abcdef" for character in subject_hash):
+        raise ProContractDeliveryError("semantic-v0 handoff has an invalid snapshot identity")
+    root = Path(workspace.manifest.state_dir) / "data/opencode/snapshot"
+    if root.is_symlink() or not root.is_dir():
+        raise ProContractDeliveryError("semantic-v0 snapshot store is unavailable")
+    projects = tuple(root.iterdir())
+    if len(projects) > 128 or any(path.is_symlink() or not path.is_dir() for path in projects):
+        raise ProContractDeliveryError("semantic-v0 snapshot store is invalid")
+    repositories = tuple(path for project in projects for path in project.iterdir())
+    if len(repositories) > 128 or any(path.is_symlink() or not path.is_dir() for path in repositories):
+        raise ProContractDeliveryError("semantic-v0 snapshot store is invalid")
+    environment = {
+        "PATH": os.defpath,
+        "LANG": "C",
+        "LC_ALL": "C",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_OPTIONAL_LOCKS": "0",
+    }
+    matches = []
+    for repository in repositories:
+        result = campaign_process.run_bounded(
+            ("git", "-c", "core.hooksPath=/dev/null", f"--git-dir={repository}", "cat-file", "-t", subject_hash),
+            None,
+            10,
+            1,
+            1024,
+            environment,
+        )
+        if result.returncode == 0 and result.stdout.strip() == "tree":
+            matches.append(repository)
+    if len(matches) != 1:
+        raise ProContractDeliveryError("semantic-v0 handoff tree is unavailable or ambiguous")
+    temporary = Path(tempfile.mkdtemp(prefix=".contract-export.", dir=destination.parent))
+    try:
+        initialized = campaign_process.run_bounded(
+            ("git", "init", "--quiet", str(temporary)), None, 10, 1, 64 * 1024, environment
+        )
+        if initialized.returncode != 0:
+            raise ProContractDeliveryError("semantic-v0 export repository initialization failed")
+        alternates = temporary / ".git/objects/info/alternates"
+        alternates.parent.mkdir(parents=True, exist_ok=True)
+        alternates.write_text(str((matches[0] / "objects").resolve()) + "\n")
+        commands = (
+            ("git", "-C", str(temporary), "read-tree", subject_hash),
+            ("git", "-C", str(temporary), "checkout-index", "--all", "--force"),
+            ("git", "-C", str(temporary), "update-index", "--refresh"),
+            (
+                "git",
+                "-c",
+                "user.name=ProgramBench",
+                "-c",
+                "user.email=programbench@localhost",
+                "-C",
+                str(temporary),
+                "commit-tree",
+                subject_hash,
+                "-m",
+                "semantic-v0 frozen handoff",
+            ),
+        )
+        results = tuple(
+            campaign_process.run_bounded(
+                command,
+                None,
+                120,
+                1,
+                64 * 1024,
+                environment,
+            )
+            for command in commands
+        )
+        if any(result.returncode != 0 for result in results):
+            raise ProContractDeliveryError("semantic-v0 handoff tree could not be materialized")
+        commit = results[-1].stdout.strip()
+        updated = campaign_process.run_bounded(
+            ("git", "-C", str(temporary), "update-ref", "HEAD", commit), None, 10, 1, 1024, environment
+        )
+        if (
+            updated.returncode != 0
+            or _git_snapshot_identity(temporary, _owned_writable_roots(workspace)) != subject_hash
+        ):
+            raise ProContractDeliveryError("semantic-v0 materialized tree does not match its handoff")
+        os.replace(temporary, destination)
+        _sync_directory(destination.parent)
+    finally:
+        if temporary.exists():
+            _remove_tree(temporary)
+    return {"contractID": contract_id, "subjectHash": subject_hash, "directory": str(destination)}
 
 
 def _git_snapshot_identity(export: Path, owned_roots: tuple[Path, ...] = ()) -> str | None:
@@ -4643,6 +4836,15 @@ def _verify_done_delivery(job_root: Path, result: ProContractResult, workspace: 
         execution = discharge.get("execution")
         report_path = job_root / "verifier-report.json"
         report = _read_json(report_path)
+        expected_replay = (
+            {
+                "policyHash": _hash_json(REPLAY_POLICY),
+                "evidenceHash": result.replay_evidence_hash,
+                "passed": True,
+            }
+            if isinstance(issue.get("payload"), Mapping) and issue["payload"].get("evidence") != {"type": "principal"}
+            else None
+        )
         if (
             not isinstance(report, Mapping)
             or report_path.read_bytes()
@@ -4670,12 +4872,7 @@ def _verify_done_delivery(job_root: Path, result: ProContractResult, workspace: 
                 "subjectHash": result.subject_hash,
                 "treeHash": _tree_hash(subject_record.get("subject")),
             }
-            or report.get("replay")
-            != {
-                "policyHash": _hash_json(REPLAY_POLICY),
-                "evidenceHash": result.replay_evidence_hash,
-                "passed": True,
-            }
+            or report.get("replay") != expected_replay
             or report.get("package") != {"command": "package_workspace", "exit": 0, "archiveHash": result.package_hash}
             or report.get("preflight")
             != {

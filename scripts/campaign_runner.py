@@ -33,7 +33,7 @@ from programbench.submission import FIXTURE_PREFIX
 from programbench.utils.load_data import load_all_instances
 from programbench.utils.instance_filters import filter_instances
 from scripts.campaign_install import InstallRecord, prepare_install
-from scripts.campaign_procontract import HttpProContractApi, run_procontract
+from scripts.campaign_procontract import HttpProContractApi, protocol_for_revision, run_procontract
 from scripts.campaign_state import JobLease, JobPaths, JobState, StateStore
 from scripts.campaign_stop import StopToken
 from scripts.campaign_usage import CircuitBreaker
@@ -52,7 +52,7 @@ ARM_SELECTIONS = ("paired", "procontract", "vanilla")
 JOB_CLEANUP_MAX_ATTEMPTS = 3
 JOB_CLEANUP_TIMEOUT_SECONDS = 0.25
 DRY_RUN_OUTPUT = Path("campaign-dry-run")
-_CREDENTIAL_ENV = ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENCODE_SERVER_PASSWORD")
+_CREDENTIAL_ENV = ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENCODE_CONFIG_CONTENT", "OPENCODE_SERVER_PASSWORD")
 
 
 class CampaignError(RuntimeError):
@@ -675,6 +675,7 @@ def run_job(
                             breaker=breaker,
                             api=api,
                             stop_token=stop,
+                            protocol=protocol_for_revision(getattr(install, "revision", "")),
                         )
                     state = store.read_optional()
                     if (

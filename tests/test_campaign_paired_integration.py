@@ -148,7 +148,7 @@ def test_real_docker_paired_fake_binaries_run_four_jobs_and_resume(
             assert {"packaged", "preflighted", "done"} <= set(state.phase_timestamps or {})
             assert submission.is_file()
             with tarfile.open(submission, "r:gz") as archive:
-                assert archive.getnames() == ["calculator.sh", "compile.sh"]
+                assert archive.getnames() == ["calculator.sh", "compile.sh", "validate.sh"]
             if candidate.arm == "vanilla":
                 assert paths.root.joinpath("vanilla-preflight.json").is_file()
             else:
@@ -384,6 +384,7 @@ def _fake_opencode_source(arm: str, version: str) -> str:
         TASK = "Implement the documented program in this cleanroom. Produce source, a relocatable compile.sh, and ./executable. Use the reference only for black-box experiments."
         CALCULATOR = {_calculator_source()!r}
         COMPILE = "#!/bin/sh\\ncp calculator.sh executable\\nchmod +x executable\\n"
+        VALIDATE = "#!/bin/sh\\n./executable 2 + 3 | grep -qx 5\\n"
         LOCK = threading.Lock()
 
 
@@ -439,12 +440,16 @@ def _fake_opencode_source(arm: str, version: str) -> str:
             root.joinpath("calculator.sh").write_text(CALCULATOR)
             root.joinpath("compile.sh").write_text(COMPILE)
             root.joinpath("executable").write_text(CALCULATOR)
-            for name in ("calculator.sh", "compile.sh", "executable"):
+            root.joinpath("validate.sh").write_text(VALIDATE)
+            for name in ("calculator.sh", "compile.sh", "executable", "validate.sh"):
                 root.joinpath(name).chmod(0o755)
             if not git:
                 return None
             subprocess.run(("git", "init", "-q", str(root)), check=True)
-            subprocess.run(("git", "-C", str(root), "add", "calculator.sh", "compile.sh", "executable"), check=True)
+            subprocess.run(
+                ("git", "-C", str(root), "add", "calculator.sh", "compile.sh", "executable", "validate.sh"),
+                check=True,
+            )
             environment = {{
                 **os.environ,
                 "GIT_AUTHOR_NAME": "fixture",
@@ -497,7 +502,7 @@ def _fake_opencode_source(arm: str, version: str) -> str:
                     "claim": payload["evidence"]["claim"],
                     "replay": payload["evidence"]["replay"],
                 }},
-                "resolution": {{"maxAttempts": 1, "retryDelay": 0}},
+                "resolution": payload["resolution"],
             }}
             contract = {{
                 "id": payload["id"],

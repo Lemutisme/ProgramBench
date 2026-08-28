@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import shutil
 import subprocess
 import threading
 from urllib.parse import urlparse
@@ -928,6 +929,80 @@ def test_issue_payload_records_supported_model_identity(
     assert payload["model"] == expected
 
 
+def test_issue_response_accepts_only_exact_formation_receipt(tmp_path: Path) -> None:
+    from scripts.campaign_procontract import (
+        ProContractConflictError,
+        _formation_hash,
+        _validate_issue_response,
+        build_issue_payload,
+    )
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    _, workspace = _workspace(tmp_path, paths)
+    payload = build_issue_payload(workspace, now=100.0)
+    contract = _contract(payload, status="active")
+    response = {
+        "data": contract,
+        "execution": _execution(payload),
+        "receipt": {"frontier": 0, "hash": "ledger"},
+        "formationHash": _formation_hash(payload, contract["specHash"]),
+    }
+
+    assert _validate_issue_response(response, payload)["formationHash"] == response["formationHash"]
+    persisted = json.loads(json.dumps(response, sort_keys=True))
+    assert (
+        _validate_issue_response(persisted, json.loads(json.dumps(payload, sort_keys=True)))["formationHash"]
+        == response["formationHash"]
+    )
+    with pytest.raises(ProContractConflictError, match="formation hash"):
+        _validate_issue_response({**response, "formationHash": "0" * 64}, payload)
+
+
+def test_semantic_v0_uses_same_execution_terms_without_unsupported_evidence(tmp_path: Path) -> None:
+    from scripts.campaign_procontract import build_issue_payload
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    _, workspace = _workspace(tmp_path, paths)
+
+    current = build_issue_payload(workspace, now=100.0)
+    legacy = build_issue_payload(workspace, now=100.0, protocol="semantic-v0")
+
+    assert {key: legacy[key] for key in ("goal", "brief", "authority", "budget")} == {
+        key: current[key] for key in ("goal", "brief", "authority", "budget")
+    }
+    assert legacy["evidence"] == {"type": "principal"}
+    assert "policy" not in legacy
+
+
+def test_semantic_v0_materializes_only_the_exact_institution_snapshot(tmp_path: Path) -> None:
+    from scripts.campaign_procontract import (
+        ProContractDeliveryError,
+        _git_snapshot_identity,
+        _materialize_legacy_snapshot,
+    )
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    _, workspace = _workspace(tmp_path, paths)
+    source = tmp_path / "source"
+    subject_hash = _write_git_export(source)
+    repository = workspace.manifest.state_dir / "data/opencode/snapshot/project/worktree"
+    shutil.copytree(source / ".git", repository)
+    destination = workspace.manifest.state_dir / "contract-export-pct_legacy"
+
+    assert _materialize_legacy_snapshot(workspace, "pct_legacy", subject_hash, destination) == {
+        "contractID": "pct_legacy",
+        "subjectHash": subject_hash,
+        "directory": str(destination),
+    }
+    assert _git_snapshot_identity(destination, (workspace.candidate, workspace.manifest.state_dir)) == subject_hash
+    assert destination.joinpath("executable").read_text() == "binary"
+    with pytest.raises(ProContractDeliveryError, match="unavailable or ambiguous"):
+        _materialize_legacy_snapshot(workspace, "pct_other", "0" * 40, workspace.manifest.state_dir / "missing")
+
+
 @pytest.mark.parametrize(
     ("model", "variant"),
     [
@@ -1568,6 +1643,72 @@ def test_happy_lifecycle_uses_native_scheduler_and_exact_delivery(
         report["preflight"]["reportHash"]
         == __import__("hashlib").sha256((paths.root / "procontract-preflight.json").read_bytes()).hexdigest()
     )
+
+
+def test_semantic_v0_lifecycle_freezes_snapshot_before_external_preflight_and_attestation(tmp_path: Path) -> None:
+    from scripts.campaign_procontract import _expected_spec, build_issue_payload, run_procontract
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    store = _state(paths)
+    _, workspace = _workspace(tmp_path, paths)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock(), protocol="semantic-v0")
+    source = tmp_path / "source"
+    subject_hash = _write_git_export(source)
+    shutil.copytree(
+        source / ".git",
+        workspace.manifest.state_dir / "data/opencode/snapshot/project/worktree",
+    )
+    spec = _expected_spec(payload)
+    contract = {
+        "id": payload["id"],
+        "scope": payload["scope"],
+        "spec": spec,
+        "issuer": "local-owner",
+        "revision": 1,
+        "status": "verification",
+        "specHash": __import__("hashlib").sha256(json.dumps(spec, separators=(",", ":")).encode()).hexdigest(),
+        "handoff": {
+            "summary": "ready",
+            "uncertainties": [],
+            "subjectHash": subject_hash,
+            "time": 100001,
+        },
+    }
+    api = FakeApi(contract, _execution(payload))
+
+    def package(subject: Path, run_dir: Path, instance_id: str) -> Path:
+        assert subject.joinpath("executable").read_text() == "binary"
+        archive = run_dir / instance_id / "submission.tar.gz"
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        archive.write_bytes(b"archive")
+        return archive
+
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease._handle_active = True
+        result = run_procontract(
+            job,
+            store,
+            workspace,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=_limits(),
+            breaker=CircuitBreaker(),
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+            package=package,
+            preflight=lambda *_: SimpleNamespace(executable_hash="e" * 64, output="ok"),
+            protocol="semantic-v0",
+        )
+
+    assert result.completion.value == "discharged"
+    assert result.subject_hash == subject_hash
+    assert result.replay_evidence_hash is None
+    assert api.exports == []
+    assert len(api.attestations) == 1
+    assert json.loads((paths.root / "verifier-report.json").read_text())["replay"] is None
 
 
 def test_executor_visible_challenge_rotates_session_and_completes_next_attempt(tmp_path: Path) -> None:

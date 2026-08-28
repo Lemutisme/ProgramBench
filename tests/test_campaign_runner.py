@@ -910,7 +910,16 @@ def test_public_entrypoint_requires_resume_after_documented_dry_run(tmp_path: Pa
     assert "--dry-run" in dry_run
     assert "--resume" in inference
 
-    instances = [{"instance_id": "one", "difficulty": "easy", "language": "python", "image_name": "one-image", "repository": "owner/one", "commit": "a" * 40}]
+    instances = [
+        {
+            "instance_id": "one",
+            "difficulty": "easy",
+            "language": "python",
+            "image_name": "one-image",
+            "repository": "owner/one",
+            "commit": "a" * 40,
+        }
+    ]
     prepared = []
     executed = []
     original_plan_campaign = campaign_runner.plan_campaign
@@ -1002,8 +1011,22 @@ def test_plan_dry_run_prepares_each_arm_once_without_workspace(tmp_path: Path):
     plan = plan_campaign(
         load_config(config_path),
         [
-            {"instance_id": "one", "difficulty": "easy", "language": "python", "image_name": "one-image", "repository": "owner/one", "commit": "a" * 40},
-            {"instance_id": "two", "difficulty": "hard", "language": "rust", "image_name": "two-image", "repository": "owner/two", "commit": "b" * 40},
+            {
+                "instance_id": "one",
+                "difficulty": "easy",
+                "language": "python",
+                "image_name": "one-image",
+                "repository": "owner/one",
+                "commit": "a" * 40,
+            },
+            {
+                "instance_id": "two",
+                "difficulty": "hard",
+                "language": "rust",
+                "image_name": "two-image",
+                "repository": "owner/two",
+                "commit": "b" * 40,
+            },
         ],
         output=tmp_path / "out",
         limit=2,
@@ -1026,9 +1049,11 @@ def test_selection_instance_normalizes_missing_difficulty_without_inventing_meta
         "difficulty": "unspecified",
         "language": "python",
     }
-    assert _selection_instance(
-        {"instance_id": "two", "difficulty": "  custom  ", "language": "rust"}
-    ) == {"instance_id": "two", "difficulty": "  custom  ", "language": "rust"}
+    assert _selection_instance({"instance_id": "two", "difficulty": "  custom  ", "language": "rust"}) == {
+        "instance_id": "two",
+        "difficulty": "  custom  ",
+        "language": "rust",
+    }
 
 
 @pytest.mark.parametrize("difficulty", [[], True, 1])
@@ -1262,7 +1287,12 @@ def test_real_dataset_selection_excludes_fixture_and_freezes_optional_difficulty
 def test_campaign_forwards_openai_compatible_gateway_environment() -> None:
     from scripts.campaign_runner import _CREDENTIAL_ENV
 
-    assert _CREDENTIAL_ENV == ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENCODE_SERVER_PASSWORD")
+    assert _CREDENTIAL_ENV == (
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "OPENCODE_CONFIG_CONTENT",
+        "OPENCODE_SERVER_PASSWORD",
+    )
 
 
 def test_all_selection_counts_only_real_benchmark_instances(tmp_path: Path):
@@ -1274,9 +1304,28 @@ def test_all_selection_counts_only_real_benchmark_instances(tmp_path: Path):
     config_path = tmp_path / "campaign.yaml"
     config_path.write_text(_config(repo))
     instances = [
-        {"instance_id": "real__one", "language": "python", "image_name": "one", "repository": "owner/one", "commit": "a" * 40},
-        {"instance_id": "real__two", "difficulty": "easy", "language": "rust", "image_name": "two", "repository": "owner/two", "commit": "b" * 40},
-        {"instance_id": "testorg__calculator.abc1234", "language": "python", "image_name": "fixture", "repository": "testorg/calculator", "commit": "c" * 40},
+        {
+            "instance_id": "real__one",
+            "language": "python",
+            "image_name": "one",
+            "repository": "owner/one",
+            "commit": "a" * 40,
+        },
+        {
+            "instance_id": "real__two",
+            "difficulty": "easy",
+            "language": "rust",
+            "image_name": "two",
+            "repository": "owner/two",
+            "commit": "b" * 40,
+        },
+        {
+            "instance_id": "testorg__calculator.abc1234",
+            "language": "python",
+            "image_name": "fixture",
+            "repository": "testorg/calculator",
+            "commit": "c" * 40,
+        },
     ]
 
     plan = plan_campaign(
@@ -1302,9 +1351,30 @@ def test_plan_uses_programbench_regex_filter_and_all_after_exclusions(tmp_path: 
     plan = plan_campaign(
         load_config(config_path),
         [
-            {"instance_id": "keep__one", "difficulty": "easy", "language": "python", "image_name": "one", "repository": "owner/one", "commit": "a" * 40},
-            {"instance_id": "keep__two", "difficulty": "hard", "language": "rust", "image_name": "two", "repository": "owner/two", "commit": "b" * 40},
-            {"instance_id": "skip__three", "difficulty": "hard", "language": "rust", "image_name": "three", "repository": "owner/three", "commit": "c" * 40},
+            {
+                "instance_id": "keep__one",
+                "difficulty": "easy",
+                "language": "python",
+                "image_name": "one",
+                "repository": "owner/one",
+                "commit": "a" * 40,
+            },
+            {
+                "instance_id": "keep__two",
+                "difficulty": "hard",
+                "language": "rust",
+                "image_name": "two",
+                "repository": "owner/two",
+                "commit": "b" * 40,
+            },
+            {
+                "instance_id": "skip__three",
+                "difficulty": "hard",
+                "language": "rust",
+                "image_name": "three",
+                "repository": "owner/three",
+                "commit": "c" * 40,
+            },
         ],
         output=tmp_path / "out",
         instance_filter="keep__.*",
@@ -1324,7 +1394,16 @@ def test_resume_uses_frozen_install_data_without_resolving_moving_refs(tmp_path:
     repo.mkdir()
     config_path = tmp_path / "campaign.yaml"
     config_path.write_text(_config(repo))
-    instances = [{"instance_id": "one", "difficulty": "easy", "language": "python", "image_name": "one-image", "repository": "owner/one", "commit": "a" * 40}]
+    instances = [
+        {
+            "instance_id": "one",
+            "difficulty": "easy",
+            "language": "python",
+            "image_name": "one-image",
+            "repository": "owner/one",
+            "commit": "a" * 40,
+        }
+    ]
     plan_campaign(
         load_config(config_path),
         instances,
@@ -1356,8 +1435,22 @@ def test_resume_rejects_changed_frozen_selection_options(tmp_path: Path):
     config_path = tmp_path / "campaign.yaml"
     config_path.write_text(_config(repo))
     instances = [
-        {"instance_id": "one", "difficulty": "easy", "language": "python", "image_name": "one-image", "repository": "owner/one", "commit": "a" * 40},
-        {"instance_id": "two", "difficulty": "hard", "language": "rust", "image_name": "two-image", "repository": "owner/two", "commit": "b" * 40},
+        {
+            "instance_id": "one",
+            "difficulty": "easy",
+            "language": "python",
+            "image_name": "one-image",
+            "repository": "owner/one",
+            "commit": "a" * 40,
+        },
+        {
+            "instance_id": "two",
+            "difficulty": "hard",
+            "language": "rust",
+            "image_name": "two-image",
+            "repository": "owner/two",
+            "commit": "b" * 40,
+        },
     ]
     plan_campaign(
         load_config(config_path),
@@ -1391,7 +1484,16 @@ def test_resume_acknowledges_recoverable_breaker_pause_but_not_hard_stop(tmp_pat
     repo.mkdir()
     config_path = tmp_path / "campaign.yaml"
     config_path.write_text(_config(repo))
-    instances = [{"instance_id": "one", "difficulty": "easy", "language": "python", "image_name": "one", "repository": "owner/one", "commit": "a" * 40}]
+    instances = [
+        {
+            "instance_id": "one",
+            "difficulty": "easy",
+            "language": "python",
+            "image_name": "one",
+            "repository": "owner/one",
+            "commit": "a" * 40,
+        }
+    ]
     config = load_config(config_path)
     plan_campaign(
         config,
@@ -1455,7 +1557,16 @@ def test_persisted_hard_stop_resume_runs_cleanup_only_without_admission(tmp_path
     config_path = tmp_path / "campaign.yaml"
     config_path.write_text(_config(repo))
     config = load_config(config_path)
-    instances = [{"instance_id": "one", "difficulty": "easy", "language": "python", "image_name": "one", "repository": "owner/one", "commit": "a" * 40}]
+    instances = [
+        {
+            "instance_id": "one",
+            "difficulty": "easy",
+            "language": "python",
+            "image_name": "one",
+            "repository": "owner/one",
+            "commit": "a" * 40,
+        }
+    ]
     plan = campaign_runner.plan_campaign(
         config,
         instances,
@@ -1805,6 +1916,46 @@ def test_run_job_passes_campaign_stop_token_to_adapter(tmp_path: Path, monkeypat
 
     assert result.status == "completed"
     assert seen == [token]
+
+
+def test_run_job_selects_semantic_protocol_from_frozen_install_revision(tmp_path: Path, monkeypatch):
+    from scripts import campaign_runner
+    from scripts.campaign_procontract import SEMANTIC_ATTEMPTS_REVISION
+    from scripts.run_opencode import load_config
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config_path = tmp_path / "campaign.yaml"
+    config_path.write_text(_config(repo))
+    plan = campaign_runner.CampaignPlan(
+        tmp_path / "out", tmp_path / "out/campaign.json", load_config(config_path), ("one",), (), {}, False
+    )
+    seen = []
+
+    class Workspace:
+        base_url = "http://127.0.0.1:9999"
+        port = 9999
+
+        def stop_for_freeze(self):
+            return None
+
+    def adapter(*_args, **kwargs):
+        seen.append(kwargs["protocol"])
+
+    monkeypatch.setattr(
+        campaign_runner, "_install_for", lambda *_: SimpleNamespace(revision=SEMANTIC_ATTEMPTS_REVISION)
+    )
+    result = campaign_runner.run_job(
+        plan,
+        campaign_runner.CampaignJob("one", "procontract", "one-image"),
+        breaker=CircuitBreaker(),
+        workspace_factory=lambda *_: Workspace(),
+        procontract_runner=adapter,
+        procontract_api_factory=lambda _: object(),
+    )
+
+    assert result.status == "completed"
+    assert seen == ["semantic-v0"]
 
 
 def test_run_job_with_preexisting_campaign_stop_never_allocates_workspace(tmp_path: Path):
@@ -2334,8 +2485,22 @@ def test_fake_paired_campaign_script_main_resumes_without_adapter_calls(tmp_path
     config_path = tmp_path / "campaign.yaml"
     config_path.write_text(_config(repo))
     instances = [
-        {"instance_id": "one", "difficulty": "easy", "language": "python", "image_name": "one-image", "repository": "owner/one", "commit": "a" * 40},
-        {"instance_id": "two", "difficulty": "hard", "language": "rust", "image_name": "two-image", "repository": "owner/two", "commit": "b" * 40},
+        {
+            "instance_id": "one",
+            "difficulty": "easy",
+            "language": "python",
+            "image_name": "one-image",
+            "repository": "owner/one",
+            "commit": "a" * 40,
+        },
+        {
+            "instance_id": "two",
+            "difficulty": "hard",
+            "language": "rust",
+            "image_name": "two-image",
+            "repository": "owner/two",
+            "commit": "b" * 40,
+        },
     ]
     prepared = []
 
@@ -2541,8 +2706,22 @@ def test_fake_paired_campaign_pause_and_interrupt_drain_real_active_job_paths(tm
     plan = campaign_runner.plan_campaign(
         load_config(config_path),
         [
-            {"instance_id": "one", "difficulty": "easy", "language": "python", "image_name": "one-image", "repository": "owner/one", "commit": "a" * 40},
-            {"instance_id": "two", "difficulty": "hard", "language": "rust", "image_name": "two-image", "repository": "owner/two", "commit": "b" * 40},
+            {
+                "instance_id": "one",
+                "difficulty": "easy",
+                "language": "python",
+                "image_name": "one-image",
+                "repository": "owner/one",
+                "commit": "a" * 40,
+            },
+            {
+                "instance_id": "two",
+                "difficulty": "hard",
+                "language": "rust",
+                "image_name": "two-image",
+                "repository": "owner/two",
+                "commit": "b" * 40,
+            },
         ],
         output=tmp_path / "out",
         limit=2,
