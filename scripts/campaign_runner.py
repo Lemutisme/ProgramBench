@@ -675,7 +675,10 @@ def run_job(
                             breaker=breaker,
                             api=api,
                             stop_token=stop,
-                            protocol=protocol_for_revision(getattr(install, "revision", "")),
+                            protocol=protocol_for_revision(
+                                getattr(install, "revision", ""),
+                                next(arm.execution_policy for arm in plan.config.arms if arm.name == candidate.arm),
+                            ),
                         )
                     state = store.read_optional()
                     if (
@@ -1106,6 +1109,7 @@ def _config_manifest(config: CampaignConfig) -> dict[str, object]:
                 "revision": arm.revision,
                 "mode": arm.mode,
                 "binary": str(arm.binary) if arm.binary else None,
+                **({"execution_policy": arm.execution_policy} if arm.execution_policy != "behavioral" else {}),
             }
             for arm in config.arms
         },

@@ -48,6 +48,7 @@ class ArmConfig:
     revision: str
     mode: Literal["procontract", "vanilla"]
     binary: Path | None = None
+    execution_policy: Literal["behavioral", "none"] = "behavioral"
 
 
 @dataclass(frozen=True)

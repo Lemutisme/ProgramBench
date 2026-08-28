@@ -138,7 +138,27 @@ excluded:
     assert type(result.limits.total_cost_soft) is float
     assert type(result.limits.total_cost_hard) is float
     assert result.arms[0].repo == repo
+    assert result.arms[0].execution_policy == "behavioral"
     assert result.excluded == frozenset({"old.instance"})
+
+
+def test_load_config_freezes_policy_ablation_outside_binary_identity(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config = load_config(
+        _write_text(
+            tmp_path / "campaign.yaml",
+            campaign_yaml(repo).replace(
+                "    mode: procontract\n", "    mode: procontract\n    execution_policy: none\n"
+            ),
+        )
+    )
+    manifest = tmp_path / "campaign.json"
+
+    freeze_campaign_config(config, manifest)
+
+    assert config.arms[0].execution_policy == "none"
+    assert json.loads(manifest.read_text())["arms"]["procontract"]["execution_policy"] == "none"
 
 
 def test_load_config_allows_cost_caps_to_be_disabled(tmp_path: Path):

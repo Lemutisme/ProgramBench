@@ -807,8 +807,15 @@ def _contract(
 ) -> dict[str, object]:
     replay = payload["evidence"]["replay"]  # type: ignore[index]
     spec = {
-        key: payload[key]
-        for key in ("trigger", "goal", "policy", "brief", "requires", "authority", "budget", "evidence", "resolution")
+        "trigger": payload["trigger"],
+        "goal": payload["goal"],
+        **({"policy": payload["policy"]} if "policy" in payload else {}),
+        "brief": payload["brief"],
+        "requires": payload["requires"],
+        "authority": payload["authority"],
+        "budget": payload["budget"],
+        "evidence": payload["evidence"],
+        "resolution": payload["resolution"],
     }
     return {
         "id": payload["id"],
@@ -844,6 +851,7 @@ def _execution(payload: dict[str, object]) -> dict[str, object]:
         "revision": 1,
         "location": payload["location"],
         "model": payload["model"],
+        **({"executionPolicy": payload["executionPolicy"]} if "executionPolicy" in payload else {}),
         "sessionID": "ses_contract",
         "promptID": "msg_contract",
         "dispatched": True,
@@ -1069,6 +1077,30 @@ def test_semantic_v0_uses_same_execution_terms_without_unsupported_evidence(tmp_
     }
     assert legacy["evidence"] == {"type": "principal"}
     assert "policy" not in legacy
+
+
+def test_policy_split_keeps_execution_policy_outside_contract_terms(tmp_path: Path) -> None:
+    from scripts.campaign_procontract import (
+        ACCEPTANCE_POLICY,
+        _expected_spec,
+        _validate_execution,
+        build_issue_payload,
+    )
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    _, workspace = _workspace(tmp_path, paths)
+    payload = build_issue_payload(workspace, now=100.0, protocol="policy-split-v1")
+
+    assert payload["executionPolicy"] == ACCEPTANCE_POLICY
+    assert "policy" not in payload
+    assert "policy" not in _expected_spec(payload)
+    assert _validate_execution(_execution(payload), payload, 1)["executionPolicy"] == ACCEPTANCE_POLICY
+    policyless = build_issue_payload(workspace, now=100.0, protocol="policy-split-none-v1")
+    assert "executionPolicy" not in policyless
+    assert "policy" not in policyless
+    assert policyless["brief"] == payload["brief"]
+    assert "broad black-box differential experiments" not in str(payload["brief"])
 
 
 def test_semantic_v0_materializes_only_the_exact_institution_snapshot(tmp_path: Path) -> None:

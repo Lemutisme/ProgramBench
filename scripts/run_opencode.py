@@ -132,7 +132,7 @@ _LIMIT_KEYS = frozenset(
     {"wall_time_seconds", "provider_turns", "procontract_actions", "total_cost_soft", "total_cost_hard"}
 )
 _CACHE_KEYS = frozenset({"warmup_turns", "minimum_read_ratio", "stop_after_consecutive_failures"})
-_ARM_KEYS = frozenset({"repo", "revision", "mode", "binary"})
+_ARM_KEYS = frozenset({"repo", "revision", "mode", "binary", "execution_policy"})
 
 
 @dataclass(frozen=True)
@@ -150,7 +150,9 @@ class Limits:
         if any(value <= 0 for value in integer_values):
             raise ConfigError("all limits must be positive")
         costs = (self.total_cost_soft, self.total_cost_hard)
-        if any(value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))) for value in costs):
+        if any(
+            value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))) for value in costs
+        ):
             raise ConfigError("cost limits must be numeric or null")
         object.__setattr__(
             self,
@@ -395,6 +397,9 @@ def _load_arms(raw: object, config_dir: Path) -> tuple[ArmConfig, ArmConfig]:
         if not isinstance(revision, str) or not revision:
             raise ConfigError(f"arm {name} revision must be a nonempty string")
         binary = value.get("binary")
+        execution_policy = value.get("execution_policy", "behavioral")
+        if execution_policy not in {"behavioral", "none"}:
+            raise ConfigError(f"arm {name} execution_policy must be behavioral or none")
         result.append(
             ArmConfig(
                 name=name,
@@ -402,6 +407,7 @@ def _load_arms(raw: object, config_dir: Path) -> tuple[ArmConfig, ArmConfig]:
                 revision=revision,
                 mode=mode,
                 binary=_path_value(value, "binary", config_dir) if binary is not None else None,
+                execution_policy=execution_policy,
             )
         )
     return result[0], result[1]
@@ -483,6 +489,7 @@ def _canonical_config(config: CampaignConfig) -> dict[str, object]:
                 "revision": arm.revision,
                 "mode": arm.mode,
                 "binary": str(arm.binary.resolve()) if arm.binary else None,
+                **({"execution_policy": arm.execution_policy} if arm.execution_policy != "behavioral" else {}),
             }
             for arm in config.arms
         },

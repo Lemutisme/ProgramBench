@@ -67,7 +67,8 @@ MAX_OBSERVATION_ATTEMPTS = 6
 MAX_CONTRACT_ATTEMPTS = 3
 MAX_CREDENTIAL_SCAN_BYTES = 512 * 1024 * 1024
 SEMANTIC_ATTEMPTS_REVISION = "ed8bd2b7992485264335a541b40c1c03a4b35619"
-ProContractProtocol = Literal["current", "semantic-v0"]
+POLICY_SPLIT_REVISION = "7054140b61e5cdeceef61f6bc6e6520eefe7ac79"
+ProContractProtocol = Literal["current", "semantic-v0", "policy-split-v1", "policy-split-none-v1"]
 MODEL = "openai/gpt-5.6-luna"
 VARIANT = "max"
 SUPPORTED_MODEL_VARIANTS = frozenset(
@@ -148,15 +149,21 @@ CONTROL_ARTIFACT_NAMES = (
 
 
 def _acceptance_policy(protocol: ProContractProtocol) -> str:
-    if protocol == "current":
+    if protocol in {"current", "policy-split-v1"}:
         return ACCEPTANCE_POLICY
+    if protocol == "policy-split-none-v1":
+        return ""
     if protocol == "semantic-v0":
         return LEGACY_ACCEPTANCE_POLICY
     raise ProContractError("unknown ProContract protocol")
 
 
-def protocol_for_revision(revision: str) -> ProContractProtocol:
-    return "semantic-v0" if revision == SEMANTIC_ATTEMPTS_REVISION else "current"
+def protocol_for_revision(revision: str, execution_policy: str = "behavioral") -> ProContractProtocol:
+    if revision == SEMANTIC_ATTEMPTS_REVISION:
+        return "semantic-v0"
+    if revision == POLICY_SPLIT_REVISION:
+        return "policy-split-none-v1" if execution_policy == "none" else "policy-split-v1"
+    return "current"
 
 
 _CONTRACT_STATUSES = {"dormant", "active", "verification", "escalated", "discharged", "released"}
@@ -799,13 +806,23 @@ def build_issue_payload(
             "state transition. This Contract's complete obligation and validation end in this Session when "
             "the native replay below establishes delivery readiness. Later ProgramBench scoring is an out-of-scope "
             "observation; it creates no future obligation and is not a reason to revise these delivery terms."
-            " Do not report ready merely because the program compiles. Before handoff, use the reference for broad "
-            "black-box differential experiments covering documented commands, flags, errors, boundary cases, and "
-            "stateful behavior; preserve discoveries as regression tests and continue until no material behavioral "
-            "gap remains or the shared Contract budget is exhausted."
+            + (
+                " Do not report ready merely because the program compiles. Before handoff, use the reference for "
+                "broad black-box differential experiments covering documented commands, flags, errors, boundary "
+                "cases, and stateful behavior; preserve discoveries as regression tests and continue until no "
+                "material behavioral gap remains or the shared Contract budget is exhausted."
+                if protocol in {"current", "semantic-v0"}
+                else ""
+            )
         ),
     ).to_dict()
     if protocol == "current":
+        return payload
+    if protocol == "policy-split-v1":
+        payload["executionPolicy"] = payload.pop("policy")
+        return payload
+    if protocol == "policy-split-none-v1":
+        payload.pop("policy")
         return payload
     if protocol != "semantic-v0":
         raise ProContractError("unknown ProContract protocol")
@@ -2861,7 +2878,7 @@ def _load_or_create_issue(
         "payloadHash": _hash_json(_ordered_issue_payload(payload)),
         "acceptancePolicyUTF8": base64.b64encode(acceptance_policy.encode()).decode(),
         "acceptanceHash": hashlib.sha256(acceptance_policy.encode()).hexdigest(),
-        "replayPolicyHash": _hash_json(REPLAY_POLICY) if protocol == "current" else None,
+        "replayPolicyHash": _hash_json(REPLAY_POLICY) if protocol != "semantic-v0" else None,
     }
     if _contains_credential(record, _credential_values(_all_credential_names(workspace.manifest.credential_env))):
         raise ProContractError("Contract issue request contains a provider credential")
@@ -2942,7 +2959,7 @@ def _validate_issue_record(
         or raw["payloadHash"] != _hash_json(expected)
         or raw["acceptancePolicyUTF8"] != base64.b64encode(acceptance_policy.encode()).decode()
         or raw["acceptanceHash"] != hashlib.sha256(acceptance_policy.encode()).hexdigest()
-        or raw["replayPolicyHash"] != (_hash_json(REPLAY_POLICY) if protocol == "current" else None)
+        or raw["replayPolicyHash"] != (_hash_json(REPLAY_POLICY) if protocol != "semantic-v0" else None)
     ):
         raise ProContractConflictError("persisted Contract issue conflicts with this job")
 
@@ -3117,6 +3134,7 @@ def _ordered_issue_payload(payload: Mapping[str, object]) -> dict[str, object]:
         "id": payload["id"],
         "scope": payload["scope"],
         "goal": spec["goal"],
+        **({"executionPolicy": payload["executionPolicy"]} if "executionPolicy" in payload else {}),
         **({"policy": spec["policy"]} if "policy" in spec else {}),
         "brief": spec["brief"],
         "requires": spec["requires"],
@@ -3452,7 +3470,7 @@ def _validate_execution(raw: object, payload: Mapping[str, object], revision: in
         "turnsUsed",
         "actionsUsed",
     }
-    allowed = required | {"leaseOwner", "leaseExpiresAt"}
+    allowed = required | {"executionPolicy", "leaseOwner", "leaseExpiresAt"}
     if not isinstance(raw, Mapping) or not required <= set(raw) or set(raw) - allowed:
         raise ProContractError("Contract execution response schema is invalid")
     if (
@@ -3460,6 +3478,7 @@ def _validate_execution(raw: object, payload: Mapping[str, object], revision: in
         or raw["revision"] != revision
         or raw["location"] != payload["location"]
         or raw["model"] != payload["model"]
+        or raw.get("executionPolicy") != payload.get("executionPolicy")
         or not isinstance(raw["sessionID"], str)
         or not raw["sessionID"].startswith("ses")
         or not isinstance(raw["promptID"], str)
@@ -3470,6 +3489,8 @@ def _validate_execution(raw: object, payload: Mapping[str, object], revision: in
             for key in ("attempts", "nextActionAt", "turnsUsed", "actionsUsed")
         )
         or raw["attempts"] > int(payload["resolution"]["maxAttempts"])  # type: ignore[index]
+        or "executionPolicy" in raw
+        and (not isinstance(raw["executionPolicy"], str) or not raw["executionPolicy"])
         or "leaseOwner" in raw
         and (not isinstance(raw["leaseOwner"], str) or not raw["leaseOwner"])
         or "leaseExpiresAt" in raw
@@ -3492,6 +3513,7 @@ def _validate_execution(raw: object, payload: Mapping[str, object], revision: in
             "providerID": model["providerID"],
             **({"variant": model["variant"]} if "variant" in model else {}),
         },
+        **({"executionPolicy": raw["executionPolicy"]} if "executionPolicy" in raw else {}),
         "sessionID": raw["sessionID"],
         "promptID": raw["promptID"],
         "dispatched": raw["dispatched"],
@@ -3510,6 +3532,7 @@ def _binding_identity(execution: Mapping[str, object]) -> tuple[object, ...]:
         execution["revision"],
         execution["location"],
         execution["model"],
+        execution.get("executionPolicy"),
         execution["sessionID"],
         execution["promptID"],
     )
@@ -3521,6 +3544,7 @@ def _binding_contract_identity(execution: Mapping[str, object]) -> tuple[object,
         execution["revision"],
         execution["location"],
         execution["model"],
+        execution.get("executionPolicy"),
     )
 
 
