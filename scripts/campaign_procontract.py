@@ -3468,8 +3468,47 @@ def _materialize_legacy_snapshot(
         "GIT_CONFIG_GLOBAL": "/dev/null",
         "GIT_OPTIONAL_LOCKS": "0",
     }
+    candidate = Path(workspace.manifest.candidate).absolute()
+    candidate_git = candidate / ".git"
+    candidate_objects = candidate_git / "objects"
+    if (
+        candidate.is_symlink()
+        or candidate_git.is_symlink()
+        or not candidate_git.is_dir()
+        or candidate_objects.is_symlink()
+        or not candidate_objects.is_dir()
+    ):
+        raise ProContractDeliveryError("semantic-v0 candidate object store is invalid")
+    try:
+        candidate_root = candidate.resolve(strict=True)
+        candidate_objects = candidate_objects.resolve(strict=True)
+    except OSError as error:
+        raise ProContractDeliveryError("semantic-v0 candidate object store is invalid") from error
+    if candidate_root not in candidate_objects.parents:
+        raise ProContractDeliveryError("semantic-v0 candidate object store escaped its workspace")
+    candidate_alternates = candidate_objects / "info/alternates"
+    if candidate_alternates.exists() or candidate_alternates.is_symlink():
+        raise ProContractDeliveryError("semantic-v0 candidate object store uses an uncontrolled alternate")
     matches = []
     for repository in repositories:
+        objects = repository / "objects"
+        if objects.is_symlink() or not objects.is_dir():
+            raise ProContractDeliveryError("semantic-v0 snapshot object store is invalid")
+        nested_alternates = objects / "info/alternates"
+        if nested_alternates.exists() or nested_alternates.is_symlink():
+            if (
+                nested_alternates.is_symlink()
+                or not nested_alternates.is_file()
+                or nested_alternates.stat().st_size > 4096
+            ):
+                raise ProContractDeliveryError("semantic-v0 snapshot alternate is invalid")
+            try:
+                values = tuple(line for line in nested_alternates.read_text().splitlines() if line)
+            except (OSError, UnicodeError) as error:
+                raise ProContractDeliveryError("semantic-v0 snapshot alternate is invalid") from error
+            allowed = {"/candidate/.git/objects", str(candidate_objects)}
+            if not values or any(value not in allowed for value in values):
+                raise ProContractDeliveryError("semantic-v0 snapshot uses an uncontrolled alternate")
         result = campaign_process.run_bounded(
             ("git", "-c", "core.hooksPath=/dev/null", f"--git-dir={repository}", "cat-file", "-t", subject_hash),
             None,
@@ -3479,9 +3518,10 @@ def _materialize_legacy_snapshot(
             environment,
         )
         if result.returncode == 0 and result.stdout.strip() == "tree":
-            matches.append(repository)
+            matches.append(objects)
     if len(matches) != 1:
         raise ProContractDeliveryError("semantic-v0 handoff tree is unavailable or ambiguous")
+    snapshot_objects = matches[0]
     temporary = Path(tempfile.mkdtemp(prefix=".contract-export.", dir=destination.parent))
     try:
         initialized = campaign_process.run_bounded(
@@ -3491,7 +3531,7 @@ def _materialize_legacy_snapshot(
             raise ProContractDeliveryError("semantic-v0 export repository initialization failed")
         alternates = temporary / ".git/objects/info/alternates"
         alternates.parent.mkdir(parents=True, exist_ok=True)
-        alternates.write_text(str((matches[0] / "objects").resolve()) + "\n")
+        alternates.write_text(f"{snapshot_objects.resolve()}\n{candidate_objects}\n")
         commands = (
             ("git", "-C", str(temporary), "read-tree", subject_hash),
             ("git", "-C", str(temporary), "checkout-index", "--all", "--force"),

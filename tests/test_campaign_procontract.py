@@ -986,10 +986,7 @@ def test_semantic_v0_materializes_only_the_exact_institution_snapshot(tmp_path: 
     paths = JobPaths(tmp_path / "job")
     paths.root.mkdir()
     _, workspace = _workspace(tmp_path, paths)
-    source = tmp_path / "source"
-    subject_hash = _write_git_export(source)
-    repository = workspace.manifest.state_dir / "data/opencode/snapshot/project/worktree"
-    shutil.copytree(source / ".git", repository)
+    subject_hash = _write_legacy_snapshot_store(workspace)
     destination = workspace.manifest.state_dir / "contract-export-pct_legacy"
 
     assert _materialize_legacy_snapshot(workspace, "pct_legacy", subject_hash, destination) == {
@@ -1001,6 +998,23 @@ def test_semantic_v0_materializes_only_the_exact_institution_snapshot(tmp_path: 
     assert destination.joinpath("executable").read_text() == "binary"
     with pytest.raises(ProContractDeliveryError, match="unavailable or ambiguous"):
         _materialize_legacy_snapshot(workspace, "pct_other", "0" * 40, workspace.manifest.state_dir / "missing")
+
+
+def test_semantic_v0_rejects_uncontrolled_snapshot_alternate(tmp_path: Path) -> None:
+    from scripts.campaign_procontract import ProContractDeliveryError, _materialize_legacy_snapshot
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    _, workspace = _workspace(tmp_path, paths)
+    subject_hash = _write_legacy_snapshot_store(workspace, extra_alternate="/tmp/uncontrolled/objects")
+
+    with pytest.raises(ProContractDeliveryError, match="uncontrolled alternate"):
+        _materialize_legacy_snapshot(
+            workspace,
+            "pct_legacy",
+            subject_hash,
+            workspace.manifest.state_dir / "contract-export-pct_legacy",
+        )
 
 
 @pytest.mark.parametrize(
@@ -1654,12 +1668,7 @@ def test_semantic_v0_lifecycle_freezes_snapshot_before_external_preflight_and_at
     _, workspace = _workspace(tmp_path, paths)
     clock = FakeClock()
     payload = build_issue_payload(workspace, now=clock(), protocol="semantic-v0")
-    source = tmp_path / "source"
-    subject_hash = _write_git_export(source)
-    shutil.copytree(
-        source / ".git",
-        workspace.manifest.state_dir / "data/opencode/snapshot/project/worktree",
-    )
+    subject_hash = _write_legacy_snapshot_store(workspace)
     spec = _expected_spec(payload)
     contract = {
         "id": payload["id"],
@@ -5244,6 +5253,20 @@ def _tree_identity(root: Path) -> list[tuple[str, int, int, str]]:
         )
         for path in sorted(root.rglob("*"))
     ]
+
+
+def _write_legacy_snapshot_store(workspace: FakeWorkspace, *, extra_alternate: str | None = None) -> str:
+    workspace.candidate.rmdir()
+    subject_hash = _write_git_export(workspace.candidate)
+    repository = workspace.manifest.state_dir / "data/opencode/snapshot/project/worktree"
+    subprocess.run(("git", "init", "--bare", "--quiet", str(repository)), check=True)
+    source = workspace.candidate / ".git/objects" / subject_hash[:2] / subject_hash[2:]
+    target = repository / "objects" / subject_hash[:2] / subject_hash[2:]
+    target.parent.mkdir(parents=True)
+    shutil.copyfile(source, target)
+    values = ["/candidate/.git/objects", *([extra_alternate] if extra_alternate else [])]
+    repository.joinpath("objects/info/alternates").write_text("\n".join(values) + "\n")
+    return subject_hash
 
 
 def _write_git_export(root: Path, *, ignored: bool = False) -> str:
