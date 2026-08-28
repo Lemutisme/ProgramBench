@@ -77,7 +77,10 @@ SUPPORTED_MODEL_VARIANTS = frozenset(
 )
 LOCATION = "/candidate"
 ACCEPTANCE_POLICY = (
-    "ProgramBench delivery policy v2: hand off one exact frozen candidate snapshot containing compile.sh, "
+    "ProgramBench delivery policy v2: enumerate documented surfaces, boundary and error semantics, and material "
+    "interactions; use batched differential probes within the action deadline, then preserve observations as "
+    "regression checks after coherent edits. Delivery replay alone is not a behavioral stopping condition. Hand "
+    "off one exact frozen candidate snapshot containing compile.sh, "
     "executable, and a self-contained validate.sh regression suite after the native replay runs compile.sh with "
     "common package-manager network access disabled and then validate.sh, with both exiting 0 within 600 seconds. "
     "validate.sh must encode behavioral evidence learned from black-box reference experiments and must not access "
@@ -1345,6 +1348,13 @@ def _run_procontract(
     )
     bound_execution = execution
     progress_path = job.job.root / "procontract-progress.json"
+    if state.provider_turns or state.actions or state.cost:
+        observed_execution = api.get_execution(str(payload["id"]))
+        if isinstance(observed_execution, Mapping):
+            current_execution = _validate_execution(observed_execution, payload, int(contract["revision"]))
+            if not _execution_successor(bound_execution, current_execution):
+                raise ProContractConflictError("native Contract execution binding regressed during recovery")
+            bound_execution = current_execution
     usage, actions, messages = _restore_contract_progress(progress_path, state, payload, bound_execution)
     if (state.provider_turns or state.actions or state.cost) and usage.provider_turns <= MAX_PROVIDER_TURNS:
         breaker.observe(workspace.manifest.job_id, state.generation, usage, terminal=False)
@@ -1479,12 +1489,7 @@ def _run_procontract(
                         clock,
                     )
                 if _binding_identity(current_execution) != _binding_identity(bound_execution):
-                    if (
-                        _binding_contract_identity(current_execution) != _binding_contract_identity(bound_execution)
-                        or int(current_execution["attempts"]) <= int(bound_execution["attempts"])
-                        or int(current_execution["turnsUsed"]) < int(bound_execution["turnsUsed"])
-                        or int(current_execution["actionsUsed"]) < int(bound_execution["actionsUsed"])
-                    ):
+                    if not _execution_successor(bound_execution, current_execution):
                         raise ProContractConflictError("native Contract execution binding changed after issue")
                     bound_execution = current_execution
                 execution = current_execution
@@ -3494,6 +3499,18 @@ def _binding_contract_identity(execution: Mapping[str, object]) -> tuple[object,
         execution["location"],
         execution["model"],
     )
+
+
+def _execution_successor(previous: Mapping[str, object], current: Mapping[str, object]) -> bool:
+    if _binding_contract_identity(current) != _binding_contract_identity(previous):
+        return False
+    if int(current["turnsUsed"]) < int(previous["turnsUsed"]) or int(current["actionsUsed"]) < int(
+        previous["actionsUsed"]
+    ):
+        return False
+    if _binding_identity(current) == _binding_identity(previous):
+        return int(current["attempts"]) >= int(previous["attempts"])
+    return int(current["attempts"]) > int(previous["attempts"])
 
 
 def _validate_quiet(raw: object, payload: Mapping[str, object]) -> Mapping[str, object]:

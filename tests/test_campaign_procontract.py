@@ -1010,6 +1010,33 @@ def test_execution_hash_restores_model_ref_schema_order_without_changing_issue_o
     assert _hash_json(execution) == "08df5b7d64ab290b2e24de8fe27dda2de8e9fdbc60f72b8a396432964a5da47c"
 
 
+def test_execution_successor_accepts_only_monotonic_recovery_bindings(tmp_path: Path) -> None:
+    from scripts.campaign_procontract import _execution_successor, build_issue_payload
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    _, workspace = _workspace(tmp_path, paths)
+    previous = _execution(build_issue_payload(workspace, now=100.0))
+
+    assert _execution_successor(previous, previous)
+    assert _execution_successor(previous, {**previous, "turnsUsed": 2, "actionsUsed": 3})
+    assert _execution_successor(
+        previous,
+        {
+            **previous,
+            "sessionID": "ses_contract_retry",
+            "promptID": "msg_contract_retry",
+            "attempts": 2,
+            "turnsUsed": 2,
+            "actionsUsed": 3,
+        },
+    )
+    assert not _execution_successor(previous, {**previous, "turnsUsed": 0})
+    assert not _execution_successor(previous, {**previous, "actionsUsed": 1})
+    assert not _execution_successor(previous, {**previous, "revision": 2})
+    assert not _execution_successor(previous, {**previous, "sessionID": "ses_contract_retry"})
+
+
 def test_semantic_v0_uses_same_execution_terms_without_unsupported_evidence(tmp_path: Path) -> None:
     from scripts.campaign_procontract import build_issue_payload
 
