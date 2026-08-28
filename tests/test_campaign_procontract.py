@@ -959,6 +959,57 @@ def test_issue_response_accepts_only_exact_formation_receipt(tmp_path: Path) -> 
         _validate_issue_response({**response, "formationHash": "0" * 64}, payload)
 
 
+def test_sorted_faithful_issue_reloads_exact_formation_reconciliation_hashes(tmp_path: Path) -> None:
+    from scripts.campaign_procontract import (
+        _formation_hash,
+        _hash_json,
+        _reconcile_ambiguous_issue,
+        _validate_issue_response,
+        build_issue_payload,
+    )
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    _, workspace = _workspace(tmp_path, paths)
+    payload = build_issue_payload(workspace, now=100.0)
+    contract = _contract(payload)
+    execution = _execution(payload)
+    formation = {
+        "data": contract,
+        "execution": execution,
+        "receipt": {"frontier": 0, "hash": "ledger"},
+        "formationHash": _formation_hash(payload, contract["specHash"]),
+    }
+    persisted_formation = json.loads(json.dumps(formation, sort_keys=True))
+
+    assert (
+        _validate_issue_response(persisted_formation, json.loads(json.dumps(payload, sort_keys=True)))["formationHash"]
+        == formation["formationHash"]
+    )
+
+    path = paths.root / "procontract-issue-response.json"
+    reconciled = _reconcile_ambiguous_issue(FakeApi(contract, execution), payload, path, ())
+    assert reconciled is not None
+    persisted = json.loads(path.read_text())
+    validated = _validate_issue_response(persisted, json.loads(json.dumps(payload, sort_keys=True)))
+    assert persisted["reconciliation"]["contractHash"] == _hash_json(validated["data"])
+    assert persisted["reconciliation"]["executionHash"] == _hash_json(validated["execution"])
+
+
+def test_execution_hash_restores_model_ref_schema_order_without_changing_issue_order(tmp_path: Path) -> None:
+    from scripts.campaign_procontract import _hash_json, _validate_execution, build_issue_payload
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    _, workspace = _workspace(tmp_path, paths)
+    payload = build_issue_payload(workspace, now=100.0)
+    execution = _validate_execution(json.loads(json.dumps(_execution(payload), sort_keys=True)), payload, 1)
+
+    assert list(payload["model"]) == ["providerID", "id", "variant"]
+    assert list(execution["model"]) == ["id", "providerID", "variant"]
+    assert _hash_json(execution) == "08df5b7d64ab290b2e24de8fe27dda2de8e9fdbc60f72b8a396432964a5da47c"
+
+
 def test_semantic_v0_uses_same_execution_terms_without_unsupported_evidence(tmp_path: Path) -> None:
     from scripts.campaign_procontract import build_issue_payload
 

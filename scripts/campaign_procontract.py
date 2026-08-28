@@ -2830,7 +2830,7 @@ def _load_or_create_issue(
         "contractID": payload["id"],
         "startedAt": now,
         "payload": payload,
-        "payloadHash": _hash_json(payload),
+        "payloadHash": _hash_json(_ordered_issue_payload(payload)),
         "acceptancePolicyUTF8": base64.b64encode(acceptance_policy.encode()).decode(),
         "acceptanceHash": hashlib.sha256(acceptance_policy.encode()).hexdigest(),
         "replayPolicyHash": _hash_json(REPLAY_POLICY) if protocol == "current" else None,
@@ -2961,7 +2961,7 @@ def _reconcile_ambiguous_issue(
         "receipt": None,
         "reconciliation": {
             "version": 1,
-            "payloadHash": _hash_json(payload),
+            "payloadHash": _hash_json(_ordered_issue_payload(payload)),
             "contractHash": _hash_json(contract),
             "executionHash": _hash_json(execution),
         },
@@ -3000,7 +3000,7 @@ def _validate_issue_response(raw: object, payload: Mapping[str, object]) -> Mapp
         or reconciliation
         != {
             "version": 1,
-            "payloadHash": _hash_json(payload),
+            "payloadHash": _hash_json(_ordered_issue_payload(payload)),
             "contractHash": _hash_json(contract),
             "executionHash": _hash_json(execution),
         }
@@ -3057,7 +3057,7 @@ def _validate_contract(raw: object, payload: Mapping[str, object]) -> Mapping[st
     ):
         raise ProContractConflictError("Contract response conflicts with frozen issue")
     _validate_contract_optionals(raw)
-    return raw
+    return _ordered_contract(raw, expected_spec)
 
 
 def _expected_spec(payload: Mapping[str, object]) -> dict[str, object]:
@@ -3076,6 +3076,36 @@ def _expected_spec(payload: Mapping[str, object]) -> dict[str, object]:
         if payload["evidence"] == {"type": "principal"}
         else {"type": "principal", "claim": PRINCIPAL_CLAIM, "replay": REPLAY_POLICY},
         "resolution": {"maxAttempts": MAX_CONTRACT_ATTEMPTS, "retryDelay": 0},
+    }
+
+
+def _ordered_issue_payload(payload: Mapping[str, object]) -> dict[str, object]:
+    spec = _expected_spec(payload)
+    location = payload["location"]
+    model = payload["model"]
+    if not isinstance(location, Mapping) or not isinstance(model, Mapping):
+        raise ProContractError("Contract issue context is invalid")
+    return {
+        "id": payload["id"],
+        "scope": payload["scope"],
+        "goal": spec["goal"],
+        **({"policy": spec["policy"]} if "policy" in spec else {}),
+        "brief": spec["brief"],
+        "requires": spec["requires"],
+        "location": {
+            "directory": location["directory"],
+            **({"workspaceID": location["workspaceID"]} if "workspaceID" in location else {}),
+        },
+        "model": {
+            "providerID": model["providerID"],
+            "id": model["id"],
+            **({"variant": model["variant"]} if "variant" in model else {}),
+        },
+        "trigger": spec["trigger"],
+        "authority": spec["authority"],
+        "budget": spec["budget"],
+        "evidence": spec["evidence"],
+        "resolution": spec["resolution"],
     }
 
 
@@ -3157,6 +3187,128 @@ def _validate_contract_optionals(raw: Mapping[str, object]) -> None:
             or not isinstance(pending["reason"], str)
         ):
             raise ProContractError("Contract pending revision schema is invalid")
+
+
+def _ordered_contract(raw: Mapping[str, object], spec: Mapping[str, object]) -> dict[str, object]:
+    escalation = raw.get("escalation")
+    blocked = raw.get("blocked")
+    handoff = raw.get("handoff")
+    challenge = raw.get("challenge")
+    pending = raw.get("pendingRevision")
+    return {
+        "id": raw["id"],
+        "scope": raw["scope"],
+        "spec": dict(spec),
+        "issuer": raw["issuer"],
+        "revision": raw["revision"],
+        "status": raw["status"],
+        "specHash": raw["specHash"],
+        **({"escalation": {"reason": escalation["reason"], "time": escalation["time"]}} if escalation else {}),
+        **({"blocked": {"reason": blocked["reason"], "time": blocked["time"]}} if blocked else {}),
+        **({"handoff": _ordered_handoff(handoff)} if isinstance(handoff, Mapping) else {}),
+        **({"challenge": _ordered_challenge(challenge)} if isinstance(challenge, Mapping) else {}),
+        **(
+            {
+                "pendingRevision": {
+                    "spec": _ordered_spec(pending["spec"]),
+                    "specHash": pending["specHash"],
+                    "reason": pending["reason"],
+                }
+            }
+            if isinstance(pending, Mapping)
+            else {}
+        ),
+        **({"attestationID": raw["attestationID"]} if "attestationID" in raw else {}),
+    }
+
+
+def _ordered_handoff(value: Mapping[str, object]) -> dict[str, object]:
+    replay = value.get("replay")
+    return {
+        "summary": value["summary"],
+        "uncertainties": value["uncertainties"],
+        "subjectHash": value["subjectHash"],
+        **(
+            {
+                "replay": {
+                    "policyHash": replay["policyHash"],
+                    "subjectHash": replay["subjectHash"],
+                    "evidenceHash": replay["evidenceHash"],
+                    "passed": replay["passed"],
+                    "summary": replay["summary"],
+                }
+            }
+            if isinstance(replay, Mapping)
+            else {}
+        ),
+        "time": value["time"],
+    }
+
+
+def _ordered_challenge(value: Mapping[str, object]) -> dict[str, object]:
+    return {
+        "revision": value["revision"],
+        "subjectHash": value["subjectHash"],
+        "evidenceHash": value["evidenceHash"],
+        "disclosure": value["disclosure"],
+        **({"summary": value["summary"]} if "summary" in value else {}),
+        "time": value["time"],
+        **({"attestationID": value["attestationID"]} if "attestationID" in value else {}),
+    }
+
+
+def _ordered_spec(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise ProContractError("Contract specification is invalid")
+    trigger = value["trigger"]
+    budget = value["budget"]
+    evidence = value["evidence"]
+    resolution = value["resolution"]
+    if not all(isinstance(item, Mapping) for item in (trigger, budget, evidence, resolution)):
+        raise ProContractError("Contract specification is invalid")
+    replay = evidence.get("replay")
+    return {
+        "trigger": {"type": trigger["type"], **({"at": trigger["at"]} if "at" in trigger else {})},
+        "goal": value["goal"],
+        **({"policy": value["policy"]} if "policy" in value else {}),
+        "brief": value["brief"],
+        "requires": [
+            {
+                "contractID": item["contractID"],
+                "revision": item["revision"],
+                **({"policy": item["policy"]} if "policy" in item else {}),
+            }
+            for item in value["requires"]
+            if isinstance(item, Mapping)
+        ],
+        "authority": value["authority"],
+        "budget": {"turns": budget["turns"], "actions": budget["actions"], "deadline": budget["deadline"]},
+        "evidence": {
+            "type": evidence["type"],
+            **({"claim": evidence["claim"]} if "claim" in evidence else {}),
+            **({"replay": _ordered_replay_policy(replay)} if isinstance(replay, Mapping) else {}),
+        },
+        "resolution": {"maxAttempts": resolution["maxAttempts"], "retryDelay": resolution["retryDelay"]},
+    }
+
+
+def _ordered_replay_policy(value: Mapping[str, object]) -> dict[str, object]:
+    return {
+        "checks": [
+            {
+                "argv": item["argv"],
+                **({"cwd": item["cwd"]} if "cwd" in item else {}),
+                "timeout": item["timeout"],
+                "exit": item["exit"],
+            }
+            for item in value["checks"]
+            if isinstance(item, Mapping)
+        ],
+        "protected": [
+            {"path": item["path"], "hash": item["hash"]} for item in value["protected"] if isinstance(item, Mapping)
+        ],
+        "artifacts": value["artifacts"],
+    }
 
 
 def _valid_spec_schema(value: object) -> bool:
@@ -3296,7 +3448,32 @@ def _validate_execution(raw: object, payload: Mapping[str, object], revision: in
         and (type(raw["leaseExpiresAt"]) is not int or raw["leaseExpiresAt"] < 0)
     ):
         raise ProContractConflictError("Contract execution conflicts with frozen issue")
-    return raw
+    location = raw["location"]
+    model = raw["model"]
+    if not isinstance(location, Mapping) or not isinstance(model, Mapping):
+        raise ProContractError("Contract execution binding is invalid")
+    return {
+        "contractID": raw["contractID"],
+        "revision": raw["revision"],
+        "location": {
+            "directory": location["directory"],
+            **({"workspaceID": location["workspaceID"]} if "workspaceID" in location else {}),
+        },
+        "model": {
+            "id": model["id"],
+            "providerID": model["providerID"],
+            **({"variant": model["variant"]} if "variant" in model else {}),
+        },
+        "sessionID": raw["sessionID"],
+        "promptID": raw["promptID"],
+        "dispatched": raw["dispatched"],
+        "attempts": raw["attempts"],
+        "nextActionAt": raw["nextActionAt"],
+        "turnsUsed": raw["turnsUsed"],
+        "actionsUsed": raw["actionsUsed"],
+        **({"leaseOwner": raw["leaseOwner"]} if "leaseOwner" in raw else {}),
+        **({"leaseExpiresAt": raw["leaseExpiresAt"]} if "leaseExpiresAt" in raw else {}),
+    }
 
 
 def _binding_identity(execution: Mapping[str, object]) -> tuple[object, ...]:
