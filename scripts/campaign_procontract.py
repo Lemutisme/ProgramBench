@@ -63,6 +63,7 @@ MAX_WALL_TIME_SECONDS = 21600
 MAX_PROVIDER_TURNS = 1000
 MAX_ACTIONS = 4000
 MAX_MUTATION_ATTEMPTS = 3
+MAX_OBSERVATION_ATTEMPTS = 6
 MAX_CONTRACT_ATTEMPTS = 3
 MAX_CREDENTIAL_SCAN_BYTES = 512 * 1024 * 1024
 SEMANTIC_ATTEMPTS_REVISION = "ed8bd2b7992485264335a541b40c1c03a4b35619"
@@ -1368,6 +1369,7 @@ def _run_procontract(
     }
 
     if state.phase == "executing":
+        observation_failures = 0
         while True:
             try:
                 found = api.get_contract(str(payload["id"]))
@@ -1516,6 +1518,7 @@ def _run_procontract(
                             poll_interval,
                             quiet,
                         )
+                    observation_failures = 0
                     sleeper(min(poll_interval, max(0.001, deadline - clock())))
                     continue
                 previous_usage, previous_actions, previous_messages = usage, actions, messages
@@ -1523,6 +1526,7 @@ def _run_procontract(
                     projected = api.messages(str(execution["sessionID"]))
                 except ProContractHttpError as error:
                     if error.status_code == 404 and contract["status"] in {"dormant", "active"}:
+                        observation_failures = 0
                         sleeper(min(poll_interval, max(0.001, deadline - clock())))
                         continue
                     raise
@@ -1760,6 +1764,7 @@ def _run_procontract(
                             "native Contract verification observation",
                         )
                         break
+                    observation_failures = 0
                     sleeper(min(poll_interval, max(0.001, deadline - clock())))
                     continue
                 if status == "discharged":
@@ -1822,9 +1827,11 @@ def _run_procontract(
                         poll_interval,
                         quiet,
                     )
+                observation_failures = 0
                 sleeper(min(poll_interval, max(0.001, deadline - clock())))
             except ProContractHttpError as error:
                 if error.status_code == 429:
+                    observation_failures = 0
                     _observe_rate_limit(breaker, error.retry_after, str(error), clock, deadline)
                     if _backoff(breaker, clock, sleeper, poll_interval, deadline):
                         completion = (
@@ -1859,8 +1866,24 @@ def _run_procontract(
                             quiet,
                         )
                     continue
+                safety = _safety_completion(
+                    breaker,
+                    limits,
+                    max(usage.provider_turns, int(execution["turnsUsed"])),
+                    max(actions, int(execution["actionsUsed"])),
+                    clock,
+                    deadline,
+                )
+                transient = error.transient or error.status_code is None or error.status_code >= 500
+                if transient:
+                    observation_failures += 1
+                    if safety is None and observation_failures < MAX_OBSERVATION_ATTEMPTS:
+                        sleeper(min(poll_interval, max(0.001, deadline - clock())))
+                        continue
                 completion = (
-                    ProContractCompletion.AUTH if error.status_code in {401, 403} else ProContractCompletion.LOST_SERVER
+                    ProContractCompletion.AUTH
+                    if error.status_code in {401, 403}
+                    else safety or ProContractCompletion.LOST_SERVER
                 )
                 if error.status_code in {401, 403}:
                     breaker.observe_error(error.status_code, detail=str(error))

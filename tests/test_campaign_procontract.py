@@ -251,6 +251,23 @@ class LostApi(FakeApi):
         return None
 
 
+class ObservationHttpApi(FakeApi):
+    def __init__(self, contract: dict[str, object], execution: dict[str, object], failures: int) -> None:
+        super().__init__(contract, execution)
+        self.failures = failures
+        self.gets = 0
+
+    def get_contract(self, contract_id: str) -> dict[str, object] | None:
+        from scripts.campaign_procontract import ProContractHttpError
+
+        self.gets += 1
+        if self.failures == 0:
+            return super().get_contract(contract_id)
+        if self.failures > 0:
+            self.failures -= 1
+        raise ProContractHttpError("observation unavailable", status_code=503, transient=True)
+
+
 class NoExecutionApi(FakeApi):
     def get_execution(self, contract_id: str) -> dict[str, object] | None:
         return None
@@ -4824,6 +4841,39 @@ def test_lost_server_after_issue_preserves_contract_evidence_and_stops_writer(tm
     assert (paths.root / "procontract-issue-response.json").is_file()
     assert not (paths.root / "subject").exists()
     assert api.attestations == []
+
+
+def test_transient_contract_observation_does_not_destroy_a_live_trajectory(tmp_path: Path) -> None:
+    from scripts.campaign_procontract import build_issue_payload, run_procontract
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    store = _state(paths)
+    _, workspace = _workspace(tmp_path, paths)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock())
+    api = ObservationHttpApi(_contract(payload), _execution(payload), 2)
+
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease._handle_active = True
+        result = run_procontract(
+            job,
+            store,
+            workspace,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=_limits(),
+            breaker=CircuitBreaker(),
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+            package=lambda subject, run_dir, iid: _package(run_dir, iid),
+            preflight=lambda archive, iid: SimpleNamespace(executable_hash="e" * 64, output="ok"),
+        )
+
+    assert result.completion.value == "discharged"
+    assert api.gets >= 3
+    assert clock.now >= 102
 
 
 def test_transport_failure_before_accepted_issue_is_explicitly_retryable(tmp_path: Path) -> None:
