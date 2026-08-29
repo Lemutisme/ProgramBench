@@ -1,0 +1,27 @@
+model: openai/gpt-5.6-luna
+variant: max
+
+limits:
+  wall_time_seconds: 21600
+  provider_turns: 1000
+  procontract_actions: 4000
+  total_cost_soft: null
+  total_cost_hard: null
+
+cache:
+  warmup_turns: 10
+  minimum_read_ratio: 0.80
+  stop_after_consecutive_failures: 2
+
+arms:
+  procontract:
+    repo: ${OPENCODE_REPO}
+    revision: 910d9f2856323ad5493ee52f8cb2c315d2172e10
+    mode: procontract
+    execution_policy: behavioral
+  vanilla:
+    repo: ${OPENCODE_REPO}
+    revision: origin/dev
+    mode: vanilla
+
+excluded: []

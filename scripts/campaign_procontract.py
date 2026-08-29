@@ -67,7 +67,12 @@ MAX_OBSERVATION_ATTEMPTS = 6
 MAX_CONTRACT_ATTEMPTS = 3
 MAX_CREDENTIAL_SCAN_BYTES = 512 * 1024 * 1024
 SEMANTIC_ATTEMPTS_REVISION = "ed8bd2b7992485264335a541b40c1c03a4b35619"
-POLICY_SPLIT_REVISION = "7054140b61e5cdeceef61f6bc6e6520eefe7ac79"
+POLICY_SPLIT_REVISIONS = frozenset(
+    {
+        "7054140b61e5cdeceef61f6bc6e6520eefe7ac79",
+        "910d9f2856323ad5493ee52f8cb2c315d2172e10",
+    }
+)
 ProContractProtocol = Literal["current", "semantic-v0", "policy-split-v1", "policy-split-none-v1"]
 MODEL = "openai/gpt-5.6-luna"
 VARIANT = "max"
@@ -161,7 +166,7 @@ def _acceptance_policy(protocol: ProContractProtocol) -> str:
 def protocol_for_revision(revision: str, execution_policy: str = "behavioral") -> ProContractProtocol:
     if revision == SEMANTIC_ATTEMPTS_REVISION:
         return "semantic-v0"
-    if revision == POLICY_SPLIT_REVISION:
+    if revision in POLICY_SPLIT_REVISIONS:
         return "policy-split-none-v1" if execution_policy == "none" else "policy-split-v1"
     return "current"
 
