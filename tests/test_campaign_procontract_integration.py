@@ -576,6 +576,7 @@ def test_pinned_real_binary_completes_native_procontract_lifecycle(
                 "#!/bin/sh\nprintf '#!/bin/sh\\necho real-procontract-fixture\\n' > ./executable\nchmod +x ./executable\n"
             )
             seed.joinpath("executable").write_text("#!/bin/sh\necho real-procontract-fixture\n")
+            seed.joinpath("validate.sh").write_text("#!/bin/sh\n./executable >/dev/null\n")
             seed.joinpath("opencode.json").write_text(
                 json.dumps(
                     {
@@ -630,7 +631,8 @@ def test_pinned_real_binary_completes_native_procontract_lifecycle(
                     tag,
                     "/bin/sh",
                     "-ec",
-                    "cp /seed/compile.sh /seed/executable /candidate/; chmod 755 /candidate/compile.sh /candidate/executable; "
+                    "cp /seed/compile.sh /seed/executable /seed/validate.sh /candidate/; "
+                    "chmod 755 /candidate/compile.sh /candidate/executable /candidate/validate.sh; "
                     "chown -R root:root /candidate; "
                     "git -C /candidate init -q; git -C /candidate config user.name fixture; "
                     "git -C /candidate config user.email fixture@example.com; git -C /candidate add -A; "
@@ -685,6 +687,9 @@ def test_pinned_real_binary_completes_native_procontract_lifecycle(
                 expected_port=workspace.port,
                 password=PASSWORD,
             )
+            protocol = os.environ.get("PROGRAMBENCH_PROCONTRACT_PROTOCOL", "current")
+            if protocol not in {"current", "semantic-v0", "policy-split-v1", "policy-split-none-v1"}:
+                pytest.fail("PROGRAMBENCH_PROCONTRACT_PROTOCOL is invalid")
             breaker = CircuitBreaker()
             result = run_procontract(
                 job,
@@ -697,6 +702,7 @@ def test_pinned_real_binary_completes_native_procontract_lifecycle(
                 api=api,
                 sleeper=sleeper,
                 poll_interval=0.1,
+                protocol=protocol,  # type: ignore[arg-type]
             )
 
             assert result.completion.value == expected_completion
