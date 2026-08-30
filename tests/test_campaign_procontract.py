@@ -1103,6 +1103,24 @@ def test_policy_split_keeps_execution_policy_outside_contract_terms(tmp_path: Pa
     assert "broad black-box differential experiments" not in str(payload["brief"])
 
 
+@pytest.mark.parametrize("name", ["interface", "representation", "reactive", "breadth"])
+def test_task_conditioned_policy_changes_only_the_execution_binding(tmp_path: Path, name: str) -> None:
+    from scripts.campaign_policy import POLICIES
+    from scripts.campaign_procontract import _expected_spec, build_issue_payload, protocol_for_revision
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    _, workspace = _workspace(tmp_path, paths)
+    protocol = protocol_for_revision("0f3c9720463741febdd9222a44940b30d4bb5ed1", name)
+    payload = build_issue_payload(workspace, now=100.0, protocol=protocol)
+    policyless = build_issue_payload(workspace, now=100.0, protocol="policy-split-none-v1")
+
+    assert payload["executionPolicy"] == POLICIES[name]
+    assert "policy" not in payload
+    assert _expected_spec(payload) == _expected_spec(policyless)
+    assert "cover every applicable" not in str(payload["brief"])
+
+
 def test_semantic_v0_materializes_only_the_exact_institution_snapshot(tmp_path: Path) -> None:
     from scripts.campaign_procontract import (
         ProContractDeliveryError,

@@ -1958,6 +1958,33 @@ def test_run_job_selects_semantic_protocol_from_frozen_install_revision(tmp_path
     assert seen == ["semantic-v0"]
 
 
+def test_task_topology_selects_execution_policy_without_changing_contract_terms(tmp_path: Path):
+    from scripts import campaign_runner
+    from scripts.run_opencode import load_config
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config_path = tmp_path / "campaign.yaml"
+    config_path.write_text(
+        _config(repo).replace(
+            "    mode: procontract\n", "    mode: procontract\n    execution_policy: topology\n"
+        )
+        + """
+topologies:
+  one:
+    interface_breadth: broad
+    state: persistent
+    representation: text
+    output: exact
+"""
+    )
+    config = load_config(config_path)
+
+    assert campaign_runner._execution_policy(config, campaign_runner.CampaignJob("one", "procontract", "image")) == "interface"
+    with pytest.raises(campaign_runner.CampaignError, match="no frozen topology"):
+        campaign_runner._execution_policy(config, campaign_runner.CampaignJob("two", "procontract", "image"))
+
+
 def test_run_job_with_preexisting_campaign_stop_never_allocates_workspace(tmp_path: Path):
     from scripts import campaign_runner
     from scripts.campaign_stop import StopToken

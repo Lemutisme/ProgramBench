@@ -29,6 +29,7 @@ from scripts.campaign_freeze import (
     _snapshot_candidate,
     _verify_no_credentials,
 )
+from scripts.campaign_policy import POLICIES
 from scripts.campaign_state import JobLease, JobState, StateError, StateStore
 from scripts.campaign_stop import CampaignStopped, StopAwareApi, StopToken, stop_aware_sleeper
 from scripts.campaign_usage import CircuitBreaker, UsageParseError, UsageSummary
@@ -71,9 +72,19 @@ POLICY_SPLIT_REVISIONS = frozenset(
     {
         "7054140b61e5cdeceef61f6bc6e6520eefe7ac79",
         "910d9f2856323ad5493ee52f8cb2c315d2172e10",
+        "0f3c9720463741febdd9222a44940b30d4bb5ed1",
     }
 )
-ProContractProtocol = Literal["current", "semantic-v0", "policy-split-v1", "policy-split-none-v1"]
+ProContractProtocol = Literal[
+    "current",
+    "semantic-v0",
+    "policy-split-v1",
+    "policy-split-none-v1",
+    "policy-split-interface-v1",
+    "policy-split-representation-v1",
+    "policy-split-reactive-v1",
+    "policy-split-breadth-v1",
+]
 MODEL = "openai/gpt-5.6-luna"
 VARIANT = "max"
 SUPPORTED_MODEL_VARIANTS = frozenset(
@@ -83,17 +94,7 @@ SUPPORTED_MODEL_VARIANTS = frozenset(
     }
 )
 LOCATION = "/candidate"
-ACCEPTANCE_POLICY = (
-    "ProgramBench delivery policy v2: enumerate documented surfaces, boundary and error semantics, and material "
-    "interactions; use batched differential probes within the action deadline, then preserve observations as "
-    "regression checks after coherent edits. Delivery replay alone is not a behavioral stopping condition. Hand "
-    "off one exact frozen candidate snapshot containing compile.sh, "
-    "executable, and a self-contained validate.sh regression suite after the native replay runs compile.sh with "
-    "common package-manager network access disabled and then validate.sh, with both exiting 0 within 600 seconds. "
-    "validate.sh must encode behavioral evidence learned from black-box reference experiments and must not access "
-    "the reference, network, or ambient package caches during replay. The ProgramBench harness "
-    "performs packaging and preflight only; official benchmark evaluation remains external."
-)
+ACCEPTANCE_POLICY = POLICIES["behavioral"]
 LEGACY_ACCEPTANCE_POLICY = (
     "ProgramBench semantic-v0 delivery policy: materialize the exact institution-captured handoff tree, package "
     "that frozen subject, and require the standard ProgramBench compile, validation, and executable preflight "
@@ -158,6 +159,14 @@ def _acceptance_policy(protocol: ProContractProtocol) -> str:
         return ACCEPTANCE_POLICY
     if protocol == "policy-split-none-v1":
         return ""
+    if protocol == "policy-split-interface-v1":
+        return POLICIES["interface"]
+    if protocol == "policy-split-representation-v1":
+        return POLICIES["representation"]
+    if protocol == "policy-split-reactive-v1":
+        return POLICIES["reactive"]
+    if protocol == "policy-split-breadth-v1":
+        return POLICIES["breadth"]
     if protocol == "semantic-v0":
         return LEGACY_ACCEPTANCE_POLICY
     raise ProContractError("unknown ProContract protocol")
@@ -167,7 +176,14 @@ def protocol_for_revision(revision: str, execution_policy: str = "behavioral") -
     if revision == SEMANTIC_ATTEMPTS_REVISION:
         return "semantic-v0"
     if revision in POLICY_SPLIT_REVISIONS:
-        return "policy-split-none-v1" if execution_policy == "none" else "policy-split-v1"
+        return {
+            "none": "policy-split-none-v1",
+            "behavioral": "policy-split-v1",
+            "interface": "policy-split-interface-v1",
+            "representation": "policy-split-representation-v1",
+            "reactive": "policy-split-reactive-v1",
+            "breadth": "policy-split-breadth-v1",
+        }[execution_policy]
     return "current"
 
 
@@ -485,6 +501,7 @@ class ProContractIssueRequest:
     brief: str
     model: str
     variant: str
+    execution_policy: str
 
     def __post_init__(self) -> None:
         if (
@@ -504,7 +521,7 @@ class ProContractIssueRequest:
             "id": self.contract_id,
             "scope": self.scope,
             "goal": ORIGINAL_TASK,
-            "policy": ACCEPTANCE_POLICY,
+            "policy": self.execution_policy,
             "brief": self.brief,
             "requires": [],
             "location": {"directory": LOCATION},
@@ -801,14 +818,14 @@ def build_issue_payload(
         deadline=int(now * 1000) + MAX_WALL_TIME_SECONDS * 1000,
         model=model,
         variant=variant,
+        execution_policy=_acceptance_policy(protocol),
         brief=(
             "ProgramBench native delivery Contract. Complete this exact benchmark task:\n\n"
             f"{ORIGINAL_TASK}\n\n"
             "Work only in /candidate with the delegated filesystem and process authority. Produce a relocatable "
-            "compile.sh and executable. Also produce executable validate.sh containing self-contained regression "
-            "tests derived from reference experiments; it must run without the reference, network, or ambient "
-            "package caches and must cover every applicable documented command, flag, error, boundary class, and "
-            "state transition. This Contract's complete obligation and validation end in this Session when "
+            "compile.sh and executable. Also produce executable validate.sh containing finite, self-contained "
+            "delivery checks; it must run without the reference, network, or ambient package caches. This "
+            "Contract's complete obligation and validation end in this Session when "
             "the native replay below establishes delivery readiness. Later ProgramBench scoring is an out-of-scope "
             "observation; it creates no future obligation and is not a reason to revise these delivery terms."
             + (
@@ -823,7 +840,13 @@ def build_issue_payload(
     ).to_dict()
     if protocol == "current":
         return payload
-    if protocol == "policy-split-v1":
+    if protocol in {
+        "policy-split-v1",
+        "policy-split-interface-v1",
+        "policy-split-representation-v1",
+        "policy-split-reactive-v1",
+        "policy-split-breadth-v1",
+    }:
         payload["executionPolicy"] = payload.pop("policy")
         return payload
     if protocol == "policy-split-none-v1":

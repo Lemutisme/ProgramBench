@@ -1,0 +1,55 @@
+model: openai/gpt-5.6-luna
+variant: max
+
+limits:
+  wall_time_seconds: 21600
+  provider_turns: 1000
+  procontract_actions: 4000
+  total_cost_soft: null
+  total_cost_hard: null
+
+cache:
+  warmup_turns: 10
+  minimum_read_ratio: 0.80
+  stop_after_consecutive_failures: 2
+
+arms:
+  procontract:
+    repo: ${OPENCODE_REPO}
+    revision: 0f3c9720463741febdd9222a44940b30d4bb5ed1
+    mode: procontract
+    execution_policy: topology
+    binary: /home/duozhou/.config/superpowers/worktrees/opencode/topology-policy/packages/opencode/dist/opencode-linux-x64/bin/opencode
+  vanilla:
+    repo: ${OPENCODE_REPO}
+    revision: origin/dev
+    mode: vanilla
+
+topologies:
+  guumaster__hostctl.d6d9699:
+    interface_breadth: broad
+    state: persistent
+    representation: text
+    output: exact
+  mfridman__tparse.2416b4b:
+    interface_breadth: broad
+    state: stateless
+    representation: text
+    output: exact
+  mibk__dupl.1bf052b:
+    interface_breadth: narrow
+    state: stateless
+    representation: syntax
+    output: semantic
+  eradman__entr.8e2e8b4:
+    interface_breadth: narrow
+    state: reactive
+    representation: text
+    output: exact
+  ffmpeg__ffmpeg.360a402:
+    interface_breadth: massive
+    state: stateless
+    representation: structured
+    output: exact
+
+excluded: []

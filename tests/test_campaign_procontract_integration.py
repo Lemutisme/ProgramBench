@@ -688,7 +688,16 @@ def test_pinned_real_binary_completes_native_procontract_lifecycle(
                 password=PASSWORD,
             )
             protocol = os.environ.get("PROGRAMBENCH_PROCONTRACT_PROTOCOL", "current")
-            if protocol not in {"current", "semantic-v0", "policy-split-v1", "policy-split-none-v1"}:
+            if protocol not in {
+                "current",
+                "semantic-v0",
+                "policy-split-v1",
+                "policy-split-none-v1",
+                "policy-split-interface-v1",
+                "policy-split-representation-v1",
+                "policy-split-reactive-v1",
+                "policy-split-breadth-v1",
+            }:
                 pytest.fail("PROGRAMBENCH_PROCONTRACT_PROTOCOL is invalid")
             breaker = CircuitBreaker()
             result = run_procontract(

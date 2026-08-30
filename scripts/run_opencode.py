@@ -12,7 +12,7 @@ import math
 import os
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Collection, Mapping, Sequence
 
@@ -104,6 +104,8 @@ from scripts.campaign_procontract import (
 # Public compatibility re-exports for callers that historically imported state helpers here.
 import yaml
 
+from scripts.campaign_policy import POLICIES, TaskTopology
+
 
 class ConfigError(ValueError):
     """Raised when campaign configuration or its frozen manifest is invalid."""
@@ -127,7 +129,8 @@ def _construct_unique_mapping(
 
 _UniqueKeyLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_unique_mapping)
 
-_TOP_LEVEL_KEYS = frozenset({"model", "variant", "limits", "cache", "arms", "excluded"})
+_TOP_LEVEL_KEYS = frozenset({"model", "variant", "limits", "cache", "arms", "excluded", "topologies"})
+_REQUIRED_TOP_LEVEL_KEYS = _TOP_LEVEL_KEYS - {"topologies"}
 _LIMIT_KEYS = frozenset(
     {"wall_time_seconds", "provider_turns", "procontract_actions", "total_cost_soft", "total_cost_hard"}
 )
@@ -205,6 +208,7 @@ class CampaignConfig:
     arms: tuple[ArmConfig, ArmConfig]
     excluded: frozenset[str]
     cache: CacheConfig
+    topologies: Mapping[str, TaskTopology] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -283,7 +287,7 @@ def load_config(path: Path) -> CampaignConfig:
         raw = yaml.load(source, Loader=_UniqueKeyLoader)
     except (TypeError, yaml.YAMLError) as error:
         raise ConfigError(f"invalid YAML: {error}") from error
-    _require_keys(raw, _TOP_LEVEL_KEYS, _TOP_LEVEL_KEYS, "top-level config")
+    _require_keys(raw, _TOP_LEVEL_KEYS, _REQUIRED_TOP_LEVEL_KEYS, "top-level config")
 
     limits = _load_limits(raw.get("limits"))
     cache = _load_cache(raw.get("cache"))
@@ -299,6 +303,7 @@ def load_config(path: Path) -> CampaignConfig:
         arms=arms,
         excluded=frozenset(excluded),
         cache=cache,
+        topologies=_load_topologies(raw.get("topologies", {})),
     )
 
 
@@ -398,8 +403,8 @@ def _load_arms(raw: object, config_dir: Path) -> tuple[ArmConfig, ArmConfig]:
             raise ConfigError(f"arm {name} revision must be a nonempty string")
         binary = value.get("binary")
         execution_policy = value.get("execution_policy", "behavioral")
-        if execution_policy not in {"behavioral", "none"}:
-            raise ConfigError(f"arm {name} execution_policy must be behavioral or none")
+        if execution_policy not in {*POLICIES, "topology"}:
+            raise ConfigError(f"arm {name} execution_policy must be one of {', '.join([*POLICIES, 'topology'])}")
         result.append(
             ArmConfig(
                 name=name,
@@ -426,6 +431,32 @@ def _path_value(values: Mapping[str, object], name: str, config_dir: Path) -> Pa
         raise ConfigError(f"{name} contains an unsupported environment variable")
     candidate = Path(value).expanduser()
     return (config_dir / candidate).resolve() if not candidate.is_absolute() else candidate.resolve()
+
+
+def _load_topologies(raw: object) -> dict[str, TaskTopology]:
+    if not isinstance(raw, dict):
+        raise ConfigError("topologies must be a mapping from instance ID to task topology")
+    result: dict[str, TaskTopology] = {}
+    allowed = {"interface_breadth", "state", "representation", "output"}
+    values = {
+        "interface_breadth": {"narrow", "broad", "massive"},
+        "state": {"stateless", "persistent", "reactive"},
+        "representation": {"text", "structured", "syntax"},
+        "output": {"semantic", "exact"},
+    }
+    for instance_id, topology in raw.items():
+        if not isinstance(instance_id, str) or not instance_id or not isinstance(topology, dict):
+            raise ConfigError("topologies must map nonempty instance IDs to mappings")
+        _require_keys(topology, allowed, allowed, f"topology {instance_id}")
+        if any(topology[name] not in choices for name, choices in values.items()):
+            raise ConfigError(f"topology {instance_id} contains an unknown categorical value")
+        result[instance_id] = TaskTopology(
+            interface_breadth=topology["interface_breadth"],
+            state=topology["state"],
+            representation=topology["representation"],
+            output=topology["output"],
+        )
+    return result
 
 
 def _require_string(values: Mapping[str, object], name: str) -> str:
@@ -493,6 +524,21 @@ def _canonical_config(config: CampaignConfig) -> dict[str, object]:
             }
             for arm in config.arms
         },
+        **(
+            {
+                "topologies": {
+                    instance_id: {
+                        "interface_breadth": topology.interface_breadth,
+                        "state": topology.state,
+                        "representation": topology.representation,
+                        "output": topology.output,
+                    }
+                    for instance_id, topology in sorted(config.topologies.items())
+                }
+            }
+            if config.topologies
+            else {}
+        ),
         "excluded": sorted(config.excluded),
     }
 

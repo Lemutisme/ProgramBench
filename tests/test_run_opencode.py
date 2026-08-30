@@ -161,6 +161,45 @@ def test_load_config_freezes_policy_ablation_outside_binary_identity(tmp_path: P
     assert json.loads(manifest.read_text())["arms"]["procontract"]["execution_policy"] == "none"
 
 
+@pytest.mark.parametrize("name", ["interface", "representation", "reactive", "breadth"])
+def test_load_config_accepts_task_conditioned_policy_names(tmp_path: Path, name: str):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config = load_config(
+        _write_text(
+            tmp_path / "campaign.yaml",
+            campaign_yaml(repo).replace(
+                "    mode: procontract\n", f"    mode: procontract\n    execution_policy: {name}\n"
+            ),
+        )
+    )
+
+    assert config.arms[0].execution_policy == name
+
+
+def test_load_config_freezes_task_topology_separately_from_contract_terms(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    source = campaign_yaml(repo).replace(
+        "    mode: procontract\n", "    mode: procontract\n    execution_policy: topology\n"
+    )
+    source += """
+topologies:
+  owner__tool.abcdef0:
+    interface_breadth: broad
+    state: persistent
+    representation: text
+    output: exact
+"""
+    config = load_config(_write_text(tmp_path / "campaign.yaml", source))
+    manifest = tmp_path / "campaign.json"
+
+    freeze_campaign_config(config, manifest)
+
+    assert config.topologies["owner__tool.abcdef0"].interface_breadth == "broad"
+    assert json.loads(manifest.read_text())["topologies"]["owner__tool.abcdef0"]["state"] == "persistent"
+
+
 def test_load_config_allows_cost_caps_to_be_disabled(tmp_path: Path):
     repo = tmp_path / "repo"
     repo.mkdir()

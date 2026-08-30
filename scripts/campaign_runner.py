@@ -33,6 +33,7 @@ from programbench.submission import FIXTURE_PREFIX
 from programbench.utils.load_data import load_all_instances
 from programbench.utils.instance_filters import filter_instances
 from scripts.campaign_install import InstallRecord, prepare_install
+from scripts.campaign_policy import select_policy
 from scripts.campaign_procontract import HttpProContractApi, protocol_for_revision, run_procontract
 from scripts.campaign_state import JobLease, JobPaths, JobState, StateStore
 from scripts.campaign_stop import StopToken
@@ -676,8 +677,7 @@ def run_job(
                             api=api,
                             stop_token=stop,
                             protocol=protocol_for_revision(
-                                getattr(install, "revision", ""),
-                                next(arm.execution_policy for arm in plan.config.arms if arm.name == candidate.arm),
+                                getattr(install, "revision", ""), _execution_policy(plan.config, candidate)
                             ),
                         )
                     state = store.read_optional()
@@ -1097,6 +1097,16 @@ def _image_name(instance: Mapping[str, object]) -> str:
     return image
 
 
+def _execution_policy(config: CampaignConfig, candidate: CampaignJob) -> str:
+    selected = next(arm.execution_policy for arm in config.arms if arm.name == candidate.arm)
+    if selected != "topology":
+        return selected
+    topology = config.topologies.get(candidate.instance_id)
+    if topology is None:
+        raise CampaignError(f"task-conditioned policy has no frozen topology for {candidate.instance_id}")
+    return select_policy(topology)
+
+
 def _config_manifest(config: CampaignConfig) -> dict[str, object]:
     return {
         "model": config.model,
@@ -1113,6 +1123,15 @@ def _config_manifest(config: CampaignConfig) -> dict[str, object]:
             }
             for arm in config.arms
         },
+        **(
+            {
+                "topologies": {
+                    instance_id: asdict(topology) for instance_id, topology in sorted(config.topologies.items())
+                }
+            }
+            if config.topologies
+            else {}
+        ),
         "excluded": sorted(config.excluded),
     }
 
