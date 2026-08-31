@@ -1,6 +1,6 @@
 import pytest
 
-from scripts.campaign_policy import POLICIES, TaskTopology, policy, select_policy
+from scripts.campaign_policy import CAPABILITY_CONSERVATION, POLICIES, TaskTopology, policy, select_policy
 
 
 @pytest.mark.parametrize(
@@ -11,7 +11,7 @@ from scripts.campaign_policy import POLICIES, TaskTopology, policy, select_polic
         (TaskTopology("broad", "persistent", "text", "semantic"), "interface"),
         (TaskTopology("broad", "stateless", "text", "exact"), "interface"),
         (TaskTopology("narrow", "stateless", "syntax", "semantic"), "representation"),
-        (TaskTopology("narrow", "stateless", "text", "semantic"), "none"),
+        (TaskTopology("narrow", "stateless", "text", "semantic"), "behavioral"),
     ],
 )
 def test_selects_regime_from_topology_without_task_identity(topology: TaskTopology, expected: str) -> None:
@@ -24,6 +24,8 @@ def test_policies_are_concise_and_keep_settlement_terms_out() -> None:
         assert len(text) <= 1_200
         assert "Contract" not in text
         assert (not text) == (name == "none")
+        if name != "none":
+            assert text.startswith(CAPABILITY_CONSERVATION)
 
 
 def test_rejects_unknown_policy() -> None:

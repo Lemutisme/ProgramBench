@@ -16,7 +16,7 @@ cache:
 arms:
   procontract:
     repo: ${OPENCODE_REPO}
-    revision: 597d22a8058c054ccc19f4f82daceea6034a620b
+    revision: e100b0fa97404ca21ad2373372ee4255877d7eaa
     mode: procontract
     execution_policy: topology
     binary: /home/duozhou/.config/superpowers/worktrees/opencode/topology-policy/packages/opencode/dist/opencode-linux-x64/bin/opencode
