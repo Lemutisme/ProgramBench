@@ -73,6 +73,7 @@ POLICY_SPLIT_REVISIONS = frozenset(
         "7054140b61e5cdeceef61f6bc6e6520eefe7ac79",
         "910d9f2856323ad5493ee52f8cb2c315d2172e10",
         "0f3c9720463741febdd9222a44940b30d4bb5ed1",
+        "597d22a8058c054ccc19f4f82daceea6034a620b",
     }
 )
 ProContractProtocol = Literal[
