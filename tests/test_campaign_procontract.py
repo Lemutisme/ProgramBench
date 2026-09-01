@@ -1103,7 +1103,7 @@ def test_policy_split_keeps_execution_policy_outside_contract_terms(tmp_path: Pa
     assert "broad black-box differential experiments" not in str(payload["brief"])
 
 
-@pytest.mark.parametrize("name", ["interface", "representation", "reactive", "breadth"])
+@pytest.mark.parametrize("name", ["interface", "representation", "reactive", "breadth", "fast", "deep"])
 def test_task_conditioned_policy_changes_only_the_execution_binding(tmp_path: Path, name: str) -> None:
     from scripts.campaign_policy import POLICIES
     from scripts.campaign_procontract import _expected_spec, build_issue_payload, protocol_for_revision

@@ -161,7 +161,7 @@ def test_load_config_freezes_policy_ablation_outside_binary_identity(tmp_path: P
     assert json.loads(manifest.read_text())["arms"]["procontract"]["execution_policy"] == "none"
 
 
-@pytest.mark.parametrize("name", ["interface", "representation", "reactive", "breadth"])
+@pytest.mark.parametrize("name", ["interface", "representation", "reactive", "breadth", "fast", "deep"])
 def test_load_config_accepts_task_conditioned_policy_names(tmp_path: Path, name: str):
     repo = tmp_path / "repo"
     repo.mkdir()

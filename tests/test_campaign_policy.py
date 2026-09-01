@@ -19,9 +19,18 @@ def test_selects_regime_from_topology_without_task_identity(topology: TaskTopolo
 
 
 def test_policies_are_concise_and_keep_settlement_terms_out() -> None:
-    assert set(POLICIES) == {"none", "behavioral", "interface", "representation", "reactive", "breadth"}
+    assert set(POLICIES) == {
+        "none",
+        "behavioral",
+        "interface",
+        "representation",
+        "reactive",
+        "breadth",
+        "fast",
+        "deep",
+    }
     for name, text in POLICIES.items():
-        assert len(text) <= 1_200
+        assert len(text) <= 1_800
         assert "Contract" not in text
         assert (not text) == (name == "none")
         if name != "none":

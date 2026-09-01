@@ -6,7 +6,16 @@ from dataclasses import dataclass
 from typing import Literal
 
 
-ExecutionPolicyName = Literal["none", "behavioral", "interface", "representation", "reactive", "breadth"]
+ExecutionPolicyName = Literal[
+    "none",
+    "behavioral",
+    "interface",
+    "representation",
+    "reactive",
+    "breadth",
+    "fast",
+    "deep",
+]
 
 
 @dataclass(frozen=True)
@@ -25,6 +34,13 @@ CAPABILITY_CONSERVATION = (
     "loses one cannot replace the incumbent. Treat delivery replay as packaging evidence, not capability saturation. "
     "Stop only when all documented high-impact cells have evidence, no material discrepancy remains, and recent "
     "holdout or metamorphic probes reveal no new class."
+)
+
+PROBE_CORPUS_POLICY = (
+    " Before handoff create probes/cases.json as {\"version\":1,\"cases\":[...]}. Each answer-free case has "
+    "id, argv (arguments only), optional stdin/env/files/timeoutSeconds; each fixture file has path, content, and "
+    "optional executable. Do not store expected outputs. The host will run the frozen cases independently against "
+    "reference and candidate and will reject any exit/stdout/stderr/timeout residual."
 )
 
 POLICIES: dict[ExecutionPolicyName, str] = {
@@ -55,6 +71,21 @@ POLICIES: dict[ExecutionPolicyName, str] = {
         "probe and implementation budgets by observable surface and implementation leverage. Build shared primitives, "
         "then complete high-value families end to end rather than adding shallow cases across the whole interface."
     ),
+    "fast": CAPABILITY_CONSERVATION
+    + (
+        " Fast lane: batch a small discriminating probe basis, choose the strongest available semantic primitive, "
+        "then make one coherent implementation early and reserve the remaining budget for residual repair. Maintain "
+        "answer-free typed cases for host replay. Rebuild from a fresh checkout before handoff."
+    )
+    + PROBE_CORPUS_POLICY,
+    "deep": CAPABILITY_CONSERVATION
+    + (
+        " Deep lane: establish a broad behavioral basis before implementation, choose mature semantic primitives, "
+        "and organize the implementation by capability family. Maintain probes/cases.json as answer-free typed cases "
+        "for host replay; use differential fuzz and residual clusters for targeted repair, re-expanding the basis "
+        "when failures cross families. Perform multiple fresh rebuilds before handoff."
+    )
+    + PROBE_CORPUS_POLICY,
 }
 
 

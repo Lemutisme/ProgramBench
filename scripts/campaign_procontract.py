@@ -30,6 +30,7 @@ from scripts.campaign_freeze import (
     _verify_no_credentials,
 )
 from scripts.campaign_policy import POLICIES
+from scripts.campaign_probe import replay_archive, validate_report
 from scripts.campaign_state import JobLease, JobState, StateError, StateStore
 from scripts.campaign_stop import CampaignStopped, StopAwareApi, StopToken, stop_aware_sleeper
 from scripts.campaign_usage import CircuitBreaker, UsageParseError, UsageSummary
@@ -86,6 +87,8 @@ ProContractProtocol = Literal[
     "policy-split-representation-v1",
     "policy-split-reactive-v1",
     "policy-split-breadth-v1",
+    "policy-split-fast-v1",
+    "policy-split-deep-v1",
 ]
 MODEL = "openai/gpt-5.6-luna"
 VARIANT = "max"
@@ -144,6 +147,7 @@ CONTROL_ARTIFACT_NAMES = (
     "procontract-package-request.json",
     "procontract-package.json",
     "procontract-preflight.json",
+    "probe-report.json",
     "verifier-report.json",
     "procontract-attestation-request.json",
     "procontract-attestation.json",
@@ -169,6 +173,10 @@ def _acceptance_policy(protocol: ProContractProtocol) -> str:
         return POLICIES["reactive"]
     if protocol == "policy-split-breadth-v1":
         return POLICIES["breadth"]
+    if protocol == "policy-split-fast-v1":
+        return POLICIES["fast"]
+    if protocol == "policy-split-deep-v1":
+        return POLICIES["deep"]
     if protocol == "semantic-v0":
         return LEGACY_ACCEPTANCE_POLICY
     raise ProContractError("unknown ProContract protocol")
@@ -185,6 +193,8 @@ def protocol_for_revision(revision: str, execution_policy: str = "behavioral") -
             "representation": "policy-split-representation-v1",
             "reactive": "policy-split-reactive-v1",
             "breadth": "policy-split-breadth-v1",
+            "fast": "policy-split-fast-v1",
+            "deep": "policy-split-deep-v1",
         }[execution_policy]
     return "current"
 
@@ -848,6 +858,8 @@ def build_issue_payload(
         "policy-split-representation-v1",
         "policy-split-reactive-v1",
         "policy-split-breadth-v1",
+        "policy-split-fast-v1",
+        "policy-split-deep-v1",
     }:
         payload["executionPolicy"] = payload.pop("policy")
         return payload
@@ -889,6 +901,7 @@ def run_procontract(
     poll_interval: float = 1,
     package: Callable[[Path, Path, str], Path] = package_workspace,
     preflight: Callable[[Path, str], PreflightResult] = preflight_candidate,
+    probe: Callable[[Path, str], Mapping[str, object]] = replay_archive,
     stop_token: StopToken | None = None,
     protocol: ProContractProtocol = "current",
 ) -> ProContractResult:
@@ -924,6 +937,10 @@ def run_procontract(
         stop.checkpoint()
         return preflight(archive, instance_id)
 
+    def guarded_probe(archive: Path, instance_id: str) -> Mapping[str, object]:
+        stop.checkpoint()
+        return probe(archive, instance_id)
+
     try:
         result = _run_procontract(
             job,
@@ -939,6 +956,7 @@ def run_procontract(
             poll_interval=poll_interval,
             package=guarded_package,
             preflight=guarded_preflight,
+            probe=guarded_probe,
             protocol=protocol,
         )
         state = state_store.read()
@@ -1211,6 +1229,7 @@ def _run_procontract(
     poll_interval: float,
     package: Callable[[Path, Path, str], Path],
     preflight: Callable[[Path, str], PreflightResult],
+    probe: Callable[[Path, str], Mapping[str, object]],
     protocol: ProContractProtocol,
 ) -> ProContractResult:
     """Issue or adopt one native scheduler-owned Contract and deliver its exact handoff."""
@@ -1975,6 +1994,8 @@ def _run_procontract(
             api,
             package,
             preflight,
+            probe,
+            protocol,
             breaker,
             clock,
             sleeper,
@@ -2052,6 +2073,8 @@ def _deliver(
     api: ProContractApi,
     package: Callable[[Path, Path, str], Path],
     preflight: Callable[[Path, str], PreflightResult],
+    probe: Callable[[Path, str], Mapping[str, object]],
+    protocol: ProContractProtocol,
     breaker: CircuitBreaker,
     clock: Callable[[], float],
     sleeper: Callable[[float], None],
@@ -2307,13 +2330,24 @@ def _deliver(
         }
         _write_json(preflight_path, preflight_record)
     _validate_preflight(preflight_record, archive)
+    probe_record: Mapping[str, object] | None = None
+    if protocol in {"policy-split-fast-v1", "policy-split-deep-v1"}:
+        probe_path = job.job.root / "probe-report.json"
+        probe_record = _read_json(probe_path) if probe_path.exists() else probe(archive, workspace.manifest.instance_id)
+        probe_record = validate_report(probe_record)
+        _write_or_verify_json(probe_path, probe_record, "host probe report")
+        if not probe_record["passed"]:
+            raise ProContractDeliveryError("host probe corpus found residual behavioral differences")
     archive = _publish_submission(archive, job.job.submission)
     if state.phase == "packaged":
         state = state_store.transition(
             "preflighted",
             command_identity=command_identity,
             expected_generation=state.generation,
-            artifact_hashes={"procontract-preflight.json": _sha256(preflight_path)},
+            artifact_hashes={
+                "procontract-preflight.json": _sha256(preflight_path),
+                **({"probe-report.json": _sha256(job.job.root / "probe-report.json")} if probe_record else {}),
+            },
         )
 
     report_path = job.job.root / "verifier-report.json"
@@ -2352,6 +2386,15 @@ def _deliver(
             "exits": preflight_record["exits"],
             "outputHash": preflight_record["outputHash"],
             "reportHash": _sha256(preflight_path),
+        },
+        "probe": None
+        if probe_record is None
+        else {
+            "corpusHash": probe_record["corpusHash"],
+            "cases": probe_record["cases"],
+            "residuals": len(probe_record["residuals"]),
+            "passed": probe_record["passed"],
+            "reportHash": probe_record["reportHash"],
         },
     }
     if report_path.exists():
@@ -5195,6 +5238,17 @@ def _verify_done_delivery(job_root: Path, result: ProContractResult, workspace: 
             }
         ):
             raise ProContractConflictError("terminal verifier report conflicts with result")
+        probe_summary = report.get("probe")
+        if probe_summary is not None:
+            probe_report = validate_report(_read_json(job_root / "probe-report.json"))
+            if probe_summary != {
+                "corpusHash": probe_report["corpusHash"],
+                "cases": probe_report["cases"],
+                "residuals": len(probe_report["residuals"]),
+                "passed": probe_report["passed"],
+                "reportHash": probe_report["reportHash"],
+            }:
+                raise ProContractConflictError("terminal host probe report conflicts with verifier evidence")
         if (
             not isinstance(subject_record, Mapping)
             or set(subject_record) != {"version", "subject"}
