@@ -32,7 +32,7 @@ while (($#)); do
   case "$1" in
     --output) output="$2"; shift 2 ;;
     --dry-run) dry=1; shift ;;
-    --evaluate) evaluate=1; shift ;;
+    --evaluate|--evaluate-only) evaluate=1; shift ;;
     --arm) arm="$2"; shift 2 ;;
     *) shift ;;
   esac
@@ -136,6 +136,22 @@ def test_procontract_all_config_has_full_run_cost_guardrail() -> None:
     assert config["limits"]["total_cost_hard"] == 225
 
 
+def test_durable_luna_config_pins_recovery_runtime_and_official_resource_limits() -> None:
+    config = yaml.safe_load(
+        (ROOT / "scripts/opencode_programbench_luna_max_durable_recovery_all.yaml").read_text()
+    )
+
+    assert config["arms"]["procontract"]["revision"] == "92c4ac59e032a5d04255ede9ea7ca2522b097d23"
+    assert config["arms"]["procontract"]["binary"].startswith("/home/duozhou/opencode-durable-recovery/")
+    assert config["limits"] == {
+        "wall_time_seconds": 21600,
+        "provider_turns": 1000,
+        "procontract_actions": 4000,
+        "total_cost_soft": None,
+        "total_cost_hard": None,
+    }
+
+
 def test_run_all_rejects_quarantined_key_without_creating_output(tmp_path: Path) -> None:
     output = tmp_path / "output"
     opencode = tmp_path / "opencode"
@@ -186,7 +202,7 @@ def test_run_all_chains_plan_inference_evaluation_and_writes_summary(tmp_path: P
     assert "--all" in invocations[0] and "--dry-run" in invocations[0]
     assert "campaign_prewarm.py" in invocations[1]
     assert "--resume" in invocations[2] and "--evaluate" not in invocations[2]
-    assert "--resume" in invocations[3] and "--evaluate" in invocations[3]
+    assert "--resume" in invocations[3] and "--evaluate-only" in invocations[3]
     summary = json.loads((output / "RUN_ALL_SUMMARY.json").read_text())
     assert summary["status"] == "completed"
     assert summary["campaign"]["selected_instances"] == 200

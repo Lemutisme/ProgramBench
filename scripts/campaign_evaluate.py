@@ -51,6 +51,7 @@ HF_BLOB_COPY_TIMEOUT_SECONDS = 1800
 MAX_PARTIAL_QUARANTINE_FILES = 128
 MAX_PARTIAL_QUARANTINE_BYTES = 512 * 1024 * 1024
 MAX_PARTIAL_HISTORY_RECORDS = 64
+MAX_EVALUATOR_GENERATIONS = 3
 _CREDENTIAL_ENV = ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENCODE_SERVER_PASSWORD")
 _CREDENTIAL_PATTERN = re.compile(
     r"(?i)\b(?:authorization|api[_-]?key|password|token)\b\s*[:=]\s*[^\s,;]+"
@@ -248,6 +249,7 @@ def evaluate_campaign(
     blob_syncer: Callable[[str, tuple[str, ...]], Path] | None = None,
     sleeper: Callable[[float], None] = time.sleep,
     adoption_timeout: float = 60,
+    unattended: bool = False,
 ) -> CampaignEvaluationResult:
     """Evaluate every frozen arm at most once and write an exact report."""
     root = _canonical_campaign_root(campaign_root)
@@ -286,7 +288,7 @@ def evaluate_campaign(
         image_plan: Mapping[str, object] | None = None
         try:
             image_plan = _prepare_campaign_image_tags(root, image_identities, command_runner is None)
-            if retry_evaluator and not any(
+            if retry_evaluator and not unattended and not any(
                 (state := _read_optional_json(root / "evaluation-state" / f"{arm}.json")) is not None
                 and state.get("status") == "interrupted"
                 for arm in active_arms
@@ -294,30 +296,32 @@ def evaluate_campaign(
                 raise CampaignEvaluationError("--retry-evaluator requires an explicit interrupted state")
             evidence = _prepare_evidence(root, jobs)
             _preflight_foreign_eval_artifacts(root, jobs)
-            arm_states = {
-                arm: _evaluate_arm(
-                    root,
-                    arm,
-                    tuple(instance_id for instance_id, candidate_arm in jobs if candidate_arm == arm),
-                    evidence,
-                    {instance_id: scoring_metadata[instance_id] for instance_id in manifest["selected_ids"]},
-                    manifest,
-                    image_plan,
-                    hf_inputs,
-                    retry_evaluator,
-                    command_runner or campaign_process.run_checked,
-                    process_probe or _process_identity_alive,
-                    process_group_probe or _process_group_alive,
-                    cgroup_probe or _cgroup_alive,
-                    container_probe
-                    or (_evaluator_containers_alive if command_runner is None else lambda _prefix: False),
-                    container_cleanup
-                    or (_cleanup_evaluator_containers if command_runner is None else lambda _prefix: ()),
-                    sleeper,
-                    adoption_timeout,
-                )
-                for arm in active_arms
-            }
+            arm_states = {}
+            for arm in active_arms:
+                for _generation in range(MAX_EVALUATOR_GENERATIONS if unattended else 1):
+                    arm_states[arm] = _evaluate_arm(
+                        root,
+                        arm,
+                        tuple(instance_id for instance_id, candidate_arm in jobs if candidate_arm == arm),
+                        evidence,
+                        {instance_id: scoring_metadata[instance_id] for instance_id in manifest["selected_ids"]},
+                        manifest,
+                        image_plan,
+                        hf_inputs,
+                        retry_evaluator or unattended,
+                        command_runner or campaign_process.run_checked,
+                        process_probe or _process_identity_alive,
+                        process_group_probe or _process_group_alive,
+                        cgroup_probe or _cgroup_alive,
+                        container_probe
+                        or (_evaluator_containers_alive if command_runner is None else lambda _prefix: False),
+                        container_cleanup
+                        or (_cleanup_evaluator_containers if command_runner is None else lambda _prefix: ()),
+                        sleeper,
+                        adoption_timeout,
+                    )
+                    if arm_states[arm].get("status") != "interrupted" or not unattended:
+                        break
             _verify_campaign_image_tags(image_plan, command_runner is None)
             _repair_comparison_bundle(root)
             report = _comparison(root, manifest_path, manifest, jobs, evidence, lookup, arm_states)

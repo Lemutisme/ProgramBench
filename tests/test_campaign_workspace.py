@@ -853,6 +853,21 @@ def test_exact_manifest_adopts_and_restarts_a_stopped_container(tmp_path: Path) 
     assert any(command[1] == "start" for command in docker.commands)
 
 
+def test_missing_owned_container_is_recreated_with_the_same_persisted_mounts(tmp_path: Path) -> None:
+    docker = RecordingDocker()
+    value = request(tmp_path, docker)
+    first = ensure_workspace(value)
+    docker.containers.pop(first.container_name)
+    docker.containers.pop(first.container_id)
+
+    recovered = ensure_workspace(value)
+
+    assert recovered.adopted
+    assert recovered.manifest.state_dir == first.manifest.state_dir
+    assert recovered.manifest.candidate == first.manifest.candidate
+    assert sum(command[1] == "create" for command in docker.commands) == 2
+
+
 def test_stopped_restart_crash_after_start_reconciles_new_port(tmp_path: Path) -> None:
     docker = FaultDocker("disabled")
     value = request(tmp_path, docker)
@@ -894,7 +909,7 @@ def test_stopped_restart_health_failure_persists_truthful_launch(tmp_path: Path)
         ensure_workspace(replace(value, health_probe=lambda _url, _timeout: False, health_timeout=0.01))
 
     interrupted = json.loads(workspace.manifest_path.read_text())
-    assert interrupted["phase"] == "launching"
+    assert interrupted["phase"] == "stopped"
     assert interrupted["candidate_mutable"] is True
     assert interrupted["container_id"] == workspace.container_id
     assert interrupted["port"] == 48125

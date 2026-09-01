@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 
 import pytest
 
-from scripts.campaign_state import JobLease, JobPaths, JobState, StateConflictError, StateStore
+from scripts.campaign_state import JobLease, JobPaths, JobState, RecoverableJobError, StateConflictError, StateStore
 from scripts.campaign_usage import CircuitBreaker
 from scripts.campaign_workspace import WorkspaceError, WorkspaceLease
 from scripts.run_opencode import Limits
@@ -2211,19 +2211,19 @@ def test_concurrent_attestation_cannot_be_attributed_to_intended_report(tmp_path
 
 
 @pytest.mark.parametrize(
-    ("status", "retry_after", "completion", "calls"),
+    ("status", "retry_after", "recovery_phase", "calls"),
     [
-        (401, None, "auth", 1),
-        (503, None, "lost_server", 1),
-        (429, "21600", "lost_server", 1),
-        (429, "1", "lost_server", 1),
+        (401, None, "waiting_provider", 1),
+        (503, None, "restarting_server", 1),
+        (429, "21600", "waiting_provider", 1),
+        (429, "1", "waiting_provider", 1),
     ],
 )
-def test_uncommitted_attestation_errors_preserve_terminal_trajectory(
+def test_uncommitted_attestation_errors_preserve_recoverable_trajectory(
     tmp_path: Path,
     status: int,
     retry_after: str | None,
-    completion: str,
+    recovery_phase: str,
     calls: int,
 ) -> None:
     from scripts.campaign_procontract import ProContractHttpError, build_issue_payload, run_procontract
@@ -2247,23 +2247,24 @@ def test_uncommitted_attestation_errors_preserve_terminal_trajectory(
 
     with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
         workspace.lease._handle_active = True
-        result = run_procontract(
-            job,
-            store,
-            workspace,
-            model="openai/gpt-5.6-luna",
-            variant="max",
-            limits=_limits(),
-            breaker=CircuitBreaker(clock=clock, retry_after_max=21600),
-            api=api,
-            clock=clock,
-            sleeper=clock.sleep,
-            poll_interval=30,
-            package=lambda subject, run_dir, iid: _package(run_dir, iid),
-            preflight=lambda archive, iid: SimpleNamespace(executable_hash="e" * 64, output="ok"),
-        )
+        with pytest.raises(RecoverableJobError) as caught:
+            run_procontract(
+                job,
+                store,
+                workspace,
+                model="openai/gpt-5.6-luna",
+                variant="max",
+                limits=_limits(),
+                breaker=CircuitBreaker(clock=clock, retry_after_max=21600),
+                api=api,
+                clock=clock,
+                sleeper=clock.sleep,
+                poll_interval=30,
+                package=lambda subject, run_dir, iid: _package(run_dir, iid),
+                preflight=lambda archive, iid: SimpleNamespace(executable_hash="e" * 64, output="ok"),
+            )
 
-    assert result.completion.value == completion
+    assert caught.value.phase == recovery_phase
     assert api.attest_calls == calls
     assert api.attestations == []
 
@@ -2303,9 +2304,9 @@ def test_malformed_committed_attestation_response_is_not_falsely_attributed(tmp_
     )
 
 
-@pytest.mark.parametrize(("status", "failures", "completion"), [(401, -1, "auth"), (429, 1, "lost_server")])
+@pytest.mark.parametrize(("status", "failures"), [(401, -1), (429, 1)])
 def test_attestation_reconcile_uses_stage_http_policy(
-    tmp_path: Path, status: int, failures: int, completion: str
+    tmp_path: Path, status: int, failures: int
 ) -> None:
     from scripts.campaign_procontract import ProContractHttpError, build_issue_payload, run_procontract
 
@@ -2328,22 +2329,22 @@ def test_attestation_reconcile_uses_stage_http_policy(
 
     with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
         workspace.lease._handle_active = True
-        result = run_procontract(
-            job,
-            store,
-            workspace,
-            model="openai/gpt-5.6-luna",
-            variant="max",
-            limits=_limits(),
-            breaker=CircuitBreaker(clock=clock),
-            api=api,
-            clock=clock,
-            sleeper=clock.sleep,
-            package=lambda subject, run_dir, iid: _package(run_dir, iid),
-            preflight=lambda archive, iid: SimpleNamespace(executable_hash="e" * 64, output="ok"),
-        )
-
-    assert result.completion.value == completion
+        with pytest.raises(RecoverableJobError) as caught:
+            run_procontract(
+                job,
+                store,
+                workspace,
+                model="openai/gpt-5.6-luna",
+                variant="max",
+                limits=_limits(),
+                breaker=CircuitBreaker(clock=clock),
+                api=api,
+                clock=clock,
+                sleeper=clock.sleep,
+                package=lambda subject, run_dir, iid: _package(run_dir, iid),
+                preflight=lambda archive, iid: SimpleNamespace(executable_hash="e" * 64, output="ok"),
+            )
+        assert caught.value.phase == ("waiting_provider" if status == 401 else "restarting_server")
     assert api.attest_calls == 1
     if status == 429:
         assert api.reconcile_calls == 2
@@ -2982,6 +2983,7 @@ def test_pending_revision_precedes_safety_and_delivery(tmp_path: Path, status: s
         )
     assert result.completion.value == "pending_revision"
     assert api.exports == [] and api.attestations == []
+    assert store.read().phase == "awaiting_revision"
 
 
 @pytest.mark.parametrize("binding", ["rotated", "missing"])
@@ -3607,6 +3609,27 @@ def test_credential_in_sensitive_telemetry_does_not_block_clean_publication(
     assert leaked is not None and before is not None
     assert _tree_identity(leaked.parent) == before
     assert leaked.read_text() == secret
+
+
+def test_execution_failure_signal_trips_cross_job_provider_wave_without_raw_error(tmp_path: Path) -> None:
+    from scripts import campaign_procontract
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    _, workspace = _workspace(tmp_path, paths)
+    payload = campaign_procontract.build_issue_payload(workspace, now=100)
+    failure = {"kind": "transient", "fingerprint": "a" * 64}
+    execution = campaign_procontract._validate_execution(
+        {**_execution(payload), "dispatched": False, "lastFailure": failure},
+        payload,
+        1,
+    )
+    breaker = CircuitBreaker(clock=lambda: 100, provider_failure_backoff=30)
+
+    assert campaign_procontract._observe_execution_failure(breaker, "job-1", execution, lambda: 100) is None
+    assert campaign_procontract._observe_execution_failure(breaker, "job-2", execution, lambda: 100) is None
+    assert campaign_procontract._observe_execution_failure(breaker, "job-3", execution, lambda: 100) == "wait"
+    assert breaker.backoff_until == 130
 
 
 def test_credential_in_external_git_object_store_fails_closed_without_mutation(
@@ -4272,7 +4295,7 @@ def test_stage_http_429_retries_same_read_to_success(tmp_path: Path, stage: str)
 
 
 @pytest.mark.parametrize("stage", ["export", "pre_attest", "quiet"])
-def test_stage_http_auth_preserves_auth_completion(tmp_path: Path, stage: str) -> None:
+def test_stage_http_auth_preserves_recoverable_contract(tmp_path: Path, stage: str) -> None:
     from scripts.campaign_procontract import ProContractHttpError, build_issue_payload, run_procontract
 
     paths = JobPaths(tmp_path / "job")
@@ -4291,27 +4314,28 @@ def test_stage_http_auth_preserves_auth_completion(tmp_path: Path, stage: str) -
 
     with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
         workspace.lease._handle_active = True
-        result = run_procontract(
-            job,
-            store,
-            workspace,
-            model="openai/gpt-5.6-luna",
-            variant="max",
-            limits=_limits(),
-            breaker=CircuitBreaker(clock=clock),
-            api=api,
-            clock=clock,
-            sleeper=clock.sleep,
-            package=lambda subject, run_dir, iid: _package(run_dir, iid),
-            preflight=lambda archive, iid: SimpleNamespace(executable_hash="e" * 64, output="ok"),
-        )
+        with pytest.raises(RecoverableJobError) as caught:
+            run_procontract(
+                job,
+                store,
+                workspace,
+                model="openai/gpt-5.6-luna",
+                variant="max",
+                limits=_limits(),
+                breaker=CircuitBreaker(clock=clock),
+                api=api,
+                clock=clock,
+                sleeper=clock.sleep,
+                package=lambda subject, run_dir, iid: _package(run_dir, iid),
+                preflight=lambda archive, iid: SimpleNamespace(executable_hash="e" * 64, output="ok"),
+            )
 
-    assert result.completion.value == "auth"
+    assert caught.value.phase == "waiting_provider"
     assert len(api.attestations) == (1 if stage == "quiet" else 0)
 
 
 @pytest.mark.parametrize("stage", ["export", "pre_attest", "quiet"])
-def test_stage_http_loss_preserves_native_classification(tmp_path: Path, stage: str) -> None:
+def test_stage_http_loss_requests_same_job_server_restart(tmp_path: Path, stage: str) -> None:
     from scripts.campaign_procontract import ProContractHttpError, build_issue_payload, run_procontract
 
     paths = JobPaths(tmp_path / "job")
@@ -4330,30 +4354,24 @@ def test_stage_http_loss_preserves_native_classification(tmp_path: Path, stage: 
 
     with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
         workspace.lease._handle_active = True
-        result = run_procontract(
-            job,
-            store,
-            workspace,
-            model="openai/gpt-5.6-luna",
-            variant="max",
-            limits=_limits(),
-            breaker=CircuitBreaker(clock=clock),
-            api=api,
-            clock=clock,
-            sleeper=clock.sleep,
-            package=lambda subject, run_dir, iid: _package(run_dir, iid),
-            preflight=lambda archive, iid: SimpleNamespace(executable_hash="e" * 64, output="ok"),
-        )
+        with pytest.raises(RecoverableJobError) as caught:
+            run_procontract(
+                job,
+                store,
+                workspace,
+                model="openai/gpt-5.6-luna",
+                variant="max",
+                limits=_limits(),
+                breaker=CircuitBreaker(clock=clock),
+                api=api,
+                clock=clock,
+                sleeper=clock.sleep,
+                package=lambda subject, run_dir, iid: _package(run_dir, iid),
+                preflight=lambda archive, iid: SimpleNamespace(executable_hash="e" * 64, output="ok"),
+            )
 
-    if stage == "quiet":
-        assert result.completion.value == "discharged"
-        assert result.quiet_unconfirmed is True
-        assert len(api.attestations) == 1
-    else:
-        assert result.completion.value == "lost_server"
-        assert result.status == "verification"
-        assert result.outstanding == (str(payload["id"]),)
-        assert api.attestations == []
+    assert caught.value.phase == "restarting_server"
+    assert len(api.attestations) == (1 if stage == "quiet" else 0)
 
 
 @pytest.mark.parametrize("stage", ["export", "pre_attest", "quiet"])
@@ -4712,25 +4730,28 @@ def test_auth_breaker_stops_accepted_contract(tmp_path: Path, status: int) -> No
         _execution(payload),
         ProContractHttpError("credential must not leak", status_code=status),
     )
+    breaker = CircuitBreaker()
 
     with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
         workspace.lease._handle_active = True
-        result = run_procontract(
-            job,
-            store,
-            workspace,
-            model="openai/gpt-5.6-luna",
-            variant="max",
-            limits=_limits(),
-            breaker=CircuitBreaker(),
-            api=api,
-            clock=clock,
-            sleeper=clock.sleep,
-        )
+        with pytest.raises(RecoverableJobError) as caught:
+            run_procontract(
+                job,
+                store,
+                workspace,
+                model="openai/gpt-5.6-luna",
+                variant="max",
+                limits=_limits(),
+                breaker=breaker,
+                api=api,
+                clock=clock,
+                sleeper=clock.sleep,
+            )
 
-    assert result.completion.value == "auth"
-    assert api.interrupts == ["ses_contract"]
-    assert "credential must not leak" not in __import__("json").dumps(result.to_dict())
+    assert caught.value.phase == "waiting_provider"
+    assert breaker.pause_reason == "provider authentication failure"
+    assert api.interrupts == []
+    assert not paths.root.joinpath("procontract-result.json").exists()
 
 
 def test_global_auth_failure_still_attempts_one_targeted_interrupt(tmp_path: Path) -> None:
@@ -4747,25 +4768,27 @@ def test_global_auth_failure_still_attempts_one_targeted_interrupt(tmp_path: Pat
         _execution(payload),
         ProContractHttpError("unauthorized", status_code=401),
     )
+    breaker = CircuitBreaker()
 
     with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
         workspace.lease._handle_active = True
-        result = run_procontract(
-            job,
-            store,
-            workspace,
-            model="openai/gpt-5.6-luna",
-            variant="max",
-            limits=_limits(),
-            breaker=CircuitBreaker(),
-            api=api,
-            clock=clock,
-            sleeper=clock.sleep,
-        )
+        with pytest.raises(RecoverableJobError):
+            run_procontract(
+                job,
+                store,
+                workspace,
+                model="openai/gpt-5.6-luna",
+                variant="max",
+                limits=_limits(),
+                breaker=breaker,
+                api=api,
+                clock=clock,
+                sleeper=clock.sleep,
+            )
 
-    assert result.completion.value == "auth"
-    assert api.interrupts == ["ses_contract"]
-    assert workspace.stops == 1
+    assert breaker.pause_reason == "provider authentication failure"
+    assert api.interrupts == []
+    assert workspace.stops == 0
 
 
 def test_rate_limit_rejoins_same_contract_trajectory(tmp_path: Path) -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import threading
 import time
 from collections import Counter
@@ -372,6 +373,9 @@ class CircuitBreaker:
         total_cost_hard: int | float | str | Decimal | None = None,
         retry_after_default: int = 30,
         retry_after_max: int = 3600,
+        provider_failure_threshold: int = 3,
+        provider_failure_window: int = 120,
+        provider_failure_backoff: int = 60,
     ) -> None:
         if minimum_read_ratio is not None:
             minimum_cache_ratio = minimum_read_ratio
@@ -394,6 +398,12 @@ class CircuitBreaker:
             raise UsageParseError("retry-after default must be nonnegative")
         if type(retry_after_max) is not int or retry_after_max < retry_after_default:
             raise UsageParseError("retry-after maximum is invalid")
+        if type(provider_failure_threshold) is not int or provider_failure_threshold < 2:
+            raise UsageParseError("provider failure threshold must be at least two")
+        if type(provider_failure_window) is not int or provider_failure_window <= 0:
+            raise UsageParseError("provider failure window must be positive")
+        if type(provider_failure_backoff) is not int or provider_failure_backoff <= 0:
+            raise UsageParseError("provider failure backoff must be positive")
         soft = None if soft_cost_cap is None else _decimal(soft_cost_cap)
         hard = None if hard_cost_cap is None else _decimal(hard_cost_cap)
         if soft is not None and soft <= 0 or hard is not None and hard <= 0:
@@ -408,6 +418,9 @@ class CircuitBreaker:
         self._clock = clock
         self._retry_after_default = retry_after_default
         self._retry_after_max = retry_after_max
+        self._provider_failure_threshold = provider_failure_threshold
+        self._provider_failure_window = provider_failure_window
+        self._provider_failure_backoff = provider_failure_backoff
         self._lock = threading.RLock()
         self._totals = _CampaignTotals()
         self._campaign_usage = UsageSummary()
@@ -422,6 +435,9 @@ class CircuitBreaker:
         self._cache_acknowledged = False
         self._soft_acknowledged = False
         self._backoff_until: float | None = None
+        self._provider_failures: dict[str, dict[str, float]] = {}
+        self._provider_failure_waves: dict[str, int] = {}
+        self._provider_backoff_fingerprint: str | None = None
 
     @classmethod
     def from_campaign_config(cls, config: object, **kwargs: object) -> CircuitBreaker:
@@ -492,6 +508,15 @@ class CircuitBreaker:
             return self._backoff_until
 
     @property
+    def provider_wave_active(self) -> bool:
+        with self._lock:
+            return (
+                self._provider_backoff_fingerprint is not None
+                and self._backoff_until is not None
+                and self._clock() < self._backoff_until
+            )
+
+    @property
     def pause_reason(self) -> str | None:
         with self._lock:
             if "auth" in self._pause_causes:
@@ -503,7 +528,11 @@ class CircuitBreaker:
             if "cache" in self._pause_causes:
                 return "cache health below campaign threshold"
             if self._backoff_until is not None and self._clock() < self._backoff_until:
-                return "provider rate limit backoff"
+                return (
+                    "provider failure wave backoff"
+                    if self._provider_backoff_fingerprint is not None
+                    else "provider rate limit backoff"
+                )
             return None
 
     def observe(
@@ -719,6 +748,45 @@ class CircuitBreaker:
     def observe_provider_error(self, status_code: int, **kwargs: object) -> None:
         self.observe_error(status_code, **kwargs)
 
+    def observe_provider_failure(
+        self,
+        job_id: str,
+        fingerprint: str,
+        *,
+        status_code: int | None = None,
+        retry_after: object = None,
+        now: float | None = None,
+    ) -> bool:
+        """Trip a campaign backoff after the same credential-free failure reaches distinct jobs."""
+        if not isinstance(job_id, str) or not job_id:
+            raise UsageParseError("provider failure job ID must be nonempty")
+        if not isinstance(fingerprint, str) or re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None:
+            raise UsageParseError("provider failure fingerprint must be a SHA-256 digest")
+        if status_code in {401, 403, 429}:
+            self.observe_error(status_code, retry_after=retry_after, now=now)
+            return self.paused
+        current = self._clock() if now is None else _finite_time(now)
+        with self._lock:
+            cutoff = current - self._provider_failure_window
+            self._provider_failures = {
+                key: {job: observed for job, observed in jobs.items() if observed >= cutoff}
+                for key, jobs in self._provider_failures.items()
+            }
+            self._provider_failures = {key: jobs for key, jobs in self._provider_failures.items() if jobs}
+            observations = self._provider_failures.setdefault(fingerprint, {})
+            changed = observations.get(job_id) != current
+            observations[job_id] = current
+            if len(observations) >= self._provider_failure_threshold and self._provider_backoff_fingerprint is None:
+                waves = self._provider_failure_waves.get(fingerprint, 0) + 1
+                self._provider_failure_waves[fingerprint] = waves
+                delay = min(self._retry_after_max, self._provider_failure_backoff * 2 ** (waves - 1))
+                self._backoff_until = max(self._backoff_until or current, current + delay)
+                self._provider_backoff_fingerprint = fingerprint
+                changed = True
+            if changed:
+                self._state_version += 1
+            return self._provider_backoff_fingerprint == fingerprint
+
     def acknowledge(self, reason: str | None = None) -> None:
         with self._lock:
             self._apply_cost_caps()
@@ -773,7 +841,7 @@ class CircuitBreaker:
             jobs = dict(self._jobs)
             violations = set(self._turn_limit_violations)
             state = {
-                "version": 1,
+                "version": 2,
                 "cache_warmup_turns": self.cache_warmup_turns,
                 "minimum_cache_ratio": _decimal_string(self.minimum_cache_ratio),
                 "consecutive_failures": self.consecutive_failures,
@@ -788,6 +856,15 @@ class CircuitBreaker:
                 "soft_cost_cap": None if self.soft_cost_cap is None else _decimal_string(self.soft_cost_cap),
                 "hard_cost_cap": None if self.hard_cost_cap is None else _decimal_string(self.hard_cost_cap),
                 "campaign_usage": self._totals.compact_dict(),
+                "provider_failure_threshold": self._provider_failure_threshold,
+                "provider_failure_window": self._provider_failure_window,
+                "provider_failure_backoff": self._provider_failure_backoff,
+                "provider_failures": {
+                    fingerprint: dict(sorted(observations.items()))
+                    for fingerprint, observations in sorted(self._provider_failures.items())
+                },
+                "provider_failure_waves": dict(sorted(self._provider_failure_waves.items())),
+                "provider_backoff_fingerprint": self._provider_backoff_fingerprint,
             }
         state["jobs"] = {
             job: {
@@ -811,9 +888,7 @@ class CircuitBreaker:
         raw = _load_json(snapshot, max_bytes=MAX_SNAPSHOT_BYTES)
         if not isinstance(raw, Mapping):
             raise UsageParseError("breaker snapshot must be an object")
-        _require_keys(
-            raw,
-            {
+        legacy_keys = {
                 "version",
                 "cache_warmup_turns",
                 "minimum_cache_ratio",
@@ -830,11 +905,24 @@ class CircuitBreaker:
                 "hard_cost_cap",
                 "campaign_usage",
                 "jobs",
-            },
-        )
+            }
+        provider_keys = {
+            "provider_failure_threshold",
+            "provider_failure_window",
+            "provider_failure_backoff",
+            "provider_failures",
+            "provider_failure_waves",
+            "provider_backoff_fingerprint",
+        }
+        version_value = raw.get("version")
+        if version_value == 1:
+            _require_keys(raw, legacy_keys)
+        elif version_value == 2:
+            _require_keys(raw, legacy_keys | provider_keys)
+        else:
+            raise UsageParseError("invalid breaker snapshot version or cache failures")
         if (
             type(raw["version"]) is not int
-            or raw["version"] != 1
             or type(raw["cache_failures"]) is not int
             or raw["cache_failures"] < 0
         ):
@@ -860,6 +948,9 @@ class CircuitBreaker:
             clock=clock,
             retry_after_default=raw["retry_after_default"],
             retry_after_max=raw["retry_after_max"],
+            provider_failure_threshold=raw.get("provider_failure_threshold", 3),
+            provider_failure_window=raw.get("provider_failure_window", 120),
+            provider_failure_backoff=raw.get("provider_failure_backoff", 60),
             **kwargs,
         )
         if "soft" in causes and breaker.soft_cost_cap is None:
@@ -922,6 +1013,21 @@ class CircuitBreaker:
             breaker._soft_acknowledged = raw["soft_cap_acknowledged"]
             breaker._pause_causes = set(causes)
             breaker._backoff_until = backoff
+            if raw["version"] == 2:
+                failures = _provider_failure_observations(raw["provider_failures"])
+                waves = _provider_failure_wave_counts(raw["provider_failure_waves"])
+                fingerprint = raw["provider_backoff_fingerprint"]
+                if fingerprint is not None and (
+                    not isinstance(fingerprint, str) or re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None
+                ):
+                    raise UsageParseError("provider backoff fingerprint is invalid")
+                if fingerprint is not None and backoff is None:
+                    raise UsageParseError("provider backoff fingerprint requires a deadline")
+                if fingerprint is not None and fingerprint not in failures:
+                    raise UsageParseError("provider backoff fingerprint has no observations")
+                breaker._provider_failures = failures
+                breaker._provider_failure_waves = waves
+                breaker._provider_backoff_fingerprint = fingerprint
             breaker._campaign_usage = UsageSummary()
             breaker._jobs = restored
             breaker._turn_limit_violations = {
@@ -989,6 +1095,7 @@ class CircuitBreaker:
     def _release_backoff(self) -> None:
         if self._backoff_until is not None and self._clock() >= self._backoff_until:
             self._backoff_until = None
+            self._provider_backoff_fingerprint = None
 
     def _is_paused(self) -> bool:
         self._release_backoff()
@@ -1333,6 +1440,43 @@ def _finite_time(value: object) -> float:
     if not math.isfinite(converted):
         raise UsageParseError("time must be finite")
     return converted
+
+
+def _provider_failure_observations(value: object) -> dict[str, dict[str, float]]:
+    if not isinstance(value, Mapping):
+        raise UsageParseError("provider failure observations must be an object")
+    result: dict[str, dict[str, float]] = {}
+    for fingerprint, observations in value.items():
+        if (
+            not isinstance(fingerprint, str)
+            or re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None
+            or not isinstance(observations, Mapping)
+            or not observations
+        ):
+            raise UsageParseError("provider failure observation is invalid")
+        parsed = {
+            job: _finite_time(observed)
+            for job, observed in observations.items()
+            if isinstance(job, str) and job
+        }
+        if len(parsed) != len(observations):
+            raise UsageParseError("provider failure observation job is invalid")
+        result[fingerprint] = parsed
+    return result
+
+
+def _provider_failure_wave_counts(value: object) -> dict[str, int]:
+    if not isinstance(value, Mapping):
+        raise UsageParseError("provider failure wave counts must be an object")
+    if any(
+        not isinstance(fingerprint, str)
+        or re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None
+        or type(count) is not int
+        or count <= 0
+        for fingerprint, count in value.items()
+    ):
+        raise UsageParseError("provider failure wave count is invalid")
+    return dict(value)
 
 
 def _ratio_at_least(read: int, prompt_total: int, threshold: Decimal) -> bool:

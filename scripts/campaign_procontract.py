@@ -29,7 +29,7 @@ from scripts.campaign_freeze import (
     _snapshot_candidate,
     _verify_no_credentials,
 )
-from scripts.campaign_state import JobLease, JobState, StateError, StateStore
+from scripts.campaign_state import JobLease, JobState, RecoverableJobError, StateError, StateStore
 from scripts.campaign_stop import CampaignStopped, StopAwareApi, StopToken, stop_aware_sleeper
 from scripts.campaign_usage import CircuitBreaker, UsageParseError, UsageSummary
 from scripts.campaign_vanilla import (
@@ -40,6 +40,7 @@ from scripts.campaign_vanilla import (
     _credential_values,
     _observe_rate_limit,
     _observe_terminal_usage,
+    _provider_error,
     _require_monotonic,
     _sanitize,
     _sha256,
@@ -1267,7 +1268,9 @@ def _run_procontract(
                 _all_credential_names(workspace.manifest.credential_env),
             )
         except ProContractHttpError:
-            return _finish_ambiguous_issue_stop(job, state_store, state, workspace, issue, clock)
+            raise RecoverableJobError(
+                "restarting_server", "contract_issue_reconcile_failed", clock() + 5
+            ) from None
         state = _set_issue_marker(
             marker_path,
             state_store,
@@ -1315,7 +1318,9 @@ def _run_procontract(
             except ProContractConflictError:
                 raise
             except ProContractHttpError:
-                return _finish_ambiguous_issue_stop(job, state_store, state, workspace, issue, clock)
+                raise RecoverableJobError(
+                    "restarting_server", "contract_issue_reconcile_failed", clock() + 5
+                ) from None
             except ProContractError:
                 raise
             if accepted is not None:
@@ -1351,6 +1356,11 @@ def _run_procontract(
                     continue
             if status_code in {401, 403}:
                 breaker.observe_error(status_code, detail=str(error))
+                raise RecoverableJobError(
+                    "waiting_provider",
+                    "provider_authentication_failure",
+                    clock(),
+                ) from None
             _fail_issue_admission(
                 job,
                 state_store,
@@ -1393,6 +1403,18 @@ def _run_procontract(
     if state.phase == "executing":
         observation_failures = 0
         while True:
+            if breaker.active_stop_reason == "provider authentication failure":
+                raise RecoverableJobError(
+                    "waiting_provider",
+                    "provider_authentication_failure",
+                    clock(),
+                )
+            if breaker.provider_wave_active:
+                raise RecoverableJobError(
+                    "waiting_provider",
+                    "provider_failure_wave",
+                    breaker.backoff_until or clock() + 60,
+                )
             try:
                 found = api.get_contract(str(payload["id"]))
                 found_execution = api.get_execution(str(payload["id"]))
@@ -1518,6 +1540,24 @@ def _run_procontract(
                     bound_execution = current_execution
                 execution = current_execution
                 if execution["dispatched"] is False:
+                    provider_health = _observe_execution_failure(
+                        breaker,
+                        workspace.manifest.job_id,
+                        execution,
+                        clock,
+                    )
+                    if provider_health == "auth":
+                        raise RecoverableJobError(
+                            "waiting_provider",
+                            "provider_authentication_failure",
+                            clock(),
+                        )
+                    if provider_health == "wait":
+                        raise RecoverableJobError(
+                            "waiting_provider",
+                            "provider_failure_wave",
+                            breaker.backoff_until or clock() + 60,
+                        )
                     safety = _verification_safety_completion(breaker, clock, deadline)
                     if safety is not None:
                         return _stop_and_finish(
@@ -1586,6 +1626,25 @@ def _run_procontract(
                         provider_turns=turns,
                         actions=actions,
                         cost=float(usage.cost),
+                    )
+                provider_health = _observe_provider_health(
+                    breaker,
+                    workspace.manifest.job_id,
+                    messages,
+                    clock,
+                    deadline,
+                )
+                if provider_health == "auth":
+                    raise RecoverableJobError(
+                        "waiting_provider",
+                        "provider_authentication_failure",
+                        clock(),
+                    )
+                if provider_health == "wait":
+                    raise RecoverableJobError(
+                        "waiting_provider",
+                        "provider_failure_wave",
+                        breaker.backoff_until or clock() + 60,
                     )
                 quiet = _validate_quiet(api.quiet(str(payload["scope"])), payload)
                 if contract.get("pendingRevision") is not None:
@@ -1902,6 +1961,10 @@ def _run_procontract(
                     if safety is None and observation_failures < MAX_OBSERVATION_ATTEMPTS:
                         sleeper(min(poll_interval, max(0.001, deadline - clock())))
                         continue
+                    if safety is None:
+                        raise RecoverableJobError(
+                            "restarting_server", "contract_observation_transport_failed", clock() + 5
+                        ) from None
                 completion = (
                     ProContractCompletion.AUTH
                     if error.status_code in {401, 403}
@@ -1909,6 +1972,11 @@ def _run_procontract(
                 )
                 if error.status_code in {401, 403}:
                     breaker.observe_error(error.status_code, detail=str(error))
+                    raise RecoverableJobError(
+                        "waiting_provider",
+                        "provider_authentication_failure",
+                        clock(),
+                    ) from None
                 return _stop_and_finish(
                     job,
                     state_store,
@@ -1957,6 +2025,12 @@ def _run_procontract(
             deadline,
         )
     except ProContractNativeOutcome as outcome:
+        if outcome.completion is ProContractCompletion.AUTH:
+            raise RecoverableJobError(
+                "waiting_provider",
+                "provider_authentication_failure",
+                clock(),
+            ) from None
         outcome_quiet = (
             _pending_revision_quiet(payload) if outcome.completion is ProContractCompletion.PENDING_REVISION else quiet
         )
@@ -1990,7 +2064,41 @@ def _run_procontract(
             clock,
             quiet=outcome_quiet,
         )
-    except (CandidateError, CredentialLeakError, ProContractDeliveryError, ProContractHttpError, WorkspaceError):
+    except ProContractHttpError as error:
+        if error.status_code in {401, 403}:
+            breaker.observe_error(error.status_code, detail=str(error), now=clock())
+            raise RecoverableJobError(
+                "waiting_provider",
+                "provider_authentication_failure",
+                clock(),
+            ) from None
+        if error.status_code == 429:
+            _observe_rate_limit(breaker, error.retry_after, str(error), clock, deadline)
+            raise RecoverableJobError(
+                "waiting_provider",
+                "provider_rate_limit",
+                breaker.backoff_until or clock() + 1,
+            ) from None
+        if error.transient or error.status_code is None or error.status_code >= 500:
+            raise RecoverableJobError("restarting_server", "delivery_transport_failed", clock() + 5) from None
+        return _finish_without_delivery(
+            job,
+            state_store,
+            state_store.read(),
+            workspace,
+            command_identity,
+            payload,
+            contract,
+            execution,
+            usage,
+            actions,
+            issue,
+            ProContractCompletion.DELIVERY_FAILED,
+            "native Contract delivery verification failed",
+            clock,
+            quiet=quiet,
+        )
+    except (CandidateError, CredentialLeakError, ProContractDeliveryError, WorkspaceError):
         return _finish_without_delivery(
             job,
             state_store,
@@ -2341,12 +2449,7 @@ def _deliver(
     try:
         workspace = restart_delivery_workspace(workspace, api)
     except (WorkspaceError, ProContractError):
-        raise ProContractNativeOutcome(
-            ProContractCompletion.LOST_SERVER,
-            contract,
-            execution,
-            "restart_failed",
-        ) from None
+        raise RecoverableJobError("restarting_server", "delivery_restart_failed", clock() + 5) from None
     safety = _verification_safety_completion(breaker, clock, deadline)
     if safety is not None:
         raise ProContractNativeOutcome(safety, contract, execution)
@@ -2501,8 +2604,22 @@ def _deliver(
                 raise ProContractConflictError("Contract left verification after ambiguous attestation") from None
             if status_code in {401, 403}:
                 breaker.observe_error(status_code, detail=str(error))
+                raise RecoverableJobError(
+                    "waiting_provider", "provider_authentication_failure", clock()
+                ) from None
             if status_code == 429:
                 _observe_rate_limit(breaker, error.retry_after, str(error), clock, deadline)
+                raise RecoverableJobError(
+                    "waiting_provider",
+                    "provider_rate_limit",
+                    breaker.backoff_until or clock() + 1,
+                ) from None
+            if isinstance(error, ProContractHttpError) and (
+                error.transient or error.status_code is None or error.status_code >= 500
+            ):
+                raise RecoverableJobError(
+                    "restarting_server", "attestation_transport_failed", clock() + 5
+                ) from None
             raise ProContractNativeOutcome(
                 _verification_safety_completion(breaker, clock, deadline)
                 or (ProContractCompletion.AUTH if status_code in {401, 403} else ProContractCompletion.LOST_SERVER),
@@ -3475,7 +3592,7 @@ def _validate_execution(raw: object, payload: Mapping[str, object], revision: in
         "turnsUsed",
         "actionsUsed",
     }
-    allowed = required | {"executionPolicy", "leaseOwner", "leaseExpiresAt"}
+    allowed = required | {"executionPolicy", "leaseOwner", "leaseExpiresAt", "lastFailure"}
     if not isinstance(raw, Mapping) or not required <= set(raw) or set(raw) - allowed:
         raise ProContractError("Contract execution response schema is invalid")
     if (
@@ -3500,6 +3617,15 @@ def _validate_execution(raw: object, payload: Mapping[str, object], revision: in
         and (not isinstance(raw["leaseOwner"], str) or not raw["leaseOwner"])
         or "leaseExpiresAt" in raw
         and (type(raw["leaseExpiresAt"]) is not int or raw["leaseExpiresAt"] < 0)
+        or "lastFailure" in raw
+        and (
+            not isinstance(raw["lastFailure"], Mapping)
+            or set(raw["lastFailure"]) != {"kind", "fingerprint"}
+            or raw["lastFailure"].get("kind") not in {"authentication", "quota", "transient"}
+            or not isinstance(raw["lastFailure"].get("fingerprint"), str)
+            or len(raw["lastFailure"]["fingerprint"]) != 64
+            or any(character not in "0123456789abcdef" for character in raw["lastFailure"]["fingerprint"])
+        )
     ):
         raise ProContractConflictError("Contract execution conflicts with frozen issue")
     location = raw["location"]
@@ -3528,6 +3654,7 @@ def _validate_execution(raw: object, payload: Mapping[str, object], revision: in
         "actionsUsed": raw["actionsUsed"],
         **({"leaseOwner": raw["leaseOwner"]} if "leaseOwner" in raw else {}),
         **({"leaseExpiresAt": raw["leaseExpiresAt"]} if "leaseExpiresAt" in raw else {}),
+        **({"lastFailure": dict(raw["lastFailure"])} if "lastFailure" in raw else {}),
     }
 
 
@@ -4291,7 +4418,9 @@ def _observe_after_attestation(
         except ProContractHttpError as error:
             if error.status_code in {401, 403}:
                 breaker.observe_error(error.status_code, detail=str(error))
-                raise ProContractNativeOutcome(ProContractCompletion.AUTH, current, current_execution) from None
+                raise RecoverableJobError(
+                    "waiting_provider", "provider_authentication_failure", clock()
+                ) from None
             if error.status_code == 429:
                 _observe_rate_limit(breaker, error.retry_after, str(error), clock, deadline)
                 if _backoff(breaker, clock, sleeper, poll_interval, deadline):
@@ -4307,7 +4436,13 @@ def _observe_after_attestation(
         if attempt + 1 >= MAX_MUTATION_ATTEMPTS or clock() >= deadline:
             break
         sleeper(min(poll_interval, deadline - clock()))
-    raise ProContractNativeOutcome(ProContractCompletion.LOST_SERVER, current, current_execution)
+    if clock() >= deadline:
+        raise ProContractNativeOutcome(
+            _verification_safety_completion(breaker, clock, deadline) or ProContractCompletion.LOST_SERVER,
+            current,
+            current_execution,
+        )
+    raise RecoverableJobError("restarting_server", "attestation_observation_transport_failed", clock() + 5)
 
 
 def _stage_http(
@@ -4326,7 +4461,9 @@ def _stage_http(
         except ProContractHttpError as error:
             if error.status_code in {401, 403}:
                 breaker.observe_error(error.status_code, detail=str(error))
-                raise ProContractNativeOutcome(ProContractCompletion.AUTH, contract, execution) from None
+                raise RecoverableJobError(
+                    "waiting_provider", "provider_authentication_failure", clock()
+                ) from None
             if error.status_code == 429:
                 _observe_rate_limit(breaker, error.retry_after, str(error), clock, deadline)
                 if _backoff(breaker, clock, sleeper, poll_interval, deadline):
@@ -4340,7 +4477,13 @@ def _stage_http(
         if attempt + 1 >= MAX_MUTATION_ATTEMPTS or clock() >= deadline:
             break
         sleeper(min(poll_interval, deadline - clock()))
-    raise ProContractNativeOutcome(ProContractCompletion.LOST_SERVER, contract, execution)
+    if clock() >= deadline:
+        raise ProContractNativeOutcome(
+            _verification_safety_completion(breaker, clock, deadline) or ProContractCompletion.LOST_SERVER,
+            contract,
+            execution,
+        )
+    raise RecoverableJobError("restarting_server", "delivery_transport_failed", clock() + 5)
 
 
 def _stage_contract_observation(
@@ -4456,6 +4599,12 @@ def _stop_and_finish(
     poll_interval: float,
     quiet: Mapping[str, object],
 ) -> ProContractResult:
+    if completion is ProContractCompletion.AUTH:
+        raise RecoverableJobError(
+            "waiting_provider",
+            "provider_authentication_failure",
+            clock(),
+        )
     session_id = str(execution["sessionID"])
     _write_or_verify_json(
         job.job.root / "procontract-native-result.json",
@@ -4501,6 +4650,50 @@ def _stop_and_finish(
         quiet=quiet,
         interrupt_attempted=interrupt_path.exists(),
     )
+
+
+def _observe_provider_health(
+    breaker: CircuitBreaker,
+    job_id: str,
+    messages: Mapping[str, object],
+    clock: Callable[[], float],
+    deadline: float,
+) -> Literal["auth", "wait"] | None:
+    error = _provider_error(messages)
+    if error is None:
+        return None
+    if error[0] in {401, 403}:
+        breaker.observe_error(error[0], detail=error[2], now=clock())
+        return "auth"
+    if error[0] == 429:
+        _observe_rate_limit(breaker, error[1], error[2], clock, deadline)
+        return "wait"
+    fingerprint = hashlib.sha256(
+        json.dumps([error[0], error[2]], ensure_ascii=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return (
+        "wait"
+        if breaker.observe_provider_failure(job_id, fingerprint, status_code=error[0], now=clock())
+        else None
+    )
+
+
+def _observe_execution_failure(
+    breaker: CircuitBreaker,
+    job_id: str,
+    execution: Mapping[str, object],
+    clock: Callable[[], float],
+) -> Literal["auth", "wait"] | None:
+    failure = execution.get("lastFailure")
+    if not isinstance(failure, Mapping):
+        return None
+    if failure.get("kind") == "authentication":
+        breaker.observe_error(401, now=clock())
+        return "auth"
+    fingerprint = failure.get("fingerprint")
+    if not isinstance(fingerprint, str):
+        raise ProContractError("Contract execution failure fingerprint is invalid")
+    return "wait" if breaker.observe_provider_failure(job_id, fingerprint, now=clock()) else None
 
 
 def _pending_revision_quiet(payload: Mapping[str, object]) -> Mapping[str, object]:
@@ -4906,7 +5099,9 @@ def _finish_without_delivery(
         if path.is_file()
     }
     state_store.transition(
-        "interrupted"
+        "awaiting_revision"
+        if completion is ProContractCompletion.PENDING_REVISION
+        else "interrupted"
         if completion
         in {
             ProContractCompletion.WALL_TIME,
@@ -4915,7 +5110,6 @@ def _finish_without_delivery(
             ProContractCompletion.AUTH,
             ProContractCompletion.HARD_COST,
             ProContractCompletion.OUTSTANDING,
-            ProContractCompletion.PENDING_REVISION,
             ProContractCompletion.INTERRUPTED,
         }
         else "failed",

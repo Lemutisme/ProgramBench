@@ -12,6 +12,7 @@ SEED="${RUN_ALL_SEED:-42}"
 EXPECTED_INSTANCES="${RUN_ALL_EXPECTED_INSTANCES:-200}"
 ARM="${RUN_ALL_ARM:-paired}"
 FILTER="${RUN_ALL_FILTER:-}"
+ACKNOWLEDGE="${RUN_ALL_ACKNOWLEDGE:-}"
 ALLOW_QUARANTINED_KEY=0
 QUARANTINE="${RUN_ALL_COMPROMISED_KEY_QUARANTINE:-/tmp/procontract-sensitive-quarantine-20260819}"
 OUTPUT_CREATED=0
@@ -37,6 +38,7 @@ Options:
   --expected-instances N     Fail before inference unless exactly N are frozen (default: 200)
   --arm MODE                 paired, procontract, or vanilla (default: paired)
   --filter REGEX             Run only instance IDs matching this regex
+  --acknowledge REASON       Resume after cache, auth, soft, or all pause is explicitly resolved
   --allow-quarantined-key    Explicitly authorize the locally known exposed key
   -h, --help                 Show this help
 
@@ -106,6 +108,11 @@ while (($#)); do
       FILTER="$2"
       shift 2
       ;;
+    --acknowledge)
+      (($# >= 2)) || die "--acknowledge requires a value"
+      ACKNOWLEDGE="$2"
+      shift 2
+      ;;
     --allow-quarantined-key)
       ALLOW_QUARANTINED_KEY=1
       shift
@@ -125,6 +132,8 @@ positive_integer "$WORKERS" || die "--workers must be a positive integer"
 [[ "$SEED" =~ ^-?[0-9]+$ ]] || die "--seed must be an integer"
 positive_integer "$EXPECTED_INSTANCES" || die "--expected-instances must be a positive integer"
 [[ "$ARM" == paired || "$ARM" == procontract || "$ARM" == vanilla ]] || die "--arm must be paired, procontract, or vanilla"
+[[ -z "$ACKNOWLEDGE" || "$ACKNOWLEDGE" == cache || "$ACKNOWLEDGE" == auth || "$ACKNOWLEDGE" == soft || "$ACKNOWLEDGE" == all ]] \
+  || die "--acknowledge must be cache, auth, soft, or all"
 
 if ! command -v bun >/dev/null && [[ -x "$HOME/.bun/bin/bun" ]]; then
   export PATH="$HOME/.bun/bin:$PATH"
@@ -313,6 +322,8 @@ breaker = read_json(output / "breaker.json")
 comparison = read_json(output / "comparison.json")
 states = defaultdict(Counter)
 exit_classes = defaultdict(Counter)
+recovery_reasons = defaultdict(Counter)
+process_generations = defaultdict(dict)
 for job_arm in ("procontract", "vanilla"):
     for path in (output / job_arm).glob("*/state.json"):
         state = read_json(path)
@@ -321,6 +332,10 @@ for job_arm in ("procontract", "vanilla"):
             continue
         states[job_arm][str(state.get("phase") or "unknown")] += 1
         exit_classes[job_arm][str(state.get("exit_class") or "none")] += 1
+        recovery_reasons[job_arm][str(state.get("recovery_reason") or "none")] += 1
+        generation = state.get("process_generation", 0)
+        if type(generation) is int and generation >= 0:
+            process_generations[job_arm][path.parent.name] = generation
 
 files = []
 for directory, names, filenames in os.walk(output):
@@ -375,6 +390,15 @@ summary = {
     "jobs": {
         "phase_counts": {arm: dict(values) for arm, values in states.items()},
         "exit_class_counts": {arm: dict(values) for arm, values in exit_classes.items()},
+        "recovery_reason_counts": {arm: dict(values) for arm, values in recovery_reasons.items()},
+        "process_generations": {
+            arm: {
+                "total": sum(values.values()),
+                "max": max(values.values(), default=0),
+                "recovered_jobs": sum(value > 1 for value in values.values()),
+            }
+            for arm, values in process_generations.items()
+        },
     },
     "breaker": breaker,
     "evaluation": {
@@ -483,13 +507,17 @@ else
   exit "$PREWARM_STATUS"
 fi
 
-if run_phase inference "${RUNNER[@]}" --resume; then
+INFERENCE_COMMAND=("${RUNNER[@]}" --resume)
+if [[ -n "$ACKNOWLEDGE" ]]; then
+  INFERENCE_COMMAND+=(--acknowledge "$ACKNOWLEDGE")
+fi
+if run_phase inference "${INFERENCE_COMMAND[@]}"; then
   INFERENCE_STATUS=0
 else
   INFERENCE_STATUS=$?
 fi
 
-if run_phase evaluation "${RUNNER[@]}" --resume --evaluate; then
+if run_phase evaluation "${RUNNER[@]}" --resume --evaluate-only --retry-evaluator; then
   EVALUATION_STATUS=0
 else
   EVALUATION_STATUS=$?

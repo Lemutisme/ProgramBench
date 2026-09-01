@@ -545,6 +545,27 @@ def test_state_store_retry_infra_reset_reopens_only_eligible_failure(tmp_path: P
     assert reset.reset_at is not None
 
 
+def test_recoverable_process_generation_preserves_semantic_usage_and_resumes_exact_phase(tmp_path: Path):
+    store = store_at(tmp_path / "state.json", "executing", provider_turns=7, actions=9, cost=1.5)
+    current = store.read()
+    first = store.begin_process(expected_generation=current.generation, pid=123)
+    waiting = store.defer_recovery(
+        "waiting_provider",
+        expected_generation=first.generation,
+        reason="provider_failure_wave",
+        retry_at=200,
+    )
+
+    assert waiting.process_generation == 1
+    assert (waiting.provider_turns, waiting.actions, waiting.cost) == (7, 9, 1.5)
+    resumed = store.begin_process(expected_generation=waiting.generation, pid=456)
+    assert resumed.phase == "executing"
+    assert resumed.process_generation == 2
+    assert resumed.recovery_reason is None
+    assert resumed.retry_at is None
+    assert (resumed.provider_turns, resumed.actions, resumed.cost) == (7, 9, 1.5)
+
+
 def test_state_store_resume_reset_reopens_only_interrupted_job(tmp_path: Path):
     paths = JobPaths(tmp_path)
     store = store_at(paths.state, "interrupted")

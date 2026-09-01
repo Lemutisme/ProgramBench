@@ -32,14 +32,16 @@ from programbench.candidate import package_workspace, preflight_candidate
 from programbench.submission import FIXTURE_PREFIX
 from programbench.utils.load_data import load_all_instances
 from programbench.utils.instance_filters import filter_instances
+from scripts import campaign_process
 from scripts.campaign_install import InstallRecord, prepare_install
 from scripts.campaign_procontract import HttpProContractApi, protocol_for_revision, run_procontract
-from scripts.campaign_state import JobLease, JobPaths, JobState, StateStore
+from scripts.campaign_state import JobLease, JobPaths, JobState, RecoverableJobError, StateStore
 from scripts.campaign_stop import StopToken
 from scripts.campaign_usage import CircuitBreaker
 from scripts.campaign_vanilla import HttpOpenCodeApi, VanillaResult, run_vanilla
 from scripts.campaign_workspace import (
     WorkspaceLease,
+    WorkspaceHealthError,
     WorkspaceRequest,
     ensure_workspace,
     reconcile_workspace_for_cleanup,
@@ -351,6 +353,7 @@ def run_campaign(
     execute = execute or (lambda _job, _stop: None)
     stop = stop_event if isinstance(stop_event, StopToken) else StopToken(stop_event)
     pending = deque(jobs)
+    awaiting: list[CampaignJob] = []
     running: dict[Future[object], CampaignJob] = {}
     completed = 0
     failed = 0
@@ -410,7 +413,13 @@ def run_campaign(
                 candidate = running.pop(future)
                 try:
                     outcome = future.result()
-                    if isinstance(outcome, JobRunResult) and outcome.status == "cleanup_failed":
+                    if isinstance(outcome, JobRunResult) and outcome.status == "recoverable":
+                        pending.append(candidate)
+                        _append_log(state_path, candidate, "recoverable")
+                    elif isinstance(outcome, JobRunResult) and outcome.status == "awaiting_revision":
+                        awaiting.append(candidate)
+                        _append_log(state_path, candidate, "awaiting_revision")
+                    elif isinstance(outcome, JobRunResult) and outcome.status == "cleanup_failed":
                         cleanup_failures += 1
                         failed += 1
                         stop.set("workspace_cleanup_failed")
@@ -510,7 +519,15 @@ def run_campaign(
         raise CampaignShutdownError(
             f"campaign shutdown failed for {len(running) + len(force_failures) + cleanup_failures} active job(s)"
         )
-    return CampaignResult(completed, failed, tuple(pending), len(running), breaker.pause_reason, paused, interrupted)
+    return CampaignResult(
+        completed,
+        failed,
+        (*tuple(pending), *awaiting),
+        len(running),
+        breaker.pause_reason,
+        paused,
+        interrupted,
+    )
 
 
 def run_cleanup_campaign(
@@ -595,8 +612,25 @@ def run_job(
             return JobRunResult(candidate, "skipped")
         if state is None:
             store.write(JobState("planned"))
-        elif redo or (retry_infra and state.phase == "failed") or (resume and state.phase == "interrupted"):
+        elif (
+            redo
+            or retry_infra
+            and state.phase == "failed"
+            or resume
+            and state.phase == "interrupted"
+            or resume
+            and state.phase == "failed"
+            and state.exit_class in {"lost_server", "execution_failed", "delivery_failed"}
+        ):
             job_lease.reset_for_rerun()
+        state = store.read()
+        if state.phase in {"waiting_provider", "restarting_server"} and state.retry_at is not None:
+            while time.time() < state.retry_at:
+                if stop.wait(min(1.0, max(0.0, state.retry_at - time.time()))):
+                    _terminalize(store, "interrupted", "campaign_stop")
+                    return JobRunResult(candidate, "interrupted")
+        if not cleanup_only:
+            state = store.begin_process(expected_generation=store.read().generation, pid=os.getpid())
         if (stop.is_set() or breaker.stop_active) and not cleanup_only:
             _terminalize(store, "interrupted", "campaign_stop")
             return JobRunResult(candidate, "interrupted")
@@ -617,6 +651,15 @@ def run_job(
         try:
             with WorkspaceLease(request) as workspace_lease:
                 workspace = workspace_factory(request, workspace_lease)
+                current = store.read()
+                container_id = getattr(workspace, "container_id", None)
+                if (
+                    not cleanup_only
+                    and isinstance(container_id, str)
+                    and current.phase not in {"done", "failed", "interrupted"}
+                    and current.container_ids != (container_id,)
+                ):
+                    store.update(expected_generation=current.generation, container_ids=(container_id,))
                 active = stop.registry.register(
                     candidate,
                     force_stop=getattr(workspace, "force_stop", workspace.stop_for_freeze),
@@ -681,6 +724,8 @@ def run_job(
                             ),
                         )
                     state = store.read_optional()
+                    if state is not None and state.phase == "awaiting_revision":
+                        return JobRunResult(candidate, "awaiting_revision", result)
                     if (
                         state is not None
                         and state.phase in {"frozen", "packaged", "preflighted", "done", "failed", "interrupted"}
@@ -691,7 +736,25 @@ def run_job(
                         _terminalize(store, "interrupted", "campaign_stop")
                         return JobRunResult(candidate, "interrupted")
                     return JobRunResult(candidate, "completed", result)
+                except RecoverableJobError as error:
+                    return _defer_job_recovery(paths, store, workspace, workspace_lease, candidate, error)
                 except BaseException as error:
+                    failed_state = store.read_optional()
+                    if failed_state is not None and failed_state.phase == "executing" and isinstance(
+                        error, (OSError, campaign_process.ProcessError)
+                    ):
+                        return _defer_job_recovery(
+                            paths,
+                            store,
+                            workspace,
+                            workspace_lease,
+                            candidate,
+                            RecoverableJobError(
+                                "restarting_server",
+                                "execution_process_failed",
+                                time.time() + min(60, 2 ** min(failed_state.process_generation, 5)),
+                            ),
+                        )
                     exit_class, traceback_hash = _exception_metadata(store, error)
                     interrupted = stop.is_set()
                     cleanup_deadline = time.monotonic() + JOB_CLEANUP_TIMEOUT_SECONDS
@@ -739,6 +802,18 @@ def run_job(
                     return JobRunResult(candidate, "interrupted" if stop.is_set() else "failed")
                 finally:
                     stop.registry.unregister(active)
+        except WorkspaceHealthError:
+            state = store.read()
+            if state.phase in {"planned", "preparing", "executing", "frozen", "packaged", "preflighted"}:
+                retry_at = time.time() + min(60, 2 ** min(state.process_generation, 5))
+                store.defer_recovery(
+                    "restarting_server",
+                    expected_generation=state.generation,
+                    reason="workspace_health_failed",
+                    retry_at=retry_at,
+                )
+                return JobRunResult(candidate, "recoverable")
+            return JobRunResult(candidate, "failed")
         except BaseException as error:
             exit_class, traceback_hash = _exception_metadata(store, error)
             _terminalize(
@@ -768,6 +843,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--arm", choices=ARM_SELECTIONS, default="paired")
     parser.add_argument("--evaluate", action="store_true", help="evaluate both arms and write the paired report")
     parser.add_argument(
+        "--evaluate-only",
+        action="store_true",
+        help="refuse nonterminal jobs and evaluate without entering model execution",
+    )
+    parser.add_argument(
         "--retry-evaluator",
         action="store_true",
         help="explicitly retry an interrupted evaluator without forcing completed results",
@@ -781,8 +861,14 @@ def parse_args(arguments: Sequence[str] | None = None) -> argparse.Namespace:
     values = list(arguments) if arguments is not None else None
     args = parser.parse_args(values)
     supplied = values if values is not None else os.sys.argv[1:]
-    if args.retry_evaluator and not args.evaluate:
-        parser.error("--retry-evaluator requires --evaluate")
+    if args.retry_evaluator and not (args.evaluate or args.evaluate_only):
+        parser.error("--retry-evaluator requires --evaluate or --evaluate-only")
+    if args.evaluate and args.evaluate_only:
+        parser.error("--evaluate and --evaluate-only conflict")
+    if args.evaluate_only and not args.resume:
+        parser.error("--evaluate-only requires --resume")
+    if args.evaluate_only and (args.redo or args.retry_infra):
+        parser.error("--evaluate-only conflicts with inference retry options")
     if args.all and any(value == "--limit" or value.startswith("--limit=") for value in supplied):
         parser.error("--limit and --all conflict")
     if args.workers > MAX_ACTIVE_JOBS:
@@ -823,6 +909,19 @@ def main(arguments: Sequence[str] | None = None) -> int:
         if breaker_path.exists()
         else CircuitBreaker.from_campaign_config(config)
     )
+    if args.evaluate_only:
+        if plan.cleanup_only:
+            raise CampaignError("evaluation-only refuses a campaign that still requires cleanup")
+        if not _selected_jobs_terminal(plan):
+            raise CampaignError("evaluation-only refuses nonterminal jobs")
+        from scripts.campaign_evaluate import CampaignEvaluationError, evaluate_campaign
+
+        try:
+            evaluation = evaluate_campaign(plan.output, retry_evaluator=args.retry_evaluator, unattended=True)
+            return 0 if evaluation.status == "completed" else 1
+        except CampaignEvaluationError as error:
+            print(f"campaign evaluation refused: {_sanitize_evaluation_error(error)}", file=sys.stderr, flush=True)
+            return 1
     if plan.cleanup_only:
         run_cleanup_campaign(plan, breaker)
         print(f"campaign remains paused after cleanup: {breaker.pause_reason}", file=sys.stderr, flush=True)
@@ -1497,10 +1596,59 @@ def _terminalize(
             else {}
             if traceback_hash is None
             else {"traceback": traceback_hash},
+            recovery_reason=None,
+            retry_at=None,
         )
         return True
     except BaseException:
         return False
+
+
+def _defer_job_recovery(
+    paths: JobPaths,
+    store: StateStore,
+    workspace: object,
+    workspace_lease: WorkspaceLease,
+    candidate: CampaignJob,
+    error: RecoverableJobError,
+) -> JobRunResult:
+    attempts = 0
+    deadline = time.monotonic() + JOB_CLEANUP_TIMEOUT_SECONDS
+    while workspace_lease._handle_active and attempts < JOB_CLEANUP_MAX_ATTEMPTS and time.monotonic() < deadline:
+        attempts += 1
+        if not _bounded_cleanup_stop(
+            _workspace_cleanup_operation(workspace), max(0.0, deadline - time.monotonic())
+        ):
+            continue
+        workspace_lease.release_handle()
+    if workspace_lease._handle_active:
+        evidence_path = paths.root / "cleanup-failure.json"
+        container_id = getattr(workspace, "container_id", None)
+        _atomic_json(
+            evidence_path,
+            {
+                "version": 1,
+                "attempts": attempts,
+                "container_ids": [container_id] if isinstance(container_id, str) else [],
+                "status": "cleanup_failed",
+            },
+        )
+        _terminalize(
+            store,
+            "failed",
+            "cleanup_failed",
+            artifact_hashes={evidence_path.name: hashlib.sha256(evidence_path.read_bytes()).hexdigest()},
+        )
+        return JobRunResult(candidate, "cleanup_failed")
+    workspace_lease.release_handle()
+    state = store.read()
+    store.defer_recovery(
+        error.phase,
+        expected_generation=state.generation,
+        reason=error.reason,
+        retry_at=error.retry_at,
+    )
+    return JobRunResult(candidate, "recoverable")
 
 
 def _exception_metadata(store: StateStore, error: BaseException) -> tuple[str, str]:

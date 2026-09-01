@@ -828,6 +828,10 @@ def _resume(
         _write_manifest(manifest.manifest_path, manifest)
         return _activate(manifest, request, runner, probe, adopted=True, inspected=inspected)
     if inspected is None:
+        if manifest.phase in {"running", "launching"} and manifest.candidate_mutable:
+            restarting = replace(manifest, phase="launching", container_id=None, port=None, exit_code=None)
+            _write_manifest(restarting.manifest_path, restarting)
+            return _launch(restarting, request, runner, probe, adopted=True)
         raise ContainerConflictError("owned container is missing; evidence retained")
     _require_exact_container(inspected, manifest, check_port=manifest.port is not None)
     return _activate(manifest, request, runner, probe, adopted=True, inspected=inspected)
@@ -898,10 +902,12 @@ def _launch(
 ) -> DockerWorkspace:
     _require_binary(manifest)
     _require_path_identities(manifest)
-    if manifest.phase not in {"candidate_ready", "launching"} or manifest.candidate_mutable:
+    restarting = manifest.phase == "launching" and manifest.candidate_mutable
+    if not restarting and (manifest.phase not in {"candidate_ready", "launching"} or manifest.candidate_mutable):
         raise WorkspaceError("workspace launch requires a verified pre-execution phase")
-    _require_candidate_ready(manifest)
-    _verify_candidate(runner, request.docker, manifest, publish=False)
+    if not restarting:
+        _require_candidate_ready(manifest)
+        _verify_candidate(runner, request.docker, manifest, publish=False)
     launching = replace(manifest, container_id=None, port=None, phase="launching")
     _write_manifest(manifest.manifest_path, launching)
     command = [
@@ -982,7 +988,19 @@ def _activate(
     _require_exact_container(inspected, activated, check_port=True)
     if activated.phase == "launching":
         _write_manifest(activated.manifest_path, activated)
-    _wait_health(activated, probe, request.health_timeout)
+    try:
+        _wait_health(activated, probe, request.health_timeout)
+    except WorkspaceHealthError:
+        _docker(runner, (request.docker, "stop", "--time", "10", current_id), 30, "stop")
+        stopped = _inspect_container(runner, request.docker, activated.container_name)
+        if stopped is None or _running(stopped):
+            raise ContainerConflictError("unhealthy owned container did not stop cleanly") from None
+        _require_exact_container(stopped, activated, check_port=True)
+        _write_manifest(
+            activated.manifest_path,
+            replace(activated, phase="stopped", candidate_mutable=True, exit_code=_exit_code(stopped)),
+        )
+        raise
     _require_binary(activated)
     final_inspected = _inspect_container(runner, request.docker, activated.container_name)
     if final_inspected is None or not _running(final_inspected):

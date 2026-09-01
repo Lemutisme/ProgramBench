@@ -2569,6 +2569,35 @@ def test_retry_flag_requires_an_explicit_interrupted_state(tmp_path: Path) -> No
         evaluate_campaign(root, instances=instances, retry_evaluator=True, command_runner=_runner([]))
 
 
+def test_unattended_evaluator_recovers_two_lost_generations_in_one_call(tmp_path: Path) -> None:
+    from scripts.campaign_evaluate import evaluate_campaign
+
+    root, instances = _campaign(tmp_path / "campaign", arms=("procontract",))
+    attempts = []
+
+    def flaky(command, _cwd, _timeout, _grace, _limit, _environment, *, on_start):
+        attempts.append(len(attempts) + 1)
+        on_start(999999, 999999, f"attempt-{attempts[-1]}")
+        if len(attempts) < 3:
+            raise TimeoutError
+        _write_eval(Path(command[4]) / "one/one.eval.json", statuses=("passed", "failure", "failure"))
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    result = evaluate_campaign(
+        root,
+        instances=instances,
+        unattended=True,
+        command_runner=flaky,
+        process_probe=lambda _pid, _started: False,
+        process_group_probe=lambda _pgid: False,
+        cgroup_probe=lambda _path: False,
+    )
+
+    assert result.status == "completed"
+    assert attempts == [1, 2, 3]
+    assert json.loads((root / "evaluation-state/procontract.json").read_text())["attempt"] == 3
+
+
 def test_unknown_durable_evaluator_status_refuses_duplicate_launch(tmp_path: Path) -> None:
     from scripts.campaign_evaluate import CampaignEvaluationError, evaluate_campaign
 

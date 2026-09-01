@@ -359,6 +359,23 @@ def test_scheduler_counts_normalized_job_failure_as_failed():
     assert result.failed == 1
 
 
+def test_scheduler_requeues_recoverable_generation_without_counting_a_failure():
+    from scripts.campaign_runner import JobRunResult, run_campaign
+
+    calls = []
+
+    def execute(candidate, _stop):
+        calls.append(candidate.key)
+        return JobRunResult(candidate, "recoverable" if len(calls) == 1 else "completed")
+
+    result = run_campaign((job(0),), workers=1, execute=execute)
+
+    assert calls == [job(0).key, job(0).key]
+    assert result.completed == 1
+    assert result.failed == 0
+    assert result.pending == ()
+
+
 def test_scheduler_counts_normalized_interruption_as_failed():
     from scripts.campaign_runner import JobRunResult, run_campaign
 
@@ -858,6 +875,49 @@ def test_cli_limit_and_all_conflict_and_non_dry_requires_output():
         parse_args(["--config", "campaign.yaml", "--workers", "9", "--dry-run"])
     with pytest.raises(SystemExit, match="2"):
         parse_args(["--config", "campaign.yaml", "--redo", "--retry-infra", "--dry-run"])
+
+
+def test_evaluate_only_refuses_nonterminal_jobs_and_never_enters_inference(tmp_path: Path, monkeypatch):
+    from scripts import campaign_evaluate, campaign_runner
+
+    output = tmp_path / "campaign"
+    output.mkdir()
+    (output / "campaign.json").write_text("{}")
+    (output / "breaker.json").write_text(json.dumps(CircuitBreaker().snapshot()))
+    candidate = campaign_runner.CampaignJob("one", "procontract", "image")
+    plan = campaign_runner.CampaignPlan(
+        output,
+        output / "campaign.json",
+        object(),
+        ("one",),
+        (candidate,),
+        {},
+        False,
+    )
+    store = campaign_runner.StateStore(output / "procontract/one/state.json")
+    state = store.write(campaign_runner.JobState("planned"))
+    monkeypatch.setattr(campaign_runner, "load_config", lambda _path: object())
+    monkeypatch.setattr(campaign_runner, "plan_campaign", lambda *_args, **_kwargs: plan)
+    monkeypatch.setattr(campaign_runner, "run_campaign", lambda *_args, **_kwargs: pytest.fail("inference entered"))
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENCODE_SERVER_PASSWORD", raising=False)
+    arguments = ["--config", "unused", "--output", str(output), "--resume", "--evaluate-only"]
+
+    with pytest.raises(campaign_runner.CampaignError, match="nonterminal"):
+        campaign_runner.main(arguments)
+
+    store.transition(
+        "failed",
+        command_identity="test",
+        expected_generation=state.generation,
+        exit_class="semantic_failure",
+    )
+    monkeypatch.setattr(
+        campaign_evaluate,
+        "evaluate_campaign",
+        lambda *_args, **_kwargs: SimpleNamespace(status="completed"),
+    )
+    assert campaign_runner.main(arguments) == 0
 
 
 def test_direct_script_cli_help_is_import_safe():
@@ -1681,7 +1741,7 @@ def test_persisted_hard_stop_resume_runs_cleanup_only_without_admission(tmp_path
 
 
 @pytest.mark.parametrize("phase", ["planned", "preparing", "executing", "frozen", "packaged", "preflighted"])
-def test_resume_preserves_unfinished_state_without_reset(tmp_path: Path, monkeypatch, phase: str):
+def test_resume_fences_unfinished_state_without_semantic_reset(tmp_path: Path, monkeypatch, phase: str):
     from scripts import campaign_runner
     from scripts.run_opencode import load_config
 
@@ -1720,7 +1780,8 @@ def test_resume_preserves_unfinished_state_without_reset(tmp_path: Path, monkeyp
         vanilla_api_factory=lambda _: object(),
     )
 
-    assert seen == [before]
+    assert seen == [before + 1]
+    assert store.read().process_generation == 1
 
 
 def test_run_job_dispatches_vanilla_once_and_skips_a_terminal_retry(tmp_path: Path, monkeypatch):

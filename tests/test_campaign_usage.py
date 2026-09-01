@@ -134,6 +134,48 @@ def test_breaker_hard_cap_requests_active_work_stop_at_exact_crossing() -> None:
     assert breaker.paused
 
 
+def test_same_provider_failure_across_three_jobs_trips_durable_wave_backoff() -> None:
+    now = [100.0]
+    fingerprint = "a" * 64
+    breaker = CircuitBreaker(clock=lambda: now[0], provider_failure_backoff=30)
+
+    assert not breaker.observe_provider_failure("job-1", fingerprint)
+    assert not breaker.observe_provider_failure("job-1", fingerprint)
+    assert not breaker.observe_provider_failure("job-2", fingerprint)
+    assert breaker.observe_provider_failure("job-3", fingerprint)
+    assert breaker.provider_wave_active
+    assert breaker.pause_reason == "provider failure wave backoff"
+    assert breaker.backoff_until == 130
+
+    restored = CircuitBreaker.from_snapshot(breaker.snapshot(), clock=lambda: now[0])
+    assert restored.provider_wave_active
+    assert restored.snapshot() == breaker.snapshot()
+    now[0] = 130
+    assert restored.admission_allowed
+    assert not restored.provider_wave_active
+
+
+def test_legacy_breaker_snapshot_upgrades_without_losing_usage() -> None:
+    breaker = CircuitBreaker()
+    breaker.observe("job", 1, usage(turns=1, cost="0.25"), terminal=False)
+    legacy = breaker.snapshot()
+    legacy["version"] = 1
+    for key in (
+        "provider_failure_threshold",
+        "provider_failure_window",
+        "provider_failure_backoff",
+        "provider_failures",
+        "provider_failure_waves",
+        "provider_backoff_fingerprint",
+    ):
+        legacy.pop(key)
+
+    restored = CircuitBreaker.from_snapshot(legacy)
+
+    assert restored.campaign_usage == breaker.campaign_usage
+    assert restored.snapshot()["version"] == 2
+
+
 def test_breaker_observation_generations_are_idempotent_and_delta_based() -> None:
     breaker = CircuitBreaker()
     first = usage(turns=1, cost="0.1")

@@ -58,11 +58,49 @@ class JobLockedError(RuntimeError):
         super().__init__(f"job lock is already held: {path}{detail}")
 
 
+class RecoverableJobError(RuntimeError):
+    """Request another fenced controller/server generation for the same durable job."""
+
+    def __init__(self, phase: Literal["waiting_provider", "restarting_server"], reason: str, retry_at: float) -> None:
+        if phase not in {"waiting_provider", "restarting_server"}:
+            raise StateError("recoverable job phase is invalid")
+        if not isinstance(reason, str) or not reason or len(reason) > 128:
+            raise StateError("recoverable job reason is invalid")
+        self.phase = phase
+        self.reason = reason
+        self.retry_at = _finite_float(retry_at, "job retry time")
+        super().__init__(reason)
+
+
 Phase = Literal[
-    "planned", "preparing", "executing", "frozen", "packaged", "preflighted", "done", "failed", "interrupted"
+    "planned",
+    "preparing",
+    "executing",
+    "waiting_provider",
+    "restarting_server",
+    "awaiting_revision",
+    "frozen",
+    "packaged",
+    "preflighted",
+    "done",
+    "failed",
+    "interrupted",
 ]
 _PHASES = frozenset(
-    {"planned", "preparing", "executing", "frozen", "packaged", "preflighted", "done", "failed", "interrupted"}
+    {
+        "planned",
+        "preparing",
+        "executing",
+        "waiting_provider",
+        "restarting_server",
+        "awaiting_revision",
+        "frozen",
+        "packaged",
+        "preflighted",
+        "done",
+        "failed",
+        "interrupted",
+    }
 )
 _NORMAL_NEXT = {
     "planned": "preparing",
@@ -74,7 +112,22 @@ _NORMAL_NEXT = {
 }
 PHASE_TRANSITIONS: Mapping[str, tuple[Phase, ...]] = MappingProxyType(
     {
-        **{phase: (next_phase, "failed", "interrupted") for phase, next_phase in _NORMAL_NEXT.items()},
+        **{
+            phase: (next_phase, "failed", "interrupted")
+            for phase, next_phase in _NORMAL_NEXT.items()
+            if phase != "executing"
+        },
+        "executing": (
+            "frozen",
+            "waiting_provider",
+            "restarting_server",
+            "awaiting_revision",
+            "failed",
+            "interrupted",
+        ),
+        "waiting_provider": ("executing", "failed", "interrupted"),
+        "restarting_server": ("executing", "failed", "interrupted"),
+        "awaiting_revision": ("executing", "failed", "interrupted"),
         "done": (),
         "failed": (),
         "interrupted": (),
@@ -109,6 +162,9 @@ class JobState:
     reset_reason: str | None = None
     reset_at: float | None = None
     generation: int = 0
+    process_generation: int = 0
+    recovery_reason: str | None = None
+    retry_at: float | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.phase, str) or self.phase not in _PHASES:
@@ -155,22 +211,38 @@ class JobState:
             object.__setattr__(self, "reset_at", _finite_float(self.reset_at, "reset time"))
         if type(self.generation) is not int or self.generation < 0:
             raise StateError("generation must be a nonnegative integer")
+        if type(self.process_generation) is not int or self.process_generation < 0:
+            raise StateError("process generation must be a nonnegative integer")
+        if self.recovery_reason is not None and (
+            not isinstance(self.recovery_reason, str) or not self.recovery_reason or len(self.recovery_reason) > 128
+        ):
+            raise StateError("recovery reason must be a nonempty bounded string")
+        if self.retry_at is not None:
+            object.__setattr__(self, "retry_at", _finite_float(self.retry_at, "job retry time"))
+        if self.phase in {"waiting_provider", "restarting_server"}:
+            if self.recovery_reason is None or self.retry_at is None:
+                raise StateError("recoverable phase requires reason and retry time")
+        elif self.recovery_reason is not None or self.retry_at is not None:
+            raise StateError("recovery metadata requires a recoverable phase")
 
     def to_dict(self) -> dict[str, object]:
         validated = JobState(
-            self.phase,
-            dict(self.phase_timestamps or {}),
-            self.pid,
-            tuple(self.container_ids),
-            self.exit_class,
-            self.provider_turns,
-            self.actions,
-            self.cost,
-            dict(self.artifact_hashes or {}),
-            self.command_identity,
-            self.reset_reason,
-            self.reset_at,
-            self.generation,
+            phase=self.phase,
+            phase_timestamps=dict(self.phase_timestamps or {}),
+            pid=self.pid,
+            container_ids=tuple(self.container_ids),
+            exit_class=self.exit_class,
+            provider_turns=self.provider_turns,
+            actions=self.actions,
+            cost=self.cost,
+            artifact_hashes=dict(self.artifact_hashes or {}),
+            command_identity=self.command_identity,
+            reset_reason=self.reset_reason,
+            reset_at=self.reset_at,
+            generation=self.generation,
+            process_generation=self.process_generation,
+            recovery_reason=self.recovery_reason,
+            retry_at=self.retry_at,
         )
         return {
             "phase": validated.phase,
@@ -186,6 +258,9 @@ class JobState:
             "reset_reason": validated.reset_reason,
             "reset_at": validated.reset_at,
             "generation": validated.generation,
+            "process_generation": validated.process_generation,
+            "recovery_reason": validated.recovery_reason,
+            "retry_at": validated.retry_at,
         }
 
     @classmethod
@@ -206,6 +281,9 @@ class JobState:
             "reset_reason",
             "reset_at",
             "generation",
+            "process_generation",
+            "recovery_reason",
+            "retry_at",
         }
         if set(raw) - expected:
             raise StateError("job state contains unknown fields")
@@ -224,6 +302,9 @@ class JobState:
                 reset_reason=raw.get("reset_reason"),
                 reset_at=raw.get("reset_at"),
                 generation=raw.get("generation", 0),
+                process_generation=raw.get("process_generation", 0),
+                recovery_reason=raw.get("recovery_reason"),
+                retry_at=raw.get("retry_at"),
             )
         except (KeyError, TypeError, ValueError, OverflowError) as error:
             if isinstance(error, StateError):
@@ -515,6 +596,66 @@ class StateStore:
                 raise StateError("update contains immutable metadata")
             return self._commit_locked(replace(current, **changes, generation=current.generation + 1))
 
+    def begin_process(self, *, expected_generation: int, pid: int) -> JobState:
+        """Fence one controller generation without changing the semantic Contract attempt."""
+        if type(pid) is not int or pid <= 0:
+            raise StateError("process pid must be a positive integer")
+        with self._state_lock():
+            current = self._read_unlocked()
+            self._check_generation(current, expected_generation)
+            if current.phase in {"done", "failed", "interrupted", "awaiting_revision"}:
+                raise StateError(f"cannot begin a process from phase {current.phase!r}")
+            phase = (
+                "planned"
+                if current.phase in {"waiting_provider", "restarting_server"} and current.command_identity is None
+                else "executing"
+                if current.phase in {"waiting_provider", "restarting_server"}
+                else current.phase
+            )
+            timestamps = dict(current.phase_timestamps or {})
+            if phase != current.phase:
+                timestamps[phase] = time.time()
+            return self._commit_locked(
+                replace(
+                    current,
+                    phase=phase,
+                    phase_timestamps=timestamps,
+                    pid=pid,
+                    process_generation=current.process_generation + 1,
+                    recovery_reason=None,
+                    retry_at=None,
+                    generation=current.generation + 1,
+                )
+            )
+
+    def defer_recovery(
+        self,
+        phase: Literal["waiting_provider", "restarting_server"],
+        *,
+        expected_generation: int,
+        reason: str,
+        retry_at: float,
+    ) -> JobState:
+        if phase not in {"waiting_provider", "restarting_server"}:
+            raise StateError("recovery phase is invalid")
+        with self._state_lock():
+            current = self._read_unlocked()
+            self._check_generation(current, expected_generation)
+            if current.phase not in {"planned", "preparing", "executing", "frozen", "packaged", "preflighted"}:
+                raise StateError("only an active job can defer recovery")
+            return self._commit_locked(
+                replace(
+                    current,
+                    phase=phase,
+                    phase_timestamps={**dict(current.phase_timestamps or {}), phase: time.time()},
+                    pid=None,
+                    exit_class=reason,
+                    recovery_reason=reason,
+                    retry_at=retry_at,
+                    generation=current.generation + 1,
+                )
+            )
+
     def reset_for_rerun(
         self, *, redo: bool, retry_infra: bool, resume: bool = False, expected_generation: int | None = None
     ) -> JobState:
@@ -532,6 +673,12 @@ class StateStore:
                 reason = "retry_infra"
             elif resume and current.phase == "interrupted":
                 reason = "resume"
+            elif resume and current.phase == "failed" and current.exit_class in {
+                "lost_server",
+                "execution_failed",
+                "delivery_failed",
+            }:
+                reason = f"recover_legacy:{current.exit_class}"
             else:
                 raise StateError(f"reset is not allowed for phase {current.phase!r}")
             reset_at = time.time()
@@ -542,6 +689,8 @@ class StateStore:
                     phase_timestamps={"planned": reset_at},
                     reset_reason=reason,
                     reset_at=reset_at,
+                    recovery_reason=None,
+                    retry_at=None,
                     generation=current.generation + 1,
                 )
             )
@@ -584,7 +733,11 @@ class StateStore:
         if not isinstance(current_phase, str) or current_phase not in _PHASES:
             raise StateError(f"unknown job phase: {current_phase!r}")
         transitions = PHASE_TRANSITIONS.get(current_phase)
-        candidates = tuple(phase for phase in transitions or () if phase not in ("failed", "interrupted"))
+        candidates = tuple(
+            phase
+            for phase in transitions or ()
+            if phase not in {"failed", "interrupted", "waiting_provider", "restarting_server", "awaiting_revision"}
+        )
         if not candidates:
             raise StateError(f"phase {current_phase!r} has no next phase")
         if len(candidates) != 1:
@@ -716,7 +869,12 @@ def should_run(
     if redo:
         return True
     if state is not None and state.phase == "failed":
-        return retry_infra and state.exit_class == "infrastructure_failed_before_provider"
+        return (
+            retry_infra
+            and state.exit_class == "infrastructure_failed_before_provider"
+            or resume
+            and state.exit_class in {"lost_server", "execution_failed", "delivery_failed"}
+        )
     if state is not None and state.phase == "done":
         return False
     if _valid_submission(job.submission):
@@ -725,6 +883,10 @@ def should_run(
         return True
     if state.phase == "planned":
         return True
+    if state.phase in {"waiting_provider", "restarting_server"}:
+        return True
+    if state.phase == "awaiting_revision":
+        return False
     return resume
 
 
