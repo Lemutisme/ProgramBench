@@ -853,6 +853,20 @@ def test_exact_manifest_adopts_and_restarts_a_stopped_container(tmp_path: Path) 
     assert any(command[1] == "start" for command in docker.commands)
 
 
+def test_restart_shares_stop_ownership_with_the_pre_restart_handle(tmp_path: Path) -> None:
+    docker = RecordingDocker()
+    workspace = ensure_workspace(request(tmp_path, docker))
+    workspace.stop()
+
+    restarted = workspace.restart()
+    workspace.force_stop()
+
+    assert restarted.stop_coordinator is workspace.stop_coordinator
+    assert not workspace.lease._handle_active
+    assert json.loads(workspace.manifest_path.read_text())["phase"] == "stopped"
+    assert docker.containers[workspace.container_id]["State"]["Running"] is False
+
+
 def test_missing_owned_container_is_recreated_with_the_same_persisted_mounts(tmp_path: Path) -> None:
     docker = RecordingDocker()
     value = request(tmp_path, docker)

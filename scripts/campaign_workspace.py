@@ -514,6 +514,12 @@ class StopCoordinator:
             self._state = "stopped"
             self._condition.notify_all()
 
+    def reopen(self) -> None:
+        with self._condition:
+            if self._state != "stopped":
+                raise WorkspaceError("workspace stop coordinator can reopen only after a completed stop")
+            self._state = "ready"
+
 
 @dataclass(frozen=True)
 class CleanupWorkspace:
@@ -611,8 +617,9 @@ class DockerWorkspace:
     def restart(self) -> "DockerWorkspace":
         if self.lease._handle_active:
             raise WorkspaceError("running workspace must be stopped before restart")
+        self.stop_coordinator.reopen()
         try:
-            return ensure_workspace(self.request, self.lease)
+            return replace(ensure_workspace(self.request, self.lease), stop_coordinator=self.stop_coordinator)
         except BaseException:
             self.lease._handle_active = True
             current = _load_manifest(self.manifest_path)
