@@ -5,11 +5,17 @@ umask 077
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
-OUTPUT="${P0_FULL_OUTPUT:-$REPO_ROOT/output/luna-max-policy-split-p0-200-20260902-v1}"
+OUTPUT="${P0_FULL_OUTPUT:-$REPO_ROOT/output/luna-max-policy-split-p0-200-20260902-v2}"
 
 export OPENCODE_REPO="${OPENCODE_REPO:-/home/duozhou/opencode-p0-durable}"
 if [[ -z "${OPENCODE_SERVER_PASSWORD:-}" ]]; then
-  read -r OPENCODE_SERVER_PASSWORD < <(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
+  read -r OPENCODE_SERVER_PASSWORD < <(python3 - "$OUTPUT" <<'PY'
+from hashlib import sha256
+import sys
+
+print(sha256(("programbench-local-control\0" + sys.argv[1]).encode()).hexdigest())
+PY
+)
   export OPENCODE_SERVER_PASSWORD
 fi
 
