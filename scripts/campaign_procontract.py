@@ -3080,7 +3080,7 @@ def _validate_issue_record(
     if (
         raw["contractID"] != expected["id"]
         or raw["payload"] != expected
-        or raw["payloadHash"] != _hash_json(expected)
+        or raw["payloadHash"] != _hash_json(_ordered_issue_payload(expected))
         or raw["acceptancePolicyUTF8"] != base64.b64encode(acceptance_policy.encode()).decode()
         or raw["acceptanceHash"] != hashlib.sha256(acceptance_policy.encode()).hexdigest()
         or raw["replayPolicyHash"] != (_hash_json(REPLAY_POLICY) if protocol != "semantic-v0" else None)

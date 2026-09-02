@@ -1103,6 +1103,36 @@ def test_policy_split_keeps_execution_policy_outside_contract_terms(tmp_path: Pa
     assert "broad black-box differential experiments" not in str(payload["brief"])
 
 
+def test_persisted_policy_split_issue_reloads_with_canonical_payload_order(tmp_path: Path) -> None:
+    from scripts.campaign_procontract import _load_or_create_issue
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    _, workspace = _workspace(tmp_path, paths)
+    issue_path = paths.root / "procontract-issue.json"
+
+    created = _load_or_create_issue(
+        issue_path,
+        workspace,
+        "openai/gpt-5.6-luna",
+        "max",
+        FakeClock(),
+        "policy-split-v1",
+    )
+
+    assert (
+        _load_or_create_issue(
+            issue_path,
+            workspace,
+            "openai/gpt-5.6-luna",
+            "max",
+            FakeClock(),
+            "policy-split-v1",
+        )
+        == created
+    )
+
+
 def test_durable_policy_split_runtime_keeps_behavioral_policy_outside_spec() -> None:
     from scripts.campaign_procontract import protocol_for_revision
 
