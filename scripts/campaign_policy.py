@@ -15,6 +15,8 @@ ExecutionPolicyName = Literal[
     "breadth",
     "fast",
     "deep",
+    "v2",
+    "v2-probe",
 ]
 
 
@@ -41,6 +43,19 @@ PROBE_CORPUS_POLICY = (
     "id, argv (arguments only), optional stdin/env/files/timeoutSeconds; each fixture file has path, content, and "
     "optional executable. Do not store expected outputs. The host will run the frozen cases independently against "
     "reference and candidate and will reject any exit/stdout/stderr/timeout residual."
+)
+
+V2_CAPABILITY_POLICY = (
+    "ProgramBench delivery policy v2: enumerate documented surfaces, boundary and error semantics, and material "
+    "interactions; use batched differential probes within the action deadline, then preserve observations as "
+    "regression checks after coherent edits. Delivery replay alone is not a behavioral stopping condition. Hand "
+    "off one exact frozen candidate snapshot containing compile.sh, executable, and a self-contained validate.sh "
+    "regression suite after native replay runs compile.sh with package-manager network access disabled and then "
+    "validate.sh, both exiting 0 within 600 seconds. validate.sh must encode behavioral evidence learned from "
+    "black-box reference experiments and must not access the reference, network, or ambient package caches during "
+    "replay. Before handoff, broadly probe every applicable documented command, flag, error, boundary class, and "
+    "state transition; continue until no material behavioral gap remains or the shared budget is exhausted. The "
+    "ProgramBench harness performs packaging and preflight only; official benchmark evaluation remains external."
 )
 
 POLICIES: dict[ExecutionPolicyName, str] = {
@@ -86,6 +101,8 @@ POLICIES: dict[ExecutionPolicyName, str] = {
         "when failures cross families. Perform multiple fresh rebuilds before handoff."
     )
     + PROBE_CORPUS_POLICY,
+    "v2": V2_CAPABILITY_POLICY,
+    "v2-probe": V2_CAPABILITY_POLICY + PROBE_CORPUS_POLICY,
 }
 
 

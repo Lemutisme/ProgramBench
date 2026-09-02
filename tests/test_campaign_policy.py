@@ -28,12 +28,14 @@ def test_policies_are_concise_and_keep_settlement_terms_out() -> None:
         "breadth",
         "fast",
         "deep",
+        "v2",
+        "v2-probe",
     }
     for name, text in POLICIES.items():
         assert len(text) <= 1_800
         assert "Contract" not in text
         assert (not text) == (name == "none")
-        if name != "none":
+        if name not in {"none", "v2", "v2-probe"}:
             assert text.startswith(CAPABILITY_CONSERVATION)
 
 

@@ -76,6 +76,7 @@ POLICY_SPLIT_REVISIONS = frozenset(
         "0f3c9720463741febdd9222a44940b30d4bb5ed1",
         "597d22a8058c054ccc19f4f82daceea6034a620b",
         "e100b0fa97404ca21ad2373372ee4255877d7eaa",
+        "ce518afccc70a4c083f7efa07bd81de614eee592",
     }
 )
 ProContractProtocol = Literal[
@@ -89,6 +90,8 @@ ProContractProtocol = Literal[
     "policy-split-breadth-v1",
     "policy-split-fast-v1",
     "policy-split-deep-v1",
+    "policy-split-v2-external-v1",
+    "policy-split-v2-probe-v1",
 ]
 MODEL = "openai/gpt-5.6-luna"
 VARIANT = "max"
@@ -177,6 +180,10 @@ def _acceptance_policy(protocol: ProContractProtocol) -> str:
         return POLICIES["fast"]
     if protocol == "policy-split-deep-v1":
         return POLICIES["deep"]
+    if protocol == "policy-split-v2-external-v1":
+        return POLICIES["v2"]
+    if protocol == "policy-split-v2-probe-v1":
+        return POLICIES["v2-probe"]
     if protocol == "semantic-v0":
         return LEGACY_ACCEPTANCE_POLICY
     raise ProContractError("unknown ProContract protocol")
@@ -195,6 +202,8 @@ def protocol_for_revision(revision: str, execution_policy: str = "behavioral") -
             "breadth": "policy-split-breadth-v1",
             "fast": "policy-split-fast-v1",
             "deep": "policy-split-deep-v1",
+            "v2": "policy-split-v2-external-v1",
+            "v2-probe": "policy-split-v2-probe-v1",
         }[execution_policy]
     return "current"
 
@@ -860,6 +869,8 @@ def build_issue_payload(
         "policy-split-breadth-v1",
         "policy-split-fast-v1",
         "policy-split-deep-v1",
+        "policy-split-v2-external-v1",
+        "policy-split-v2-probe-v1",
     }:
         payload["executionPolicy"] = payload.pop("policy")
         return payload
@@ -2331,7 +2342,7 @@ def _deliver(
         _write_json(preflight_path, preflight_record)
     _validate_preflight(preflight_record, archive)
     probe_record: Mapping[str, object] | None = None
-    if protocol in {"policy-split-fast-v1", "policy-split-deep-v1"}:
+    if protocol in {"policy-split-fast-v1", "policy-split-deep-v1", "policy-split-v2-probe-v1"}:
         probe_path = job.job.root / "probe-report.json"
         probe_record = _read_json(probe_path) if probe_path.exists() else probe(archive, workspace.manifest.instance_id)
         probe_record = validate_report(probe_record)
@@ -3248,8 +3259,20 @@ def _validate_contract_optionals(raw: Mapping[str, object]) -> None:
         if not isinstance(handoff, Mapping) or set(handoff) not in (
             {"summary", "uncertainties", "subjectHash", "time"},
             {"summary", "uncertainties", "subjectHash", "replay", "time"},
+            {"summary", "uncertainties", "subject", "subjectHash", "time"},
+            {"summary", "uncertainties", "subject", "subjectHash", "replay", "time"},
         ):
             raise ProContractError("Contract handoff schema is invalid")
+        if "subject" in handoff:
+            subject = handoff["subject"]
+            if (
+                not isinstance(subject, Mapping)
+                or set(subject) != {"hash", "specHash", "artifacts"}
+                or subject["hash"] != handoff["subjectHash"]
+                or subject["specHash"] != raw["specHash"]
+                or subject["artifacts"] != REPLAY_POLICY["artifacts"]
+            ):
+                raise ProContractConflictError("Contract subject coordinate conflicts with frozen issue")
         if (
             not isinstance(handoff["summary"], str)
             or not handoff["summary"]
@@ -3276,15 +3299,18 @@ def _validate_contract_optionals(raw: Mapping[str, object]) -> None:
     if "challenge" in raw:
         challenge = raw["challenge"]
         required = {"revision", "subjectHash", "evidenceHash", "disclosure", "time"}
+        optional = {"specHash", "summary", "attestationID"}
         if (
             not isinstance(challenge, Mapping)
             or not required <= set(challenge)
-            or set(challenge) - (required | {"summary", "attestationID"})
+            or set(challenge) - (required | optional)
         ):
             raise ProContractError("Contract challenge schema is invalid")
         if (
             type(challenge["revision"]) is not int
             or challenge["revision"] <= 0
+            or "specHash" in challenge
+            and (not isinstance(challenge["specHash"], str) or not challenge["specHash"])
             or any(not isinstance(challenge[key], str) or not challenge[key] for key in ("subjectHash", "evidenceHash"))
             or challenge["disclosure"] not in {"executor", "sealed"}
             or type(challenge["time"]) is not int
@@ -3343,9 +3369,11 @@ def _ordered_contract(raw: Mapping[str, object], spec: Mapping[str, object]) -> 
 
 def _ordered_handoff(value: Mapping[str, object]) -> dict[str, object]:
     replay = value.get("replay")
+    subject = value.get("subject")
     return {
         "summary": value["summary"],
         "uncertainties": value["uncertainties"],
+        **({"subject": dict(subject)} if isinstance(subject, Mapping) else {}),
         "subjectHash": value["subjectHash"],
         **(
             {
@@ -3367,6 +3395,7 @@ def _ordered_handoff(value: Mapping[str, object]) -> dict[str, object]:
 def _ordered_challenge(value: Mapping[str, object]) -> dict[str, object]:
     return {
         "revision": value["revision"],
+        **({"specHash": value["specHash"]} if "specHash" in value else {}),
         "subjectHash": value["subjectHash"],
         "evidenceHash": value["evidenceHash"],
         "disclosure": value["disclosure"],
@@ -3529,6 +3558,23 @@ def _valid_candidate_path(value: object) -> bool:
     return ".." not in normalized.split("/")
 
 
+def _valid_execution_policy_coordinate(value: object, policy: object) -> bool:
+    if value is None:
+        return True
+    required = {"policyHash", "lineage"}
+    optional = {"selectorHash", "approvalReceipt"}
+    return (
+        isinstance(policy, str)
+        and isinstance(value, Mapping)
+        and required <= set(value)
+        and not set(value) - (required | optional)
+        and value["policyHash"] == hashlib.sha256(policy.encode()).hexdigest()
+        and isinstance(value["lineage"], list)
+        and all(isinstance(item, str) and item for item in value["lineage"])
+        and all(name not in value or isinstance(value[name], str) and bool(value[name]) for name in optional)
+    )
+
+
 def _validate_execution(raw: object, payload: Mapping[str, object], revision: int) -> Mapping[str, object]:
     required = {
         "contractID",
@@ -3543,7 +3589,7 @@ def _validate_execution(raw: object, payload: Mapping[str, object], revision: in
         "turnsUsed",
         "actionsUsed",
     }
-    allowed = required | {"executionPolicy", "leaseOwner", "leaseExpiresAt"}
+    allowed = required | {"executionPolicy", "executionPolicyCoordinate", "leaseOwner", "leaseExpiresAt"}
     if not isinstance(raw, Mapping) or not required <= set(raw) or set(raw) - allowed:
         raise ProContractError("Contract execution response schema is invalid")
     if (
@@ -3552,6 +3598,7 @@ def _validate_execution(raw: object, payload: Mapping[str, object], revision: in
         or raw["location"] != payload["location"]
         or raw["model"] != payload["model"]
         or raw.get("executionPolicy") != payload.get("executionPolicy")
+        or not _valid_execution_policy_coordinate(raw.get("executionPolicyCoordinate"), payload.get("executionPolicy"))
         or not isinstance(raw["sessionID"], str)
         or not raw["sessionID"].startswith("ses")
         or not isinstance(raw["promptID"], str)
@@ -3587,6 +3634,11 @@ def _validate_execution(raw: object, payload: Mapping[str, object], revision: in
             **({"variant": model["variant"]} if "variant" in model else {}),
         },
         **({"executionPolicy": raw["executionPolicy"]} if "executionPolicy" in raw else {}),
+        **(
+            {"executionPolicyCoordinate": dict(raw["executionPolicyCoordinate"])}
+            if isinstance(raw.get("executionPolicyCoordinate"), Mapping)
+            else {}
+        ),
         "sessionID": raw["sessionID"],
         "promptID": raw["promptID"],
         "dispatched": raw["dispatched"],
@@ -3606,6 +3658,7 @@ def _binding_identity(execution: Mapping[str, object]) -> tuple[object, ...]:
         execution["location"],
         execution["model"],
         execution.get("executionPolicy"),
+        execution.get("executionPolicyCoordinate"),
         execution["sessionID"],
         execution["promptID"],
     )
@@ -3618,6 +3671,7 @@ def _binding_contract_identity(execution: Mapping[str, object]) -> tuple[object,
         execution["location"],
         execution["model"],
         execution.get("executionPolicy"),
+        execution.get("executionPolicyCoordinate"),
     )
 
 

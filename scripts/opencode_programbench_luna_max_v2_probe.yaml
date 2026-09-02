@@ -1,0 +1,28 @@
+model: openai/gpt-5.6-luna
+variant: max
+
+limits:
+  wall_time_seconds: 21600
+  provider_turns: 1000
+  procontract_actions: 4000
+  total_cost_soft: null
+  total_cost_hard: null
+
+cache:
+  warmup_turns: 10
+  minimum_read_ratio: 0.80
+  stop_after_consecutive_failures: 2
+
+arms:
+  procontract:
+    repo: ${OPENCODE_REPO}
+    revision: ce518afccc70a4c083f7efa07bd81de614eee592
+    mode: procontract
+    execution_policy: v2-probe
+    binary: /home/duozhou/.config/superpowers/worktrees/opencode/contract-tcb/packages/opencode/dist/opencode-linux-x64/bin/opencode
+  vanilla:
+    repo: ${OPENCODE_REPO}
+    revision: origin/dev
+    mode: vanilla
+
+excluded: []

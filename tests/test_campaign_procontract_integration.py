@@ -699,6 +699,8 @@ def test_pinned_real_binary_completes_native_procontract_lifecycle(
                 "policy-split-breadth-v1",
                 "policy-split-fast-v1",
                 "policy-split-deep-v1",
+                "policy-split-v2-external-v1",
+                "policy-split-v2-probe-v1",
             }:
                 pytest.fail("PROGRAMBENCH_PROCONTRACT_PROTOCOL is invalid")
             breaker = CircuitBreaker()

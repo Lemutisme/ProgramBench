@@ -1103,7 +1103,9 @@ def test_policy_split_keeps_execution_policy_outside_contract_terms(tmp_path: Pa
     assert "broad black-box differential experiments" not in str(payload["brief"])
 
 
-@pytest.mark.parametrize("name", ["interface", "representation", "reactive", "breadth", "fast", "deep"])
+@pytest.mark.parametrize(
+    "name", ["interface", "representation", "reactive", "breadth", "fast", "deep", "v2", "v2-probe"]
+)
 def test_task_conditioned_policy_changes_only_the_execution_binding(tmp_path: Path, name: str) -> None:
     from scripts.campaign_policy import POLICIES
     from scripts.campaign_procontract import _expected_spec, build_issue_payload, protocol_for_revision
@@ -1119,6 +1121,34 @@ def test_task_conditioned_policy_changes_only_the_execution_binding(tmp_path: Pa
     assert "policy" not in payload
     assert _expected_spec(payload) == _expected_spec(policyless)
     assert "cover every applicable" not in str(payload["brief"])
+
+
+def test_contract_tcb_coordinates_are_validated_without_entering_spec(tmp_path: Path) -> None:
+    import hashlib
+
+    from scripts.campaign_procontract import _validate_contract, _validate_execution, build_issue_payload
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    _, workspace = _workspace(tmp_path, paths)
+    payload = build_issue_payload(workspace, now=100.0, protocol="policy-split-v2-external-v1")
+    execution = _execution(payload)
+    execution["executionPolicyCoordinate"] = {
+        "policyHash": hashlib.sha256(str(payload["executionPolicy"]).encode()).hexdigest(),
+        "lineage": [],
+    }
+    contract = _contract(payload)
+    contract["handoff"]["subject"] = {
+        "hash": contract["handoff"]["subjectHash"],
+        "specHash": contract["specHash"],
+        "artifacts": ["compile.sh", "executable", "validate.sh"],
+    }
+
+    assert _validate_execution(execution, payload, 1)["executionPolicyCoordinate"] == execution[
+        "executionPolicyCoordinate"
+    ]
+    assert _validate_contract(contract, payload)["handoff"]["subject"] == contract["handoff"]["subject"]
+    assert "executionPolicy" not in contract["spec"]
 
 
 def test_semantic_v0_materializes_only_the_exact_institution_snapshot(tmp_path: Path) -> None:
