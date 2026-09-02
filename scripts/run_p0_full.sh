@@ -5,7 +5,7 @@ umask 077
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
-OUTPUT="${P0_FULL_OUTPUT:-$REPO_ROOT/output/luna-max-policy-split-p0-200-20260902-v2}"
+OUTPUT="${P0_FULL_OUTPUT:-$REPO_ROOT/output/luna-max-policy-split-p0-200-20260902-v3}"
 
 export OPENCODE_REPO="${OPENCODE_REPO:-/home/duozhou/opencode-p0-durable}"
 if [[ -z "${OPENCODE_SERVER_PASSWORD:-}" ]]; then
