@@ -561,6 +561,10 @@ class CleanupWorkspace:
     def candidate(self) -> Path:
         return self.manifest.candidate
 
+    @property
+    def cleanup_timeout_seconds(self) -> float:
+        return 35.0
+
     def stop_for_freeze(self) -> None:
         self.lease.release_handle()
 
@@ -612,6 +616,10 @@ class DockerWorkspace:
     @property
     def candidate(self) -> Path:
         return self.manifest.candidate
+
+    @property
+    def cleanup_timeout_seconds(self) -> float:
+        return 35.0
 
     @property
     def state_dir(self) -> Path:

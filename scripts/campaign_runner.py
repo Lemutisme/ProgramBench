@@ -668,7 +668,7 @@ def run_job(
                 try:
                     if cleanup_only and state is not None and state.exit_class == "cleanup_failed":
                         if not _bounded_cleanup_stop(
-                            _workspace_cleanup_operation(workspace), JOB_CLEANUP_TIMEOUT_SECONDS
+                            _workspace_cleanup_operation(workspace), _workspace_cleanup_timeout(workspace)
                         ):
                             return JobRunResult(candidate, "cleanup_failed")
                         workspace_lease.release_handle()
@@ -757,7 +757,7 @@ def run_job(
                         )
                     exit_class, traceback_hash = _exception_metadata(store, error)
                     interrupted = stop.is_set()
-                    cleanup_deadline = time.monotonic() + JOB_CLEANUP_TIMEOUT_SECONDS
+                    cleanup_deadline = time.monotonic() + _workspace_cleanup_timeout(workspace)
                     attempts = 0
                     while (
                         workspace_lease._handle_active
@@ -1468,6 +1468,13 @@ def _workspace_cleanup_operation(workspace: object) -> Callable[[], object]:
     return force_stop if callable(force_stop) else getattr(workspace, "stop_for_freeze")
 
 
+def _workspace_cleanup_timeout(workspace: object) -> float:
+    value = getattr(workspace, "cleanup_timeout_seconds", JOB_CLEANUP_TIMEOUT_SECONDS)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        return JOB_CLEANUP_TIMEOUT_SECONDS
+    return min(float(value), 60.0)
+
+
 def _cleanup_recovery_evidence(paths: JobPaths, workspace: object) -> Mapping[str, str]:
     manifest_path = getattr(workspace, "manifest_path", None)
     manifest_hash = (
@@ -1613,7 +1620,7 @@ def _defer_job_recovery(
     error: RecoverableJobError,
 ) -> JobRunResult:
     attempts = 0
-    deadline = time.monotonic() + JOB_CLEANUP_TIMEOUT_SECONDS
+    deadline = time.monotonic() + _workspace_cleanup_timeout(workspace)
     while workspace_lease._handle_active and attempts < JOB_CLEANUP_MAX_ATTEMPTS and time.monotonic() < deadline:
         attempts += 1
         if not _bounded_cleanup_stop(

@@ -385,6 +385,7 @@ def test_workspace_constructs_redacted_dynamic_loopback_server(tmp_path: Path) -
     assert workspace.candidate != workspace.state_dir
     assert workspace.candidate.joinpath("executable").exists() is False
     assert workspace.candidate.joinpath("reference").is_symlink()
+    assert workspace.cleanup_timeout_seconds == 35.0
     text = workspace.manifest_path.read_text()
     assert "OPENAI_API_KEY" in text and "secret-value" not in text
     assert docker.observed_phases == ["preparing", "launching"]
