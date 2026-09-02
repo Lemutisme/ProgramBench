@@ -237,7 +237,7 @@ def _snapshot_candidate(source: Path, destination: Path) -> None:
                 continue
             name = names[index]
             frames[-1][5] = index + 1
-            if root is True and name in {"reference", ".programbench-cleanroom.json"}:
+            if root is True and name in {".git", "reference", ".programbench-cleanroom.json"}:
                 continue
             child_relative = name if relative == "." else f"{relative}/{name}"
             child = target / name

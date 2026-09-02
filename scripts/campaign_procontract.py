@@ -154,6 +154,7 @@ CONTROL_ARTIFACT_NAMES = (
     "procontract-interrupt.json",
     "procontract-admission-error.json",
 )
+DELIVERY_CONTROL_PATHS = (".git", ".programbench-cleanroom.json", "reference")
 
 
 def _acceptance_policy(protocol: ProContractProtocol) -> str:
@@ -1391,6 +1392,11 @@ def _run_procontract(
                 raise ProContractConflictError("native Contract execution binding regressed during recovery")
             bound_execution = current_execution
     usage, actions, messages = _restore_contract_progress(progress_path, state, payload, bound_execution)
+    messages = _restore_verification_messages(
+        job.job.root / "procontract-verification.json",
+        messages,
+        usage,
+    )
     if (state.provider_turns or state.actions or state.cost) and usage.provider_turns <= MAX_PROVIDER_TURNS:
         breaker.observe(workspace.manifest.job_id, state.generation, usage, terminal=False)
     quiet: Mapping[str, object] = {
@@ -2276,7 +2282,9 @@ def _deliver(
                         "contractID": payload["id"],
                         "subjectHash": handoff["subjectHash"],
                         "directory": str(export_dir),
-                        "treeHash": _tree_hash(_semantic_inventory(export_dir)) if export_dir.is_dir() else None,
+                        "treeHash": _tree_hash(_semantic_inventory(export_dir, excluded=DELIVERY_CONTROL_PATHS))
+                        if export_dir.is_dir()
+                        else None,
                         "complete": False,
                     },
                     "ambiguous Contract export evidence",
@@ -2935,6 +2943,30 @@ def _compact_progress_messages(value: object) -> object:
     if isinstance(value, list):
         return [_compact_progress_messages(item) for item in value]
     return value
+
+
+def _restore_verification_messages(
+    path: Path,
+    messages: Mapping[str, object],
+    usage: UsageSummary,
+) -> Mapping[str, object]:
+    if not path.is_file():
+        return messages
+    raw = _read_json(path)
+    if (
+        not isinstance(raw, Mapping)
+        or set(raw) != {"version", "contract", "execution", "quiet", "messages"}
+        or raw["version"] != 1
+        or not isinstance(raw["messages"], Mapping)
+    ):
+        raise ProContractError("persisted Contract verification observation is invalid")
+    verified = raw["messages"]
+    if (
+        _compact_progress_messages(verified) != _compact_progress_messages(messages)
+        or _summarize_usage(verified) != usage
+    ):
+        raise ProContractConflictError("persisted Contract verification messages conflict with durable progress")
+    return verified
 
 
 def _merge_attempt_messages(previous: Mapping[str, object], current: Mapping[str, object]) -> Mapping[str, object]:
@@ -3791,7 +3823,7 @@ def _write_export_complete(
             "contractID": contract_id,
             "subjectHash": subject_hash,
             "directory": str(export),
-            "treeHash": _tree_hash(_semantic_inventory(export)),
+            "treeHash": _tree_hash(_semantic_inventory(export, excluded=DELIVERY_CONTROL_PATHS)),
             "gitSnapshotIdentity": git_identity,
         },
         "complete Contract export evidence",
@@ -3811,7 +3843,7 @@ def _validate_export_complete(
         "contractID": contract_id,
         "subjectHash": subject_hash,
         "directory": str(export),
-        "treeHash": _tree_hash(_semantic_inventory(export)),
+        "treeHash": _tree_hash(_semantic_inventory(export, excluded=DELIVERY_CONTROL_PATHS)),
         "gitSnapshotIdentity": git_identity,
     }:
         raise ProContractConflictError("persisted complete Contract export evidence is invalid")
@@ -4198,16 +4230,23 @@ def _git_blob_digest(content: bytes, length: int) -> str:
 
 def _materialize_subject(export: Path, subject: Path, job_root: Path, credential_names: tuple[str, ...]) -> None:
     _verify_no_credentials(export, credential_names, published_only=False)
-    export_inventory = _semantic_inventory(export, read_only_modes=True)
+    export_inventory = _semantic_inventory(
+        export,
+        read_only_modes=True,
+        excluded=DELIVERY_CONTROL_PATHS,
+    )
     inventory_path = job_root / "procontract-subject.json"
     if subject.exists():
-        if _semantic_inventory(subject) != export_inventory:
+        if _semantic_inventory(subject, excluded=DELIVERY_CONTROL_PATHS) != export_inventory:
             raise ProContractDeliveryError("persisted subject conflicts with native Contract export")
     else:
         temporary = Path(tempfile.mkdtemp(prefix=".subject.", dir=subject.parent))
         try:
             _snapshot_candidate(export, temporary)
-            if _semantic_inventory(export, read_only_modes=True) != export_inventory:
+            if (
+                _semantic_inventory(export, read_only_modes=True, excluded=DELIVERY_CONTROL_PATHS)
+                != export_inventory
+            ):
                 raise ProContractDeliveryError("Contract export changed during subject freeze")
             _make_read_only(temporary)
             os.replace(temporary, subject)
@@ -4223,14 +4262,19 @@ def _materialize_subject(export: Path, subject: Path, job_root: Path, credential
     _verify_no_credentials(subject, credential_names, published_only=False)
 
 
-def _semantic_inventory(root: Path, *, read_only_modes: bool = False) -> list[dict[str, object]]:
+def _semantic_inventory(
+    root: Path,
+    *,
+    read_only_modes: bool = False,
+    excluded: tuple[str, ...] = (),
+) -> list[dict[str, object]]:
     return [
         {
             key: value
             for key, value in item.items()
             if key not in {"device", "inode"} and not (index == 0 and key == "mode")
         }
-        for index, item in enumerate(_inventory(root, read_only_modes=read_only_modes))
+        for index, item in enumerate(_inventory(root, read_only_modes=read_only_modes, excluded=excluded))
     ]
 
 

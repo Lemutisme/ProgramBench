@@ -887,6 +887,8 @@ def test_natural_idle_stops_container_before_freezing_background_writer(tmp_path
 
 def test_freeze_excludes_only_trusted_root_markers_not_candidate_files_with_same_name(tmp_path: Path) -> None:
     paths, record, request, workspace = prepared(tmp_path)
+    workspace.candidate.joinpath(".git").mkdir()
+    workspace.candidate.joinpath(".git/config").write_text("local Git control")
     workspace.candidate.joinpath("reference").symlink_to("/workspace/executable")
     workspace.candidate.joinpath("docs").mkdir()
     workspace.candidate.joinpath("docs/reference").write_text("candidate documentation")
@@ -910,6 +912,7 @@ def test_freeze_excludes_only_trusted_root_markers_not_candidate_files_with_same
         )
     assert not paths.root.joinpath("subject/reference").exists()
     assert not paths.root.joinpath("subject/.programbench-cleanroom.json").exists()
+    assert not paths.root.joinpath("subject/.git").exists()
     assert paths.root.joinpath("subject/docs/reference").read_text() == "candidate documentation"
 
 

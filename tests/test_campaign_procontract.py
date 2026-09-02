@@ -3468,6 +3468,87 @@ def test_progress_compacts_ignored_provider_metadata_before_double_buffering(tmp
     assert raw["previous"]["messages"] == raw["current"]["messages"]
 
 
+def test_verification_restores_full_messages_from_compacted_durable_progress(tmp_path: Path) -> None:
+    from scripts.campaign_procontract import (
+        ProContractConflictError,
+        _compact_progress_messages,
+        _restore_verification_messages,
+    )
+    from scripts.campaign_vanilla import _summarize_usage
+
+    messages = {
+        "data": [
+            {
+                "id": "msg_assistant",
+                "type": "assistant",
+                "content": [
+                    {
+                        "type": "reasoning",
+                        "text": "full historical reasoning",
+                        "providerMetadata": {"openai": {"itemId": "item_one"}},
+                    }
+                ],
+                "tokens": {"input": 10, "output": 3, "reasoning": 2, "cache": {"read": 4, "write": 0}},
+                "cost": 1,
+            }
+        ]
+    }
+    path = tmp_path / "procontract-verification.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "contract": {},
+                "execution": {},
+                "quiet": {},
+                "messages": messages,
+            }
+        )
+    )
+    compact = _compact_progress_messages(messages)
+    usage = _summarize_usage(messages)
+
+    assert _restore_verification_messages(path, compact, usage) == messages
+
+    changed = copy.deepcopy(compact)
+    changed["data"][0]["tokens"]["output"] = 4
+    with pytest.raises(ProContractConflictError, match="durable progress"):
+        _restore_verification_messages(path, changed, usage)
+
+
+def test_materialized_delivery_subject_excludes_only_harness_and_git_controls(tmp_path: Path) -> None:
+    from scripts.campaign_procontract import (
+        DELIVERY_CONTROL_PATHS,
+        _materialize_subject,
+        _semantic_inventory,
+    )
+
+    export = tmp_path / "export"
+    export.mkdir()
+    export.joinpath(".git/info").mkdir(parents=True)
+    export.joinpath(".git/config").write_text("Git control")
+    export.joinpath(".programbench-cleanroom.json").write_text("harness control")
+    export.joinpath("reference").symlink_to("/workspace/executable")
+    export.joinpath("docs").mkdir()
+    export.joinpath("docs/reference").write_text("user documentation")
+    export.joinpath("executable").write_text("delivery")
+    subject = tmp_path / "job/subject"
+    subject.parent.mkdir()
+
+    _materialize_subject(export, subject, subject.parent, ())
+    _materialize_subject(export, subject, subject.parent, ())
+
+    assert not subject.joinpath(".git").exists()
+    assert not subject.joinpath(".programbench-cleanroom.json").exists()
+    assert not subject.joinpath("reference").exists()
+    assert subject.joinpath("docs/reference").read_text() == "user documentation"
+    assert _semantic_inventory(subject) == _semantic_inventory(
+        export,
+        read_only_modes=True,
+        excluded=DELIVERY_CONTROL_PATHS,
+    )
+
+
 def test_attempt_message_merge_replaces_live_suffix_and_appends_rotated_session() -> None:
     from scripts.campaign_procontract import _merge_attempt_messages
 
