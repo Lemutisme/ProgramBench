@@ -28,7 +28,6 @@ from scripts.campaign_workspace import (
     WorkspaceHealthError,
     WorkspaceLease,
     WorkspaceRequest,
-    _configure_snapshot_excludes,
     _run_docker,
     ensure_workspace as ensure_workspace_impl,
 )
@@ -389,25 +388,6 @@ def test_workspace_constructs_redacted_dynamic_loopback_server(tmp_path: Path) -
     text = workspace.manifest_path.read_text()
     assert "OPENAI_API_KEY" in text and "secret-value" not in text
     assert docker.observed_phases == ["preparing", "launching"]
-
-
-def test_snapshot_excludes_only_root_harness_controls(tmp_path: Path) -> None:
-    workspace = ensure_workspace(request(tmp_path, RecordingDocker()))
-    info = workspace.candidate / ".git/info"
-    info.mkdir(parents=True)
-    exclude = info / "exclude"
-    exclude.write_text("*.local\n")
-
-    _configure_snapshot_excludes(workspace.manifest)
-    first = exclude.read_text()
-    _configure_snapshot_excludes(workspace.manifest)
-
-    assert exclude.read_text() == first
-    assert set(line for line in first.splitlines() if line and not line.startswith("#")) == {
-        "*.local",
-        "/reference",
-        "/.programbench-cleanroom.json",
-    }
 
 
 def test_default_health_probe_uses_principal_basic_auth(monkeypatch: pytest.MonkeyPatch) -> None:

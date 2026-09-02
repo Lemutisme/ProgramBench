@@ -64,7 +64,6 @@ _FIXED_ENV = {
     "XDG_CONFIG_HOME": "/state/config",
     "XDG_DATA_HOME": "/state/data",
 }
-_SNAPSHOT_EXCLUDES = ("/reference", "/.programbench-cleanroom.json")
 _ENTRYPOINT = ("/opencode",)
 _COMMAND = ("serve", "--hostname", "0.0.0.0", "--port", "4096")
 _IMAGE_CONFIG_TEMPLATE = "\n".join(("{{json .Id}}", "{{json .Os}}", "{{json .Architecture}}"))
@@ -142,6 +141,7 @@ test -L /candidate/reference
 test "$(readlink /candidate/reference)" = /workspace/executable
 find /workspace -xdev ! -path /workspace/executable -exec /bin/sh -ec '
   for source do
+    test "$source" = /workspace/.git/info/exclude && continue
     target="/candidate${source#/workspace}"
     test -e "$target" || test -L "$target"
     test "$(stat -c "%F:%a" "$source")" = "$(stat -c "%F:%a" "$target")"
@@ -152,12 +152,24 @@ find /workspace -xdev ! -path /workspace/executable -exec /bin/sh -ec '
 ' verify-source {} +
 find /candidate -xdev ! -path /candidate/reference ! -path /candidate/.programbench-cleanroom.json -exec /bin/sh -ec '
   for target do
+    test "$target" = /candidate/.git/info/exclude && continue
     source="/workspace${target#/candidate}"
     test -e "$source" || test -L "$source"
     test "$source" != /workspace/executable
   done
 ' verify-candidate {} +
 if test -f /candidate-ready; then
+  if test -d /candidate/.git && test ! -L /candidate/.git; then
+    test ! -L /candidate/.git/info
+    mkdir -p /candidate/.git/info
+    test ! -L /candidate/.git/info/exclude
+    touch /candidate/.git/info/exclude
+    for rule in /reference /.programbench-cleanroom.json; do
+      grep -Fqx "$rule" /candidate/.git/info/exclude || printf '%s\n' "$rule" >> /candidate/.git/info/exclude
+    done
+    chown agent:agent /candidate/.git/info/exclude
+    chmod 644 /candidate/.git/info/exclude
+  fi
   cp /candidate-ready /candidate/.programbench-cleanroom.json.pending
   chown agent:agent /candidate/.programbench-cleanroom.json.pending
   chmod 644 /candidate/.programbench-cleanroom.json.pending
@@ -802,13 +814,11 @@ def _resume(
         )
         _write_manifest(manifest.manifest_path, manifest)
     if manifest.phase == "stopped":
-        _configure_snapshot_excludes(manifest)
         return _restart_stopped(manifest, request, runner, probe)
     if _requires_cleanroom_validation(manifest):
         _require_candidate_ready(manifest)
         _verify_candidate(runner, request.docker, manifest, publish=False)
         _cleanup_candidate_preparation(manifest)
-    _configure_snapshot_excludes(manifest)
     inspected = _inspect_container(runner, request.docker, manifest.container_name)
     if (
         inspected is not None
@@ -918,7 +928,6 @@ def _launch(
     if not restarting:
         _require_candidate_ready(manifest)
         _verify_candidate(runner, request.docker, manifest, publish=False)
-    _configure_snapshot_excludes(manifest)
     launching = replace(manifest, container_id=None, port=None, phase="launching")
     _write_manifest(manifest.manifest_path, launching)
     command = [
@@ -1441,41 +1450,6 @@ def _cleanup_candidate_preparation(manifest: WorkspaceManifest) -> None:
             removed = True
     if removed:
         _sync_directory(manifest.state_root)
-
-
-def _configure_snapshot_excludes(manifest: WorkspaceManifest) -> None:
-    git = manifest.candidate / ".git"
-    if not git.exists():
-        return
-    if git.is_symlink() or not git.is_dir():
-        raise ContainerConflictError("candidate Git metadata is not a local directory")
-    info = git / "info"
-    if info.is_symlink() or info.exists() and not info.is_dir():
-        raise ContainerConflictError("candidate Git info path is unsafe")
-    info.mkdir(mode=0o755, exist_ok=True)
-    exclude = info / "exclude"
-    if exclude.is_symlink() or exclude.exists() and not exclude.is_file():
-        raise ContainerConflictError("candidate Git exclude path is unsafe")
-    existing = exclude.read_text() if exclude.exists() else ""
-    rules = {line.strip() for line in existing.splitlines() if line.strip() and not line.lstrip().startswith("#")}
-    missing = tuple(rule for rule in _SNAPSHOT_EXCLUDES if rule not in rules)
-    if not missing:
-        return
-    content = existing + ("" if not existing or existing.endswith("\n") else "\n")
-    content += "# ProgramBench harness controls are outside the delivery subject.\n" + "\n".join(missing) + "\n"
-    descriptor, temporary = tempfile.mkstemp(prefix=".exclude.", dir=info)
-    try:
-        with os.fdopen(descriptor, "w") as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(temporary, exclude.stat().st_mode & 0o777 if exclude.exists() else 0o644)
-        os.replace(temporary, exclude)
-        _sync_file(exclude)
-        _sync_directory(info)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
 
 
 def _sync_candidate_ready(manifest: WorkspaceManifest) -> None:
