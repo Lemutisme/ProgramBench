@@ -1103,6 +1103,14 @@ def test_policy_split_keeps_execution_policy_outside_contract_terms(tmp_path: Pa
     assert "broad black-box differential experiments" not in str(payload["brief"])
 
 
+def test_durable_policy_split_runtime_keeps_behavioral_policy_outside_spec() -> None:
+    from scripts.campaign_procontract import protocol_for_revision
+
+    revision = "97d61022abdc33397ee97447c7bbc6f571574e1e"
+    assert protocol_for_revision(revision, "behavioral") == "policy-split-v1"
+    assert protocol_for_revision(revision, "none") == "policy-split-none-v1"
+
+
 def test_semantic_v0_materializes_only_the_exact_institution_snapshot(tmp_path: Path) -> None:
     from scripts.campaign_procontract import (
         ProContractDeliveryError,

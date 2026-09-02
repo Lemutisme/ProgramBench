@@ -72,6 +72,8 @@ POLICY_SPLIT_REVISIONS = frozenset(
     {
         "7054140b61e5cdeceef61f6bc6e6520eefe7ac79",
         "910d9f2856323ad5493ee52f8cb2c315d2172e10",
+        "b2c5fb8dc95b24b8aec1a227f771695c8e0c6593",
+        "97d61022abdc33397ee97447c7bbc6f571574e1e",
     }
 )
 ProContractProtocol = Literal["current", "semantic-v0", "policy-split-v1", "policy-split-none-v1"]
