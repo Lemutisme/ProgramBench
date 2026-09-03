@@ -52,6 +52,7 @@ def test_partial_package_preserves_workspace_without_compile_script(tmp_path: Pa
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     workspace.joinpath("notes.txt").write_text("unfinished candidate\n")
+    workspace.joinpath(".programbench-cleanroom.json").write_text("harness control\n")
 
     archive = package_workspace(
         workspace,

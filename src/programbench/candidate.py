@@ -22,7 +22,15 @@ from programbench.utils.internet_control import block_build_internet_dns, restor
 
 DEFAULT_IMAGE_TAG = "task_cleanroom_v6"
 PORTABLE_ARCHIVE_MTIME = 315532800
-_EXCLUDED_NAMES = {".git", ".programbench", "executable", "reference", "reference-bin", "submission.tar.gz"}
+_EXCLUDED_NAMES = {
+    ".git",
+    ".programbench",
+    ".programbench-cleanroom.json",
+    "executable",
+    "reference",
+    "reference-bin",
+    "submission.tar.gz",
+}
 
 
 class CandidateError(RuntimeError):
