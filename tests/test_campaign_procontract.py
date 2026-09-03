@@ -1139,6 +1139,7 @@ def test_durable_policy_split_runtime_keeps_behavioral_policy_outside_spec() -> 
     revision = "97d61022abdc33397ee97447c7bbc6f571574e1e"
     assert protocol_for_revision(revision, "behavioral") == "policy-split-v1"
     assert protocol_for_revision(revision, "none") == "policy-split-none-v1"
+    assert protocol_for_revision("c6c4a4c3ab154cbd5a3cbe70f25a8bbe4739f72b", "behavioral") == "policy-split-v1"
 
 
 def test_semantic_v0_materializes_only_the_exact_institution_snapshot(tmp_path: Path) -> None:
