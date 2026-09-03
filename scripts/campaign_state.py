@@ -596,6 +596,34 @@ class StateStore:
                 raise StateError("update contains immutable metadata")
             return self._commit_locked(replace(current, **changes, generation=current.generation + 1))
 
+    def record_artifacts(
+        self,
+        *,
+        expected_generation: int,
+        artifact_hashes: Mapping[str, str],
+    ) -> JobState:
+        if not isinstance(artifact_hashes, Mapping) or not artifact_hashes or any(
+            not isinstance(name, str) or not name or not isinstance(digest, str) or not digest
+            for name, digest in artifact_hashes.items()
+        ):
+            raise StateError("recorded artifact hashes must be a nonempty string mapping")
+        with self._state_lock():
+            current = self._read_unlocked()
+            self._check_generation(current, expected_generation)
+            previous = dict(current.artifact_hashes or {})
+            if any(name in previous and previous[name] != digest for name, digest in artifact_hashes.items()):
+                raise StateConflictError("recorded artifact conflicts with the existing durable seal")
+            merged = {**previous, **dict(artifact_hashes)}
+            if merged == previous:
+                return current
+            return self._commit_locked(
+                replace(
+                    current,
+                    artifact_hashes=merged,
+                    generation=current.generation + 1,
+                )
+            )
+
     def begin_process(self, *, expected_generation: int, pid: int) -> JobState:
         """Fence one controller generation without changing the semantic Contract attempt."""
         if type(pid) is not int or pid <= 0:

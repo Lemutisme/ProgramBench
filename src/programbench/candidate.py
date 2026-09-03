@@ -35,10 +35,18 @@ class PreflightResult:
     output: str
 
 
-def package_workspace(workspace: Path, run_dir: Path, instance_id: str) -> Path:
+def package_workspace(
+    workspace: Path,
+    run_dir: Path,
+    instance_id: str,
+    *,
+    require_compile: bool = True,
+) -> Path:
     if not workspace.is_dir():
         raise CandidateError(f"Candidate workspace does not exist: {workspace}")
-    if not (workspace / "compile.sh").is_file():
+    if type(require_compile) is not bool:
+        raise CandidateError("Candidate compile requirement must be bool")
+    if require_compile and not (workspace / "compile.sh").is_file():
         raise CandidateError("Candidate workspace must contain compile.sh")
 
     output = run_dir / instance_id / "submission.tar.gz"

@@ -376,6 +376,22 @@ def test_scheduler_requeues_recoverable_generation_without_counting_a_failure():
     assert result.pending == ()
 
 
+def test_scheduler_prioritizes_recoverable_generation_before_new_work():
+    from scripts.campaign_runner import JobRunResult, run_campaign
+
+    calls = []
+
+    def execute(candidate, _stop):
+        calls.append(candidate.key)
+        return JobRunResult(candidate, "recoverable" if calls == [job(0).key] else "completed")
+
+    result = run_campaign((job(0), job(1)), workers=1, execute=execute)
+
+    assert calls == [job(0).key, job(0).key, job(1).key]
+    assert result.completed == 2
+    assert result.failed == 0
+
+
 def test_scheduler_counts_normalized_interruption_as_failed():
     from scripts.campaign_runner import JobRunResult, run_campaign
 
@@ -906,11 +922,31 @@ def test_evaluate_only_refuses_nonterminal_jobs_and_never_enters_inference(tmp_p
     with pytest.raises(campaign_runner.CampaignError, match="nonterminal"):
         campaign_runner.main(arguments)
 
-    store.transition(
-        "failed",
-        command_identity="test",
+    submission = output / "procontract/one/submission.tar.gz"
+    submission.write_bytes(b"partial candidate")
+    digest = hashlib.sha256(submission.read_bytes()).hexdigest()
+    receipt = output / "procontract/one/candidate-artifact.json"
+    receipt.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "status": "published",
+                "submission": "submission.tar.gz",
+                "sha256": digest,
+                "partial": True,
+                "reason": "pending_revision",
+                "source_phase": "awaiting_revision",
+                "source_exit_class": "pending_revision",
+            },
+            sort_keys=True,
+        )
+    )
+    store.record_artifacts(
         expected_generation=state.generation,
-        exit_class="semantic_failure",
+        artifact_hashes={
+            receipt.name: hashlib.sha256(receipt.read_bytes()).hexdigest(),
+            submission.name: digest,
+        },
     )
     monkeypatch.setattr(
         campaign_evaluate,
@@ -2237,6 +2273,9 @@ def test_run_job_force_stops_before_unregistering_unexpected_adapter_failure(tmp
             self.request = request
             self.lease = lease
             self.stops = 0
+            self.candidate = request.job.root / "candidate"
+            self.candidate.mkdir(parents=True)
+            self.candidate.joinpath("unfinished.txt").write_text("candidate survives adapter failure\n")
             lease.claim_handle(request)
 
         def stop_for_freeze(self):
@@ -2272,10 +2311,82 @@ def test_run_job_force_stops_before_unregistering_unexpected_adapter_failure(tmp
     assert result.status == "failed"
     assert state.phase == "failed"
     assert state.exit_class == "execution_failed"
+    paths = campaign_runner.JobPaths(plan.output / "vanilla/one")
+    assert paths.submission.is_file()
+    receipt = json.loads(paths.root.joinpath("candidate-artifact.json").read_text())
+    assert receipt["status"] == "published"
+    assert receipt["partial"] is True
+    assert state.artifact_hashes["submission.tar.gz"] == hashlib.sha256(paths.submission.read_bytes()).hexdigest()
+    assert state.artifact_hashes["traceback"]
     assert "adapter-secret" not in (state.exit_class or "")
     assert workspaces[0].request.job.root.joinpath("child-stop-observed").is_file()
     assert not workspaces[0].lease._handle_active
     assert token.registry.active_jobs() == ()
+
+
+def test_run_job_conserves_candidate_when_contract_awaits_revision(tmp_path: Path, monkeypatch):
+    from scripts import campaign_runner
+    from scripts.run_opencode import load_config
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config_path = tmp_path / "campaign.yaml"
+    config_path.write_text(_config(repo))
+    plan = campaign_runner.CampaignPlan(
+        tmp_path / "out",
+        tmp_path / "out/campaign.json",
+        load_config(config_path),
+        ("one",),
+        (),
+        {},
+        False,
+    )
+    candidate = campaign_runner.CampaignJob("one", "procontract", "one-image")
+
+    class Workspace:
+        base_url = "http://127.0.0.1:9999"
+        port = 9999
+
+        def __init__(self, request, lease):
+            self.request = request
+            self.lease = lease
+            self.candidate = request.job.root / "candidate"
+            self.candidate.mkdir(parents=True)
+            self.candidate.joinpath("work.txt").write_text("partial revision candidate\n")
+            lease.claim_handle(request)
+
+        def stop_for_freeze(self):
+            self.lease.release_handle()
+
+    def adapter(_job, store, workspace, **_kwargs):
+        state = store.read()
+        state = store.transition("preparing", command_identity="contract", expected_generation=state.generation)
+        state = store.transition("executing", command_identity="contract", expected_generation=state.generation)
+        store.transition(
+            "awaiting_revision",
+            command_identity="contract",
+            expected_generation=state.generation,
+            exit_class="pending_revision",
+        )
+        workspace.stop_for_freeze()
+        return SimpleNamespace(completion="pending_revision")
+
+    monkeypatch.setattr(campaign_runner, "_install_for", lambda *_: SimpleNamespace(revision="test"))
+    result = campaign_runner.run_job(
+        plan,
+        candidate,
+        breaker=CircuitBreaker(),
+        workspace_factory=lambda request, lease: Workspace(request, lease),
+        procontract_runner=adapter,
+        procontract_api_factory=lambda _: object(),
+    )
+
+    paths = campaign_runner.JobPaths(plan.output / "procontract/one")
+    state = campaign_runner.StateStore(paths.state).read()
+    assert result.status == "awaiting_revision"
+    assert state.phase == "awaiting_revision"
+    assert paths.submission.is_file()
+    assert json.loads(paths.root.joinpath("candidate-artifact.json").read_text())["partial"] is True
 
 
 def test_run_job_retries_transient_cleanup_without_stopping_campaign(tmp_path: Path, monkeypatch):

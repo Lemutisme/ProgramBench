@@ -324,6 +324,7 @@ states = defaultdict(Counter)
 exit_classes = defaultdict(Counter)
 recovery_reasons = defaultdict(Counter)
 process_generations = defaultdict(dict)
+artifact_outcomes = defaultdict(Counter)
 for job_arm in ("procontract", "vanilla"):
     for path in (output / job_arm).glob("*/state.json"):
         state = read_json(path)
@@ -336,6 +337,15 @@ for job_arm in ("procontract", "vanilla"):
         generation = state.get("process_generation", 0)
         if type(generation) is int and generation >= 0:
             process_generations[job_arm][path.parent.name] = generation
+        receipt = read_json(path.parent / "candidate-artifact.json")
+        failure = read_json(path.parent / "candidate-artifact-failure.json")
+        artifact_outcomes[job_arm][
+            "published"
+            if isinstance(receipt, dict) and receipt.get("status") == "published"
+            else "failed"
+            if isinstance(failure, dict) and failure.get("status") == "failed"
+            else "missing"
+        ] += 1
 
 files = []
 for directory, names, filenames in os.walk(output):
@@ -391,6 +401,7 @@ summary = {
         "phase_counts": {arm: dict(values) for arm, values in states.items()},
         "exit_class_counts": {arm: dict(values) for arm, values in exit_classes.items()},
         "recovery_reason_counts": {arm: dict(values) for arm, values in recovery_reasons.items()},
+        "artifact_outcome_counts": {arm: dict(values) for arm, values in artifact_outcomes.items()},
         "process_generations": {
             arm: {
                 "total": sum(values.values()),

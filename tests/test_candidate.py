@@ -48,6 +48,22 @@ def test_package_requires_compile_script(tmp_path: Path):
         package_workspace(workspace, tmp_path / "run", "owner__repo.abc")
 
 
+def test_partial_package_preserves_workspace_without_compile_script(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    workspace.joinpath("notes.txt").write_text("unfinished candidate\n")
+
+    archive = package_workspace(
+        workspace,
+        tmp_path / "run",
+        "owner__repo.abc",
+        require_compile=False,
+    )
+
+    with tarfile.open(archive, "r:gz") as packaged:
+        assert packaged.getnames() == ["notes.txt"]
+
+
 def test_package_rejects_renamed_reference_artifact(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     workspace = tmp_path / "workspace"
     workspace.mkdir()

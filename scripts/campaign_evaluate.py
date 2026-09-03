@@ -1035,8 +1035,11 @@ def _prepare_evidence(
         job_root = root / arm / instance_id
         _reject_symlink_components(job_root, root, f"job path for {instance_id}/{arm}")
         state = JobState.from_dict(_read_json(job_root / "state.json", f"job state for {instance_id}/{arm}"))
-        if state.phase not in TERMINAL_PHASES:
-            raise CampaignEvaluationError(f"selected inference job is nonterminal: {instance_id}/{arm}")
+        artifact_receipt = _candidate_artifact_receipt(job_root)
+        if state.phase not in TERMINAL_PHASES and artifact_receipt is None:
+            raise CampaignEvaluationError(
+                f"selected inference job is nonterminal and has no sealed candidate artifact: {instance_id}/{arm}"
+            )
         if state.exit_class == "credential_leak":
             raise CampaignEvaluationError(f"credential leak blocks evaluation: {instance_id}/{arm}")
         if secrets and any(_file_contains_secret(path, secrets) for path in _published_credential_paths(job_root)):
@@ -1058,6 +1061,8 @@ def _prepare_evidence(
             None,
         )
         if submission is not None:
+            if artifact_receipt is not None and artifact_receipt["sha256"] != _sha256(submission):
+                raise CampaignEvaluationError(f"candidate artifact receipt conflicts: {instance_id}/{arm}")
             staged = root / "evaluation" / arm / instance_id / "submission.tar.gz"
             _mkdir_contained(staged.parent, root)
             if staged.exists():
@@ -1099,6 +1104,42 @@ def _prepare_evidence(
             "expected_executable_hash": result.get("executable_hash"),
         }
     return evidence
+
+
+def _candidate_artifact_receipt(job_root: Path) -> Mapping[str, object] | None:
+    path = job_root / "candidate-artifact.json"
+    if not path.exists():
+        return None
+    _require_regular_contained(path, job_root, "candidate artifact receipt")
+    receipt = _read_json(path, "candidate artifact receipt")
+    if (
+        set(receipt)
+        != {
+            "version",
+            "status",
+            "submission",
+            "sha256",
+            "partial",
+            "reason",
+            "source_phase",
+            "source_exit_class",
+        }
+        or receipt.get("version") != 1
+        or receipt.get("status") != "published"
+        or receipt.get("submission") != "submission.tar.gz"
+        or not isinstance(receipt.get("sha256"), str)
+        or type(receipt.get("partial")) is not bool
+        or not isinstance(receipt.get("reason"), str)
+        or not isinstance(receipt.get("source_phase"), str)
+        or receipt.get("source_exit_class") is not None
+        and not isinstance(receipt.get("source_exit_class"), str)
+    ):
+        raise CampaignEvaluationError("candidate artifact receipt is malformed")
+    submission = job_root / "submission.tar.gz"
+    _require_regular_contained(submission, job_root, "candidate artifact submission")
+    if _sha256(submission) != receipt["sha256"]:
+        raise CampaignEvaluationError("candidate artifact receipt hash conflicts with submission")
+    return receipt
 
 
 def _published_credential_paths(job_root: Path) -> tuple[Path, ...]:

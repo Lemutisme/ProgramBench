@@ -34,6 +34,7 @@ from programbench.utils.load_data import load_all_instances
 from programbench.utils.instance_filters import filter_instances
 from scripts import campaign_process
 from scripts.campaign_install import InstallRecord, prepare_install
+from scripts.campaign_freeze import CredentialLeakError, _verify_no_credentials
 from scripts.campaign_procontract import HttpProContractApi, protocol_for_revision, run_procontract
 from scripts.campaign_state import JobLease, JobPaths, JobState, RecoverableJobError, StateStore
 from scripts.campaign_stop import StopToken
@@ -55,6 +56,8 @@ JOB_CLEANUP_MAX_ATTEMPTS = 3
 JOB_CLEANUP_TIMEOUT_SECONDS = 0.25
 DRY_RUN_OUTPUT = Path("campaign-dry-run")
 _CREDENTIAL_ENV = ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENCODE_CONFIG_CONTENT", "OPENCODE_SERVER_PASSWORD")
+_CANDIDATE_ARTIFACT = "candidate-artifact.json"
+_CANDIDATE_ARTIFACT_FAILURE = "candidate-artifact-failure.json"
 
 
 class CampaignError(RuntimeError):
@@ -414,7 +417,7 @@ def run_campaign(
                 try:
                     outcome = future.result()
                     if isinstance(outcome, JobRunResult) and outcome.status == "recoverable":
-                        pending.append(candidate)
+                        pending.appendleft(candidate)
                         _append_log(state_path, candidate, "recoverable")
                     elif isinstance(outcome, JobRunResult) and outcome.status == "awaiting_revision":
                         awaiting.append(candidate)
@@ -680,6 +683,7 @@ def run_job(
                         return JobRunResult(candidate, "completed")
                     if (stop.is_set() or breaker.stop_active) and not cleanup_only:
                         workspace.stop_for_freeze()
+                        _conserve_candidate_artifact(paths, store, workspace, candidate, "campaign_stop")
                         _terminalize(store, "interrupted", "campaign_stop")
                         return JobRunResult(candidate, "interrupted")
                     if candidate.arm == "vanilla":
@@ -724,6 +728,23 @@ def run_job(
                             ),
                         )
                     state = store.read_optional()
+                    if state is not None and state.phase in {
+                        "awaiting_revision",
+                        "frozen",
+                        "packaged",
+                        "preflighted",
+                        "done",
+                        "failed",
+                        "interrupted",
+                    }:
+                        _conserve_candidate_artifact(
+                            paths,
+                            store,
+                            workspace,
+                            candidate,
+                            state.exit_class or state.phase,
+                        )
+                        state = store.read_optional()
                     if state is not None and state.phase == "awaiting_revision":
                         return JobRunResult(candidate, "awaiting_revision", result)
                     if (
@@ -755,7 +776,7 @@ def run_job(
                                 time.time() + min(60, 2 ** min(failed_state.process_generation, 5)),
                             ),
                         )
-                    exit_class, traceback_hash = _exception_metadata(store, error)
+                    exit_class, traceback_hash = _exception_metadata(paths, store, error)
                     interrupted = stop.is_set()
                     cleanup_deadline = time.monotonic() + _workspace_cleanup_timeout(workspace)
                     attempts = 0
@@ -793,6 +814,13 @@ def run_job(
                             },
                         )
                         return JobRunResult(candidate, "cleanup_failed")
+                    _conserve_candidate_artifact(
+                        paths,
+                        store,
+                        workspace,
+                        candidate,
+                        "campaign_stop" if interrupted else exit_class,
+                    )
                     _terminalize(
                         store,
                         "interrupted" if interrupted else "failed",
@@ -815,7 +843,7 @@ def run_job(
                 return JobRunResult(candidate, "recoverable")
             return JobRunResult(candidate, "failed")
         except BaseException as error:
-            exit_class, traceback_hash = _exception_metadata(store, error)
+            exit_class, traceback_hash = _exception_metadata(paths, store, error)
             _terminalize(
                 store,
                 "interrupted" if stop.is_set() else "failed",
@@ -912,8 +940,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
     if args.evaluate_only:
         if plan.cleanup_only:
             raise CampaignError("evaluation-only refuses a campaign that still requires cleanup")
-        if not _selected_jobs_terminal(plan):
-            raise CampaignError("evaluation-only refuses nonterminal jobs")
+        if not _selected_jobs_evaluable(plan):
+            raise CampaignError("evaluation-only refuses nonterminal jobs without a sealed candidate artifact")
         from scripts.campaign_evaluate import CampaignEvaluationError, evaluate_campaign
 
         try:
@@ -926,7 +954,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
         run_cleanup_campaign(plan, breaker)
         print(f"campaign remains paused after cleanup: {breaker.pause_reason}", file=sys.stderr, flush=True)
         return 1
-    terminal_evaluation = args.evaluate and not (args.redo or args.retry_infra) and _selected_jobs_terminal(plan)
+    terminal_evaluation = args.evaluate and not (args.redo or args.retry_infra) and _selected_jobs_evaluable(plan)
     required = ("OPENAI_API_KEY", "OPENCODE_SERVER_PASSWORD")
     missing = tuple(name for name in required if not os.environ.get(name))
     if missing and not terminal_evaluation:
@@ -1049,15 +1077,36 @@ def _plan_from_manifest(
     )
 
 
-def _selected_jobs_terminal(plan: CampaignPlan) -> bool:
+def _selected_jobs_evaluable(plan: CampaignPlan) -> bool:
     try:
         return all(
             (state := StateStore(plan.output / job.arm / job.instance_id / "state.json").read_optional()) is not None
-            and state.phase in {"frozen", "packaged", "preflighted", "done", "failed", "interrupted"}
+            and (
+                state.phase in {"frozen", "packaged", "preflighted", "done", "failed", "interrupted"}
+                or _candidate_artifact_published(plan.output / job.arm / job.instance_id)
+            )
             for job in plan.jobs
         )
-    except (OSError, ValueError):
+    except (CampaignError, OSError, ValueError):
         return False
+
+
+def _candidate_artifact_published(job_root: Path) -> bool:
+    receipt_path = job_root / _CANDIDATE_ARTIFACT
+    if not receipt_path.is_file() or receipt_path.is_symlink():
+        return False
+    receipt = _read_json(receipt_path)
+    submission = job_root / "submission.tar.gz"
+    return (
+        receipt.get("version") == 1
+        and receipt.get("status") == "published"
+        and receipt.get("submission") == submission.name
+        and isinstance(receipt.get("sha256"), str)
+        and type(receipt.get("partial")) is bool
+        and submission.is_file()
+        and not submission.is_symlink()
+        and hashlib.sha256(submission.read_bytes()).hexdigest() == receipt["sha256"]
+    )
 
 
 def _validate_instance_row(instance: Mapping[str, object]) -> dict[str, object]:
@@ -1552,6 +1601,123 @@ def _finalize_vanilla_delivery(
         )
 
 
+def _conserve_candidate_artifact(
+    paths: JobPaths,
+    store: StateStore,
+    workspace: object,
+    candidate: CampaignJob,
+    reason: str,
+) -> bool:
+    candidate_path = getattr(workspace, "candidate", None)
+    if not isinstance(candidate_path, Path):
+        return False
+    receipt_path = paths.root / _CANDIDATE_ARTIFACT
+    try:
+        if receipt_path.is_file():
+            receipt = _read_json(receipt_path)
+            if (
+                set(receipt)
+                != {
+                    "version",
+                    "status",
+                    "submission",
+                    "sha256",
+                    "partial",
+                    "reason",
+                    "source_phase",
+                    "source_exit_class",
+                }
+                or receipt.get("version") != 1
+                or receipt.get("status") != "published"
+                or receipt.get("submission") != paths.submission.name
+                or not isinstance(receipt.get("sha256"), str)
+                or type(receipt.get("partial")) is not bool
+                or not paths.submission.is_file()
+                or paths.submission.is_symlink()
+                or hashlib.sha256(paths.submission.read_bytes()).hexdigest() != receipt["sha256"]
+            ):
+                raise CampaignError("persisted candidate artifact receipt is invalid")
+            state = store.read()
+            store.record_artifacts(
+                expected_generation=state.generation,
+                artifact_hashes={
+                    receipt_path.name: hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
+                    paths.submission.name: str(receipt["sha256"]),
+                },
+            )
+            return True
+        lease = getattr(workspace, "lease", None)
+        if isinstance(lease, WorkspaceLease) and lease._handle_active:
+            if not _bounded_cleanup_stop(
+                _workspace_cleanup_operation(workspace),
+                _workspace_cleanup_timeout(workspace),
+            ):
+                raise CampaignError("candidate workspace could not be stopped for artifact publication")
+            lease.release_handle()
+        state = store.read()
+        _verify_no_credentials(
+            candidate_path,
+            tuple(name for name in _CREDENTIAL_ENV if os.environ.get(name)),
+            published_only=False,
+        )
+        if not paths.submission.is_file() or paths.submission.is_symlink():
+            archive = package_workspace(
+                candidate_path,
+                paths.root,
+                candidate.instance_id,
+                require_compile=False,
+            )
+            if paths.submission.exists():
+                raise CampaignError("candidate artifact publication path is occupied")
+            os.link(archive, paths.submission)
+        digest = hashlib.sha256(paths.submission.read_bytes()).hexdigest()
+        _atomic_json(
+            receipt_path,
+            {
+                "version": 1,
+                "status": "published",
+                "submission": paths.submission.name,
+                "sha256": digest,
+                "partial": not (state.phase == "done"),
+                "reason": str(reason)[:128],
+                "source_phase": state.phase,
+                "source_exit_class": state.exit_class,
+            },
+        )
+        state = store.read()
+        store.record_artifacts(
+            expected_generation=state.generation,
+            artifact_hashes={
+                receipt_path.name: hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
+                paths.submission.name: digest,
+            },
+        )
+        return True
+    except CredentialLeakError:
+        failure = "credential_leak"
+    except BaseException:
+        failure = "artifact_publication_failed"
+    failure_path = paths.root / _CANDIDATE_ARTIFACT_FAILURE
+    _atomic_json(
+        failure_path,
+        {
+            "version": 1,
+            "status": "failed",
+            "reason": str(reason)[:128],
+            "failure": failure,
+        },
+    )
+    try:
+        state = store.read()
+        store.record_artifacts(
+            expected_generation=state.generation,
+            artifact_hashes={failure_path.name: hashlib.sha256(failure_path.read_bytes()).hexdigest()},
+        )
+    except BaseException:
+        pass
+    return False
+
+
 def _sanitize_shutdown_error(error: CampaignShutdownError) -> str:
     message = " ".join(str(error).split())[:512]
     for name in _CREDENTIAL_ENV:
@@ -1598,11 +1764,16 @@ def _terminalize(
             command_identity=state.command_identity or "campaign",
             expected_generation=state.generation,
             exit_class=exit_class,
-            artifact_hashes=artifact_hashes
-            if artifact_hashes is not None
-            else {}
-            if traceback_hash is None
-            else {"traceback": traceback_hash},
+            artifact_hashes={
+                **dict(state.artifact_hashes or {}),
+                **(
+                    dict(artifact_hashes)
+                    if artifact_hashes is not None
+                    else {}
+                    if traceback_hash is None
+                    else {"traceback": traceback_hash}
+                ),
+            },
             recovery_reason=None,
             retry_at=None,
         )
@@ -1658,7 +1829,7 @@ def _defer_job_recovery(
     return JobRunResult(candidate, "recoverable")
 
 
-def _exception_metadata(store: StateStore, error: BaseException) -> tuple[str, str]:
+def _exception_metadata(paths: JobPaths, store: StateStore, error: BaseException) -> tuple[str, str]:
     try:
         state = store.read_optional()
     except BaseException:
@@ -1671,6 +1842,32 @@ def _exception_metadata(store: StateStore, error: BaseException) -> tuple[str, s
         if state is None or state.phase in {"planned", "preparing"}
         else "execution_failed"
     )
+    frames = [
+        {"file": Path(frame.filename).name, "line": frame.lineno, "function": frame.name}
+        for frame in traceback.extract_tb(error.__traceback__)[-12:]
+    ]
+    evidence_path = paths.root / "campaign-exception.json"
+    try:
+        _atomic_json(
+            evidence_path,
+            {
+                "version": 1,
+                "type": type(error).__name__,
+                "phase": state.phase if state is not None else None,
+                "traceback_sha256": digest,
+                "frames": frames,
+            },
+        )
+        current = store.read_optional()
+        if current is not None:
+            store.record_artifacts(
+                expected_generation=current.generation,
+                artifact_hashes={
+                    evidence_path.name: hashlib.sha256(evidence_path.read_bytes()).hexdigest(),
+                },
+            )
+    except BaseException:
+        pass
     if os.environ.get("PROGRAMBENCH_EXCEPTION_FRAMES") == "1":
         print(
             json.dumps(
@@ -1679,10 +1876,7 @@ def _exception_metadata(store: StateStore, error: BaseException) -> tuple[str, s
                     "type": type(error).__name__,
                     "phase": state.phase if state is not None else None,
                     "traceback_sha256": digest,
-                    "frames": [
-                        {"file": Path(frame.filename).name, "line": frame.lineno, "function": frame.name}
-                        for frame in traceback.extract_tb(error.__traceback__)[-12:]
-                    ],
+                    "frames": frames,
                 },
                 sort_keys=True,
             ),

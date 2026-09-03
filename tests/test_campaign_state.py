@@ -84,6 +84,35 @@ def test_state_store_atomically_round_trips_and_advances_phase(tmp_path: Path):
     assert list(tmp_path.glob(".state.json.*")) == []
 
 
+def test_terminal_state_can_record_an_independent_candidate_artifact(tmp_path: Path):
+    store = StateStore(tmp_path / "state.json")
+    state = store.write(JobState("planned"))
+    state = store.transition(
+        "failed",
+        command_identity="protocol-failed",
+        expected_generation=state.generation,
+        exit_class="execution_failed",
+    )
+
+    sealed = store.record_artifacts(
+        expected_generation=state.generation,
+        artifact_hashes={"candidate-artifact.json": "a" * 64, "submission.tar.gz": "b" * 64},
+    )
+
+    assert sealed.phase == "failed"
+    assert sealed.exit_class == "execution_failed"
+    assert sealed.artifact_hashes["candidate-artifact.json"] == "a" * 64
+    assert store.record_artifacts(
+        expected_generation=sealed.generation,
+        artifact_hashes={"candidate-artifact.json": "a" * 64},
+    ) == sealed
+    with pytest.raises(StateConflictError, match="artifact conflicts"):
+        store.record_artifacts(
+            expected_generation=sealed.generation,
+            artifact_hashes={"candidate-artifact.json": "c" * 64},
+        )
+
+
 def test_job_state_freezes_nested_metadata_and_revalidates_serialization():
     timestamps = {"planned": 1.0}
     hashes = {"workspace": "abc"}

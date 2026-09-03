@@ -187,6 +187,50 @@ def test_validate_evaluation_uses_official_score_and_exact_ratio(tmp_path: Path)
     assert len(result.eval_sha256) == 64
 
 
+def test_evidence_accepts_nonterminal_protocol_with_sealed_candidate_artifact(tmp_path: Path) -> None:
+    from scripts.campaign_evaluate import _prepare_evidence
+
+    root, _instances = _campaign(tmp_path / "campaign", arms=("procontract",))
+    job = root / "procontract/one"
+    submission = job / "submission.tar.gz"
+    submission.write_bytes(job.joinpath("one/submission.tar.gz").read_bytes())
+    digest = hashlib.sha256(submission.read_bytes()).hexdigest()
+    receipt = job / "candidate-artifact.json"
+    _write_json(
+        receipt,
+        {
+            "version": 1,
+            "status": "published",
+            "submission": "submission.tar.gz",
+            "sha256": digest,
+            "partial": True,
+            "reason": "pending_revision",
+            "source_phase": "awaiting_revision",
+            "source_exit_class": "pending_revision",
+        },
+    )
+    _write_json(
+        job / "state.json",
+        JobState(
+            "awaiting_revision",
+            phase_timestamps={"planned": 1, "awaiting_revision": 3},
+            provider_turns=1,
+            actions=1,
+            cost=0,
+            exit_class="pending_revision",
+            command_identity="contract",
+            artifact_hashes={
+                receipt.name: hashlib.sha256(receipt.read_bytes()).hexdigest(),
+                submission.name: digest,
+            },
+        ).to_dict(),
+    )
+
+    evidence = _prepare_evidence(root, (("one", "procontract"),))
+
+    assert evidence[("one", "procontract")]["submission_sha256"] == digest
+
+
 def test_validate_evaluation_rejects_top_level_error(tmp_path: Path) -> None:
     from scripts.campaign_evaluate import validate_evaluation
 
