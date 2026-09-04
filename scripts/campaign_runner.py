@@ -28,13 +28,17 @@ from typing import Callable, Mapping, Sequence
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from programbench.candidate import package_workspace, preflight_candidate
+from programbench.candidate import (
+    CandidateCredentialError,
+    package_workspace,
+    preflight_candidate,
+    verify_archive_no_credentials,
+)
 from programbench.submission import FIXTURE_PREFIX
 from programbench.utils.load_data import load_all_instances
 from programbench.utils.instance_filters import filter_instances
 from scripts import campaign_process
 from scripts.campaign_install import InstallRecord, prepare_install
-from scripts.campaign_freeze import CredentialLeakError, _verify_no_credentials
 from scripts.campaign_procontract import HttpProContractApi, protocol_for_revision, run_procontract
 from scripts.campaign_state import JobLease, JobPaths, JobState, RecoverableJobError, StateStore
 from scripts.campaign_stop import StopToken
@@ -1656,16 +1660,15 @@ def _conserve_candidate_artifact(
             lease.release_handle()
         state = store.read()
         if not paths.submission.is_file() or paths.submission.is_symlink():
-            _verify_no_credentials(
-                candidate_path,
-                tuple(name for name in _CREDENTIAL_ENV if os.environ.get(name)),
-                published_only=False,
-            )
             archive = package_workspace(
                 candidate_path,
                 paths.root,
                 candidate.instance_id,
                 require_compile=False,
+            )
+            verify_archive_no_credentials(
+                archive,
+                tuple(value.encode() for name in _CREDENTIAL_ENV if (value := os.environ.get(name))),
             )
             if paths.submission.exists():
                 raise CampaignError("candidate artifact publication path is occupied")
@@ -1693,7 +1696,7 @@ def _conserve_candidate_artifact(
             },
         )
         return True
-    except CredentialLeakError:
+    except CandidateCredentialError:
         failure = "credential_leak"
     except BaseException:
         failure = "artifact_publication_failed"

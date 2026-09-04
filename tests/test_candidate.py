@@ -3,14 +3,15 @@
 import hashlib
 import os
 import shutil
+import socket
 import subprocess
 import tarfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 
 import programbench.candidate as candidate_module
-from programbench.candidate import CandidateError, package_workspace, sha256
+from programbench.candidate import CandidateCredentialError, CandidateError, package_workspace, sha256, verify_archive_no_credentials
 
 
 def test_package_is_deterministic_and_excludes_runtime_artifacts(tmp_path: Path):
@@ -63,6 +64,76 @@ def test_partial_package_preserves_workspace_without_compile_script(tmp_path: Pa
 
     with tarfile.open(archive, "r:gz") as packaged:
         assert packaged.getnames() == ["notes.txt"]
+
+
+def test_archive_credential_scan_covers_content_paths_and_links(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    workspace.joinpath("notes.txt").write_text("safe\n")
+    archive = package_workspace(workspace, tmp_path / "run", "owner__repo.abc", require_compile=False)
+
+    verify_archive_no_credentials(archive, (b"provider-secret",))
+
+    workspace.joinpath("notes.txt").write_text("split-provider-secret-value\n")
+    archive = package_workspace(workspace, tmp_path / "run", "owner__repo.abc", require_compile=False)
+    with pytest.raises(CandidateCredentialError, match="provider credential"):
+        verify_archive_no_credentials(archive, (b"provider-secret",))
+
+
+def test_partial_package_safely_omits_reference_copies_unreadable_files_and_sockets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    workspace.joinpath("safe.txt").write_text("safe\n")
+    copied = workspace / "copied-reference"
+    copied.write_text("reference bytes\n")
+    unreadable = workspace / "unreadable"
+    unreadable.write_text("runtime probe\n")
+    unreadable.chmod(0)
+    endpoint = socket.socket(socket.AF_UNIX)
+    endpoint.bind(str(workspace / "runtime.sock"))
+    tasks = tmp_path / "tasks/owner__repo.abc"
+    tasks.mkdir(parents=True)
+    tasks.joinpath("task.yaml").write_text(f"eval_clean_hashes:\n  - {sha256(copied)}\n")
+    monkeypatch.setattr(candidate_module, "TASKS_DIR", tmp_path / "tasks")
+
+    try:
+        archive = package_workspace(
+            workspace,
+            tmp_path / "run",
+            "owner__repo.abc",
+            require_compile=False,
+        )
+    finally:
+        endpoint.close()
+        unreadable.chmod(0o600)
+
+    with tarfile.open(archive, "r:gz") as packaged:
+        assert packaged.getnames() == ["safe.txt"]
+
+
+def test_partial_package_bounds_recursive_runtime_trees(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    current = workspace
+    for _ in range(candidate_module.MAX_PARTIAL_ARCHIVE_DEPTH + 20):
+        current = current / "out"
+        current.mkdir()
+    current.joinpath("unbounded.txt").write_text("must not be reached\n")
+    workspace.joinpath("delivery.txt").write_text("preserved\n")
+
+    archive = package_workspace(
+        workspace,
+        tmp_path / "run",
+        "owner__repo.abc",
+        require_compile=False,
+    )
+
+    with tarfile.open(archive, "r:gz") as packaged:
+        assert "delivery.txt" in packaged.getnames()
+        assert all(len(PurePosixPath(name).parts) <= candidate_module.MAX_PARTIAL_ARCHIVE_DEPTH for name in packaged.getnames())
 
 
 def test_package_rejects_renamed_reference_artifact(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

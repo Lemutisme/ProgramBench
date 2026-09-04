@@ -2,9 +2,10 @@
 
 import gzip
 import hashlib
+import os
 import tarfile
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import yaml
 
@@ -22,6 +23,9 @@ from programbench.utils.internet_control import block_build_internet_dns, restor
 
 DEFAULT_IMAGE_TAG = "task_cleanroom_v6"
 PORTABLE_ARCHIVE_MTIME = 315532800
+MAX_PARTIAL_ARCHIVE_BYTES = 512 * 1024 * 1024
+MAX_PARTIAL_ARCHIVE_FILES = 100_000
+MAX_PARTIAL_ARCHIVE_DEPTH = 64
 _EXCLUDED_NAMES = {
     ".git",
     ".programbench",
@@ -34,6 +38,10 @@ _EXCLUDED_NAMES = {
 
 
 class CandidateError(RuntimeError):
+    pass
+
+
+class CandidateCredentialError(CandidateError):
     pass
 
 
@@ -60,18 +68,44 @@ def package_workspace(
     output = run_dir / instance_id / "submission.tar.gz"
     temporary = output.with_name(f".{output.name}.tmp")
     clean_hashes = _clean_hashes(instance_id)
+    partial_bytes = 0
     output.parent.mkdir(parents=True, exist_ok=True)
     try:
         with temporary.open("wb") as raw:
             with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as compressed:
                 with tarfile.open(fileobj=compressed, mode="w") as archive:
-                    for path in sorted(workspace.rglob("*")):
+                    paths = workspace.rglob("*") if require_compile else _partial_paths(workspace)
+                    for path in sorted(paths):
                         relative = path.relative_to(workspace)
                         if any(part in _EXCLUDED_NAMES for part in relative.parts):
                             continue
-                        if path.is_file() and not path.is_symlink() and sha256(path) in clean_hashes:
-                            raise CandidateError(f"Candidate contains a cleanroom reference artifact: {relative}")
-                        info = archive.gettarinfo(path, arcname=relative.as_posix())
+                        if path.is_file() and not path.is_symlink():
+                            try:
+                                cleanroom_reference = sha256(path) in clean_hashes
+                            except PermissionError:
+                                if require_compile:
+                                    raise
+                                continue
+                            if cleanroom_reference:
+                                if require_compile:
+                                    raise CandidateError(
+                                        f"Candidate contains a cleanroom reference artifact: {relative}"
+                                    )
+                                continue
+                        try:
+                            info = archive.gettarinfo(path, arcname=relative.as_posix())
+                        except PermissionError:
+                            if require_compile:
+                                raise
+                            continue
+                        if info is None:
+                            if require_compile:
+                                raise CandidateError(f"Candidate contains an unsupported filesystem entry: {relative}")
+                            continue
+                        if not require_compile and info.isfile():
+                            if partial_bytes + info.size > MAX_PARTIAL_ARCHIVE_BYTES:
+                                continue
+                            partial_bytes += info.size
                         info.uid = 0
                         info.gid = 0
                         info.uname = ""
@@ -79,8 +113,12 @@ def package_workspace(
                         # ZIP-based build tools reject the Unix epoch; 1980 is deterministic and portable.
                         info.mtime = PORTABLE_ARCHIVE_MTIME
                         if path.is_file() and not path.is_symlink():
-                            with path.open("rb") as source:
-                                archive.addfile(info, source)
+                            try:
+                                with path.open("rb") as source:
+                                    archive.addfile(info, source)
+                            except PermissionError:
+                                if require_compile:
+                                    raise
                         else:
                             archive.addfile(info)
         temporary.replace(output)
@@ -143,6 +181,54 @@ def preflight_candidate(
         return PreflightResult(executable_hash=result.split()[0], output="".join(output))
     finally:
         env.cleanup()
+
+
+def verify_archive_no_credentials(archive: Path, secrets: tuple[bytes, ...]) -> None:
+    if not secrets:
+        return
+    if not archive.is_file() or archive.is_symlink():
+        raise CandidateError("Candidate archive is not a regular file")
+    overlap = max(len(secret) for secret in secrets) - 1
+    try:
+        with tarfile.open(archive, "r:gz") as packaged:
+            for member in packaged:
+                path = PurePosixPath(member.name)
+                if path.is_absolute() or ".." in path.parts or any(secret in member.name.encode() for secret in secrets):
+                    raise CandidateCredentialError("Candidate archive contains a provider credential")
+                if member.issym() or member.islnk():
+                    if any(secret in member.linkname.encode() for secret in secrets):
+                        raise CandidateCredentialError("Candidate archive contains a provider credential")
+                    continue
+                if not member.isfile():
+                    continue
+                source = packaged.extractfile(member)
+                if source is None:
+                    raise CandidateError("Candidate archive member cannot be read")
+                pending = b""
+                while chunk := source.read(1024 * 1024):
+                    pending += chunk
+                    split = max(0, len(pending) - overlap)
+                    if any(secret in pending[: split + overlap] for secret in secrets):
+                        raise CandidateCredentialError("Candidate archive contains a provider credential")
+                    pending = pending[split:]
+                if any(secret in pending for secret in secrets):
+                    raise CandidateCredentialError("Candidate archive contains a provider credential")
+    except (tarfile.TarError, OSError) as error:
+        raise CandidateError("Candidate archive cannot be scanned") from error
+
+
+def _partial_paths(workspace: Path) -> list[Path]:
+    paths: list[Path] = []
+    for root, directories, files in os.walk(workspace, topdown=True, onerror=lambda _error: None, followlinks=False):
+        if len(Path(root).relative_to(workspace).parts) >= MAX_PARTIAL_ARCHIVE_DEPTH:
+            directories.clear()
+        directories.sort()
+        files.sort()
+        remaining = MAX_PARTIAL_ARCHIVE_FILES - len(paths)
+        if remaining <= 0:
+            break
+        paths.extend(Path(root) / name for name in (*directories, *files)[:remaining])
+    return paths
 
 
 def sha256(path: Path) -> str:
