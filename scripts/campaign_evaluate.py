@@ -1093,7 +1093,9 @@ def _prepare_evidence(
             and result.get("package_hash") is not None
             and result.get("package_hash") != _sha256(submission)
         ):
-            raise CampaignEvaluationError(f"terminal artifact conflict: {instance_id}/{arm}/submission.tar.gz")
+            if artifact_receipt is None:
+                raise CampaignEvaluationError(f"terminal artifact conflict: {instance_id}/{arm}/submission.tar.gz")
+            result_error = result_error or "candidate_artifact_differs_from_protocol_package"
         evidence[(instance_id, arm)] = {
             "state": state,
             "submission": submission,
@@ -1101,7 +1103,7 @@ def _prepare_evidence(
             "result": result,
             "result_error": result_error,
             "result_sha256": _sha256(result_path) if result_path.is_file() else None,
-            "expected_executable_hash": result.get("executable_hash"),
+            "expected_executable_hash": None if artifact_receipt is not None else result.get("executable_hash"),
         }
     return evidence
 

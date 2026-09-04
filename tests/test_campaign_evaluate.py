@@ -231,6 +231,53 @@ def test_evidence_accepts_nonterminal_protocol_with_sealed_candidate_artifact(tm
     assert evidence[("one", "procontract")]["submission_sha256"] == digest
 
 
+def test_candidate_artifact_identity_is_independent_from_failed_protocol_package(tmp_path: Path) -> None:
+    from scripts.campaign_evaluate import _prepare_evidence
+
+    root, _instances = _campaign(tmp_path / "campaign", arms=("procontract",))
+    job = root / "procontract/one"
+    submission = job / "submission.tar.gz"
+    submission.write_bytes(b"salvaged candidate")
+    digest = hashlib.sha256(submission.read_bytes()).hexdigest()
+    receipt = job / "candidate-artifact.json"
+    _write_json(
+        receipt,
+        {
+            "version": 1,
+            "status": "published",
+            "submission": "submission.tar.gz",
+            "sha256": digest,
+            "partial": True,
+            "reason": "delivery_failed",
+            "source_phase": "failed",
+            "source_exit_class": "delivery_failed",
+        },
+    )
+    state = json.loads(job.joinpath("state.json").read_text())
+    state["artifact_hashes"].update(
+        {
+            receipt.name: hashlib.sha256(receipt.read_bytes()).hexdigest(),
+            submission.name: digest,
+        }
+    )
+    _write_json(job / "state.json", state)
+    result = json.loads(job.joinpath("procontract-result.json").read_text())
+    result["package_hash"] = "f" * 64
+    result["executable_hash"] = "a" * 64
+    _write_json(job / "procontract-result.json", result)
+    state = json.loads(job.joinpath("state.json").read_text())
+    state["artifact_hashes"]["procontract-result.json"] = hashlib.sha256(
+        job.joinpath("procontract-result.json").read_bytes()
+    ).hexdigest()
+    _write_json(job / "state.json", state)
+
+    evidence = _prepare_evidence(root, (("one", "procontract"),))[("one", "procontract")]
+
+    assert evidence["submission_sha256"] == digest
+    assert evidence["result_error"] == "candidate_artifact_differs_from_protocol_package"
+    assert evidence["expected_executable_hash"] is None
+
+
 def test_validate_evaluation_rejects_top_level_error(tmp_path: Path) -> None:
     from scripts.campaign_evaluate import validate_evaluation
 
