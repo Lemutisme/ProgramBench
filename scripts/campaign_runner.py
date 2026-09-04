@@ -1655,12 +1655,12 @@ def _conserve_candidate_artifact(
                 raise CampaignError("candidate workspace could not be stopped for artifact publication")
             lease.release_handle()
         state = store.read()
-        _verify_no_credentials(
-            candidate_path,
-            tuple(name for name in _CREDENTIAL_ENV if os.environ.get(name)),
-            published_only=False,
-        )
         if not paths.submission.is_file() or paths.submission.is_symlink():
+            _verify_no_credentials(
+                candidate_path,
+                tuple(name for name in _CREDENTIAL_ENV if os.environ.get(name)),
+                published_only=False,
+            )
             archive = package_workspace(
                 candidate_path,
                 paths.root,
