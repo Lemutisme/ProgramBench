@@ -196,7 +196,16 @@ def validate_evaluation(
     actual = [test.full_name for test in filtered.test_results]
     reasons.extend(f"missing_expected:{name}" for name in sorted(expected - set(actual)))
     reasons.extend(f"unexpected_test:{name}" for name in sorted(set(actual) - expected))
-    reasons.extend(f"duplicate_test:{name}" for name in sorted({name for name in actual if actual.count(name) > 1}))
+    grouped = {
+        name: [test for test in filtered.test_results if test.full_name == name]
+        for name in set(actual)
+        if actual.count(name) > 1
+    }
+    reasons.extend(
+        f"duplicate_test:{name}"
+        for name, tests in sorted(grouped.items())
+        if len(tests) > 3 or any(test.status != "passed" for test in tests[:-1])
+    )
     if set(result.test_branches) != set(active) or len(result.test_branches) != len(active):
         reasons.append("active_branch_mismatch")
 

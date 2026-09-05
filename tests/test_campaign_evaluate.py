@@ -187,6 +187,39 @@ def test_validate_evaluation_uses_official_score_and_exact_ratio(tmp_path: Path)
     assert len(result.eval_sha256) == 64
 
 
+def test_validate_evaluation_accepts_pytest_rerun_history_and_uses_final_status(tmp_path: Path) -> None:
+    from scripts.campaign_evaluate import validate_evaluation
+
+    path = tmp_path / "one.eval.json"
+    _write_eval(path, statuses=("failure",))
+    raw = json.loads(path.read_text())
+    final = raw["test_results"][0]
+    raw["test_results"] = [{**final, "status": "passed"}, {**final, "status": "passed"}, final]
+    _write_json(path, raw)
+
+    result = validate_evaluation(path, _instance(tests=("t1",)))
+
+    assert result.valid
+    assert result.resolved == 0
+    assert result.total == 1
+
+
+def test_validate_evaluation_rejects_incompatible_duplicate_history(tmp_path: Path) -> None:
+    from scripts.campaign_evaluate import validate_evaluation
+
+    path = tmp_path / "one.eval.json"
+    _write_eval(path, statuses=("failure",))
+    raw = json.loads(path.read_text())
+    final = raw["test_results"][0]
+    raw["test_results"] = [final, {**final, "status": "passed"}]
+    _write_json(path, raw)
+
+    result = validate_evaluation(path, _instance(tests=("t1",)))
+
+    assert not result.valid
+    assert result.reasons == ("duplicate_test:b1/t1",)
+
+
 def test_evidence_accepts_nonterminal_protocol_with_sealed_candidate_artifact(tmp_path: Path) -> None:
     from scripts.campaign_evaluate import _prepare_evidence
 
