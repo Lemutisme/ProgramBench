@@ -4394,6 +4394,8 @@ def _materialize_subject(export: Path, subject: Path, job_root: Path, credential
             ):
                 raise ProContractDeliveryError("Contract export changed during subject freeze")
             _make_read_only(temporary)
+            if _semantic_inventory(temporary, excluded=DELIVERY_CONTROL_PATHS) != export_inventory:
+                raise ProContractDeliveryError("Materialized subject does not match the native export")
             os.replace(temporary, subject)
             _sync_directory(subject.parent)
         finally:

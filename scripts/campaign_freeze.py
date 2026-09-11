@@ -220,10 +220,10 @@ def _snapshot_candidate(source: Path, destination: Path) -> None:
     root_fd = _open_directory(source)
     frames: list[list[object]] = []
     try:
-        frames.append([root_fd, destination, True, ".", _scan_names(root_fd, deadline, count), 0])
+        frames.append([root_fd, destination, True, ".", _scan_names(root_fd, deadline, count), 0, None])
         root_fd = -1
         while frames:
-            descriptor, target, root, relative, names, index = frames[-1]
+            descriptor, target, root, relative, names, index, mode = frames[-1]
             if (
                 not isinstance(descriptor, int)
                 or not isinstance(target, Path)
@@ -232,6 +232,8 @@ def _snapshot_candidate(source: Path, destination: Path) -> None:
             ):
                 raise VanillaError("workspace snapshot traversal state is invalid")
             if index >= len(names):
+                if mode is not None:
+                    os.chmod(target, mode)
                 os.close(descriptor)
                 frames.pop()
                 continue
@@ -250,8 +252,12 @@ def _snapshot_candidate(source: Path, destination: Path) -> None:
                 continue
             if stat.S_ISDIR(status.st_mode):
                 child_fd, current = _open_verified(descriptor, name, status, directory=True)
-                child.mkdir(mode=stat.S_IMODE(current.st_mode))
-                frames.append([child_fd, child, False, child_relative, _scan_names(child_fd, deadline, count), 0])
+                # Populate privately, then restore exact source mode bottom-up.
+                # mkdir's mode alone is filtered by the controller's umask;
+                # restoring a read-only mode before copying children also fails.
+                child.mkdir(mode=0o700)
+                frames.append([child_fd, child, False, child_relative,
+                               _scan_names(child_fd, deadline, count), 0, stat.S_IMODE(current.st_mode)])
                 continue
             if not stat.S_ISREG(status.st_mode):
                 raise VanillaError("workspace contains an unsupported filesystem object")

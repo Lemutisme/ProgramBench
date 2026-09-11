@@ -1,4 +1,5 @@
 import stat
+import os
 import subprocess
 import tarfile
 from pathlib import Path
@@ -8,6 +9,7 @@ import pytest
 from programbench.candidate import PreflightInfrastructureError, package_workspace
 from scripts.campaign_freeze import _make_read_only, _snapshot_candidate, _remove_tree
 from scripts.campaign_materialize import build_view, semantic_inventory
+from scripts.campaign_procontract import _materialize_subject
 
 
 def setup(tmp_path):
@@ -57,3 +59,57 @@ def test_modified_source_is_not_substituted_for_frozen_evidence(tmp_path):
         assert list(tmp_path.glob('.build-view.*')) == []
     finally:
         _remove_tree(sealed)
+
+
+@pytest.mark.parametrize('mask', [0o022, 0o077])
+def test_snapshot_retains_nested_and_read_only_directory_modes_under_umask(tmp_path, mask):
+    source = tmp_path / 'source'
+    source.mkdir()
+    (source / 'src/nested').mkdir(parents=True)
+    (source / 'fixtures').mkdir()
+    (source / 'src/nested/file').write_text('source\n')
+    (source / 'fixtures/frozen').write_text('immutable\n')
+    (source / 'src').chmod(0o755)
+    (source / 'src/nested').chmod(0o711)
+    (source / 'fixtures/frozen').chmod(0o444)
+    (source / 'fixtures').chmod(0o500)
+    original = semantic_inventory(source)
+    sealed = tmp_path / 'sealed'
+    sealed.mkdir()
+    previous = os.umask(mask)
+    try:
+        _snapshot_candidate(source, sealed)
+        assert semantic_inventory(sealed) == original
+        _make_read_only(sealed)
+        frozen = semantic_inventory(sealed)
+        with build_view(source, sealed, tmp_path) as working:
+            assert semantic_inventory(working) == original
+            assert stat.S_IMODE((working / 'fixtures').stat().st_mode) == 0o500
+            assert (working / 'fixtures/frozen').read_text() == 'immutable\n'
+        assert semantic_inventory(source) == original
+        assert semantic_inventory(sealed) == frozen
+    finally:
+        os.umask(previous)
+        _remove_tree(sealed)
+        _remove_tree(source)
+
+
+def test_native_subject_and_build_copy_match_under_private_controller_umask(tmp_path):
+    source = tmp_path / 'export'
+    (source / 'nested').mkdir(parents=True)
+    (source / 'nested').chmod(0o755)
+    (source / 'nested/source.txt').write_text('preserve me')
+    original = semantic_inventory(source)
+    subject = tmp_path / 'subject'
+    previous = os.umask(0o077)
+    try:
+        _materialize_subject(source, subject, tmp_path, ())
+        with build_view(source, subject, tmp_path) as working:
+            assert semantic_inventory(working) == original
+        _materialize_subject(source, subject, tmp_path, ())
+        assert semantic_inventory(source) == original
+        assert semantic_inventory(source, read_only=True) == semantic_inventory(subject)
+    finally:
+        os.umask(previous)
+        if subject.exists():
+            _remove_tree(subject)

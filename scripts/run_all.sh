@@ -236,18 +236,19 @@ write_artifact_manifest() {
   local temporary="$OUTPUT/.ARTIFACTS.sha256.$$.tmp"
   (
     cd "$OUTPUT"
-    find . -type f \
+    find . \( \
+        -path './procontract/*/workspace-state' \
+        -o -path './procontract/*/candidates' \
+        -o -path './procontract/*/.binary' \
+        -o -path './vanilla/*/workspace-state' \
+        -o -path './vanilla/*/candidates' \
+        -o -path './vanilla/*/.binary' \
+      \) -prune -o -type f \
       ! -path './.run-all.lock' \
       ! -path './ARTIFACTS.sha256' \
       ! -path './RUN_ALL_SUMMARY.json' \
       ! -path './RUN_ALL_SUMMARY.sha256' \
       ! -path './logs/run-all.log' \
-      ! -path './procontract/*/workspace-state/*' \
-      ! -path './procontract/*/candidates/*' \
-      ! -path './procontract/*/.binary/*' \
-      ! -path './vanilla/*/workspace-state/*' \
-      ! -path './vanilla/*/candidates/*' \
-      ! -path './vanilla/*/.binary/*' \
       ! -name '.ARTIFACTS.sha256.*.tmp' \
       -print0 \
       | sort -z \

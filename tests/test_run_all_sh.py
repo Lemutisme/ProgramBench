@@ -240,6 +240,33 @@ def test_run_all_forwards_instance_filter_to_every_runner_phase(tmp_path: Path) 
     assert all("--filter ^(owner__task)" in line for line in runner)
 
 
+def test_run_all_prunes_private_runtime_trees_before_hashing(tmp_path: Path) -> None:
+    output, commands, env = fake_runner_env(tmp_path)
+    private = []
+    for arm in ('procontract', 'vanilla'):
+        for name in ('workspace-state', 'candidates', '.binary'):
+            path = output / arm / 'owner__task.0000000' / name
+            path.mkdir(parents=True)
+            (path / 'private').write_text('must-not-be-indexed')
+            path.chmod(0o000)
+            private.append(path)
+    visible = output / 'procontract/owner__task.0000000/retained.json'
+    visible.write_text('{}')
+    try:
+        result = subprocess.run(['bash', str(SCRIPT), '--output', str(output)], cwd=ROOT,
+                                capture_output=True, text=True, env=env)
+        assert result.returncode == 0, result.stdout + result.stderr
+        hashes = (output / 'ARTIFACTS.sha256').read_text()
+        assert 'retained.json' in hashes
+        assert all(name not in hashes for name in ('workspace-state/', 'candidates/', '.binary/'))
+        assert 'Permission denied' not in result.stdout + result.stderr
+        assert json.loads((output / 'RUN_ALL_SUMMARY.json').read_text())['status'] == 'completed'
+        assert all(path.stat().st_mode & 0o777 == 0 for path in private)
+    finally:
+        for path in private:
+            path.chmod(0o700)
+
+
 def test_run_all_preserves_failure_summary_and_returns_nonzero(tmp_path: Path) -> None:
     output, commands, env = fake_runner_env(tmp_path)
     env["RUN_ALL_TEST_FAIL_INFERENCE"] = "1"
