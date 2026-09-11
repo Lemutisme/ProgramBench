@@ -133,7 +133,7 @@ _LIMIT_KEYS = frozenset(
     {"wall_time_seconds", "provider_turns", "procontract_actions", "total_cost_soft", "total_cost_hard"}
 )
 _CACHE_KEYS = frozenset({"warmup_turns", "minimum_read_ratio", "stop_after_consecutive_failures"})
-_ARM_KEYS = frozenset({"repo", "revision", "mode", "binary", "execution_policy"})
+_ARM_KEYS = frozenset({"repo", "revision", "mode", "binary", "execution_policy", "runtime_protocol"})
 
 
 @dataclass(frozen=True)
@@ -414,6 +414,13 @@ def _load_arms(raw: object, config_dir: Path) -> tuple[ArmConfig, ArmConfig]:
         execution_policy = value.get("execution_policy", "behavioral")
         if execution_policy not in {"behavioral", "none", "adaptive"}:
             raise ConfigError(f"arm {name} execution_policy must be behavioral, none, or adaptive")
+        runtime_protocol = value.get("runtime_protocol")
+        if runtime_protocol is not None and (
+            name != "procontract"
+            or not isinstance(runtime_protocol, str)
+            or runtime_protocol not in {"current", "semantic-v0", "policy-split-v1"}
+        ):
+            raise ConfigError("runtime_protocol must identify a supported ProContract wire protocol")
         result.append(
             ArmConfig(
                 name=name,
@@ -422,6 +429,7 @@ def _load_arms(raw: object, config_dir: Path) -> tuple[ArmConfig, ArmConfig]:
                 mode=mode,
                 binary=_path_value(value, "binary", config_dir) if binary is not None else None,
                 execution_policy=execution_policy,
+                runtime_protocol=runtime_protocol,
             )
         )
     return result[0], result[1]
@@ -505,6 +513,7 @@ def _canonical_config(config: CampaignConfig) -> dict[str, object]:
                 "mode": arm.mode,
                 "binary": str(arm.binary.resolve()) if arm.binary else None,
                 **({"execution_policy": arm.execution_policy} if arm.execution_policy != "behavioral" else {}),
+                **({"runtime_protocol": arm.runtime_protocol} if arm.runtime_protocol is not None else {}),
             }
             for arm in config.arms
         },

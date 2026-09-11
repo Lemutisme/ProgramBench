@@ -195,16 +195,26 @@ def _acceptance_policy(protocol: ProContractProtocol) -> str:
     raise ProContractError("unknown ProContract protocol")
 
 
-def protocol_for_revision(revision: str, execution_policy: str = "behavioral") -> ProContractProtocol:
+def protocol_for_revision(
+    revision: str, execution_policy: str = "behavioral", *, runtime_protocol: str | None = None
+) -> ProContractProtocol:
     if execution_policy not in {"behavioral", "none", "adaptive"}:
         raise ProContractError("unknown execution policy")
+    if runtime_protocol not in {None, "current", "semantic-v0", "policy-split-v1"}:
+        raise ProContractError("unknown runtime protocol")
+    # Explicit campaign identity is stable across new source commits. Retain
+    # historical inference only for old configs that predate this field.
+    runtime = runtime_protocol or (
+        "semantic-v0" if revision == SEMANTIC_ATTEMPTS_REVISION
+        else "policy-split-v1" if revision in POLICY_SPLIT_REVISIONS else "current"
+    )
     if execution_policy == "adaptive":
-        if revision not in POLICY_SPLIT_REVISIONS:
+        if runtime != "policy-split-v1":
             raise ProContractError("adaptive execution policy requires a policy-split runtime")
         return "policy-split-adaptive-v1"
-    if revision == SEMANTIC_ATTEMPTS_REVISION:
+    if runtime == "semantic-v0":
         return "semantic-v0"
-    if revision in POLICY_SPLIT_REVISIONS:
+    if runtime == "policy-split-v1":
         return "policy-split-none-v1" if execution_policy == "none" else "policy-split-v1"
     return "current"
 
@@ -3387,6 +3397,13 @@ def _expected_spec(payload: Mapping[str, object]) -> dict[str, object]:
     budget = payload.get("budget")
     if not isinstance(budget, Mapping):
         raise ProContractError("frozen Contract budget is invalid")
+    authority = payload.get("authority")
+    if (
+        not isinstance(authority, list)
+        or any(not isinstance(item, str) or not item for item in authority)
+        or len(set(authority)) != len(authority)
+    ):
+        raise ProContractError("frozen Contract authority is invalid")
     return _ordered_spec(
         {
             "trigger": {"type": "immediate"},
@@ -3394,7 +3411,7 @@ def _expected_spec(payload: Mapping[str, object]) -> dict[str, object]:
             **({"policy": payload["policy"]} if "policy" in payload else {}),
             "brief": payload["brief"],
             "requires": [],
-            "authority": ["filesystem.read", "filesystem.write", "process.execute"],
+            "authority": list(authority),
             "budget": {
                 "turns": budget.get("turns"),
                 "actions": budget.get("actions"),

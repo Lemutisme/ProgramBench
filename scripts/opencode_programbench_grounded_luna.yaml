@@ -19,6 +19,7 @@ arms:
     revision: 17356a1a44a07e21a4ff096af42300ec6848123a
     mode: procontract
     execution_policy: behavioral
+    runtime_protocol: policy-split-v1
     binary: /home/duozhou/opencode-grounded-evidence/packages/opencode/dist/opencode-linux-x64/bin/opencode
   vanilla:
     repo: /home/duozhou/opencode-grounded-evidence

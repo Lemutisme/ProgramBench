@@ -49,12 +49,17 @@ def main():
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--model-probe',action='store_true')
     parser.add_argument('--permission-probe',action='store_true')
+    parser.add_argument('--contract-probe',action='store_true')
     parser.add_argument('--tool-probe',action='store_true')
     parser.add_argument('--baseline',action='store_true')
     parser.add_argument('--workflow-probe',action='store_true')
     parser.add_argument('--config',type=Path,default=Path(__file__).with_name('opencode_programbench_pipeline_luna.yaml'))
     parser.add_argument('--restart-checks',type=int,default=0)
     args=parser.parse_args()
+    if args.contract_probe and (args.baseline or args.model_probe or args.tool_probe
+            or os.environ.get('OPENAI_API_KEY') != 'no-model-admission-check'
+            or os.environ.get('OPENAI_BASE_URL') != 'http://127.0.0.1:9/v1'):
+        parser.error('--contract-probe requires dummy credentials and unreachable loopback upstream, without model probes')
     os.umask(0o077)
     os.environ['OPENCODE_SERVER_PASSWORD']=secrets.token_hex(32)
     config=load_config(args.config)
@@ -91,6 +96,26 @@ def main():
                 workspace.stop()
                 workspace=workspace.restart()
                 print(json.dumps({'restart':restart+1,'status':'healthy','reference_restored':True}),flush=True)
+            if args.contract_probe:
+                from scripts.campaign_offline import DockerHttpClient
+                from scripts.campaign_procontract import (
+                    HttpProContractApi, _validate_issue_response, build_issue_payload, protocol_for_revision,
+                )
+                selected=next(item for item in config.arms if item.name=='procontract')
+                protocol=protocol_for_revision(install.revision, selected.execution_policy,
+                                               runtime_protocol=selected.runtime_protocol)
+                payload=build_issue_payload(workspace,now=time.time(),model=config.model,
+                                            variant=config.variant,protocol=protocol)
+                api=HttpProContractApi(workspace.base_url,expected_port=workspace.port,
+                                       http_client=DockerHttpClient(workspace.container_id))
+                response=_validate_issue_response(api.issue(payload),payload)
+                admitted={'protocol':protocol,'contract_id':response['data']['id'],
+                          'spec_hash':response['data']['specHash'],'authority':response['data']['spec']['authority'],
+                          'execution_policy_matches':response['execution'].get('executionPolicy')==payload.get('executionPolicy'),
+                          'real_provider_calls_enabled':False}
+                assert admitted['execution_policy_matches']
+                (args.output/'CONTRACT_CHECK.json').write_text(json.dumps(admitted,indent=2)+'\n')
+                print(json.dumps({'contract_probe':'passed',**admitted}),flush=True)
             if args.workflow_probe:
                 from scripts.campaign_workflow import check_and_continue
                 setup="from pathlib import Path; p=Path('/candidate'); (p/'compile.sh').write_text('#!/bin/sh\\nexit 7\\n'); (p/'compile.sh').chmod(0o755); (p/'validate.sh').write_text('#!/bin/sh\\nexit 0\\n'); (p/'validate.sh').chmod(0o755)"

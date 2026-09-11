@@ -737,6 +737,7 @@ def run_job(
                             paths.root / "procontract-observations.json",
                             plan.config.observations.get(candidate.instance_id, []),
                         )
+                        selected_arm = next(arm for arm in plan.config.arms if arm.name == candidate.arm)
                         result = procontract_runner(
                             job_lease,
                             store,
@@ -749,7 +750,8 @@ def run_job(
                             stop_token=stop,
                             protocol=protocol_for_revision(
                                 getattr(install, "revision", ""),
-                                next(arm.execution_policy for arm in plan.config.arms if arm.name == candidate.arm),
+                                selected_arm.execution_policy,
+                                runtime_protocol=selected_arm.runtime_protocol,
                             ),
                         )
                     state = store.read_optional()

@@ -1465,6 +1465,36 @@ def test_durable_policy_split_runtime_keeps_behavioral_policy_outside_spec() -> 
     assert protocol_for_revision("c6c4a4c3ab154cbd5a3cbe70f25a8bbe4739f72b", "behavioral") == "policy-split-v1"
 
 
+@pytest.mark.parametrize("policy,expected", [
+    ("behavioral", "policy-split-v1"), ("none", "policy-split-none-v1"), ("adaptive", "policy-split-adaptive-v1")
+])
+def test_new_runtime_commit_uses_explicit_protocol_without_a_revision_allowlist(policy, expected):
+    from scripts.campaign_procontract import protocol_for_revision
+    assert protocol_for_revision("a" * 40, policy, runtime_protocol="policy-split-v1") == expected
+
+
+def test_reference_authority_survives_canonical_issue_and_contract_validation(tmp_path: Path):
+    from scripts.campaign_procontract import (
+        _expected_spec, _hash_json, _ordered_issue_payload, _validate_contract, build_issue_payload,
+        ProContractConflictError,
+    )
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    _, workspace = _workspace(tmp_path, paths)
+    workspace.manifest.environment_names = ("OPENCODE_REFERENCE_BINDING",)
+    payload = build_issue_payload(workspace, now=100.0, protocol="policy-split-v1")
+    expected = _expected_spec(payload)
+    assert expected["authority"] == payload["authority"]
+    assert expected["authority"][-1] == "reference.run"
+    assert _ordered_issue_payload(payload)["authority"] == payload["authority"]
+    actual = _contract(payload)
+    actual["spec"] = {**actual["spec"], "authority": payload["authority"]}
+    actual["specHash"] = _hash_json(actual["spec"])
+    assert _validate_contract(actual, payload)["spec"]["authority"] == payload["authority"]
+    with pytest.raises(ProContractConflictError):
+        _validate_contract(actual, {**payload, "authority": payload["authority"][:-1]})
+
+
 @pytest.mark.parametrize("revision", ["unknown", "ed8bd2b7992485264335a541b40c1c03a4b35619"])
 def test_adaptive_policy_requires_a_policy_split_runtime(revision: str) -> None:
     from scripts.campaign_procontract import ProContractError, protocol_for_revision

@@ -1,7 +1,7 @@
 # Grounded-evidence runner provenance
 
-Status: opt-in implementation candidate, 2026-09-11. No new model experiment has
-been started by this change.
+Status: opt-in implementation candidate, 2026-09-11. Pilot admission failures
+are documented below; no performance improvement has been established.
 
 ## Baselines
 
@@ -85,6 +85,9 @@ The Core regression and design/trust limits are documented in
 `/home/duozhou/opencode-grounded-evidence/specs/pro-contract-grounded-evidence.md`.
 
 Use `scripts/opencode_programbench_grounded_luna.yaml` only with the new binary.
+Its `arms.procontract.runtime_protocol: policy-split-v1` explicitly freezes the
+wire protocol; new OpenCode commits must not rely on the historical commit
+allowlist to infer whether Policy belongs outside Spec.
 Before any model pilot, verify its frozen OpenCode revision and binary hash and
 use a fresh output root. A no-model check is:
 
@@ -113,6 +116,33 @@ Reference permissions remained `0111`. The first `v1` check exposed the
 execute-only hashing issue; its artifacts are retained rather than overwritten.
 The checked Linux x64 binary SHA-256 is
 `1496785f285a01eb942e5f903a0e837a713e4324c60faed9c438337d52c7dd7b`.
+
+## Pilot-discovered admission gaps
+
+The first requested three-task pilot exposed additional admission gaps.
+Experiment-local harness binary copies need mode `0555`, not
+`0500`, because task images can use a different agent UID. This does not change
+the reference's `0111` mode.
+
+The next launch exposed two runner bugs: unknown source commits fell back to a
+legacy Policy-in-Spec protocol, and `_expected_spec` reconstructed a fixed
+three-capability authority, discarding the issued `reference.run` capability.
+The new profile explicitly freezes its runtime protocol, and canonical issue
+hashing/response validation retain the exact issued authority. These fixes do
+not change the OpenCode binary, task budgets, or automatically admit new cases.
+Failed roots `grounded-luna-pilot3-20260911-v1` and `v2` are retained. V1 had zero
+provider requests. V2's fx and hush each sent one request that returned HTTP 200
+before transport interruption; neither has a retained usage receipt. Their cost
+is unknown, not zero, despite the runner's zero accounting before admission.
+
+`check_offline_workspace --contract-probe` now validates real compiled-server
+issue/response reconciliation as well as startup. It refuses real provider
+credentials/upstreams: use the dummy/loopback environment in the command above.
+The probe passed in `/home/duozhou/run-artifacts/grounded-contract-admission-20260911-v1`,
+including the complete authority and external execution policy. This closes the
+specific gap left by helper tests and a health-only admission smoke check.
+The post-fix runner regression passed 653 tests; JUnit is retained at
+`/home/duozhou/run-artifacts/grounded-protocol-tests-20260911.xml`.
 
 After successful admission, explicitly authorize a small pilot before any new
 full cohort. Preserve all artifacts and evaluate every selected task, including

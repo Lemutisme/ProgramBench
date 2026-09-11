@@ -162,6 +162,26 @@ def test_load_config_freezes_policy_ablation_outside_binary_identity(tmp_path: P
     assert json.loads(manifest.read_text())["arms"]["procontract"]["execution_policy"] == policy
 
 
+def test_load_config_freezes_explicit_runtime_protocol(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    path = tmp_path / "campaign.yaml"
+    path.write_text(campaign_yaml(repo).replace(
+        "    mode: procontract\n", "    mode: procontract\n    runtime_protocol: policy-split-v1\n"
+    ))
+    config = load_config(path)
+    assert config.arms[0].runtime_protocol == "policy-split-v1"
+    manifest = tmp_path / "campaign.json"
+    freeze_campaign_config(config, manifest)
+    assert json.loads(manifest.read_text())["arms"]["procontract"]["runtime_protocol"] == "policy-split-v1"
+    path.write_text(path.read_text().replace("runtime_protocol: policy-split-v1", "runtime_protocol: current"))
+    with pytest.raises(ConfigError, match="conflicts"):
+        freeze_campaign_config(load_config(path), manifest)
+    path.write_text(path.read_text().replace("runtime_protocol: current", "runtime_protocol: typo"))
+    with pytest.raises(ConfigError, match="runtime_protocol"):
+        load_config(path)
+
+
 def test_load_config_allows_cost_caps_to_be_disabled(tmp_path: Path):
     repo = tmp_path / "repo"
     repo.mkdir()
