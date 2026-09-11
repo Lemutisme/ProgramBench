@@ -88,8 +88,8 @@ def main() -> int:
     parser.add_argument("--campaign", type=Path, required=True)
     parser.add_argument("--workers", type=int, default=8)
     args = parser.parse_args()
-    if not 1 <= args.workers <= 8:
-        parser.error("--workers must be between 1 and 8")
+    if not 1 <= args.workers <= 32:
+        parser.error("--workers must be between 1 and 32")
     root = args.campaign.resolve()
     manifest_path = root / "campaign.json"
     manifest = json.loads(manifest_path.read_text())

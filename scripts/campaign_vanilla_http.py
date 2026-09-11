@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import math
+import os
 from dataclasses import dataclass
 from typing import Literal, Mapping, Protocol
 from urllib.error import HTTPError, URLError
@@ -14,7 +16,19 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 ORIGINAL_TASK = (
     "Implement the documented program in this cleanroom. Produce source, a relocatable compile.sh, and "
-    "./executable. Use the reference only for black-box experiments."
+    "./executable. Use the provided reference only for black-box experiments. "
+    "The reference entrypoints are /candidate/reference and /workspace/executable; "
+    "the candidate you build is /candidate/executable. These are different programs. "
+    "The reference symlink may be omitted by file-listing or Git tools; omission is not absence. "
+    "Internet access is forbidden during inference and is disabled. Do not obtain upstream source, "
+    "alternate reference binaries, or additional dependencies from outside this cleanroom. "
+    "Use only the supplied documentation, permitted black-box reference behavior, preinstalled tools/libraries, "
+    "and code you implement here. Do not read or decompile the reference binary."
+    " Also deliver an executable, self-contained validate.sh of regression cases derived from permitted "
+    "reference observations. Cover applicable commands, flags, errors, boundaries and state transitions. "
+    "Use batched differential probes and preserve discoveries as regression tests. A passing build alone "
+    "is not a reason to stop behavioral implementation. All work and local validation finish in this Session; "
+    "the host evaluates the final artifact later without feeding hidden tests back into your search."
 )
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 
@@ -59,8 +73,8 @@ class VanillaPromptRequest:
             or not self.message_id.startswith("msg_")
             or self.text != ORIGINAL_TASK
             or self.delivery != "steer"
-            or self.model != "openai/gpt-5.6-luna"
-            or self.variant != "max"
+            or self.model not in {"openai/gpt-5.6-luna", "openai/gpt-5.6-sol"}
+            or self.variant != ("xhigh" if self.model == "openai/gpt-5.6-sol" else "max")
             or self.directory != "/candidate"
             or self.agent is not None
             or self.files
@@ -299,6 +313,10 @@ class HttpOpenCodeApi:
     def interrupt(self, session_id: str) -> None:
         self._request("POST", f"/api/session/{_id(session_id, 'ses_')}/interrupt", expected=(204,))
 
+    def feedback(self, session_id: str, message_id: str, text: str) -> None:
+        self._request("POST", f"/api/session/{_id(session_id, 'ses_')}/prompt",
+                      {"id": _id(message_id, "msg_"), "prompt": {"text": text}, "delivery": "steer", "resume": True})
+
     def _request(
         self,
         method: str,
@@ -314,7 +332,10 @@ class HttpOpenCodeApi:
             method,
             self.base_url + path,
             body=body,
-            headers={"Accept": "application/json", **({"Content-Type": "application/json"} if body else {})},
+            headers={"Accept": "application/json", **({"Content-Type": "application/json"} if body else {}),
+                     **({"Authorization": "Basic " + base64.b64encode(
+                         (os.environ.get("OPENCODE_SERVER_USERNAME", "opencode") + ":" + os.environ["OPENCODE_SERVER_PASSWORD"]).encode()).decode()}
+                        if os.environ.get("OPENCODE_SERVER_PASSWORD") else {})},
             timeout=self.request_timeout,
             max_bytes=self.max_response_bytes,
         )

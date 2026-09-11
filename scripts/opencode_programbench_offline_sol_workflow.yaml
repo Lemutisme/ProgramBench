@@ -1,0 +1,26 @@
+model: openai/gpt-5.6-sol
+variant: xhigh
+limits:
+  wall_time_seconds: 21600
+  provider_turns: 1000
+  procontract_actions: 1000000 # nonbinding safety sentinel; effective budgets are 6h / 1000 model calls
+  total_cost_soft: null
+  total_cost_hard: null
+cache:
+  warmup_turns: 10
+  minimum_read_ratio: 0.0 # record cache behavior; do not censor runs for low cache hit rate
+  stop_after_consecutive_failures: 2
+arms:
+  procontract:
+    repo: /home/duozhou/opencode-offline-inference
+    revision: 97d61022abdc33397ee97447c7bbc6f571574e1e
+    mode: procontract
+    execution_policy: behavioral
+    binary: /home/duozhou/run-artifacts/offline-inference-sol-20260909-v1/build-v3/opencode
+  vanilla:
+    repo: /home/duozhou/opencode-offline-inference
+    revision: 97d61022abdc33397ee97447c7bbc6f571574e1e
+    mode: vanilla
+    binary: /home/duozhou/run-artifacts/offline-inference-sol-20260909-v1/build-v3/opencode
+excluded: []
+vanilla_workflow: true

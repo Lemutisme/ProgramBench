@@ -16,12 +16,9 @@ from scripts.campaign_state import JobLease, JobPaths, JobState, RecoverableJobE
 from scripts.campaign_usage import CircuitBreaker
 from scripts.campaign_workspace import WorkspaceError, WorkspaceLease
 from scripts.run_opencode import Limits
+from scripts.campaign_vanilla_http import ORIGINAL_TASK
 
 
-ORIGINAL_TASK = (
-    "Implement the documented program in this cleanroom. Produce source, a relocatable compile.sh, and "
-    "./executable. Use the reference only for black-box experiments."
-)
 DEFAULT_SUBJECT_HASH = "0e196dc2e28408ae39f4bf52e8d94577a75595bd"
 
 
@@ -187,8 +184,10 @@ class PartialExportDropApi(FakeApi):
 
 
 class MissingExportDropApi(FakeApi):
+    failure = "export command failed before materialization"
+
     def export(self, workspace: object, contract_id: str, destination: Path) -> dict[str, object]:
-        raise WorkspaceError("export command failed before materialization")
+        raise WorkspaceError(self.failure)
 
 
 class IgnoredExportDropApi(ExactExportDropApi):
@@ -930,6 +929,92 @@ def test_issue_brief_keeps_external_scoring_outside_the_session_obligation(tmp_p
     assert "not a reason to revise" in brief
 
 
+@pytest.mark.parametrize("protocol", ["current", "policy-split-v1", "policy-split-none-v1", "policy-split-adaptive-v1"])
+def test_empty_observations_preserve_native_delivery_policy(tmp_path: Path, protocol: str) -> None:
+    from scripts.campaign_procontract import (
+        PRINCIPAL_CLAIM,
+        REPLAY_POLICY,
+        _hash_json,
+        _replay_policy_hash,
+        build_issue_payload,
+    )
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    _, workspace = _workspace(tmp_path, paths)
+    payload = build_issue_payload(workspace, now=100.0, protocol=protocol)
+    assert payload == build_issue_payload(workspace, now=100.0, protocol=protocol, observations=[])
+    assert payload["evidence"] == {"type": "principal", "claim": PRINCIPAL_CLAIM, "replay": REPLAY_POLICY}
+    assert _replay_policy_hash(json.loads(json.dumps(payload, sort_keys=True))) == _hash_json(REPLAY_POLICY)
+    assert "issuer has also frozen" not in payload["brief"]
+
+
+def test_native_replay_requires_compile_to_recreate_the_derived_executable() -> None:
+    from scripts.campaign_procontract import REPLAY_POLICY
+
+    compile_check = REPLAY_POLICY["checks"][0]
+
+    assert compile_check["argv"][-3:] == ["/bin/sh", "-c", "rm -f ./executable && ./compile.sh"]
+    assert REPLAY_POLICY["checks"][1]["argv"] == ["./validate.sh"]
+
+
+@pytest.mark.parametrize("protocol", ["current", "policy-split-v1", "policy-split-none-v1", "policy-split-adaptive-v1"])
+def test_issuer_observations_bind_issue_replay_and_recovery(tmp_path: Path, protocol: str) -> None:
+    from scripts.campaign_observations import admit_observations
+    from scripts.campaign_procontract import (
+        ProContractConflictError,
+        ProContractDeliveryError,
+        REPLAY_POLICY,
+        _hash_json,
+        _load_or_create_issue,
+        _validate_contract,
+        _verification,
+    )
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    _, workspace = _workspace(tmp_path, paths)
+    observations = [{"id": "normal", "args": [], "stdin": "", "stdout": "correct\n", "stderr": "", "exit": 0}]
+    evidence_path = paths.root / "procontract-observations.json"
+    admit_observations(evidence_path, observations)
+    issue_path = paths.root / "procontract-issue.json"
+    issue = _load_or_create_issue(issue_path, workspace, "openai/gpt-5.6-luna", "max", lambda: 100.0, protocol)
+    payload = issue["payload"]
+    assert len(payload["evidence"]["replay"]["checks"]) == 3
+    assert payload["evidence"]["replay"]["checks"][:2] == REPLAY_POLICY["checks"]
+    assert "issuer-frozen finite CLI observations" in payload["evidence"]["claim"]
+    assert "outside validate.sh" in payload["brief"]
+    assert issue["replayPolicyHash"] != _hash_json(REPLAY_POLICY)
+    contract = _contract(payload)
+    assert _verification(contract, payload)[1]["policyHash"] == issue["replayPolicyHash"]
+    sorted_payload = json.loads(json.dumps(payload, sort_keys=True))
+    _validate_contract(json.loads(json.dumps(contract, sort_keys=True)), sorted_payload)
+    assert _verification(contract, sorted_payload)[1]["policyHash"] == issue["replayPolicyHash"]
+    assert _load_or_create_issue(issue_path, workspace, "openai/gpt-5.6-luna", "max", lambda: 200.0, protocol) == issue
+    weakened = copy.deepcopy(contract)
+    weakened["handoff"]["replay"]["policyHash"] = _hash_json(REPLAY_POLICY)
+    with pytest.raises(ProContractDeliveryError, match="frozen policy"):
+        _verification(weakened, payload)
+    evidence_path.unlink()
+    with pytest.raises(ProContractConflictError, match="conflicts"):
+        _load_or_create_issue(issue_path, workspace, "openai/gpt-5.6-luna", "max", lambda: 200.0, protocol)
+
+
+def test_legacy_protocol_cannot_silently_drop_issuer_observations(tmp_path: Path) -> None:
+    from scripts.campaign_procontract import ProContractError, build_issue_payload
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    _, workspace = _workspace(tmp_path, paths)
+    with pytest.raises(ProContractError, match="native replay"):
+        build_issue_payload(
+            workspace,
+            now=100.0,
+            protocol="semantic-v0",
+            observations=[{"id": "normal", "args": [], "stdin": "", "stdout": "ok", "stderr": "", "exit": 0}],
+        )
+
+
 @pytest.mark.parametrize(
     ("model", "variant", "expected"),
     [
@@ -1045,6 +1130,8 @@ def test_execution_successor_accepts_only_monotonic_recovery_bindings(tmp_path: 
 
     assert _execution_successor(previous, previous)
     assert _execution_successor(previous, {**previous, "turnsUsed": 2, "actionsUsed": 3})
+    assert _execution_successor(previous, {**previous, "promptID": "msg_continuation"})
+    assert _execution_successor(previous, {**previous, "sessionID": "ses_recovered", "promptID": "msg_recovered"})
     assert _execution_successor(
         previous,
         {
@@ -1059,7 +1146,205 @@ def test_execution_successor_accepts_only_monotonic_recovery_bindings(tmp_path: 
     assert not _execution_successor(previous, {**previous, "turnsUsed": 0})
     assert not _execution_successor(previous, {**previous, "actionsUsed": 1})
     assert not _execution_successor(previous, {**previous, "revision": 2})
-    assert not _execution_successor(previous, {**previous, "sessionID": "ses_contract_retry"})
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"contractID": "pct_other"},
+        {"revision": 2},
+        {"location": {"directory": "/other"}},
+        {"model": {"providerID": "openai", "id": "gpt-5.6-sol", "variant": "xhigh"}},
+        {"executionPolicy": "different-policy"},
+        {"attempts": 0},
+        {"turnsUsed": 0},
+        {"actionsUsed": 1},
+    ],
+)
+def test_same_attempt_continuation_preserves_authority_and_shared_counters(
+    tmp_path: Path, change: dict[str, object]
+) -> None:
+    from scripts.campaign_procontract import _execution_successor, build_issue_payload
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    _, workspace = _workspace(tmp_path, paths)
+    previous = _execution(build_issue_payload(workspace, now=100.0))
+
+    assert not _execution_successor(previous, {**previous, "promptID": "msg_continuation", **change})
+
+
+@pytest.mark.parametrize(
+    "replace_session,recover",
+    [
+        (False, "none"),
+        (False, "progress"),
+        (False, "preflight"),
+        (False, "legacy-preflight"),
+        (True, "none"),
+        (True, "progress"),
+        (True, "preflight"),
+    ],
+)
+def test_same_attempt_continuation_reaches_independent_settlement(
+    tmp_path: Path, recover: str, replace_session: bool
+) -> None:
+    from decimal import Decimal
+
+    from scripts.campaign_procontract import build_issue_payload, run_procontract
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    _state(paths)
+    _, workspace = _workspace(tmp_path, paths)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock())
+
+    class ContinuingApi(FakeApi):
+        def __init__(self) -> None:
+            super().__init__(_contract(payload, status="active"), _execution(payload))
+            self.polls = 0
+            self.transcripts: dict[str, list[dict[str, object]]] = {}
+
+        def get_contract(self, contract_id: str) -> dict[str, object] | None:
+            if self.contract["status"] == "discharged":
+                return self.contract
+            self.polls += 1
+            if self.polls <= 3:
+                self.execution = {
+                    **self.execution,
+                    "sessionID": f"ses_continuation_{self.polls}" if replace_session else "ses_contract",
+                    "promptID": f"msg_continuation_{self.polls}",
+                    "turnsUsed": self.polls + 1,
+                    "actionsUsed": self.polls + 2,
+                }
+                message = _settlement_messages(terminal=True)["data"][0]
+                message["id"] = f"msg_provider_{self.polls}"
+                message["content"][0]["id"] = f"call_provider_{self.polls}"
+                message["content"][0]["name"] = "bash"
+                self.transcripts.setdefault(str(self.execution["sessionID"]), []).append(message)
+                return self.contract
+            self.contract = _contract(payload)
+            return self.contract
+
+        def messages(self, session_id: str) -> dict[str, object]:
+            return {"data": self.transcripts.get(session_id, [])}
+
+    api = ContinuingApi()
+    preflights = 0
+
+    def preflight(archive: Path, instance_id: str) -> SimpleNamespace:
+        nonlocal preflights
+        preflights += 1
+        if recover.endswith("preflight") and preflights == 1:
+            raise InjectedCrash("before preflight commit")
+        return SimpleNamespace(executable_hash="e" * 64, output="ok")
+
+    def invoke(store: StateStore):
+        with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+            workspace.lease._handle_active = True
+            return run_procontract(
+                job,
+                store,
+                workspace,
+                model="openai/gpt-5.6-luna",
+                variant="max",
+                limits=_limits(),
+                breaker=CircuitBreaker(),
+                api=api,
+                clock=clock,
+                sleeper=clock.sleep,
+                package=lambda subject, run_dir, iid: _package(run_dir, iid),
+                preflight=preflight,
+            )
+
+    if recover == "progress":
+        with pytest.raises(InjectedCrash):
+            invoke(CrashAfterStateCommitStore(paths.state))
+        api.execution = {
+            **api.execution,
+            "promptID": "msg_continuation_after_crash",
+            "sessionID": "ses_recovered" if replace_session else "ses_contract",
+        }
+    if recover.endswith("preflight"):
+        with pytest.raises(InjectedCrash):
+            invoke(StateStore(paths.state))
+    if recover == "legacy-preflight":
+        path = paths.root / "procontract-verification.json"
+        verification = json.loads(path.read_text())
+        verification["version"] = 1
+        verification.pop("sessionMessageCount")
+        path.write_text(json.dumps(verification))
+
+    result = invoke(StateStore(paths.state))
+
+    assert result.completion.value == "discharged"
+    assert result.session_id == ("ses_continuation_3" if replace_session else "ses_contract")
+    assert result.prompt_id == "msg_continuation_3"
+    assert result.provider_turns == 4
+    assert result.actions == 5
+    assert result.cost == Decimal("6")
+    assert result.input_tokens == 30
+    assert result.output_tokens == 9
+    assert result.reasoning_tokens == 3
+    assert result.cache_read == 12
+    assert result.cache_write == 6
+    progress = json.loads((paths.root / "procontract-progress.json").read_text())
+    assert [message["id"] for message in progress["current"]["messages"]["data"]] == [
+        "msg_provider_1",
+        "msg_provider_2",
+        "msg_provider_3",
+    ]
+    assert api.execution["attempts"] == 1
+    assert len(api.issues) == 1
+    assert len(api.attestations) == 1
+    assert api.interrupts == []
+
+
+def test_live_observer_rejects_attempt_regression_without_prompt_rotation(tmp_path: Path) -> None:
+    from scripts.campaign_procontract import ProContractConflictError, build_issue_payload, run_procontract
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    store = _state(paths)
+    _, workspace = _workspace(tmp_path, paths)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock())
+
+    class RegressingApi(FakeApi):
+        def __init__(self) -> None:
+            super().__init__(_contract(payload, status="active"), _execution(payload))
+            self.polls = 0
+
+        def get_contract(self, contract_id: str) -> dict[str, object] | None:
+            if self.contract["status"] == "discharged":
+                return self.contract
+            self.polls += 1
+            self.execution = {**self.execution, "attempts": 2 if self.polls == 1 else 1}
+            if self.polls > 2:
+                self.contract = _contract(payload)
+            return self.contract
+
+    api = RegressingApi()
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease._handle_active = True
+        with pytest.raises(ProContractConflictError, match="binding"):
+            run_procontract(
+                job,
+                store,
+                workspace,
+                model="openai/gpt-5.6-luna",
+                variant="max",
+                limits=_limits(),
+                breaker=CircuitBreaker(),
+                api=api,
+                clock=clock,
+                sleeper=clock.sleep,
+                package=lambda subject, run_dir, iid: _package(run_dir, iid),
+                preflight=lambda archive, iid: SimpleNamespace(executable_hash="e" * 64, output="ok"),
+            )
+
+    assert api.attestations == []
 
 
 def test_semantic_v0_uses_same_execution_terms_without_unsupported_evidence(tmp_path: Path) -> None:
@@ -1103,7 +1388,30 @@ def test_policy_split_keeps_execution_policy_outside_contract_terms(tmp_path: Pa
     assert "broad black-box differential experiments" not in str(payload["brief"])
 
 
-def test_persisted_policy_split_issue_reloads_with_canonical_payload_order(tmp_path: Path) -> None:
+def test_adaptive_policy_changes_search_without_changing_contract_terms(tmp_path: Path) -> None:
+    from scripts.campaign_procontract import (
+        ADAPTIVE_POLICY,
+        _expected_spec,
+        _validate_execution,
+        build_issue_payload,
+    )
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    _, workspace = _workspace(tmp_path, paths)
+    baseline = build_issue_payload(workspace, now=100.0, protocol="policy-split-v1")
+    adaptive = build_issue_payload(workspace, now=100.0, protocol="policy-split-adaptive-v1")
+
+    assert adaptive["executionPolicy"] == ADAPTIVE_POLICY
+    assert _expected_spec(adaptive) == _expected_spec(baseline)
+    assert {key: value for key, value in adaptive.items() if key != "executionPolicy"} == {
+        key: value for key, value in baseline.items() if key != "executionPolicy"
+    }
+    assert _validate_execution(_execution(adaptive), adaptive, 1)["executionPolicy"] == ADAPTIVE_POLICY
+
+
+@pytest.mark.parametrize("protocol", ["policy-split-v1", "policy-split-none-v1", "policy-split-adaptive-v1"])
+def test_persisted_policy_split_issue_reloads_with_canonical_payload_order(tmp_path: Path, protocol: str) -> None:
     from scripts.campaign_procontract import _load_or_create_issue
 
     paths = JobPaths(tmp_path / "job")
@@ -1117,7 +1425,7 @@ def test_persisted_policy_split_issue_reloads_with_canonical_payload_order(tmp_p
         "openai/gpt-5.6-luna",
         "max",
         FakeClock(),
-        "policy-split-v1",
+        protocol,
     )
 
     assert (
@@ -1127,10 +1435,24 @@ def test_persisted_policy_split_issue_reloads_with_canonical_payload_order(tmp_p
             "openai/gpt-5.6-luna",
             "max",
             FakeClock(),
-            "policy-split-v1",
+            protocol,
         )
         == created
     )
+
+
+def test_persisted_issue_rejects_a_search_policy_swap(tmp_path: Path) -> None:
+    from scripts.campaign_procontract import ProContractConflictError, _load_or_create_issue
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    _, workspace = _workspace(tmp_path, paths)
+    issue_path = paths.root / "procontract-issue.json"
+    _load_or_create_issue(issue_path, workspace, "openai/gpt-5.6-luna", "max", FakeClock(), "policy-split-v1")
+    with pytest.raises(ProContractConflictError, match="conflicts with this job"):
+        _load_or_create_issue(
+            issue_path, workspace, "openai/gpt-5.6-luna", "max", FakeClock(), "policy-split-adaptive-v1"
+        )
 
 
 def test_durable_policy_split_runtime_keeps_behavioral_policy_outside_spec() -> None:
@@ -1139,7 +1461,23 @@ def test_durable_policy_split_runtime_keeps_behavioral_policy_outside_spec() -> 
     revision = "97d61022abdc33397ee97447c7bbc6f571574e1e"
     assert protocol_for_revision(revision, "behavioral") == "policy-split-v1"
     assert protocol_for_revision(revision, "none") == "policy-split-none-v1"
+    assert protocol_for_revision(revision, "adaptive") == "policy-split-adaptive-v1"
     assert protocol_for_revision("c6c4a4c3ab154cbd5a3cbe70f25a8bbe4739f72b", "behavioral") == "policy-split-v1"
+
+
+@pytest.mark.parametrize("revision", ["unknown", "ed8bd2b7992485264335a541b40c1c03a4b35619"])
+def test_adaptive_policy_requires_a_policy_split_runtime(revision: str) -> None:
+    from scripts.campaign_procontract import ProContractError, protocol_for_revision
+
+    with pytest.raises(ProContractError, match="policy-split"):
+        protocol_for_revision(revision, "adaptive")
+
+
+def test_unknown_execution_policy_is_not_silently_replaced() -> None:
+    from scripts.campaign_procontract import ProContractError, protocol_for_revision
+
+    with pytest.raises(ProContractError, match="unknown execution policy"):
+        protocol_for_revision("910d9f2856323ad5493ee52f8cb2c315d2172e10", "typo")
 
 
 def test_semantic_v0_materializes_only_the_exact_institution_snapshot(tmp_path: Path) -> None:
@@ -1787,6 +2125,7 @@ def test_happy_lifecycle_uses_native_scheduler_and_exact_delivery(
     assert issue["model"] == expected_model
     assert issue["resolution"] == {"maxAttempts": 3, "retryDelay": 0}
     assert ORIGINAL_TASK in issue["brief"]
+    assert "Internet access is forbidden during inference" in issue["brief"]
     assert workspace.stops == 2
     assert workspace.restarts == 1
     assert api.rebinds == ["http://127.0.0.1:4097"]
@@ -2390,7 +2729,8 @@ def test_attestation_reconcile_uses_stage_http_policy(
         assert clock.now >= 101
 
 
-def test_post_attestation_get_loss_retries_observation_without_second_attest(tmp_path: Path) -> None:
+@pytest.mark.parametrize("protocol", ["current", "policy-split-v1", "policy-split-adaptive-v1"])
+def test_post_attestation_get_loss_retries_observation_without_second_attest(tmp_path: Path, protocol: str) -> None:
     from scripts.campaign_procontract import ProContractHttpError, build_issue_payload, run_procontract
 
     paths = JobPaths(tmp_path / "job")
@@ -2398,7 +2738,7 @@ def test_post_attestation_get_loss_retries_observation_without_second_attest(tmp
     store = _state(paths)
     _, workspace = _workspace(tmp_path, paths)
     clock = FakeClock()
-    payload = build_issue_payload(workspace, now=clock())
+    payload = build_issue_payload(workspace, now=clock(), protocol=protocol)
     api = PostAttestGetErrorApi(
         _contract(payload),
         _execution(payload),
@@ -2415,6 +2755,7 @@ def test_post_attestation_get_loss_retries_observation_without_second_attest(tmp
             variant="max",
             limits=_limits(),
             breaker=CircuitBreaker(),
+            protocol=protocol,
             api=api,
             clock=clock,
             sleeper=clock.sleep,
@@ -2654,6 +2995,62 @@ def test_ambiguous_cli_export_missing_destination_preserves_native_loss(tmp_path
     assert result.error == "export_ambiguous"
     assert api.attestations == []
     assert (paths.root / "procontract-export-ambiguous.json").is_file()
+    diagnostic = json.loads((paths.root / "procontract-export-error.json").read_text())
+    assert diagnostic == {
+        "version": 1,
+        "contractID": payload["id"],
+        "revision": api.contract["revision"],
+        "subjectHash": api.contract["handoff"]["subjectHash"],
+        "errorType": "WorkspaceError",
+        "diagnostic": "export command failed before materialization",
+        "truncated": False,
+    }
+
+
+def test_export_failure_diagnostic_redacts_before_truncating(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts.campaign_procontract import (
+        CONTROL_ARTIFACT_NAMES,
+        MAX_DELIVERY_DIAGNOSTIC_CHARS,
+        build_issue_payload,
+        run_procontract,
+    )
+
+    secret = "export-diagnostic-secret"
+    monkeypatch.setenv("OPENAI_API_KEY", secret)
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    store = _state(paths)
+    _, workspace = _workspace(tmp_path, paths, contained=True)
+    workspace.manifest.credential_env = ("OPENAI_API_KEY",)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock())
+    api = MissingExportDropApi(_contract(payload), _execution(payload))
+    api.failure = "x" * (MAX_DELIVERY_DIAGNOSTIC_CHARS - 3) + secret
+
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease._handle_active = True
+        result = run_procontract(
+            job,
+            store,
+            workspace,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=_limits(),
+            breaker=CircuitBreaker(),
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+        )
+
+    record = json.loads((paths.root / "procontract-export-error.json").read_text())
+    assert "procontract-export-error.json" in CONTROL_ARTIFACT_NAMES
+    assert record["truncated"] is True
+    assert len(record["diagnostic"]) == MAX_DELIVERY_DIAGNOSTIC_CHARS
+    assert record["diagnostic"] == ("x" * (MAX_DELIVERY_DIAGNOSTIC_CHARS - 3) + "[REDACTED]")[:MAX_DELIVERY_DIAGNOSTIC_CHARS]
+    assert result.completion.value == "lost_server"
+    assert api.attestations == []
 
 
 def test_ambiguous_cli_export_rejects_ignored_untracked_residue(tmp_path: Path) -> None:
@@ -2858,7 +3255,7 @@ def test_conflicting_existing_contract_fails_closed_before_export(tmp_path: Path
     assert workspace.stops == 1
 
 
-@pytest.mark.parametrize("coordinate", ["specHash", "revision", "sessionID", "promptID", "location", "model"])
+@pytest.mark.parametrize("coordinate", ["specHash", "revision", "location", "model"])
 def test_stale_native_coordinates_are_rejected(tmp_path: Path, coordinate: str) -> None:
     from scripts.campaign_procontract import ProContractConflictError, build_issue_payload, run_procontract
 
@@ -3215,7 +3612,7 @@ def test_native_terminal_state_precedes_missing_execution_binding(tmp_path: Path
     assert api.exports == [] and api.attestations == []
 
 
-def test_unexplained_active_binding_rotation_is_rejected(tmp_path: Path) -> None:
+def test_session_replacement_cannot_change_frozen_model(tmp_path: Path) -> None:
     from scripts.campaign_procontract import ProContractConflictError, build_issue_payload, run_procontract
 
     paths = JobPaths(tmp_path / "job")
@@ -3228,12 +3625,17 @@ def test_unexplained_active_binding_rotation_is_rejected(tmp_path: Path) -> None
 
     class RotatedApi(FakeApi):
         def get_execution(self, contract_id: str) -> dict[str, object] | None:
-            return {**execution, "promptID": "msg_unexplained"}
+            return {
+                **execution,
+                "sessionID": "ses_unexplained",
+                "promptID": "msg_unexplained",
+                "model": {"providerID": "openai", "id": "gpt-5.6-luna", "variant": "high"},
+            }
 
     api = RotatedApi(_contract(payload, status="active"), execution)
     with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
         workspace.lease._handle_active = True
-        with pytest.raises(ProContractConflictError, match="binding"):
+        with pytest.raises(ProContractConflictError, match="execution"):
             run_procontract(
                 job,
                 store,
@@ -3303,7 +3705,7 @@ def test_delivery_failure_stops_writer_and_never_attests(tmp_path: Path, failure
 
     def preflight(archive: Path, iid: str) -> SimpleNamespace:
         if failure == "preflight":
-            raise CandidateError("secret preflight diagnostic")
+            raise CandidateError("secret preflight diagnostic api_key=private-diagnostic-key\n" + "x" * 20_000)
         return SimpleNamespace(executable_hash="e" * 64, output="ok")
 
     with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
@@ -3329,6 +3731,21 @@ def test_delivery_failure_stops_writer_and_never_attests(tmp_path: Path, failure
     assert "secret" not in __import__("json").dumps(result.to_dict())
     assert result.workspace_frozen is (failure != "replay")
     assert result.subject_hash == (None if failure == "replay" else DEFAULT_SUBJECT_HASH)
+    diagnostic_path = paths.root / "procontract-delivery-error.json"
+    diagnostic = json.loads(diagnostic_path.read_text())
+    assert diagnostic["phase"] == {"replay": "executing", "package": "frozen", "preflight": "packaged"}[failure]
+    assert diagnostic["contractID"] == result.contract_id
+    assert diagnostic["revision"] == result.revision
+    assert diagnostic["specHash"] == result.spec_hash
+    assert store.read().artifact_hashes[diagnostic_path.name] == _file_hash(diagnostic_path)
+    assert diagnostic["truncated"] is (failure == "preflight")
+    if failure == "preflight":
+        assert diagnostic["errorType"] == "CandidateError"
+        assert diagnostic["diagnostic"].startswith("secret preflight diagnostic api_key=[REDACTED]")
+        assert "private-diagnostic-key" not in diagnostic_path.read_text()
+        assert len(diagnostic["diagnostic"]) == 16_384
+        package_path = paths.root / "procontract-package.json"
+        assert diagnostic["artifactHashes"][package_path.name] == _file_hash(package_path)
 
 
 def test_package_side_effect_is_reconciled_after_response_loss(tmp_path: Path) -> None:
@@ -3426,6 +3843,47 @@ def test_resume_after_usage_state_commit_reuses_durable_progress(tmp_path: Path)
     assert result.completion.value == "discharged"
 
 
+@pytest.mark.parametrize(
+    "target,field,value",
+    [
+        ("execution", "turnsUsed", 1),
+        ("execution", "actionsUsed", 2),
+        ("progress", "sessionID", None),
+        ("progress", "sessionID", "msg_not_a_session"),
+        ("progress", "contractID", "pct_other"),
+        ("progress", "cost", "0"),
+    ],
+)
+def test_recovery_rejects_lost_usage_or_corrupt_duty_progress(
+    tmp_path: Path, target: str, field: str, value: object
+) -> None:
+    from scripts.campaign_procontract import (
+        ProContractConflictError,
+        _restore_contract_progress,
+        _write_contract_progress,
+    )
+    from scripts.campaign_vanilla import _summarize_usage
+
+    messages = _settlement_messages(terminal=True)
+    usage = _summarize_usage(messages)
+    state = JobState("executing", generation=1, provider_turns=2, actions=3, cost=float(usage.cost))
+    path = tmp_path / "procontract-progress.json"
+    payload = {"id": "pct_contract"}
+    execution = {"sessionID": "ses_recovered", "turnsUsed": 2, "actionsUsed": 3}
+    _write_contract_progress(path, state.generation, payload, {"sessionID": "ses_retired"}, messages, 2, 3, usage)
+    assert _restore_contract_progress(path, state, payload, execution)[0] == usage
+
+    if target == "execution":
+        execution[field] = value
+    if target == "progress":
+        progress = json.loads(path.read_text())
+        progress["current"][field] = value
+        path.write_text(json.dumps(progress))
+
+    with pytest.raises(ProContractConflictError):
+        _restore_contract_progress(path, state, payload, execution)
+
+
 def test_progress_compacts_ignored_provider_metadata_before_double_buffering(tmp_path: Path) -> None:
     from scripts.campaign_procontract import _write_contract_progress
     from scripts.campaign_vanilla import MAX_ARTIFACT_BYTES, _summarize_usage
@@ -3469,7 +3927,8 @@ def test_progress_compacts_ignored_provider_metadata_before_double_buffering(tmp
     assert raw["previous"]["messages"] == raw["current"]["messages"]
 
 
-def test_verification_restores_full_messages_from_compacted_durable_progress(tmp_path: Path) -> None:
+@pytest.mark.parametrize("version", [1, 2])
+def test_verification_restores_full_messages_from_compacted_durable_progress(tmp_path: Path, version: int) -> None:
     from scripts.campaign_procontract import (
         ProContractConflictError,
         _compact_progress_messages,
@@ -3498,11 +3957,12 @@ def test_verification_restores_full_messages_from_compacted_durable_progress(tmp
     path.write_text(
         json.dumps(
             {
-                "version": 1,
+                "version": version,
                 "contract": {},
                 "execution": {},
                 "quiet": {},
                 "messages": messages,
+                **({"sessionMessageCount": 1} if version == 2 else {}),
             }
         )
     )
@@ -3515,6 +3975,34 @@ def test_verification_restores_full_messages_from_compacted_durable_progress(tmp
     changed["data"][0]["tokens"]["output"] = 4
     with pytest.raises(ProContractConflictError, match="durable progress"):
         _restore_verification_messages(path, changed, usage)
+
+
+@pytest.mark.parametrize("count", [0, 1, 2, -1, 3, True, "1", None])
+def test_verification_binds_exact_current_session_suffix(tmp_path: Path, count: object) -> None:
+    from scripts.campaign_procontract import ProContractError, _read_verification_observation
+
+    messages = {"data": [{"id": "msg_retired"}, {"id": "msg_current"}]}
+    path = tmp_path / "procontract-verification.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "contract": {},
+                "execution": {},
+                "quiet": {},
+                "messages": messages,
+                "sessionMessageCount": count,
+            }
+        )
+    )
+    if type(count) is not int or not 0 <= count <= 2:
+        with pytest.raises(ProContractError, match="Session message boundary"):
+            _read_verification_observation(path)
+        return
+
+    observation = _read_verification_observation(path)
+    assert observation["messages"] == messages
+    assert observation["sessionMessageCount"] == count
 
 
 def test_materialized_delivery_subject_excludes_only_harness_and_git_controls(tmp_path: Path) -> None:
@@ -4154,6 +4642,113 @@ def test_handoff_change_immediately_after_export_stops_before_host_packaging(tmp
     assert api.attestations == []
 
 
+@pytest.mark.parametrize("field", ["sessionID", "promptID"])
+@pytest.mark.parametrize("stage", ["export", "preflight"])
+def test_delivery_rejects_native_execution_replacement_after_handoff(tmp_path: Path, field: str, stage: str) -> None:
+    from scripts.campaign_procontract import ProContractConflictError, build_issue_payload, run_procontract
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    store = _state(paths)
+    _, workspace = _workspace(tmp_path, paths)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock())
+
+    class ReplacedExecutionApi(FakeApi):
+        def export(self, workspace: object, contract_id: str, destination: Path) -> dict[str, object]:
+            response = super().export(workspace, contract_id, destination)
+            if stage == "export":
+                self.execution = {**self.execution, field: "ses_replaced" if field == "sessionID" else "msg_replaced"}
+            return response
+
+    api = ReplacedExecutionApi(_contract(payload), _execution(payload))
+
+    def preflight(archive: Path, instance_id: str) -> SimpleNamespace:
+        if stage == "preflight":
+            api.execution = {**api.execution, field: "ses_replaced" if field == "sessionID" else "msg_replaced"}
+        return SimpleNamespace(executable_hash="e" * 64, output="ok")
+
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease._handle_active = True
+        with pytest.raises(ProContractConflictError, match="Contract execution binding changed"):
+            run_procontract(
+                job,
+                store,
+                workspace,
+                model="openai/gpt-5.6-luna",
+                variant="max",
+                limits=_limits(),
+                breaker=CircuitBreaker(),
+                api=api,
+                clock=clock,
+                sleeper=clock.sleep,
+                package=lambda subject, run_dir, iid: _package(run_dir, iid),
+                preflight=preflight,
+            )
+
+    assert api.attestations == []
+
+
+@pytest.mark.parametrize("change", ["delete_first", "delete_last", "delete_all", "append", "edit", "reorder"])
+def test_delivery_rejects_current_session_transcript_change(tmp_path: Path, change: str) -> None:
+    from scripts.campaign_procontract import ProContractConflictError, build_issue_payload, run_procontract
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    store = _state(paths)
+    _, workspace = _workspace(tmp_path, paths)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock())
+
+    class ChangedMessagesApi(FakeApi):
+        def __init__(self) -> None:
+            super().__init__(_contract(payload), _execution(payload))
+            self.transcript = [
+                {"id": "msg_first", "type": "user", "text": "first"},
+                {"id": "msg_second", "type": "user", "text": "second"},
+            ]
+
+        def messages(self, session_id: str) -> dict[str, object]:
+            return {"data": copy.deepcopy(self.transcript)}
+
+        def export(self, workspace: object, contract_id: str, destination: Path) -> dict[str, object]:
+            response = super().export(workspace, contract_id, destination)
+            if change == "delete_first":
+                self.transcript.pop(0)
+            if change == "delete_last":
+                self.transcript.pop()
+            if change == "delete_all":
+                self.transcript.clear()
+            if change == "append":
+                self.transcript.append({"id": "msg_third", "type": "user", "text": "third"})
+            if change == "edit":
+                self.transcript[0]["text"] = "changed"
+            if change == "reorder":
+                self.transcript.reverse()
+            return response
+
+    api = ChangedMessagesApi()
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease._handle_active = True
+        with pytest.raises(ProContractConflictError, match="Session messages changed"):
+            run_procontract(
+                job,
+                store,
+                workspace,
+                model="openai/gpt-5.6-luna",
+                variant="max",
+                limits=_limits(),
+                breaker=CircuitBreaker(),
+                api=api,
+                clock=clock,
+                sleeper=clock.sleep,
+                package=lambda subject, run_dir, iid: _package(run_dir, iid),
+                preflight=lambda archive, iid: SimpleNamespace(executable_hash="e" * 64, output="ok"),
+            )
+
+    assert api.attestations == []
+
+
 def test_native_challenge_after_export_is_preserved_before_packaging(tmp_path: Path) -> None:
     from scripts.campaign_procontract import build_issue_payload, run_procontract
 
@@ -4299,6 +4894,7 @@ def test_replay_coordinate_change_before_attest_fails_closed(tmp_path: Path, fie
         ("contract", "specHash"),
         ("replay", "evidenceHash"),
         ("execution", "sessionID"),
+        ("execution", "promptID"),
         ("acceptanceHash",),
         ("export", "treeHash"),
         ("package", "archiveHash"),

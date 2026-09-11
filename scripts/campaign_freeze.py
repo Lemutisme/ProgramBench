@@ -298,7 +298,13 @@ def _copy_descriptor(
 
 def _remove_tree(root: Path) -> None:
     def writable(function: Callable[[str], None], path: str, exception: object) -> None:
-        os.chmod(path, 0o700)
+        target = Path(path)
+        # Unlink/rmdir require the parent's write bit, not the child's. Do not
+        # follow a symlink while cleaning an owned temporary evidence view.
+        if target.parent != root.parent:
+            os.chmod(target.parent, 0o700)
+        if not target.is_symlink():
+            os.chmod(target, 0o700)
         function(path)
 
     shutil.rmtree(root, onerror=writable)

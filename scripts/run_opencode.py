@@ -12,7 +12,7 @@ import math
 import os
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Collection, Mapping, Sequence
 
@@ -31,6 +31,7 @@ from scripts.campaign_install import (
     prepare_install,
     run_checked,
 )
+from scripts.campaign_observations import observation_record
 
 from scripts.campaign_state import (
     AmbiguousStateCommitError,
@@ -205,6 +206,8 @@ class CampaignConfig:
     arms: tuple[ArmConfig, ArmConfig]
     excluded: frozenset[str]
     cache: CacheConfig
+    observations: Mapping[str, list[dict[str, object]]] = field(default_factory=dict)
+    vanilla_workflow: bool = False
 
 
 @dataclass(frozen=True)
@@ -283,7 +286,9 @@ def load_config(path: Path) -> CampaignConfig:
         raw = yaml.load(source, Loader=_UniqueKeyLoader)
     except (TypeError, yaml.YAMLError) as error:
         raise ConfigError(f"invalid YAML: {error}") from error
-    _require_keys(raw, _TOP_LEVEL_KEYS, _TOP_LEVEL_KEYS, "top-level config")
+    _require_keys(raw, _TOP_LEVEL_KEYS | {"observations", "vanilla_workflow"}, _TOP_LEVEL_KEYS, "top-level config")
+    if type(raw.get("vanilla_workflow", False)) is not bool:
+        raise ConfigError("vanilla_workflow must be boolean")
 
     limits = _load_limits(raw.get("limits"))
     cache = _load_cache(raw.get("cache"))
@@ -291,6 +296,13 @@ def load_config(path: Path) -> CampaignConfig:
     excluded = raw.get("excluded", [])
     if not isinstance(excluded, list) or not all(isinstance(value, str) for value in excluded):
         raise ConfigError("excluded must be a list of instance IDs")
+    observations = raw.get("observations", {})
+    if not isinstance(observations, dict) or any(not isinstance(key, str) or not key for key in observations):
+        raise ConfigError("observations must map instance IDs to issuer-owned cases")
+    try:
+        admitted = {key: observation_record(value)["observations"] for key, value in observations.items()}
+    except (TypeError, ValueError) as error:
+        raise ConfigError(f"invalid issuer observations: {error}") from error
 
     return CampaignConfig(
         model=_require_string(raw, "model"),
@@ -299,6 +311,8 @@ def load_config(path: Path) -> CampaignConfig:
         arms=arms,
         excluded=frozenset(excluded),
         cache=cache,
+        observations=admitted,
+        vanilla_workflow=raw.get("vanilla_workflow", False),
     )
 
 
@@ -398,8 +412,8 @@ def _load_arms(raw: object, config_dir: Path) -> tuple[ArmConfig, ArmConfig]:
             raise ConfigError(f"arm {name} revision must be a nonempty string")
         binary = value.get("binary")
         execution_policy = value.get("execution_policy", "behavioral")
-        if execution_policy not in {"behavioral", "none"}:
-            raise ConfigError(f"arm {name} execution_policy must be behavioral or none")
+        if execution_policy not in {"behavioral", "none", "adaptive"}:
+            raise ConfigError(f"arm {name} execution_policy must be behavioral, none, or adaptive")
         result.append(
             ArmConfig(
                 name=name,
@@ -469,6 +483,7 @@ def _unlink_and_sync_parent(temporary_name: str, parent: Path) -> None:
 
 def _canonical_config(config: CampaignConfig) -> dict[str, object]:
     return {
+        **({"vanilla_workflow": True} if config.vanilla_workflow else {}),
         "model": config.model,
         "variant": config.variant,
         "limits": {
@@ -494,6 +509,7 @@ def _canonical_config(config: CampaignConfig) -> dict[str, object]:
             for arm in config.arms
         },
         "excluded": sorted(config.excluded),
+        **({"observations": dict(config.observations)} if config.observations else {}),
     }
 
 

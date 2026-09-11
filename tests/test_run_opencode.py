@@ -142,14 +142,15 @@ excluded:
     assert result.excluded == frozenset({"old.instance"})
 
 
-def test_load_config_freezes_policy_ablation_outside_binary_identity(tmp_path: Path):
+@pytest.mark.parametrize("policy", ["none", "adaptive"])
+def test_load_config_freezes_policy_ablation_outside_binary_identity(tmp_path: Path, policy: str):
     repo = tmp_path / "repo"
     repo.mkdir()
     config = load_config(
         _write_text(
             tmp_path / "campaign.yaml",
             campaign_yaml(repo).replace(
-                "    mode: procontract\n", "    mode: procontract\n    execution_policy: none\n"
+                "    mode: procontract\n", f"    mode: procontract\n    execution_policy: {policy}\n"
             ),
         )
     )
@@ -157,8 +158,8 @@ def test_load_config_freezes_policy_ablation_outside_binary_identity(tmp_path: P
 
     freeze_campaign_config(config, manifest)
 
-    assert config.arms[0].execution_policy == "none"
-    assert json.loads(manifest.read_text())["arms"]["procontract"]["execution_policy"] == "none"
+    assert config.arms[0].execution_policy == policy
+    assert json.loads(manifest.read_text())["arms"]["procontract"]["execution_policy"] == policy
 
 
 def test_load_config_allows_cost_caps_to_be_disabled(tmp_path: Path):
@@ -186,6 +187,36 @@ def test_load_config_allows_cost_caps_to_be_disabled(tmp_path: Path):
         "total_cost_soft": None,
         "total_cost_hard": None,
     }
+
+
+def test_issuer_observations_are_frozen_in_both_campaign_manifests(tmp_path: Path):
+    from scripts.campaign_runner import _config_manifest
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    path = tmp_path / "campaign.yaml"
+    cases = [{"id": "version", "args": ["--version"], "stdin": "", "stdout": "1.0\n", "stderr": "", "exit": 0}]
+    path.write_text(campaign_yaml(repo) + "\nobservations:\n  fixture.instance: " + json.dumps(cases) + "\n")
+    config = load_config(path)
+    manifest = tmp_path / "campaign.json"
+    freeze_campaign_config(config, manifest)
+    assert config.observations == {"fixture.instance": cases}
+    assert json.loads(manifest.read_text())["observations"] == config.observations
+    assert _config_manifest(config)["observations"] == config.observations
+    cases[0]["stdout"] = "changed\n"
+    path.write_text(campaign_yaml(repo) + "\nobservations:\n  fixture.instance: " + json.dumps(cases) + "\n")
+    with pytest.raises(ConfigError):
+        freeze_campaign_config(load_config(path), manifest)
+
+
+@pytest.mark.parametrize("observations", [[], {"fixture.instance": []}, {"fixture.instance": [{"id": "missing"}]}])
+def test_invalid_issuer_observations_fail_before_admission(tmp_path: Path, observations):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    path = tmp_path / "campaign.yaml"
+    path.write_text(campaign_yaml(repo) + "\nobservations: " + json.dumps(observations) + "\n")
+    with pytest.raises(ConfigError, match="observations"):
+        load_config(path)
 
 
 def test_freeze_campaign_config_reuses_identical_manifest_and_rejects_change(tmp_path: Path):

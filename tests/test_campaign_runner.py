@@ -872,7 +872,7 @@ def test_cli_parser_has_bounded_campaign_defaults_and_evaluator_flags():
     args = parser.parse_args(["--config", "campaign.yaml", "--dry-run"])
     assert args.workers == 8
     assert args.limit == 8
-    assert "8 active trajectories" in parser.format_help()
+    assert "32 active trajectories" in parser.format_help()
     evaluator = parse_args(["--config", "campaign.yaml", "--output", "out", "--evaluate"])
     assert evaluator.evaluate
     assert not evaluator.retry_evaluator
@@ -888,7 +888,7 @@ def test_cli_limit_and_all_conflict_and_non_dry_requires_output():
     with pytest.raises(SystemExit, match="2"):
         parse_args(["--config", "campaign.yaml"])
     with pytest.raises(SystemExit, match="2"):
-        parse_args(["--config", "campaign.yaml", "--workers", "9", "--dry-run"])
+        parse_args(["--config", "campaign.yaml", "--workers", "33", "--dry-run"])
     with pytest.raises(SystemExit, match="2"):
         parse_args(["--config", "campaign.yaml", "--redo", "--retry-infra", "--dry-run"])
 
@@ -956,6 +956,58 @@ def test_evaluate_only_refuses_nonterminal_jobs_and_never_enters_inference(tmp_p
     assert campaign_runner.main(arguments) == 0
 
 
+@pytest.mark.parametrize("published", [False, True])
+def test_evaluate_after_inference_preserves_revision_pause_and_scores_only_sealed_artifacts(
+    tmp_path: Path, monkeypatch, published: bool
+):
+    from scripts import campaign_evaluate, campaign_runner
+
+    output = tmp_path / "campaign"
+    output.mkdir()
+    (output / "campaign.json").write_text("{}")
+    (output / "breaker.json").write_text(json.dumps(CircuitBreaker().snapshot()))
+    candidate = campaign_runner.CampaignJob("one", "procontract", "image")
+    plan = campaign_runner.CampaignPlan(output, output / "campaign.json", object(), ("one",), (candidate,), {}, False)
+    store = campaign_runner.StateStore(output / "procontract/one/state.json")
+    store.write(campaign_runner.JobState("planned"))
+    store.transition("preparing", command_identity="test", expected_generation=0)
+    store.transition("executing", command_identity="test", expected_generation=1)
+    evaluated = []
+
+    def run(*_args, **_kwargs):
+        store.transition("awaiting_revision", command_identity="test", expected_generation=2)
+        if published:
+            submission = output / "procontract/one/submission.tar.gz"
+            submission.write_bytes(b"sealed partial candidate")
+            (submission.parent / "candidate-artifact.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "status": "published",
+                        "submission": submission.name,
+                        "sha256": hashlib.sha256(submission.read_bytes()).hexdigest(),
+                        "partial": True,
+                    }
+                )
+            )
+        return campaign_runner.CampaignResult(0, 0, (candidate,), 0, None)
+
+    def evaluate(root, **_kwargs):
+        evaluated.append(root)
+        assert store.read().phase == "awaiting_revision"
+        return SimpleNamespace(status="invalid_protocol")
+
+    monkeypatch.setattr(campaign_runner, "load_config", lambda _path: object())
+    monkeypatch.setattr(campaign_runner, "plan_campaign", lambda *_args, **_kwargs: plan)
+    monkeypatch.setattr(campaign_runner, "run_campaign", run)
+    monkeypatch.setattr(campaign_evaluate, "evaluate_campaign", evaluate)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENCODE_SERVER_PASSWORD", "test-password")
+    assert campaign_runner.main(["--config", "unused", "--output", str(output), "--resume", "--evaluate"]) == 1
+    assert evaluated == ([output] if published else [])
+    assert store.read().phase == "awaiting_revision"
+
+
 def test_direct_script_cli_help_is_import_safe():
     root = Path(__file__).parents[1]
     result = subprocess.run(
@@ -963,7 +1015,7 @@ def test_direct_script_cli_help_is_import_safe():
     )
 
     assert result.returncode == 0
-    assert "8 active trajectories" in result.stdout
+    assert "32 active trajectories" in result.stdout
     for option in (
         "--workers",
         "--limit",
@@ -1134,6 +1186,36 @@ def test_plan_dry_run_prepares_each_arm_once_without_workspace(tmp_path: Path):
     assert len(prepared) == 2
     assert len(plan.jobs) == 4
     assert plan.manifest_path.is_file()
+
+
+def test_plan_rejects_unused_observations_before_build_or_workspace(tmp_path: Path):
+    from scripts.campaign_runner import CampaignError, plan_campaign
+    from scripts.run_opencode import load_config
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config_path = tmp_path / "campaign.yaml"
+    cases = [{"id": "version", "args": [], "stdin": "", "stdout": "1.0\n", "stderr": "", "exit": 0}]
+    config_path.write_text(_config(repo) + "\nobservations:\n  typo: " + json.dumps(cases) + "\n")
+    with pytest.raises(CampaignError, match="unselected instances"):
+        plan_campaign(
+            load_config(config_path),
+            [
+                {
+                    "instance_id": "one",
+                    "difficulty": "easy",
+                    "language": "python",
+                    "image_name": "one-image",
+                    "repository": "owner/one",
+                    "commit": "a" * 40,
+                }
+            ],
+            output=tmp_path / "out",
+            limit=1,
+            dry_run=True,
+            prepare_install_fn=lambda *_: pytest.fail("invalid observations cannot start a build"),
+        )
+    assert not (tmp_path / "out").exists()
     assert not (tmp_path / "out" / "vanilla").exists()
 
 
@@ -1890,6 +1972,7 @@ def test_run_job_packages_and_preflights_a_frozen_vanilla_result(tmp_path: Path,
         base_url = "http://127.0.0.1:9999"
         port = 9999
         manifest = SimpleNamespace(subject_dir=subject)
+        candidate = paths.root / "candidate"
 
         def __init__(self, lease):
             self.lease = lease
@@ -1927,6 +2010,10 @@ def test_run_job_packages_and_preflights_a_frozen_vanilla_result(tmp_path: Path,
         subject.mkdir(parents=True)
         subject.joinpath("compile.sh").write_text("#!/bin/sh\nprintf built > executable\nchmod +x executable\n")
         subject.joinpath("source").write_text("candidate\n")
+        from scripts.campaign_freeze import _make_read_only, _snapshot_candidate
+        workspace.candidate.mkdir()
+        _snapshot_candidate(subject, workspace.candidate)
+        _make_read_only(subject)
         result_path = paths.root / "vanilla-result.json"
         result_path.write_text(json.dumps(result.to_dict(), sort_keys=True))
         state = store.read()
@@ -2053,6 +2140,48 @@ def test_run_job_selects_semantic_protocol_from_frozen_install_revision(tmp_path
 
     assert result.status == "completed"
     assert seen == ["semantic-v0"]
+
+
+@pytest.mark.parametrize("arm", ["vanilla", "procontract"])
+def test_run_job_admits_observations_before_native_adapter_only(tmp_path: Path, monkeypatch, arm: str):
+    from scripts import campaign_runner
+    from scripts.campaign_observations import load_observations
+    from scripts.run_opencode import load_config
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config_path = tmp_path / "campaign.yaml"
+    cases = [{"id": "version", "args": [], "stdin": "", "stdout": "1.0\n", "stderr": "", "exit": 0}]
+    config_path.write_text(_config(repo) + "\nobservations:\n  one: " + json.dumps(cases) + "\n")
+    plan = campaign_runner.CampaignPlan(
+        tmp_path / "out", tmp_path / "out/campaign.json", load_config(config_path), ("one",), (), {}, False
+    )
+    seen = []
+
+    class Workspace:
+        base_url = "http://127.0.0.1:9999"
+        port = 9999
+
+        def stop_for_freeze(self):
+            return None
+
+    def adapter(job_lease, *_args, **_kwargs):
+        seen.append(load_observations(job_lease.job.root / "procontract-observations.json"))
+
+    monkeypatch.setattr(campaign_runner, "_install_for", lambda *_: object())
+    result = campaign_runner.run_job(
+        plan,
+        campaign_runner.CampaignJob("one", arm, "one-image"),
+        breaker=CircuitBreaker(),
+        workspace_factory=lambda *_: Workspace(),
+        vanilla_runner=adapter,
+        procontract_runner=adapter,
+        vanilla_api_factory=lambda _: object(),
+        procontract_api_factory=lambda _: object(),
+    )
+
+    assert result.status == "completed"
+    assert seen == [cases if arm == "procontract" else []]
 
 
 def test_run_job_with_preexisting_campaign_stop_never_allocates_workspace(tmp_path: Path):

@@ -7,6 +7,7 @@
 import logging
 import os
 import subprocess
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -29,11 +30,18 @@ class ContainerEnvironment:
         cpus: int = 10,
         env: dict[str, str] | None = None,
         run_args: list[str] | None = None,
+        deadline: float | None = None,
+        prepare_workspace: bool = False,
     ):
         self.cwd = cwd
         self.executable = executable
         self.default_timeout = timeout
         self.cpus = cpus
+        self.deadline = deadline
+        self.preparation = None
+        if prepare_workspace:
+            from programbench.build_workspace import prepare_build_image
+            image, self.preparation = prepare_build_image(image, executable)
         prefix = os.environ.get("PROGRAMBENCH_CONTAINER_PREFIX", "programbench")
         if not prefix or any(
             character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-" for character in prefix
@@ -71,6 +79,11 @@ class ContainerEnvironment:
     def execute(self, command: str, *, timeout: int | None = None) -> dict[str, Any]:
         """Run a shell command inside the container."""
         timeout = timeout or self.default_timeout
+        if self.deadline is not None:
+            remaining = self.deadline - time.monotonic()
+            if remaining <= 0:
+                return {"output": "", "returncode": -1, "exception_info": "Workflow wall-time exhausted"}
+            timeout = min(timeout, remaining)
         cmd = [
             self.executable,
             "exec",
@@ -94,7 +107,7 @@ class ContainerEnvironment:
                 "returncode": result.returncode,
                 "exception_info": "",
             }
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as error:
             # When subprocess.run hits its host-side timeout, Python SIGKILLs
             # the local `docker exec` CLI. The docker daemon does not
             # propagate that into the container (only SIGINT/SIGTERM
@@ -125,7 +138,10 @@ class ContainerEnvironment:
             except Exception as e:
                 log.warning("in-container teardown after execute() timeout failed: %s", e)
             return {
-                "output": "",
+                "output": "".join(
+                    value.decode(errors="replace") if isinstance(value, bytes) else value or ""
+                    for value in (error.stdout, error.stderr)
+                ),
                 "returncode": -1,
                 "exception_info": f"Command timed out after {timeout}s",
             }
@@ -162,6 +178,30 @@ class ContainerEnvironment:
         with tar_path.open("rb") as f:
             self._stream_tar_in(container_path, stdin_stream=f, compressed=is_gz)
 
+    def copy_submission(self, tar_path: Path, container_path: str) -> None:
+        """Extract directories with temporary owner-write access, restoring exact modes last.
+
+        GNU tar assumes UID 0 can traverse/write mode-0555 directories even when
+        DAC_OVERRIDE was dropped. Python's extractall defers directory attributes
+        and works without granting the submission any capabilities.
+        """
+        code = """import pathlib,sys,tarfile
+root=sys.argv[1]
+with tarfile.open(fileobj=sys.stdin.buffer,mode='r|gz') as archive:
+ def members():
+  for member in archive:
+   path=pathlib.PurePosixPath(member.name)
+   if path.is_absolute() or '..' in path.parts:raise ValueError('unsafe submission member')
+   if member.ischr() or member.isblk() or member.isfifo():raise ValueError('special submission member')
+   yield member
+ archive.extractall(root,members=members())
+"""
+        with tar_path.open('rb') as source:
+            result = subprocess.run([self.executable,'exec','-i',self.container_id,'python3','-I','-S','-c',code,container_path],
+                                    stdin=source,capture_output=True,text=True,timeout=DOCKER_CP_TIMEOUT)
+        if result.returncode:
+            raise RuntimeError(f'Submission extraction failed: {result.stderr[:2000]}')
+
     def _stream_tar_in(
         self,
         container_path: str,
@@ -187,7 +227,7 @@ class ContainerEnvironment:
             raise RuntimeError(f"mkdir -p {container_path} in container failed: {mk.stderr.strip()}")
 
         tar_flags = "-xzf" if compressed else "-xf"
-        cmd = [self.executable, "exec", "-i", self.container_id, "tar", "-C", container_path, tar_flags, "-"]
+        cmd = [self.executable, "exec", "-i", self.container_id, "tar", "--delay-directory-restore", "-C", container_path, tar_flags, "-"]
         if producer is not None:
             tar = subprocess.Popen(producer, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             try:

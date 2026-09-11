@@ -38,8 +38,14 @@ from programbench.submission import FIXTURE_PREFIX
 from programbench.utils.load_data import load_all_instances
 from programbench.utils.instance_filters import filter_instances
 from scripts import campaign_process
+from scripts.campaign_observations import admit_observations
 from scripts.campaign_install import InstallRecord, prepare_install
-from scripts.campaign_procontract import HttpProContractApi, protocol_for_revision, run_procontract
+from scripts.campaign_procontract import (
+    HttpProContractApi,
+    _require_package_record,
+    protocol_for_revision,
+    run_procontract,
+)
 from scripts.campaign_state import JobLease, JobPaths, JobState, RecoverableJobError, StateStore
 from scripts.campaign_stop import StopToken
 from scripts.campaign_usage import CircuitBreaker
@@ -54,7 +60,7 @@ from scripts.campaign_workspace import (
 from scripts.run_opencode import CampaignConfig, ConfigError, Job, expand_jobs, load_config, select_instances
 
 
-MAX_ACTIVE_JOBS = 8
+MAX_ACTIVE_JOBS = 32
 ARM_SELECTIONS = ("paired", "procontract", "vanilla")
 JOB_CLEANUP_MAX_ATTEMPTS = 3
 JOB_CLEANUP_TIMEOUT_SECONDS = 0.25
@@ -311,6 +317,9 @@ def plan_campaign(
     )
     selected_instances = tuple(_campaign_instance(instance) for instance in selected)
     selected_ids = tuple(instance.instance_id for instance in selected_instances)
+    unused_observations = set(config.observations) - set(selected_ids)
+    if unused_observations:
+        raise CampaignError(f"issuer observations target unselected instances: {sorted(unused_observations)}")
     images = {instance.instance_id: instance.image_name for instance in selected_instances}
     jobs = expand_campaign_jobs(selected_ids, images, seed=seed, arms=arm_names)
     root.mkdir(parents=True, exist_ok=True)
@@ -654,6 +663,9 @@ def run_job(
             state_root=paths.root / "workspace-state",
             log_dir=paths.root / "logs",
             credential_env=tuple(name for name in _CREDENTIAL_ENV if os.environ.get(name)),
+            isolated=True,
+            provider_model=plan.config.model.split("/", 1)[-1],
+            provider_effort=plan.config.variant,
         )
         try:
             with WorkspaceLease(request) as workspace_lease:
@@ -691,10 +703,12 @@ def run_job(
                         _terminalize(store, "interrupted", "campaign_stop")
                         return JobRunResult(candidate, "interrupted")
                     if candidate.arm == "vanilla":
+                        from scripts.campaign_offline import DockerHttpClient
                         api = (
                             vanilla_api_factory(workspace)
                             if vanilla_api_factory
-                            else HttpOpenCodeApi(workspace.base_url, expected_port=workspace.port)
+                            else HttpOpenCodeApi(workspace.base_url, expected_port=workspace.port,
+                                http_client=DockerHttpClient(workspace.container_id) if workspace.manifest.network_mode == "none" else None)
                         )
                         result = vanilla_runner(
                             job_lease,
@@ -707,14 +721,21 @@ def run_job(
                             breaker=breaker,
                             api=api,
                             stop_token=stop,
+                            workflow=plan.config.vanilla_workflow,
                         )
                         if isinstance(result, VanillaResult):
                             _finalize_vanilla_delivery(paths, store, workspace, candidate.instance_id)
                     else:
+                        from scripts.campaign_offline import DockerHttpClient
                         api = (
                             procontract_api_factory(workspace)
                             if procontract_api_factory
-                            else HttpProContractApi(workspace.base_url, expected_port=workspace.port)
+                            else HttpProContractApi(workspace.base_url, expected_port=workspace.port,
+                                http_client=DockerHttpClient(workspace.container_id) if workspace.manifest.network_mode == "none" else None)
+                        )
+                        admit_observations(
+                            paths.root / "procontract-observations.json",
+                            plan.config.observations.get(candidate.instance_id, []),
                         )
                         result = procontract_runner(
                             job_lease,
@@ -765,8 +786,10 @@ def run_job(
                     return _defer_job_recovery(paths, store, workspace, workspace_lease, candidate, error)
                 except BaseException as error:
                     failed_state = store.read_optional()
-                    if failed_state is not None and failed_state.phase == "executing" and isinstance(
-                        error, (OSError, campaign_process.ProcessError)
+                    if (
+                        failed_state is not None
+                        and failed_state.phase == "executing"
+                        and isinstance(error, (OSError, campaign_process.ProcessError))
                     ):
                         return _defer_job_recovery(
                             paths,
@@ -859,11 +882,12 @@ def run_job(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run a bounded ProgramBench campaign: 8 active trajectories, two arms per instance, 6h/1000 limits."
+        description="Run a bounded ProgramBench campaign: at most 32 active trajectories, two arms per instance, "
+        "6h/1000 limits."
     )
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--output", type=Path)
-    parser.add_argument("--workers", type=_positive, default=8, help="active trajectories (1-8; default: 8)")
+    parser.add_argument("--workers", type=_positive, default=8, help="active trajectories (1-32; default: 8)")
     parser.add_argument("--limit", type=_positive, default=8, help="instances in the pilot (default: 8; 16 jobs)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--filter")
@@ -993,7 +1017,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
         return 1
     incomplete = bool(result.paused or result.interrupted or result.pending or result.running)
     evaluation_failed = False
-    if args.evaluate and not incomplete:
+    if args.evaluate and not result.running and (not incomplete or _selected_jobs_evaluable(plan)):
         from scripts.campaign_evaluate import CampaignEvaluationError, evaluate_campaign
 
         try:
@@ -1251,6 +1275,8 @@ def _image_name(instance: Mapping[str, object]) -> str:
 
 def _config_manifest(config: CampaignConfig) -> dict[str, object]:
     return {
+        **({"vanilla_workflow": True} if config.vanilla_workflow else {}),
+        "inference_network": "none-peer-pinned-model-channel-v1",
         "model": config.model,
         "variant": config.variant,
         "limits": asdict(config.limits),
@@ -1266,6 +1292,7 @@ def _config_manifest(config: CampaignConfig) -> dict[str, object]:
             for arm in config.arms
         },
         "excluded": sorted(config.excluded),
+        **({"observations": dict(config.observations)} if config.observations else {}),
     }
 
 
@@ -1561,7 +1588,9 @@ def _finalize_vanilla_delivery(
     state = store.read()
     command_identity = state.command_identity or "vanilla-delivery"
     if state.phase == "frozen":
-        archive = package_workspace(Path(workspace.manifest.subject_dir), paths.root.parent, instance_id)
+        from scripts.campaign_materialize import build_view
+        with build_view(workspace.candidate, Path(workspace.manifest.subject_dir), paths.root) as working:
+            archive = package_workspace(working, paths.root.parent, instance_id)
         if archive.resolve() != paths.submission.resolve() or not archive.is_file():
             raise CampaignError("vanilla candidate package was not created at the job submission path")
         state = store.transition(
@@ -1576,7 +1605,11 @@ def _finalize_vanilla_delivery(
     if state.phase == "packaged":
         if not paths.submission.is_file():
             raise CampaignError("packaged vanilla submission is missing")
-        checked = preflight_candidate(paths.submission, instance_id)
+        checked = (
+            preflight_candidate(paths.submission, instance_id, image_ref=workspace.manifest.image_digest)
+            if getattr(workspace.manifest, "network_mode", None) == "none"
+            else preflight_candidate(paths.submission, instance_id)
+        )
         preflight_path = paths.root / "vanilla-preflight.json"
         _atomic_json(
             preflight_path,
@@ -1660,11 +1693,16 @@ def _conserve_candidate_artifact(
             lease.release_handle()
         state = store.read()
         if not paths.submission.is_file() or paths.submission.is_symlink():
-            archive = package_workspace(
-                candidate_path,
-                paths.root,
-                candidate.instance_id,
-                require_compile=False,
+            sealed = paths.root / "procontract-package.json"
+            archive = (
+                _require_package_record(_read_json(sealed), paths.root)
+                if candidate.arm == "procontract" and sealed.exists()
+                else package_workspace(
+                    candidate_path,
+                    paths.root / "candidate-artifacts",
+                    candidate.instance_id,
+                    require_compile=False,
+                )
             )
             verify_archive_no_credentials(
                 archive,
@@ -1797,9 +1835,7 @@ def _defer_job_recovery(
     deadline = time.monotonic() + _workspace_cleanup_timeout(workspace)
     while workspace_lease._handle_active and attempts < JOB_CLEANUP_MAX_ATTEMPTS and time.monotonic() < deadline:
         attempts += 1
-        if not _bounded_cleanup_stop(
-            _workspace_cleanup_operation(workspace), max(0.0, deadline - time.monotonic())
-        ):
+        if not _bounded_cleanup_stop(_workspace_cleanup_operation(workspace), max(0.0, deadline - time.monotonic())):
             continue
         workspace_lease.release_handle()
     if workspace_lease._handle_active:

@@ -2117,7 +2117,7 @@ def test_evaluator_default_runner_persists_contained_cgroup_identity(
     blob.write_bytes(b"tests")
     monkeypatch.setenv("PROGRAMBENCH_BLOB_DIR", str(tmp_path / "blobs"))
 
-    def contained(command, cwd, timeout, grace, limit, *, environment, on_start=None, completion_path=None):
+    def contained(command, cwd, timeout, grace, limit, *, environment, extra_environment_names=(), on_start=None, completion_path=None):
         if command[:3] == ("docker", "image", "inspect"):
             return subprocess.CompletedProcess(command, 0, "sha256:" + "d" * 64 + "\n", "")
         if command[:2] in {("docker", "tag"), ("docker", "rmi")}:
@@ -2125,6 +2125,7 @@ def test_evaluator_default_runner_persists_contained_cgroup_identity(
         if command[:2] == ("docker", "ps"):
             return subprocess.CompletedProcess(command, 0, "", "")
         calls.append(tuple(command))
+        assert extra_environment_names == campaign_evaluate.EVALUATOR_ENVIRONMENT_NAMES
         cgroup = tmp_path / f"cgroup-{len(calls)}"
         cgroup.mkdir()
         (cgroup / "cgroup.procs").write_text(str(os.getpid()))
@@ -2166,7 +2167,7 @@ def test_contained_evaluator_timeout_removes_scoped_docker_containers(
     blob.write_bytes(b"tests")
     monkeypatch.setenv("PROGRAMBENCH_BLOB_DIR", str(tmp_path / "blobs"))
 
-    def contained(command, cwd, timeout, grace, limit, *, environment, on_start=None, completion_path=None):
+    def contained(command, cwd, timeout, grace, limit, *, environment, extra_environment_names=(), on_start=None, completion_path=None):
         if command[:3] == ("docker", "image", "inspect"):
             return subprocess.CompletedProcess(command, 0, "sha256:" + "d" * 64 + "\n", "")
         if command[:2] == ("docker", "ps"):

@@ -20,6 +20,7 @@ Do not remove this notice.
 """
 
 import logging
+import os
 import subprocess
 import tempfile
 import threading
@@ -442,7 +443,7 @@ class Evaluator:
         finally:
             host_tmp.unlink(missing_ok=True)
 
-    def _new_env(self, image: str, *, serial_pytest: bool = False) -> ContainerEnvironment:
+    def _new_env(self, image: str, *, serial_pytest: bool = False, testing: bool = False) -> ContainerEnvironment:
         # Baseline xdist hardening that always works (xdist ships with
         # every test image): replace up to N crashed workers per branch so
         # a single OOM doesn't drop the rest of that worker's queue.
@@ -455,8 +456,26 @@ class Evaluator:
         # contention as a recurring crash cause.
         addopts = "--max-worker-restart=4"
         env = {"PYTEST_ADDOPTS": addopts}
+        if testing:
+            # Plain assertions still execute, but do not render quadratic diffs
+            # for large unequal strings. Pin the runner's pytest ecosystem so a
+            # branch's pip -U cannot break the image's libtmux fixture plugin.
+            env["PYTEST_ADDOPTS"] += " --assert=plain"
+            env["PIP_CONSTRAINT"] = "/opt/programbench-eval/constraints.txt"
+            if os.environ.get("PROGRAMBENCH_SAFE_REPORTING") == "1":
+                env["PYTEST_ADDOPTS"] += " -p programbench_safe_reporting"
         if serial_pytest:
             env["PYTEST_XDIST_AUTO_NUM_WORKERS"] = "1"
+        run_args = [*DOCKER_RUN_ARGS, "--init"]
+        if not testing:
+            run_args += ["--network", "none", "--cap-drop", "ALL", "--security-opt", "no-new-privileges"]
+            wheelhouse = os.environ.get("PROGRAMBENCH_EVAL_WHEELHOUSE")
+            if not wheelhouse:
+                raise EvalStepError("missing_wheelhouse", "Offline evaluator requires PROGRAMBENCH_EVAL_WHEELHOUSE")
+            directory = Path(wheelhouse)
+            if not directory.is_absolute() or directory.is_symlink() or not directory.is_dir():
+                raise EvalStepError("invalid_wheelhouse", "Trusted evaluator wheelhouse is invalid")
+            run_args += ["--mount", f"type=bind,source={directory},target=/opt/programbench-wheels,readonly"]
         return ContainerEnvironment(
             image=image,
             cwd=WORKSPACE_DIR,
@@ -464,7 +483,8 @@ class Evaluator:
             timeout=600,
             cpus=self.docker_cpus,
             env=env,
-            run_args=[*DOCKER_RUN_ARGS, "--init"],
+            run_args=run_args,
+            prepare_workspace=not testing,
         )
 
     def _remove_hashed_files(self, env: ContainerEnvironment, log_buf: list[dict]) -> None:
@@ -490,7 +510,7 @@ class Evaluator:
             timeout=300,
         )
         assert self.submission_archive is not None
-        env.copy_in_tar(self.submission_archive, f"{WORKSPACE_DIR}/")
+        env.copy_submission(self.submission_archive, f"{WORKSPACE_DIR}/")
         self._remove_hashed_files(env, log_buf)
         # Remove any ./executable shipped in the submission archive so the
         # build must produce a fresh binary. The workspace wipe above runs
@@ -562,21 +582,40 @@ class Evaluator:
             timeout=300,
         )
         self.result.executable_hash = r["output"].split()[0]
-        # Best-effort: install pytest-rerunfailures so per-test reruns can
-        # absorb flakes inside a single branch run. Installing during compile
-        # bakes it into the committed image so per-branch containers inherit
-        # it without re-installing. Failures are accepted (no pip3, no
-        # network, ...): we just don't get --reruns and rely on
-        # --max-worker-restart + branch_retries.
+        # Test infrastructure is installed after the candidate build and hash;
+        # constraints are inherited only by the test containers. Installation
+        # failure is an explicit evaluator error, never a passing candidate.
+        self._run_step(
+            "mkdir -p /opt/programbench-eval && "
+            "printf '%s\\n' 'pytest==8.4.2' 'pytest-xdist==3.8.0' "
+            "'pytest-timeout==2.4.0' 'pytest-rerunfailures==16.1' "
+            "> /opt/programbench-eval/constraints.txt",
+            env=env,
+            log_buf=log_buf,
+            step_name="prepare_pytest_constraints",
+        )
         rerun_install = self._run_step(
-            "pip3 install -q --disable-pip-version-check pytest-rerunfailures",
+            "python3 -m pip install -q --disable-pip-version-check "
+            "--no-index --find-links /opt/programbench-wheels "
+            "-c /opt/programbench-eval/constraints.txt "
+            "pytest pytest-xdist pytest-timeout pytest-rerunfailures && "
+            "python3 -c 'import importlib.metadata as m; "
+            "print({p: m.version(p) for p in "
+            "[\"pytest\",\"pytest-xdist\",\"pytest-timeout\",\"pytest-rerunfailures\"]})'",
             env=env,
             log_buf=log_buf,
             step_name="install_rerunfailures",
-            accept_failure=True,
             timeout=120,
         )
         self._has_rerunfailures = rerun_install["returncode"] == 0
+        if os.environ.get("PROGRAMBENCH_SAFE_REPORTING") == "1":
+            module_root = self._run_step(
+                "python3 -c 'from pathlib import Path; import pytest; print(Path(pytest.__file__).parent.parent)'",
+                env=env,
+                log_buf=log_buf,
+                step_name="locate_pytest_modules",
+            )["output"].strip()
+            env.copy_in(Path(__file__).with_name("safe_reporting.py"), f"{module_root}/programbench_safe_reporting.py")
 
     def _restore_executable(self, env: ContainerEnvironment, log_buf: list[dict]) -> None:
         if self.result.executable_hash is None:
@@ -623,7 +662,7 @@ class Evaluator:
         worker via PYTEST_XDIST_AUTO_NUM_WORKERS=1. Used on retry after a
         worker crash so the same OOM/contention pattern doesn't repeat.
         """
-        env = self._new_env(image, serial_pytest=serial_pytest)
+        env = self._new_env(image, serial_pytest=serial_pytest, testing=True)
         try:
             # No wipe: each container boots fresh from the post-compile image, so
             # build artefacts (e.g. /workspace/build/xz) need to survive into the
@@ -663,7 +702,10 @@ class Evaluator:
                 # retries individual failed tests up to 2x with a 1s delay.
                 # Augmenting at exec time (not container creation) lets us
                 # re-use the committed image for every branch.
-                run_cmd = 'export PYTEST_ADDOPTS="$PYTEST_ADDOPTS --reruns=2 --reruns-delay=1" && ' + run_cmd
+                reruns = int(os.environ.get("PROGRAMBENCH_TEST_RERUNS", "2"))
+                if reruns not in {0, 1, 2}:
+                    raise ValueError("PROGRAMBENCH_TEST_RERUNS must be 0, 1, or 2")
+                run_cmd = f'export PYTEST_ADDOPTS="$PYTEST_ADDOPTS --reruns={reruns} --reruns-delay=1" && ' + run_cmd
             self._run_step(
                 run_cmd,
                 env=env,

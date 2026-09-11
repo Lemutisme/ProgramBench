@@ -231,6 +231,7 @@ def run_vanilla(
     agent: str | None = None,
     files: tuple[Mapping[str, object], ...] = (),
     stop_token: StopToken | None = None,
+    workflow: bool = False,
 ) -> VanillaResult:
     stop = stop_token or StopToken()
     guarded_api = StopAwareApi(api, stop)
@@ -252,6 +253,7 @@ def run_vanilla(
             agent=agent,
             files=files,
             stop_token=stop,
+            workflow=workflow,
         )
     except CampaignStopped:
         return _finish_active_campaign_stop(
@@ -285,6 +287,7 @@ def _run_vanilla(
     agent: str | None = None,
     files: tuple[Mapping[str, object], ...] = (),
     stop_token: StopToken | None = None,
+    workflow: bool = False,
 ) -> VanillaResult:
     """Run or adopt one durable vanilla trajectory and freeze its candidate once."""
     _validate_inputs(
@@ -873,6 +876,14 @@ def _run_vanilla(
             error_text = "session became inactive before its final provider turn settled"
             break
         if usage.provider_turns:
+            if workflow:
+                from scripts.campaign_workflow import check_and_continue
+                workspace, continued = check_and_continue(
+                    workspace, api, session_id, usage.provider_turns, wall_deadline,
+                )
+                if continued:
+                    inactive_messages = None
+                    continue
             completion = VanillaCompletion.IDLE
             break
         _sleep_before_deadline(clock, sleeper, poll_interval, wall_deadline)
@@ -1936,8 +1947,8 @@ def _validate_inputs(
         raise VanillaError("vanilla execution requires an active Docker workspace handle")
     if install.arm != "vanilla" or manifest.arm != "vanilla" or install.binary_sha256 != manifest.binary_sha256:
         raise VanillaError("vanilla installation does not match the running workspace")
-    if model != "openai/gpt-5.6-luna" or variant != "max":
-        raise VanillaError("vanilla campaign requires openai/gpt-5.6-luna variant max")
+    if (model, variant) not in {("openai/gpt-5.6-luna", "max"), ("openai/gpt-5.6-sol", "xhigh")}:
+        raise VanillaError("vanilla campaign model/variant is unsupported")
     if delivery != "steer" or agent is not None or files:
         raise VanillaError("vanilla campaign admission is fixed to steer with no custom agent or files")
     if (

@@ -41,6 +41,10 @@ class CandidateError(RuntimeError):
     pass
 
 
+class PreflightInfrastructureError(RuntimeError):
+    """Checker setup/transport failed; never feed this back as a candidate defect."""
+
+
 class CandidateCredentialError(CandidateError):
     pass
 
@@ -133,22 +137,26 @@ def preflight_candidate(
     *,
     image_tag: str = DEFAULT_IMAGE_TAG,
     docker_cpus: int = DOCKER_CPUS,
+    deadline: float | None = None,
+    image_ref: str | None = None,
 ) -> PreflightResult:
     if not archive.is_file():
         raise CandidateError(f"Candidate archive does not exist: {archive}")
 
     env = ContainerEnvironment(
-        image=f"{image_name_from_instance_id(instance_id)}:{image_tag}",
+        image=image_ref or f"{image_name_from_instance_id(instance_id)}:{image_tag}",
         cwd=WORKSPACE_DIR,
         executable=DOCKER_EXECUTABLE,
         timeout=900,
         cpus=docker_cpus,
-        run_args=[*DOCKER_RUN_ARGS, "--init"],
+        deadline=deadline,
+        prepare_workspace=True,
+        run_args=[*DOCKER_RUN_ARGS, "--init", "--network", "none", "--cap-drop", "ALL", "--security-opt", "no-new-privileges"],
     )
-    output: list[str] = []
+    output: list[str] = [f"Trusted build preparation: {env.preparation}\n"]
     try:
         _step(env, f"find {WORKSPACE_DIR} -mindepth 1 -maxdepth 1 -exec rm -rf -- {{}} +", output)
-        env.copy_in_tar(archive, f"{WORKSPACE_DIR}/")
+        env.copy_submission(archive, f"{WORKSPACE_DIR}/")
         hashes = _clean_hashes(instance_id)
         if hashes:
             pattern = "|".join(sorted(hashes))
@@ -173,11 +181,11 @@ def preflight_candidate(
         )
         try:
             block_build_internet_dns(env)
-            _step(env, "chmod +x ./compile.sh && ./compile.sh", output)
-            _step(env, "if [ -f ./validate.sh ]; then chmod +x ./validate.sh && ./validate.sh; fi", output)
+            _step(env, "chmod +x ./compile.sh && ./compile.sh", output, candidate=True)
+            _step(env, "if [ -f ./validate.sh ]; then chmod +x ./validate.sh && ./validate.sh; fi", output, candidate=True)
         finally:
             restore_build_internet_dns(env)
-        result = _step(env, "test -x ./executable && sha256sum ./executable", output)
+        result = _step(env, "test -x ./executable && sha256sum ./executable", output, candidate=True)
         return PreflightResult(executable_hash=result.split()[0], output="".join(output))
     finally:
         env.cleanup()
@@ -239,12 +247,13 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _step(env: ContainerEnvironment, command: str, output: list[str]) -> str:
+def _step(env: ContainerEnvironment, command: str, output: list[str], *, candidate: bool = False) -> str:
     result = env.execute(command, timeout=900)
     output.append(result["output"])
     if result["returncode"] != 0:
         detail = result["output"] or result["exception_info"]
-        raise CandidateError(f"Preflight command failed: {command}\n{detail.strip()}")
+        error = CandidateError if candidate else PreflightInfrastructureError
+        raise error(f"Preflight command failed: {command}\n{detail.strip()}")
     return result["output"]
 
 

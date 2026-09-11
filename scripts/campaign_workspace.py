@@ -18,6 +18,7 @@ from typing import Callable, Mapping
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
+from programbench.candidate import DEFAULT_IMAGE_TAG
 from scripts.campaign_install import InstallRecord
 from scripts.campaign_state import JobLockedError, JobPaths, job_lock
 from scripts.campaign_workspace_fs import PathIdentity, WorkspaceFilesystemError, snapshot_binary, sync_tree
@@ -418,6 +419,9 @@ class WorkspaceRequest:
     state_root: Path
     log_dir: Path
     credential_env: tuple[str, ...]
+    isolated: bool = False
+    provider_model: str = "gpt-5.6-sol"
+    provider_effort: str = "xhigh"
     docker: str = "docker"
     docker_runner: _DockerRunner | None = None
     health_probe: _HealthProbe | None = None
@@ -715,6 +719,9 @@ class DockerWorkspace:
             ),
         )
         active.release_handle()
+        if current.network_mode == "none":
+            from scripts.campaign_offline import stop_gateway
+            stop_gateway(current)
 
 
 def ensure_workspace(request: WorkspaceRequest, lease: WorkspaceLease | None = None) -> DockerWorkspace:
@@ -936,6 +943,9 @@ def _launch(
     if not restarting:
         _require_candidate_ready(manifest)
         _verify_candidate(runner, request.docker, manifest, publish=False)
+    if manifest.network_mode == "none":
+        from scripts.campaign_offline import prepare_headless_config
+        prepare_headless_config(manifest)
     launching = replace(manifest, container_id=None, port=None, phase="launching")
     _write_manifest(manifest.manifest_path, launching)
     command = [
@@ -950,17 +960,28 @@ def _launch(
         launching.container_user,
         "--network",
         launching.network_mode,
-        "-p",
-        "127.0.0.1::4096",
         "-w",
         launching.workdir,
         "--entrypoint",
         launching.entrypoint[0],
     ]
+    if launching.network_mode == "none":
+        command.extend(("--cap-drop", "ALL", "--security-opt", "no-new-privileges"))
+    else:
+        command.extend(("-p", "127.0.0.1::4096"))
     command.extend(
         value for label in _identity_labels(launching).items() for value in ("--label", f"{label[0]}={label[1]}")
     )
-    command.extend(value for name in launching.credential_env for value in ("-e", name))
+    if launching.network_mode == "none":
+        from scripts.campaign_offline import OFFLINE_ENV
+        command.extend(value for name in launching.credential_env if name == "OPENCODE_SERVER_PASSWORD" for value in ("-e", name))
+        environment = {**OFFLINE_ENV, "OPENCODE_PROCONTRACT_DISABLED": "1" if launching.arm == "vanilla" else "0"}
+        if "OPENCODE_REFERENCE_BINDING" in launching.environment_names:
+            from scripts.campaign_offline import prepare_reference_binding
+            environment["OPENCODE_REFERENCE_BINDING"] = prepare_reference_binding(launching, request.docker)
+        command.extend(value for name, setting in environment.items() for value in ("-e", f"{name}={setting}"))
+    else:
+        command.extend(value for name in launching.credential_env for value in ("-e", name))
     command.extend(value for item in _FIXED_ENV.items() for value in ("-e", f"{item[0]}={item[1]}"))
     command.extend(
         value
@@ -1006,7 +1027,7 @@ def _activate(
     current_id = inspected.get("Id")
     if not isinstance(current_id, str) or not _CONTAINER_ID.fullmatch(current_id):
         raise ContainerConflictError("started container has an invalid ID")
-    port = _published_port(runner, request.docker, current_id)
+    port = 4096 if manifest.network_mode == "none" else _published_port(runner, request.docker, current_id)
     activated = replace(
         manifest,
         container_id=current_id,
@@ -1017,7 +1038,24 @@ def _activate(
     if activated.phase == "launching":
         _write_manifest(activated.manifest_path, activated)
     try:
-        _wait_health(activated, probe, request.health_timeout)
+        if manifest.network_mode == "none":
+            from scripts.campaign_offline import admit_runtime, verify_network, wait_health
+            try:
+                admit_runtime(activated, request.docker)
+                wait_health(activated, request.health_timeout, request.docker)
+                verify_network(activated, request.docker)
+            except (ValueError, RuntimeError, OSError) as error:
+                detail = str(error)
+                for name in request.credential_env:
+                    if value := os.environ.get(name):
+                        detail = detail.replace(value, '<redacted>')
+                _write_json(activated.state_root / f'admission-error-{time.time_ns()}.json', {
+                    'type': type(error).__name__, 'message': detail[:2000],
+                    'container_id': current_id, 'phase': 'offline-admission',
+                })
+                raise WorkspaceHealthError("offline admission failed") from error
+        else:
+            _wait_health(activated, probe, request.health_timeout)
     except WorkspaceHealthError:
         _docker(runner, (request.docker, "stop", "--time", "10", current_id), 30, "stop")
         stopped = _inspect_container(runner, request.docker, activated.container_name)
@@ -1034,7 +1072,7 @@ def _activate(
     if final_inspected is None or not _running(final_inspected):
         raise ContainerConflictError("container changed during health verification")
     _require_exact_container(final_inspected, activated, check_port=True)
-    if _published_port(runner, request.docker, current_id) != port:
+    if manifest.network_mode != "none" and _published_port(runner, request.docker, current_id) != port:
         raise ContainerConflictError("container port changed during health verification")
     _require_path_identities(activated)
     ready = replace(activated, phase="running", candidate_mutable=True, exit_code=None)
@@ -1064,6 +1102,21 @@ def _expected_manifest(
     candidate = request.candidate_root / f"programbench-{job_id[:32]}"
     state_dir = request.state_root / "opencode-state"
     cache_dir = request.state_root / "cache"
+    channel = ()
+    identities = ()
+    environment = {*image_environment, *request.credential_env, *_FIXED_ENV}
+    entrypoint = _ENTRYPOINT
+    command = _COMMAND
+    if request.isolated:
+        from scripts.campaign_offline import BOOTSTRAP, CHANNEL_PATH, OFFLINE_ENV, ensure_gateway
+        directory = ensure_gateway(request)
+        channel = (MountSpec(directory, CHANNEL_PATH, "bind", True),)
+        identities = (PathIdentity.capture("provider-channel", directory),)
+        environment = {*image_environment, "OPENCODE_SERVER_PASSWORD", *_FIXED_ENV, *OFFLINE_ENV}
+        if request.arm == "procontract" and os.environ.get("PROGRAMBENCH_GROUNDED_REFERENCE") == "1":
+            environment.add("OPENCODE_REFERENCE_BINDING")
+        entrypoint = ("/usr/bin/python3",)
+        command = ("-I", "-S", "-c", BOOTSTRAP, *_COMMAND)
     return WorkspaceManifest(
         campaign=request.campaign,
         job_id=job_id,
@@ -1093,6 +1146,7 @@ def _expected_manifest(
             PathIdentity.capture("cache", cache_dir),
             PathIdentity.capture("log", request.log_dir),
             PathIdentity.capture("binary", request.install.binary),
+            *identities,
         ),
         mounts=(
             MountSpec(candidate, "/candidate", "bind", False),
@@ -1100,15 +1154,16 @@ def _expected_manifest(
             MountSpec(cache_dir, "/cache", "bind", False),
             MountSpec(request.log_dir, "/logs", "bind", False),
             MountSpec(request.install.binary, "/opencode", "bind", True),
+            *channel,
         ),
         credential_env=request.credential_env,
-        environment_names=tuple(sorted({*image_environment, *request.credential_env, *_FIXED_ENV})),
+        environment_names=tuple(sorted(environment)),
         container_user="agent",
         container_init=True,
-        network_mode="bridge",
+        network_mode="none" if request.isolated else "bridge",
         workdir="/candidate",
-        entrypoint=_ENTRYPOINT,
-        command=_COMMAND,
+        entrypoint=entrypoint,
+        command=command,
         home=_FIXED_ENV["HOME"],
         xdg_cache_home=_FIXED_ENV["XDG_CACHE_HOME"],
         xdg_config_home=_FIXED_ENV["XDG_CONFIG_HOME"],
@@ -1128,8 +1183,8 @@ def _validate_request(request: WorkspaceRequest) -> WorkspaceRequest:
         raise WorkspaceError("campaign, instance, and arm names must be safe identifiers")
     if not isinstance(request.image, str) or not request.image or "@" in request.image:
         raise WorkspaceError("image name is invalid")
-    if not request.image.endswith(":task_cleanroom"):
-        request = replace(request, image=f"{request.image}:task_cleanroom")
+    if ":" not in request.image.rsplit("/", 1)[-1]:
+        request = replace(request, image=f"{request.image}:{DEFAULT_IMAGE_TAG}")
     if (
         not request.credential_env
         or len(set(request.credential_env)) != len(request.credential_env)
@@ -1715,7 +1770,7 @@ def _require_exact_container(inspected: Mapping[str, object], manifest: Workspac
     expected_host = (
         manifest.container_init,
         manifest.network_mode,
-        {"4096/tcp": [{"HostIp": "127.0.0.1", "HostPort": ""}]},
+        {} if manifest.network_mode == "none" else {"4096/tcp": [{"HostIp": "127.0.0.1", "HostPort": ""}]},
         expected_binds,
     )
     if config.get("Hash") != _evidence_hash(expected_config) or host.get("Hash") != _evidence_hash(expected_host):
@@ -1743,6 +1798,10 @@ def _require_exact_container(inspected: Mapping[str, object], manifest: Workspac
     if check_port:
         network = inspected.get("NetworkSettings")
         ports = network.get("Ports") if isinstance(network, Mapping) else None
+        if manifest.network_mode == "none":
+            if manifest.port != 4096 or ports not in (None, {}, {"4096/tcp": None}):
+                raise ContainerConflictError("offline workspace has a published port")
+            return
         expected_port = {"4096/tcp": [{"HostIp": "127.0.0.1", "HostPort": str(manifest.port)}]}
         stopped_empty = not _running(inspected) and ports in (None, {}, {"4096/tcp": None})
         if manifest.port is None or (ports != expected_port and not stopped_empty):
@@ -1826,8 +1885,11 @@ def _validate_path_identity_schema(manifest: WorkspaceManifest) -> None:
         "cache": manifest.cache_dir,
         "log": manifest.log_dir,
         "binary": manifest.binary,
+        "provider-channel": manifest.state_root / "provider-channel",
     }
     required = REQUIRED_PATH_IDENTITIES_BY_PHASE[manifest.phase]
+    if manifest.network_mode == "none":
+        required = required | {"provider-channel"}
     if {identity.name for identity in manifest.path_identities} != required:
         raise WorkspaceError("workspace filesystem identities do not match phase requirements")
     for identity in manifest.path_identities:
@@ -1852,6 +1914,8 @@ def _capture_path_identities(manifest: WorkspaceManifest, *, include_candidate: 
     ]
     if include_candidate:
         values.append(PathIdentity.capture("candidate", manifest.candidate))
+    if manifest.network_mode == "none":
+        values.append(PathIdentity.capture("provider-channel", manifest.state_root / "provider-channel"))
     return tuple(sorted(values, key=lambda item: item.name))
 
 
@@ -1927,6 +1991,7 @@ def _require_safe_manifest_paths(manifest: WorkspaceManifest) -> None:
         MountSpec(manifest.cache_dir, "/cache", "bind", False),
         MountSpec(manifest.log_dir, "/logs", "bind", False),
         MountSpec(manifest.binary, "/opencode", "bind", True),
+        *((MountSpec(manifest.state_root / "provider-channel", "/run/programbench-provider", "bind", True),) if manifest.network_mode == "none" else ()),
     ):
         raise ContainerConflictError("workspace manifest mounts do not match its canonical roots")
     independent = (

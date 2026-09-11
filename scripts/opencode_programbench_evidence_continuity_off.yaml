@@ -1,0 +1,28 @@
+model: openai/gpt-5.6-luna
+variant: max
+
+limits:
+  wall_time_seconds: 21600
+  provider_turns: 1000
+  procontract_actions: 4000
+  total_cost_soft: null
+  total_cost_hard: null
+
+cache:
+  warmup_turns: 10
+  minimum_read_ratio: 0.80
+  stop_after_consecutive_failures: 2
+
+arms:
+  procontract:
+    repo: ${OPENCODE_REPO}
+    revision: 97d61022abdc33397ee97447c7bbc6f571574e1e
+    mode: procontract
+    execution_policy: behavioral
+    binary: /home/duozhou/run-artifacts/evidence-continuity-luna-pilot-20260907-v1/build/opencode
+  vanilla:
+    repo: ${OPENCODE_REPO}
+    revision: origin/dev
+    mode: vanilla
+
+excluded: []

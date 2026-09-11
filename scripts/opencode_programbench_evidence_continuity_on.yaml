@@ -1,0 +1,104 @@
+model: openai/gpt-5.6-luna
+variant: max
+
+limits:
+  wall_time_seconds: 21600
+  provider_turns: 1000
+  procontract_actions: 4000
+  total_cost_soft: null
+  total_cost_hard: null
+
+cache:
+  warmup_turns: 10
+  minimum_read_ratio: 0.80
+  stop_after_consecutive_failures: 2
+
+arms:
+  procontract:
+    repo: ${OPENCODE_REPO}
+    revision: 97d61022abdc33397ee97447c7bbc6f571574e1e
+    mode: procontract
+    execution_policy: behavioral
+    binary: /home/duozhou/run-artifacts/evidence-continuity-luna-pilot-20260907-v1/build/opencode
+  vanilla:
+    repo: ${OPENCODE_REPO}
+    revision: origin/dev
+    mode: vanilla
+
+excluded: []
+
+observations:
+  jqlang__jq.b33a763:
+    - id: raw-field
+      args: ["-r", ".foo"]
+      stdin: "{\"foo\":\"bar\"}\n"
+      stdout: "bar\n"
+      stderr: ""
+      exit: 0
+    - id: compact-identity
+      args: ["-c", "."]
+      stdin: "[1,2]\n"
+      stdout: "[1,2]\n"
+      stderr: ""
+      exit: 0
+  chmln__sd.87d1ba5:
+    - id: literal-global
+      args: ["foo", "bar"]
+      stdin: "foo foo\n"
+      stdout: "bar bar\n"
+      stderr: ""
+      exit: 0
+    - id: regex-digits
+      args: ["[0-9]+", "N"]
+      stdin: "a12b\n"
+      stdout: "aNb\n"
+      stderr: ""
+      exit: 0
+  tomnomnom__gron.88a6234:
+    - id: object-flatten
+      args: []
+      stdin: "{\"a\":1}\n"
+      stdout: "json = {};\njson.a = 1;\n"
+      stderr: ""
+      exit: 0
+    - id: array-flatten
+      args: []
+      stdin: "[\"x\",2]\n"
+      stdout: "json = [];\njson[0] = \"x\";\njson[1] = 2;\n"
+      stderr: ""
+      exit: 0
+  svenstaro__genact.16f96e3:
+    - id: version
+      args: ["--version"]
+      stdin: ""
+      stdout: "genact 1.5.1\n"
+      stderr: ""
+      exit: 0
+    - id: list-modules
+      args: ["--list-modules"]
+      stdin: ""
+      stdout: |
+        Available modules:
+          ansible
+          bootlog
+          botnet
+          bruteforce
+          cargo
+          cc
+          composer
+          cryptomining
+          docker_build
+          docker_image_rm
+          download
+          julia
+          kernel_compile
+          memdump
+          mkinitcpio
+          rkhunter
+          simcity
+          terraform
+          uv
+          weblog
+          wpt
+      stderr: ""
+      exit: 0

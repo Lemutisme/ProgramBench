@@ -33,7 +33,7 @@ then evaluate every terminal submission and preserve a resumable artifact tree.
 Options:
   --output PATH              Artifact root (default: output/luna-all)
   --config PATH              Campaign YAML (default: scripts/opencode_programbench_all.yaml)
-  --workers N                Active inference trajectories, 1-8 (default: 8)
+  --workers N                Active inference trajectories, 1-32 (default: 8)
   --seed N                   Frozen selection/job-order seed (default: 42)
   --expected-instances N     Fail before inference unless exactly N are frozen (default: 200)
   --arm MODE                 paired, procontract, or vanilla (default: paired)
@@ -128,7 +128,7 @@ while (($#)); do
 done
 
 positive_integer "$WORKERS" || die "--workers must be a positive integer"
-((WORKERS <= 8)) || die "--workers must not exceed 8"
+((WORKERS <= 32)) || die "--workers must not exceed 32"
 [[ "$SEED" =~ ^-?[0-9]+$ ]] || die "--seed must be an integer"
 positive_integer "$EXPECTED_INSTANCES" || die "--expected-instances must be a positive integer"
 [[ "$ARM" == paired || "$ARM" == procontract || "$ARM" == vanilla ]] || die "--arm must be paired, procontract, or vanilla"

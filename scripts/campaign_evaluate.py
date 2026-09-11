@@ -39,6 +39,7 @@ TERMINAL_PHASES = frozenset({"frozen", "packaged", "preflighted", "done", "faile
 EVALUATOR_TIMEOUT_SECONDS = 12 * 60 * 60
 EVALUATOR_GRACE_SECONDS = 30
 EVALUATOR_OUTPUT_LIMIT = 4 * 1024 * 1024
+EVALUATOR_ENVIRONMENT_NAMES = ("PROGRAMBENCH_SAFE_REPORTING", "PROGRAMBENCH_EVAL_WHEELHOUSE")
 MAX_EVAL_JSON_BYTES = 32 * 1024 * 1024
 MAX_EVAL_ARTIFACT_HASH_BYTES = 256 * 1024 * 1024
 EVAL_ARTIFACT_HASH_TIMEOUT_SECONDS = 30
@@ -2815,6 +2816,8 @@ def _evaluate_arm(
             "PROGRAMBENCH_BLOB_DIR",
             "PROGRAMBENCH_DOCKER_ORG",
             "PROGRAMBENCH_CONTAINER_PREFIX",
+            "PROGRAMBENCH_SAFE_REPORTING",
+            "PROGRAMBENCH_EVAL_WHEELHOUSE",
         )
         if (value := os.environ.get(name))
     }
@@ -2834,6 +2837,7 @@ def _evaluate_arm(
                 EVALUATOR_GRACE_SECONDS,
                 EVALUATOR_OUTPUT_LIMIT,
                 environment=environment,
+                extra_environment_names=EVALUATOR_ENVIRONMENT_NAMES,
                 on_start=on_start,
                 completion_path=completion_path,
             )

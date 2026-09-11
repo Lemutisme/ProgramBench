@@ -93,7 +93,8 @@ def test_partial_package_safely_omits_reference_copies_unreadable_files_and_sock
     unreadable.write_text("runtime probe\n")
     unreadable.chmod(0)
     endpoint = socket.socket(socket.AF_UNIX)
-    endpoint.bind(str(workspace / "runtime.sock"))
+    directory_fd = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY)
+    endpoint.bind(f"/proc/self/fd/{directory_fd}/runtime.sock")
     tasks = tmp_path / "tasks/owner__repo.abc"
     tasks.mkdir(parents=True)
     tasks.joinpath("task.yaml").write_text(f"eval_clean_hashes:\n  - {sha256(copied)}\n")
@@ -108,6 +109,7 @@ def test_partial_package_safely_omits_reference_copies_unreadable_files_and_sock
         )
     finally:
         endpoint.close()
+        os.close(directory_fd)
         unreadable.chmod(0o600)
 
     with tarfile.open(archive, "r:gz") as packaged:

@@ -18,6 +18,7 @@ from pathlib import Path
 
 import pytest
 
+from programbench.candidate import DEFAULT_IMAGE_TAG
 from scripts.campaign_install import InstallRecord
 from scripts.campaign_state import JobLease, JobPaths
 from scripts.campaign_workspace import (
@@ -129,7 +130,7 @@ class RecordingDocker:
                 if values[index - 1] == "-e"
             ]
             labels = dict(value.split("=", 1) for index, value in enumerate(values) if values[index - 1] == "--label")
-            image_index = values.index("example/task:task_cleanroom")
+            image_index = values.index(f"example/task:{DEFAULT_IMAGE_TAG}")
             state = Path(next(value for value in values if value.endswith(":/state:rw")).removesuffix(":/state:rw"))
             self.observed_phases.append(json.loads((state.parent / "workspace.json").read_text())["phase"])
             self.containers[name] = {
@@ -140,7 +141,7 @@ class RecordingDocker:
                 "State": {"Running": False, "ExitCode": 0},
                 "Mounts": mounts,
                 "Config": {
-                    "Image": "example/task:task_cleanroom",
+                    "Image": f"example/task:{DEFAULT_IMAGE_TAG}",
                     "User": values[values.index("--user") + 1],
                     "Env": env,
                     "Labels": labels,
@@ -389,6 +390,23 @@ def test_workspace_constructs_redacted_dynamic_loopback_server(tmp_path: Path) -
     text = workspace.manifest_path.read_text()
     assert "OPENAI_API_KEY" in text and "secret-value" not in text
     assert docker.observed_phases == ["preparing", "launching"]
+    assert workspace.manifest.image == f"example/task:{DEFAULT_IMAGE_TAG}"
+
+
+@pytest.mark.parametrize(
+    ("image", "expected"),
+    [
+        ("example/task", f"example/task:{DEFAULT_IMAGE_TAG}"),
+        (f"example/task:{DEFAULT_IMAGE_TAG}", f"example/task:{DEFAULT_IMAGE_TAG}"),
+        ("example/task:task_cleanroom", "example/task:task_cleanroom"),
+        ("localhost:5000/example/task", f"localhost:5000/example/task:{DEFAULT_IMAGE_TAG}"),
+    ],
+)
+def test_workspace_defaults_to_evaluator_image_without_retagging_explicit_versions(
+    tmp_path: Path, image: str, expected: str
+) -> None:
+    selected = campaign_workspace._validate_request(replace(request(tmp_path, RecordingDocker()), image=image))
+    assert selected.image == expected
 
 
 def test_default_health_probe_uses_principal_basic_auth(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -14,11 +14,12 @@ from dataclasses import dataclass, replace
 from decimal import Decimal
 from enum import Enum
 from pathlib import Path, PurePosixPath
-from typing import Callable, Literal, Mapping, Protocol
+from typing import Callable, Literal, Mapping, Protocol, Sequence
 from urllib.parse import quote, urlencode, urlparse
 
 from programbench.candidate import CandidateError, PreflightResult, package_workspace, preflight_candidate
 from scripts import campaign_process
+from scripts.campaign_observations import behavioral_replay, load_observations
 from scripts.campaign_freeze import (
     MAX_FREEZE_BYTES,
     MAX_INVENTORY_SECONDS,
@@ -58,15 +59,18 @@ from scripts.campaign_vanilla_http import (
     VanillaHttpError,
 )
 from scripts.campaign_workspace import DockerWorkspace, WorkspaceError
+from scripts.campaign_materialize import build_view
 
 
 MAX_WALL_TIME_SECONDS = 21600
 MAX_PROVIDER_TURNS = 1000
 MAX_ACTIONS = 4000
+OFFLINE_ACTION_SENTINEL = 1_000_000
 MAX_MUTATION_ATTEMPTS = 3
 MAX_OBSERVATION_ATTEMPTS = 6
 MAX_CONTRACT_ATTEMPTS = 3
 MAX_CREDENTIAL_SCAN_BYTES = 512 * 1024 * 1024
+MAX_DELIVERY_DIAGNOSTIC_CHARS = 16_384
 SEMANTIC_ATTEMPTS_REVISION = "ed8bd2b7992485264335a541b40c1c03a4b35619"
 POLICY_SPLIT_REVISIONS = frozenset(
     {
@@ -77,7 +81,9 @@ POLICY_SPLIT_REVISIONS = frozenset(
         "c6c4a4c3ab154cbd5a3cbe70f25a8bbe4739f72b",
     }
 )
-ProContractProtocol = Literal["current", "semantic-v0", "policy-split-v1", "policy-split-none-v1"]
+ProContractProtocol = Literal[
+    "current", "semantic-v0", "policy-split-v1", "policy-split-none-v1", "policy-split-adaptive-v1"
+]
 MODEL = "openai/gpt-5.6-luna"
 VARIANT = "max"
 SUPPORTED_MODEL_VARIANTS = frozenset(
@@ -92,11 +98,24 @@ ACCEPTANCE_POLICY = (
     "interactions; use batched differential probes within the action deadline, then preserve observations as "
     "regression checks after coherent edits. Delivery replay alone is not a behavioral stopping condition. Hand "
     "off one exact frozen candidate snapshot containing compile.sh, "
-    "executable, and a self-contained validate.sh regression suite after the native replay runs compile.sh with "
+    "executable, and a self-contained validate.sh regression suite after the native replay removes the derived "
+    "executable and runs compile.sh with "
     "common package-manager network access disabled and then validate.sh, with both exiting 0 within 600 seconds. "
     "validate.sh must encode behavioral evidence learned from black-box reference experiments and must not access "
     "the reference, network, or ambient package caches during replay. The ProgramBench harness "
     "performs packaging and preflight only; official benchmark evaluation remains external."
+)
+ADAPTIVE_POLICY = (
+    "ProgramBench adaptive search policy v1: choose a representation that preserves documented state, ordering, "
+    "and error semantics. When a design choice is uncertain, build the smallest end-to-end slice and run a short "
+    "black-box trace that can falsify that choice before expanding coverage. Use only task-permitted primitives "
+    "and black-box reference access. Preserve reference observations as self-contained regression fixtures in "
+    "validate.sh, then extend behavior using batched differential probes. When a counterexample exposes lost "
+    "state or a broken cross-cutting invariant, change the representation rather than add an output-specific "
+    "exception; replay earlier fixtures after coherent edits. Preserve observations, not architecture commitments. "
+    "Skip design trials when there is no material ambiguity. A design change alone does not require a Contract "
+    "revision. Delivery replay is not a behavioral stopping condition: continue while material gaps remain "
+    "within the shared budget, then hand off the exact candidate under the existing delivery terms."
 )
 LEGACY_ACCEPTANCE_POLICY = (
     "ProgramBench semantic-v0 delivery policy: materialize the exact institution-captured handoff tree, package "
@@ -105,7 +124,8 @@ LEGACY_ACCEPTANCE_POLICY = (
 )
 PRINCIPAL_CLAIM = (
     "The exact native Contract handoff is the candidate delivered for external ProgramBench evaluation, and its "
-    "declared hermetic compile and self-contained behavioral regression replay passed for that same frozen subject."
+    "declared hermetic clean rebuild and self-contained behavioral regression replay passed for that same frozen "
+    "subject."
 )
 REPLAY_POLICY = {
     "checks": [
@@ -116,7 +136,9 @@ REPLAY_POLICY = {
                 "GOPROXY=off",
                 "npm_config_offline=true",
                 "PIP_NO_INDEX=1",
-                "./compile.sh",
+                "/bin/sh",
+                "-c",
+                "rm -f ./executable && ./compile.sh",
             ],
             "cwd": ".",
             "timeout": 600_000,
@@ -134,6 +156,7 @@ PREFLIGHT_COMMANDS = [
     "test -x ./executable && sha256sum ./executable",
 ]
 CONTROL_ARTIFACT_NAMES = (
+    "procontract-observations.json",
     "procontract-issue.json",
     "procontract-issue-response.json",
     "procontract-progress.json",
@@ -141,10 +164,12 @@ CONTROL_ARTIFACT_NAMES = (
     "procontract-export.json",
     "procontract-export-complete.json",
     "procontract-export-ambiguous.json",
+    "procontract-export-error.json",
     "procontract-subject.json",
     "procontract-package-request.json",
     "procontract-package.json",
     "procontract-preflight.json",
+    "procontract-delivery-error.json",
     "verifier-report.json",
     "procontract-attestation-request.json",
     "procontract-attestation.json",
@@ -161,6 +186,8 @@ DELIVERY_CONTROL_PATHS = (".git", ".programbench-cleanroom.json", "reference")
 def _acceptance_policy(protocol: ProContractProtocol) -> str:
     if protocol in {"current", "policy-split-v1"}:
         return ACCEPTANCE_POLICY
+    if protocol == "policy-split-adaptive-v1":
+        return ADAPTIVE_POLICY
     if protocol == "policy-split-none-v1":
         return ""
     if protocol == "semantic-v0":
@@ -169,6 +196,12 @@ def _acceptance_policy(protocol: ProContractProtocol) -> str:
 
 
 def protocol_for_revision(revision: str, execution_policy: str = "behavioral") -> ProContractProtocol:
+    if execution_policy not in {"behavioral", "none", "adaptive"}:
+        raise ProContractError("unknown execution policy")
+    if execution_policy == "adaptive":
+        if revision not in POLICY_SPLIT_REVISIONS:
+            raise ProContractError("adaptive execution policy requires a policy-split runtime")
+        return "policy-split-adaptive-v1"
     if revision == SEMANTIC_ATTEMPTS_REVISION:
         return "semantic-v0"
     if revision in POLICY_SPLIT_REVISIONS:
@@ -490,6 +523,7 @@ class ProContractIssueRequest:
     brief: str
     model: str
     variant: str
+    action_limit: int = MAX_ACTIONS
 
     def __post_init__(self) -> None:
         if (
@@ -499,6 +533,7 @@ class ProContractIssueRequest:
             or self.deadline <= 0
             or ORIGINAL_TASK not in self.brief
             or (self.model, self.variant) not in SUPPORTED_MODEL_VARIANTS
+            or self.action_limit not in {MAX_ACTIONS, OFFLINE_ACTION_SENTINEL}
         ):
             raise ProContractError("native Contract issue request is invalid")
         _canonical_bytes(self.to_dict())
@@ -516,7 +551,7 @@ class ProContractIssueRequest:
             "model": {"providerID": provider_id, "id": model_id, "variant": self.variant},
             "trigger": {"type": "immediate"},
             "authority": ["filesystem.read", "filesystem.write", "process.execute"],
-            "budget": {"turns": MAX_PROVIDER_TURNS, "actions": MAX_ACTIONS, "deadline": self.deadline},
+            "budget": {"turns": MAX_PROVIDER_TURNS, "actions": self.action_limit, "deadline": self.deadline},
             "evidence": {"type": "principal", "claim": PRINCIPAL_CLAIM, "replay": REPLAY_POLICY},
             "resolution": {"maxAttempts": MAX_CONTRACT_ATTEMPTS, "retryDelay": 0},
         }
@@ -792,6 +827,7 @@ def build_issue_payload(
     model: str = MODEL,
     variant: str = VARIANT,
     protocol: ProContractProtocol = "current",
+    observations: Sequence[Mapping[str, object]] = (),
 ) -> dict[str, object]:
     """Build the exact issue request. Callers must persist it before issuing."""
     if isinstance(now, bool) or not isinstance(now, (int, float)) or not math.isfinite(now) or now < 0:
@@ -806,6 +842,7 @@ def build_issue_payload(
         deadline=int(now * 1000) + MAX_WALL_TIME_SECONDS * 1000,
         model=model,
         variant=variant,
+        action_limit=OFFLINE_ACTION_SENTINEL if getattr(manifest, "network_mode", None) == "none" else MAX_ACTIONS,
         brief=(
             "ProgramBench native delivery Contract. Complete this exact benchmark task:\n\n"
             f"{ORIGINAL_TASK}\n\n"
@@ -826,10 +863,35 @@ def build_issue_payload(
             )
         ),
     ).to_dict()
+    if "OPENCODE_REFERENCE_BINDING" in getattr(manifest, "environment_names", ()):
+        payload["authority"].append("reference.run")
+        payload["brief"] += (
+            " The host exposes reference_run for individually recorded argv/stdin probes and reference_read "
+            "for exact retained bytes. Start with a minimal discriminating input. Nonzero exits may be valid "
+            "error observations; a completed shell batch does not prove that its inner probes succeeded. "
+            "An unavailable reference is an infrastructure issue, not a basis for claiming reference coverage."
+        )
+    if observations:
+        if protocol == "semantic-v0":
+            raise ProContractError("issuer observations require native replay support")
+        payload["evidence"] = {
+            "type": "principal",
+            "claim": PRINCIPAL_CLAIM + " The same subject also passed the issuer-frozen finite CLI observations.",
+            "replay": {
+                **REPLAY_POLICY,
+                "checks": [*REPLAY_POLICY["checks"], behavioral_replay(observations)],
+            },
+        }
+        payload["brief"] += (
+            " The issuer has also frozen finite CLI observations in the replay policy, outside validate.sh. "
+            "Use contract_check to obtain concrete counterexamples and repair the working candidate. "
+            "Changing your own tests cannot remove these checks; they do not prove behavior outside their scope."
+        )
     if protocol == "current":
         return payload
-    if protocol == "policy-split-v1":
-        payload["executionPolicy"] = payload.pop("policy")
+    if protocol in {"policy-split-v1", "policy-split-adaptive-v1"}:
+        payload.pop("policy")
+        payload["executionPolicy"] = _acceptance_policy(protocol)
         return payload
     if protocol == "policy-split-none-v1":
         payload.pop("policy")
@@ -902,6 +964,8 @@ def run_procontract(
 
     def guarded_preflight(archive: Path, instance_id: str) -> PreflightResult:
         stop.checkpoint()
+        if preflight is preflight_candidate and getattr(workspace.manifest, "network_mode", None) == "none":
+            return preflight(archive, instance_id, image_ref=workspace.manifest.image_digest)
         return preflight(archive, instance_id)
 
     try:
@@ -1408,6 +1472,13 @@ def _run_procontract(
         "stateHash": "",
         "outstanding": [payload["id"]],
     }
+    if state.phase != "executing":
+        verification = _read_verification_observation(job.job.root / "procontract-verification.json")
+        contract = _validate_contract(verification["contract"], payload)
+        execution = _validate_execution(verification["execution"], payload, int(contract["revision"]))
+        if not _execution_successor(accepted["execution"], execution):
+            raise ProContractConflictError("frozen Contract execution conflicts with admitted duty")
+        quiet = _validate_quiet(verification["quiet"], payload)
 
     if state.phase == "executing":
         observation_failures = 0
@@ -1543,10 +1614,9 @@ def _run_procontract(
                         "native Contract execution binding is unavailable",
                         clock,
                     )
-                if _binding_identity(current_execution) != _binding_identity(bound_execution):
-                    if not _execution_successor(bound_execution, current_execution):
-                        raise ProContractConflictError("native Contract execution binding changed after issue")
-                    bound_execution = current_execution
+                if not _execution_successor(bound_execution, current_execution):
+                    raise ProContractConflictError("native Contract execution binding changed or regressed after issue")
+                bound_execution = current_execution
                 execution = current_execution
                 if execution["dispatched"] is False:
                     provider_health = _observe_execution_failure(
@@ -1766,13 +1836,13 @@ def _run_procontract(
                         settled_usage = usage
                         settled_actions = actions
                         for attempt in range(MAX_MUTATION_ATTEMPTS):
-                            latest = _sanitize_control(
+                            session_messages = _sanitize_control(
                                 api.messages(str(execution["sessionID"])),
                                 _all_credential_names(workspace.manifest.credential_env),
                             )
-                            if not isinstance(latest, Mapping):
+                            if not isinstance(session_messages, Mapping):
                                 raise ProContractError("sanitized settled Session messages are invalid")
-                            latest = _merge_attempt_messages(messages, latest)
+                            latest = _merge_attempt_messages(messages, session_messages)
                             latest_usage = _summarize_usage(latest)
                             latest_actions = max(_actions(latest), int(execution["actionsUsed"]))
                             _require_monotonic(
@@ -1843,11 +1913,12 @@ def _run_procontract(
                             job.job.root / "procontract-verification.json",
                             _sanitize_control(
                                 {
-                                    "version": 1,
+                                    "version": 2,
                                     "contract": contract,
                                     "execution": execution,
                                     "quiet": quiet,
                                     "messages": messages,
+                                    "sessionMessageCount": len(session_messages["data"]),
                                 },
                                 _all_credential_names(workspace.manifest.credential_env),
                             ),
@@ -2106,8 +2177,9 @@ def _run_procontract(
             "native Contract delivery verification failed",
             clock,
             quiet=quiet,
+            delivery_error=error,
         )
-    except (CandidateError, CredentialLeakError, ProContractDeliveryError, WorkspaceError):
+    except (CandidateError, CredentialLeakError, ProContractDeliveryError, WorkspaceError) as error:
         return _finish_without_delivery(
             job,
             state_store,
@@ -2124,6 +2196,7 @@ def _run_procontract(
             "native Contract delivery verification failed",
             clock,
             quiet=quiet,
+            delivery_error=error,
         )
 
 
@@ -2187,7 +2260,22 @@ def _deliver(
         else:
             try:
                 exported = api.export(workspace, str(payload["id"]), export_dir)
-            except WorkspaceError:
+            except WorkspaceError as error:
+                diagnostic = str(
+                    _sanitize_control(str(error), _all_credential_names(workspace.manifest.credential_env))
+                )
+                _write_json(
+                    job.job.root / "procontract-export-error.json",
+                    {
+                        "version": 1,
+                        "contractID": payload["id"],
+                        "revision": contract["revision"],
+                        "subjectHash": handoff["subjectHash"],
+                        "errorType": type(error).__name__,
+                        "diagnostic": diagnostic[:MAX_DELIVERY_DIAGNOSTIC_CHARS],
+                        "truncated": len(diagnostic) > MAX_DELIVERY_DIAGNOSTIC_CHARS,
+                    },
+                )
                 ambiguous_invocation = True
                 exported = {
                     "contractID": payload["id"],
@@ -2368,7 +2456,8 @@ def _deliver(
         }
         _write_json(archive_path, archive_record)
     else:
-        archive = package(subject, job.job.root, workspace.manifest.instance_id)
+        with build_view(export_dir, subject, job.job.root) as working:
+            archive = package(working, job.job.root, workspace.manifest.instance_id)
         if archive.resolve() != expected_archive.resolve() or not archive.is_file():
             raise ProContractDeliveryError("candidate package was not created")
         archive_record = {
@@ -2500,7 +2589,12 @@ def _deliver(
         ),
         _all_credential_names(workspace.manifest.credential_env),
     )
-    if restarted_messages != messages:
+    verification = _read_verification_observation(job.job.root / "procontract-verification.json")
+    verified_messages = verification["messages"]
+    count = verification.get("sessionMessageCount", len(verified_messages["data"]))
+    if verified_messages != messages or restarted_messages != {
+        "data": verified_messages["data"][len(verified_messages["data"]) - count :]
+    }:
         raise ProContractConflictError("Session messages changed during delivery restart")
     native = _native_outcome_completion(current)
     reconcilable_discharge = (
@@ -2820,7 +2914,9 @@ def _validate_inputs(
     if (
         getattr(limits, "wall_time_seconds", None) != MAX_WALL_TIME_SECONDS
         or getattr(limits, "provider_turns", None) != MAX_PROVIDER_TURNS
-        or getattr(limits, "procontract_actions", None) != MAX_ACTIONS
+        or getattr(limits, "procontract_actions", None) != (
+            OFFLINE_ACTION_SENTINEL if getattr(workspace.manifest, "network_mode", None) == "none" else MAX_ACTIONS
+        )
     ):
         raise ProContractError("ProContract limits must match its exact native budget")
     if isinstance(poll_interval, bool) or not isinstance(poll_interval, (int, float)) or not 0 < poll_interval <= 30:
@@ -2867,9 +2963,12 @@ def _restore_contract_progress(
     usage = _summarize_usage(messages)
     if (
         selected["contractID"] != payload["id"]
-        or selected["sessionID"] != execution["sessionID"]
+        or not isinstance(selected["sessionID"], str)
+        or not selected["sessionID"].startswith("ses_")
         or selected["turns"] != state.provider_turns
         or selected["actions"] != state.actions
+        or int(execution["turnsUsed"]) < state.provider_turns
+        or int(execution["actionsUsed"]) < state.actions
         or selected["cost"] != str(usage.cost)
         or float(usage.cost) != state.cost
     ):
@@ -2953,21 +3052,34 @@ def _restore_verification_messages(
 ) -> Mapping[str, object]:
     if not path.is_file():
         return messages
-    raw = _read_json(path)
-    if (
-        not isinstance(raw, Mapping)
-        or set(raw) != {"version", "contract", "execution", "quiet", "messages"}
-        or raw["version"] != 1
-        or not isinstance(raw["messages"], Mapping)
-    ):
-        raise ProContractError("persisted Contract verification observation is invalid")
-    verified = raw["messages"]
+    verified = _read_verification_observation(path)["messages"]
     if (
         _compact_progress_messages(verified) != _compact_progress_messages(messages)
         or _summarize_usage(verified) != usage
     ):
         raise ProContractConflictError("persisted Contract verification messages conflict with durable progress")
     return verified
+
+
+def _read_verification_observation(path: Path) -> Mapping[str, object]:
+    raw = _read_json(path)
+    if (
+        not isinstance(raw, Mapping)
+        or type(raw.get("version")) is not int
+        or raw["version"] not in {1, 2}
+        or set(raw)
+        != {"version", "contract", "execution", "quiet", "messages"}
+        | ({"sessionMessageCount"} if raw["version"] == 2 else set())
+        or not isinstance(raw["messages"], Mapping)
+        or set(raw["messages"]) != {"data"}
+        or not isinstance(raw["messages"]["data"], list)
+    ):
+        raise ProContractError("persisted Contract verification observation is invalid")
+    messages = raw["messages"]
+    count = raw["sessionMessageCount"] if raw["version"] == 2 else len(messages["data"])
+    if type(count) is not int or not 0 <= count <= len(messages["data"]):
+        raise ProContractError("persisted verification Session message boundary is invalid")
+    return raw
 
 
 def _merge_attempt_messages(previous: Mapping[str, object], current: Mapping[str, object]) -> Mapping[str, object]:
@@ -3018,14 +3130,20 @@ def _load_or_create_issue(
     clock: Callable[[], float],
     protocol: ProContractProtocol = "current",
 ) -> Mapping[str, object]:
+    try:
+        observations = load_observations(path.parent / "procontract-observations.json")
+    except (OSError, TypeError, ValueError) as error:
+        raise ProContractConflictError(f"issuer observations are unavailable or invalid: {error}") from error
     if path.exists():
         raw = _read_json(path)
         if not isinstance(raw, Mapping):
             raise ProContractError("persisted Contract issue is invalid")
-        _validate_issue_record(raw, workspace, model, variant, protocol)
+        _validate_issue_record(raw, workspace, model, variant, protocol, observations)
         return raw
     now = clock()
-    payload = build_issue_payload(workspace, now=now, model=model, variant=variant, protocol=protocol)
+    payload = build_issue_payload(
+        workspace, now=now, model=model, variant=variant, protocol=protocol, observations=observations
+    )
     acceptance_policy = _acceptance_policy(protocol)
     record = {
         "version": 1,
@@ -3035,7 +3153,7 @@ def _load_or_create_issue(
         "payloadHash": _hash_json(_ordered_issue_payload(payload)),
         "acceptancePolicyUTF8": base64.b64encode(acceptance_policy.encode()).decode(),
         "acceptanceHash": hashlib.sha256(acceptance_policy.encode()).hexdigest(),
-        "replayPolicyHash": _hash_json(REPLAY_POLICY) if protocol != "semantic-v0" else None,
+        "replayPolicyHash": _replay_policy_hash(payload),
     }
     if _contains_credential(record, _credential_values(_all_credential_names(workspace.manifest.credential_env))):
         raise ProContractError("Contract issue request contains a provider credential")
@@ -3089,6 +3207,7 @@ def _validate_issue_record(
     model: str,
     variant: str,
     protocol: ProContractProtocol,
+    observations: Sequence[Mapping[str, object]] = (),
 ) -> None:
     if (
         set(raw)
@@ -3108,7 +3227,9 @@ def _validate_issue_record(
     started = raw["startedAt"]
     if isinstance(started, bool) or not isinstance(started, (int, float)) or not math.isfinite(started):
         raise ProContractError("persisted Contract issue time is invalid")
-    expected = build_issue_payload(workspace, now=float(started), model=model, variant=variant, protocol=protocol)
+    expected = build_issue_payload(
+        workspace, now=float(started), model=model, variant=variant, protocol=protocol, observations=observations
+    )
     acceptance_policy = _acceptance_policy(protocol)
     if (
         raw["contractID"] != expected["id"]
@@ -3116,7 +3237,7 @@ def _validate_issue_record(
         or raw["payloadHash"] != _hash_json(_ordered_issue_payload(expected))
         or raw["acceptancePolicyUTF8"] != base64.b64encode(acceptance_policy.encode()).decode()
         or raw["acceptanceHash"] != hashlib.sha256(acceptance_policy.encode()).hexdigest()
-        or raw["replayPolicyHash"] != (_hash_json(REPLAY_POLICY) if protocol != "semantic-v0" else None)
+        or raw["replayPolicyHash"] != _replay_policy_hash(expected)
     ):
         raise ProContractConflictError("persisted Contract issue conflicts with this job")
 
@@ -3266,19 +3387,23 @@ def _expected_spec(payload: Mapping[str, object]) -> dict[str, object]:
     budget = payload.get("budget")
     if not isinstance(budget, Mapping):
         raise ProContractError("frozen Contract budget is invalid")
-    return {
-        "trigger": {"type": "immediate"},
-        "goal": payload["goal"],
-        **({"policy": payload["policy"]} if "policy" in payload else {}),
-        "brief": payload["brief"],
-        "requires": [],
-        "authority": ["filesystem.read", "filesystem.write", "process.execute"],
-        "budget": {"turns": budget.get("turns"), "actions": budget.get("actions"), "deadline": budget.get("deadline")},
-        "evidence": {"type": "principal"}
-        if payload["evidence"] == {"type": "principal"}
-        else {"type": "principal", "claim": PRINCIPAL_CLAIM, "replay": REPLAY_POLICY},
-        "resolution": {"maxAttempts": MAX_CONTRACT_ATTEMPTS, "retryDelay": 0},
-    }
+    return _ordered_spec(
+        {
+            "trigger": {"type": "immediate"},
+            "goal": payload["goal"],
+            **({"policy": payload["policy"]} if "policy" in payload else {}),
+            "brief": payload["brief"],
+            "requires": [],
+            "authority": ["filesystem.read", "filesystem.write", "process.execute"],
+            "budget": {
+                "turns": budget.get("turns"),
+                "actions": budget.get("actions"),
+                "deadline": budget.get("deadline"),
+            },
+            "evidence": payload["evidence"],
+            "resolution": {"maxAttempts": MAX_CONTRACT_ATTEMPTS, "retryDelay": 0},
+        }
+    )
 
 
 def _ordered_issue_payload(payload: Mapping[str, object]) -> dict[str, object]:
@@ -3716,15 +3841,9 @@ def _binding_contract_identity(execution: Mapping[str, object]) -> tuple[object,
 
 
 def _execution_successor(previous: Mapping[str, object], current: Mapping[str, object]) -> bool:
-    if _binding_contract_identity(current) != _binding_contract_identity(previous):
-        return False
-    if int(current["turnsUsed"]) < int(previous["turnsUsed"]) or int(current["actionsUsed"]) < int(
-        previous["actionsUsed"]
-    ):
-        return False
-    if _binding_identity(current) == _binding_identity(previous):
-        return int(current["attempts"]) >= int(previous["attempts"])
-    return int(current["attempts"]) > int(previous["attempts"])
+    return _binding_contract_identity(current) == _binding_contract_identity(previous) and all(
+        int(current[field]) >= int(previous[field]) for field in ("attempts", "turnsUsed", "actionsUsed")
+    )
 
 
 def _validate_quiet(raw: object, payload: Mapping[str, object]) -> Mapping[str, object]:
@@ -3778,14 +3897,22 @@ def _verification(
     if not isinstance(replay, Mapping):
         raise ProContractDeliveryError("native Contract handoff has no replay evidence")
     if (
-        payload["evidence"]["replay"] != REPLAY_POLICY  # type: ignore[index]
-        or replay["policyHash"] != _hash_json(REPLAY_POLICY)
+        replay["policyHash"] != _replay_policy_hash(payload)
         or replay["subjectHash"] != handoff["subjectHash"]
         or replay["passed"] is not True
         or replay["evidenceHash"] == replay["subjectHash"]
     ):
         raise ProContractDeliveryError("native Contract replay evidence does not match the frozen policy and subject")
     return handoff, replay
+
+
+def _replay_policy_hash(payload: Mapping[str, object]) -> str | None:
+    evidence = payload.get("evidence")
+    if evidence == {"type": "principal"}:
+        return None
+    if not isinstance(evidence, Mapping) or not _valid_replay_schema(evidence.get("replay")):
+        raise ProContractConflictError("frozen replay policy is invalid")
+    return _hash_json(_ordered_replay_policy(evidence["replay"]))
 
 
 def _validate_export(
@@ -5083,9 +5210,28 @@ def _finish_without_delivery(
     quiet: Mapping[str, object] | None = None,
     interrupt_attempted: bool = False,
     usage_incomplete: bool = False,
+    delivery_error: Exception | None = None,
 ) -> ProContractResult:
     if workspace.lease._handle_active:
         workspace.stop_for_freeze()
+    if delivery_error is not None:
+        diagnostic = str(
+            _sanitize_control(str(delivery_error), _all_credential_names(workspace.manifest.credential_env))
+        )
+        _write_json(
+            job.job.root / "procontract-delivery-error.json",
+            {
+                "version": 1,
+                "phase": state.phase,
+                "contractID": payload["id"],
+                "revision": contract["revision"],
+                "specHash": contract["specHash"],
+                "artifactHashes": dict(state.artifact_hashes or {}),
+                "errorType": type(delivery_error).__name__,
+                "diagnostic": diagnostic[:MAX_DELIVERY_DIAGNOSTIC_CHARS],
+                "truncated": len(diagnostic) > MAX_DELIVERY_DIAGNOSTIC_CHARS,
+            },
+        )
     _scan_terminal_credentials(job.job.root, workspace, str(payload["id"]))
     discharge_path = job.job.root / "procontract-discharge.json"
     effective_contract = contract
@@ -5365,7 +5511,7 @@ def _verify_done_delivery(job_root: Path, result: ProContractResult, workspace: 
         report = _read_json(report_path)
         expected_replay = (
             {
-                "policyHash": _hash_json(REPLAY_POLICY),
+                "policyHash": _replay_policy_hash(issue["payload"]),
                 "evidenceHash": result.replay_evidence_hash,
                 "passed": True,
             }
