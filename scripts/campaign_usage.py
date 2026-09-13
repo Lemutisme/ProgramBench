@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import re
 import threading
@@ -481,12 +482,14 @@ class CircuitBreaker:
     @property
     def hard_stopped(self) -> bool:
         with self._lock:
-            return "hard" in self._pause_causes or "auth" in self._pause_causes
+            return bool(self._pause_causes & {"hard", "auth", "system"})
 
     @property
     def active_stop_reason(self) -> str | None:
         """Return the active-work stop reason from one breaker lock snapshot."""
         with self._lock:
+            if "system" in self._pause_causes:
+                return "repeated execution protocol failure"
             if "auth" in self._pause_causes:
                 return "provider authentication failure"
             if "hard" in self._pause_causes:
@@ -519,6 +522,8 @@ class CircuitBreaker:
     @property
     def pause_reason(self) -> str | None:
         with self._lock:
+            if "system" in self._pause_causes:
+                return "repeated execution protocol failure"
             if "auth" in self._pause_causes:
                 return "provider authentication failure"
             if "hard" in self._pause_causes:
@@ -787,9 +792,27 @@ class CircuitBreaker:
                 self._state_version += 1
             return self._provider_backoff_fingerprint == fingerprint
 
+    def observe_system_failure(self, job_id: str, kind: str, *, now: float | None = None) -> bool:
+        """Persistently pause after a protocol fault recurs across distinct jobs."""
+        if kind not in {"transport", "tool_stream", "contract_conflict", "publication_scan"}:
+            raise UsageParseError("unknown execution protocol failure kind")
+        fingerprint = hashlib.sha256(("execution_protocol:" + kind).encode()).hexdigest()
+        with self._lock:
+            if self.observe_provider_failure(job_id, fingerprint, now=now):
+                self._pause_causes.add("system")
+                self._state_version += 1
+            return "system" in self._pause_causes
+
     def acknowledge(self, reason: str | None = None) -> None:
         with self._lock:
             self._apply_cost_caps()
+            if reason == "system":
+                self._pause_causes.discard("system")
+                self._provider_failures.clear()
+                self._provider_backoff_fingerprint = None
+                self._backoff_until = None
+                self._state_version += 1
+                return
             if reason == "soft":
                 if "soft" not in self._pause_causes:
                     return
@@ -816,7 +839,11 @@ class CircuitBreaker:
                 raise UsageParseError("unknown acknowledgement reason")
             had_cache_pause = "cache" in self._pause_causes
             had_soft_pause = "soft" in self._pause_causes
-            self._pause_causes.difference_update({"auth", "cache", "soft"})
+            if "system" in self._pause_causes:
+                self._provider_failures.clear()
+                self._provider_backoff_fingerprint = None
+                self._backoff_until = None
+            self._pause_causes.difference_update({"auth", "cache", "soft", "system"})
             if had_cache_pause:
                 self._cache_acknowledged = True
             if had_soft_pause:
@@ -930,7 +957,7 @@ class CircuitBreaker:
         causes = raw["pause_causes"]
         if (
             not isinstance(causes, list)
-            or any(cause not in {"cache", "auth", "soft", "hard"} for cause in causes)
+            or any(cause not in {"cache", "auth", "soft", "hard", "system"} for cause in causes)
             or len(causes) != len(set(causes))
         ):
             raise UsageParseError("invalid breaker pause causes")

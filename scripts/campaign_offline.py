@@ -30,7 +30,9 @@ OFFLINE_ENV = {
     "OPENCODE_DISABLE_MODELS_FETCH": "true",
     "OPENCODE_PROCONTRACT_DISABLED": "0",
 }
-HEADLESS_CONFIG = {"$schema": "https://opencode.ai/config.json", "permission": {"*": "allow", "question": "deny"}}
+HEADLESS_CONFIG = {"$schema": "https://opencode.ai/config.json", "permission": {
+    "*": "allow", "question": "deny", "contract_issue": "deny", "contract_revision": "deny",
+}}
 CONTROL_PROGRAM = r'''
 import base64,http.client,json,sys
 value=json.load(sys.stdin)
@@ -75,6 +77,55 @@ def prepare_headless_config(manifest):
         stream.flush()
         os.fsync(stream.fileno())
     path.chmod(0o444)
+
+
+def prepare_tooling(manifest):
+    """Freeze an explicitly supplied portable rg before the offline runtime starts."""
+    source = os.environ.get("PROGRAMBENCH_RIPGREP")
+    if not source:
+        return  # Images with rg need no injected executable; readiness is mandatory.
+    executable = Path(source).read_bytes()
+    digest = hashlib.sha256(executable).hexdigest()
+    target = manifest.cache_dir / "opencode/bin/rg"
+    for parent in (target.parent.parent, target.parent):
+        if parent.is_symlink():
+            raise ValueError("tooling directory is a symlink")
+        created = not parent.exists()
+        parent.mkdir(exist_ok=True, mode=0o755)
+        if created:
+            parent.chmod(0o755)  # Controller umask 077 must not hide tools from the agent UID.
+    if target.is_symlink():
+        raise ValueError("tooling executable is a symlink")
+    if target.exists():
+        if hashlib.sha256(target.read_bytes()).hexdigest() != digest:
+            raise ValueError("frozen ripgrep changed; use new experiment coordinates")
+        return
+    with target.open("xb") as stream:
+        stream.write(executable)
+        stream.flush()
+        os.fsync(stream.fileno())
+    target.chmod(0o555)
+
+
+def verify_tooling(manifest, docker="docker"):
+    probe = r"""
+import hashlib,json,os,pathlib,shutil,subprocess,tempfile
+rg=shutil.which('rg') or '/cache/opencode/bin/rg'
+with tempfile.TemporaryDirectory(prefix='programbench-readiness-') as root:
+ p=pathlib.Path(root)/'probe.txt';p.write_text('programbench-tool-ready\n')
+ assert p.read_text()=='programbench-tool-ready\n'
+ glob=subprocess.run([rg,'--files','--hidden',root],capture_output=True,text=True,check=True,timeout=10)
+ assert str(p) in glob.stdout.splitlines()
+ grep=subprocess.run([rg,'-n','programbench-tool-ready',str(p)],capture_output=True,text=True,check=True,timeout=10)
+ assert grep.stdout.strip()=='1:programbench-tool-ready'
+ subprocess.run(['/bin/sh','-c','test -r "$1"','readiness',str(p)],check=True,timeout=10)
+ print(json.dumps({'rg_sha256':hashlib.sha256(pathlib.Path(rg).read_bytes()).hexdigest(),'read_write':True,'glob':True,'grep':True,'shell':True}))
+"""
+    result = subprocess.run([docker, 'exec', manifest.container_id, 'python3', '-I', '-S', '-c', probe],
+                            capture_output=True, text=True, timeout=40)
+    if result.returncode:
+        raise ValueError("offline tool readiness failed; freeze a portable rg with PROGRAMBENCH_RIPGREP before execution")
+    return json.loads(result.stdout)
 
 
 def prepare_reference_binding(manifest, docker='docker'):
@@ -240,6 +291,7 @@ def verify_network(manifest, docker='docker'):
     if completed.returncode:
         raise ValueError('offline network admission probe failed')
     result = json.loads(completed.stdout)
+    result['tooling'] = verify_tooling(manifest, docker)
     if 'UNEXPECTED' in completed.stdout or result.get('interfaces') != ['lo'] or result.get('child_gateway_status') != 403:
         raise ValueError('candidate network boundary is not closed')
     if not result.get('credential_placeholder_only') or not result.get('reference_executable'):
@@ -253,8 +305,10 @@ def verify_network(manifest, docker='docker'):
         'http://127.0.0.1:4096/api/agent?location%5Bdirectory%5D=%2Fcandidate',
         body=None,headers=headers,timeout=10,max_bytes=1024*1024)
     build=next((agent for agent in json.loads(response.body)['data'] if agent['id']=='build'),None)
-    expected=[{'action':'*','resource':'*','effect':'allow'},{'action':'question','resource':'*','effect':'deny'}]
-    if build is None or build['permissions'][-2:] != expected:
+    # prepare_headless_config serializes with sort_keys=True; the runtime keeps
+    # that rule order because later permissions override earlier ones.
+    expected=[{'action':action,'resource':'*','effect':effect} for action,effect in sorted(HEADLESS_CONFIG['permission'].items())]
+    if build is None or build['permissions'][-len(expected):] != expected:
         raise ValueError('effective V2 headless permissions do not match the benchmark profile: ' + json.dumps(None if build is None else build['permissions']))
     record = result | {'container_id':manifest.container_id,'binary_sha256':manifest.binary_sha256,
                        'network_mode':manifest.network_mode,'checked_at':time.time(),

@@ -97,6 +97,12 @@ class Gateway(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
         self.db.execute("CREATE TABLE IF NOT EXISTS request (id INTEGER PRIMARY KEY, started REAL, finished REAL, peer_pid INTEGER, body_sha256 TEXT, status INTEGER, outcome TEXT, usage TEXT)")
         if 'metadata' not in {row[1] for row in self.db.execute('PRAGMA table_info(request)')}:
             self.db.execute('ALTER TABLE request ADD COLUMN metadata TEXT')
+        columns = {row[1] for row in self.db.execute('PRAGMA table_info(request)')}
+        for name, kind in (("sent", "REAL"), ("headers_at", "REAL"), ("first_byte", "REAL"),
+                           ("last_byte", "REAL"), ("terminal_at", "REAL"), ("close_reason", "TEXT"),
+                           ("error_name", "TEXT"), ("error_code", "INTEGER")):
+            if name not in columns:
+                self.db.execute(f'ALTER TABLE request ADD COLUMN {name} {kind}')
         self.db.commit()
         socket_path = channel / "provider.sock"
         if socket_path.exists() or socket_path.is_symlink():
@@ -121,7 +127,8 @@ class Gateway(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
         with self.lock:
             value = json.loads(body)
             metadata = {'model': value['model'], 'reasoning': value['reasoning'],
-                        'tool_names': [tool.get('name') for tool in value.get('tools', [])]}
+                        'tool_names': [tool.get('name') for tool in value.get('tools', [])],
+                        'prompt_cache_key': value.get('prompt_cache_key')}
             prior = self.db.execute("SELECT min(started),count(*) FROM request WHERE peer_pid IS NOT NULL").fetchone()
             if prior[0] and time.time() - prior[0] > 21600:
                 raise ValueError("wall_time_exhausted")
@@ -139,10 +146,34 @@ class Gateway(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
             self.db.commit()
             return cursor.lastrowid
 
-    def finish(self, request_id: int, status: int, outcome: str, usage: object):
+    def checkpoint(self, request_id: int, **fields):
+        allowed = {"sent", "headers_at", "first_byte", "last_byte", "terminal_at", "status", "outcome", "usage"}
+        if not fields or not fields.keys() <= allowed:
+            raise ValueError("invalid_checkpoint_fields")
         with self.lock:
-            self.db.execute("UPDATE request SET finished=?,status=?,outcome=?,usage=? WHERE id=?",
-                            (time.time(), status, outcome, json.dumps(usage), request_id))
+            self.db.execute(f"UPDATE request SET {','.join(name + '=?' for name in fields)} WHERE id=? AND finished IS NULL",
+                            (*fields.values(), request_id))
+            self.db.commit()
+
+    def finish(self, request_id: int, status: int | None, outcome: str, usage: object,
+               *, last_byte=None, close_reason="eof", error=None):
+        with self.lock:
+            self.db.execute("""UPDATE request SET finished=COALESCE(finished,?),status=COALESCE(status,?),
+                            outcome=CASE WHEN terminal_at IS NOT NULL OR finished IS NOT NULL THEN outcome ELSE ? END,
+                            usage=COALESCE(usage,?),last_byte=COALESCE(?,last_byte),close_reason=COALESCE(close_reason,?),
+                            error_name=?,error_code=? WHERE id=?""",
+                            (time.time(), status, outcome, json.dumps(usage) if usage is not None else None,
+                             last_byte, close_reason, type(error).__name__ if error else None,
+                             getattr(error, 'errno', None), request_id))
+            self.db.commit()
+
+    def checkpoint_shutdown(self):
+        # Terminal usage is already durable. Never invent usage for an admitted
+        # or sent request that did not supply a terminal response before shutdown.
+        with self.lock:
+            self.db.execute("""UPDATE request SET finished=?,close_reason='gateway_shutdown',
+                            outcome=CASE WHEN terminal_at IS NULL THEN 'gateway_stopped_unknown' ELSE outcome END
+                            WHERE peer_pid IS NOT NULL AND finished IS NULL""", (time.time(),))
             self.db.commit()
 
     def deny(self, reason: str, status: int = 403):
@@ -198,19 +229,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
         upstream = self.server.upstream
         cls = http.client.HTTPSConnection if upstream.scheme == "https" else http.client.HTTPConnection
         connection = cls(upstream.hostname, upstream.port, timeout=900)
-        status = 502
+        status = None
         usage = None
         outcome = "transport_failed"
         began = False
+        last_byte = None
+        failure = None
+        close_reason = "eof_without_terminal"
         try:
+            self.server.checkpoint(request_id, sent=time.time(), outcome="sending")
             connection.request("POST", upstream.path + "/responses", body=body,
                                headers={"Content-Type": "application/json", "Authorization": "Bearer " + self.server.api_key,
                                         "Accept-Encoding": "identity"})
             response = connection.getresponse()
             status = response.status
+            self.server.checkpoint(request_id, headers_at=time.time(), status=status, outcome="response_started")
             # Do not follow redirects or relay arbitrary upstream error bodies.
             if status != 200:
                 outcome = "upstream_http_" + str(status)
+                close_reason = "http_status"
                 message = json.dumps({"error": {"message": outcome}}).encode()
                 self.send_response(status if status >= 400 else 502)
                 self.send_header("Content-Length", str(len(message)))
@@ -225,14 +262,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-ProgramBench-Request-ID", str(request_id))
             self.send_header("Connection", "close")
             self.end_headers()
             began = True
             self.connection.settimeout(900)
             pending = bytearray()
             while chunk := response.read1(64 * 1024):
-                self.wfile.write(chunk)
-                self.wfile.flush()
+                if last_byte is None:
+                    self.server.checkpoint(request_id, first_byte=time.time())
+                last_byte = time.time()
                 pending.extend(chunk)
                 while b"\n" in pending:
                     line, _, pending = pending.partition(b"\n")
@@ -242,17 +281,35 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             if event.get("type") in ("response.completed", "response.incomplete", "response.failed"):
                                 usage = event.get("response", {}).get("usage")
                                 outcome = event["type"]
+                                close_reason = "terminal_eof"
+                                # Persist before forwarding: the client can close
+                                # immediately on the terminal frame or SIGTERM.
+                                self.server.checkpoint(request_id, terminal_at=time.time(), last_byte=last_byte,
+                                                       usage=json.dumps(usage) if usage is not None else None,
+                                                       outcome=outcome)
                         except (ValueError, AttributeError):
                             pass
                 if len(pending) > MAX_REQUEST_BYTES:
                     raise ValueError("upstream_frame_limit")
-        except (OSError, ValueError, http.client.HTTPException):
+                self.wfile.write(chunk)
+                self.wfile.flush()
+        except (OSError, ValueError, http.client.HTTPException) as error:
+            failure = error
+            close_reason = "connection_error"
             if not began:
-                self.send_error(502, "provider transport failed")
+                message = b'{"error":{"message":"provider transport failed"}}'
+                self.send_response(502)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(message)))
+                self.send_header("Connection", "close")
+                self.send_header("X-ProgramBench-Transport-Error", "upstream_connection_failed")
+                self.end_headers()
+                self.wfile.write(message)
         finally:
             self.close_connection = True
             connection.close()
-            self.server.finish(request_id, status, outcome, usage)
+            self.server.finish(request_id, status, outcome, usage, last_byte=last_byte,
+                               close_reason=close_reason, error=failure)
 
     def do_GET(self):
         self.refuse("method_not_admitted")
@@ -276,8 +333,15 @@ def main():
                      upstream=os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1",
                      api_key=os.environ["OPENAI_API_KEY"])
     (args.control / "gateway.json").write_text(json.dumps(process_identity(os.getpid())))
-    signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
-    server.serve_forever(poll_interval=0.1)
+    def stop(*_):
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    try:
+        server.serve_forever(poll_interval=0.1)
+    finally:
+        server.checkpoint_shutdown()
+        server.server_close()
 
 
 if __name__ == "__main__":

@@ -4490,7 +4490,10 @@ def _scan_credential_roots(paths: ProContractCredentialPaths, names: tuple[str, 
     # Raw state, cache, and logs are sensitive control-plane evidence and may
     # legitimately retain provider coordinates. Only publication surfaces must
     # be credential-free.
-    roots = tuple(dict.fromkeys((paths.candidate, paths.subject, paths.export, paths.git_dir)))
+    # The live candidate can contain private, untracked probes owned by the
+    # agent UID. Exact exports and the materialized delivery are the publication
+    # boundary; neither a probe nor a host EACCES is evidence of a credential leak.
+    roots = tuple(dict.fromkeys((paths.subject, paths.export, paths.git_dir)))
     for root in roots:
         if root is not None and root.is_dir():
             _verify_no_credentials(root, names, published_only=False)
@@ -4855,6 +4858,11 @@ def _observe_provider_health(
     error = _provider_error(messages)
     if error is None:
         return None
+    text = error[2].lower()
+    kind = ("transport" if "transport" in text or "stream ended before a terminal" in text else
+            "tool_stream" if "tool argument" in text or "invalid json input" in text or "responses incomplete" in text else None)
+    if kind and breaker.observe_system_failure(job_id, kind, now=clock()):
+        return "wait"
     if error[0] in {401, 403}:
         breaker.observe_error(error[0], detail=error[2], now=clock())
         return "auth"
@@ -5251,7 +5259,15 @@ def _finish_without_delivery(
                 "truncated": len(diagnostic) > MAX_DELIVERY_DIAGNOSTIC_CHARS,
             },
         )
-    _scan_terminal_credentials(job.job.root, workspace, str(payload["id"]))
+    try:
+        _scan_terminal_credentials(job.job.root, workspace, str(payload["id"]))
+    except VanillaError as scan_error:
+        _write_json(job.job.root / "procontract-delivery-error.json", _sanitize_control({
+            "version": 1, "phase": state.phase, "contractID": payload["id"],
+            "primaryCompletion": completion.value, "primaryError": error,
+            "errorType": type(scan_error).__name__, "diagnostic": str(scan_error)[:MAX_DELIVERY_DIAGNOSTIC_CHARS],
+        }, _all_credential_names(workspace.manifest.credential_env)))
+        raise
     discharge_path = job.job.root / "procontract-discharge.json"
     effective_contract = contract
     effective_execution = execution

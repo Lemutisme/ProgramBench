@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import errno
 import os
 import shutil
 import stat
@@ -30,6 +31,8 @@ def _open_directory(path: Path) -> int:
     try:
         return os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
     except OSError as error:
+        if error.errno in (errno.EACCES, errno.EPERM):
+            raise VanillaError(f"workspace directory unreadable (errno={error.errno})") from error
         raise VanillaError("workspace directory identity changed") from error
 
 
@@ -56,6 +59,8 @@ def _open_verified(parent: int, name: str, expected: os.stat_result, *, director
     try:
         descriptor = os.open(name, flags, dir_fd=parent)
     except OSError as error:
+        if error.errno in (errno.EACCES, errno.EPERM):
+            raise VanillaError(f"workspace entry unreadable during freeze (errno={error.errno})") from error
         raise VanillaError("workspace entry identity changed during freeze") from error
     current = os.fstat(descriptor)
     expected_kind = stat.S_ISDIR(expected.st_mode) if directory else stat.S_ISREG(expected.st_mode)

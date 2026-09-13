@@ -4460,7 +4460,7 @@ def test_issue_response_credential_is_sanitized_before_persistence(
     _assert_secret_absent(paths.root, secret)
 
 
-def test_native_failure_scans_candidate_credentials_before_terminal_result(
+def test_native_failure_scans_published_subject_credentials_before_terminal_result(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from scripts.campaign_freeze import CredentialLeakError
@@ -4473,7 +4473,8 @@ def test_native_failure_scans_candidate_credentials_before_terminal_result(
     store = _state(paths)
     _, workspace = _workspace(tmp_path, paths, contained=True)
     workspace.manifest.credential_env = ("CONTROL_SECRET",)
-    workspace.candidate.joinpath("private.log").write_text(secret)
+    Path(workspace.manifest.subject_dir).mkdir()
+    Path(workspace.manifest.subject_dir).joinpath("private.log").write_text(secret)
     before = _tree_identity(workspace.candidate)
     clock = FakeClock()
     payload = build_issue_payload(workspace, now=clock())
@@ -4498,14 +4499,16 @@ def test_native_failure_scans_candidate_credentials_before_terminal_result(
 
     assert api.attestations == []
     assert _tree_identity(workspace.candidate) == before
-    assert workspace.candidate.joinpath("private.log").read_text() == secret
+    assert Path(workspace.manifest.subject_dir).joinpath("private.log").read_text() == secret
     assert not paths.root.joinpath("procontract-result.json").exists()
+    diagnostic = json.loads((paths.root / "procontract-delivery-error.json").read_text())
+    assert diagnostic["primaryCompletion"] == "challenged"
+    assert diagnostic["errorType"] == "CredentialLeakError"
 
 
-def test_verification_candidate_credential_fails_before_packaging(
+def test_verification_ignores_unpublished_probe_credentials(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from scripts.campaign_freeze import CredentialLeakError
     from scripts.campaign_procontract import build_issue_payload, run_procontract
 
     secret = "candidate-secret"
@@ -4529,26 +4532,27 @@ def test_verification_candidate_credential_fails_before_packaging(
 
     with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
         workspace.lease._handle_active = True
-        with pytest.raises(CredentialLeakError):
-            run_procontract(
-                job,
-                store,
-                workspace,
-                model="openai/gpt-5.6-luna",
-                variant="max",
-                limits=_limits(),
-                breaker=CircuitBreaker(),
-                api=api,
-                clock=clock,
-                sleeper=clock.sleep,
-                package=package,
-                preflight=lambda archive, iid: SimpleNamespace(executable_hash="e" * 64, output="ok"),
-            )
+        result = run_procontract(
+            job,
+            store,
+            workspace,
+            model="openai/gpt-5.6-luna",
+            variant="max",
+            limits=_limits(),
+            breaker=CircuitBreaker(),
+            api=api,
+            clock=clock,
+            sleeper=clock.sleep,
+            package=package,
+            preflight=lambda archive, iid: SimpleNamespace(executable_hash="e" * 64, output="ok"),
+        )
 
-    assert packages == 0
-    assert not paths.root.joinpath(workspace.manifest.instance_id, "submission.tar.gz").exists()
-    assert api.attestations == []
+    assert packages == 1
+    assert result.completion.value == "discharged"
+    assert paths.root.joinpath(workspace.manifest.instance_id, "submission.tar.gz").exists()
+    assert len(api.attestations) == 1
     assert _tree_identity(workspace.candidate) == before
+
 
 
 def test_typed_control_scan_excludes_unknown_bulk_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

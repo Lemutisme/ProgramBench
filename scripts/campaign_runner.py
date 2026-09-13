@@ -787,6 +787,8 @@ def run_job(
                 except RecoverableJobError as error:
                     return _defer_job_recovery(paths, store, workspace, workspace_lease, candidate, error)
                 except BaseException as error:
+                    if type(error).__name__ == "ProContractConflictError":
+                        breaker.observe_system_failure(candidate.instance_id + ":" + candidate.arm, "contract_conflict")
                     failed_state = store.read_optional()
                     if (
                         failed_state is not None
@@ -872,6 +874,8 @@ def run_job(
                 return JobRunResult(candidate, "recoverable")
             return JobRunResult(candidate, "failed")
         except BaseException as error:
+            if type(error).__name__ == "ProContractConflictError":
+                breaker.observe_system_failure(candidate.instance_id + ":" + candidate.arm, "contract_conflict")
             exit_class, traceback_hash = _exception_metadata(paths, store, error)
             _terminalize(
                 store,
@@ -896,7 +900,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--retry-infra", action="store_true")
     parser.add_argument("--redo", action="store_true")
-    parser.add_argument("--acknowledge", choices=("cache", "auth", "soft", "all"))
+    parser.add_argument("--acknowledge", choices=("cache", "auth", "soft", "system", "all"))
     parser.add_argument("--all", action="store_true")
     parser.add_argument("--arm", choices=ARM_SELECTIONS, default="paired")
     parser.add_argument("--evaluate", action="store_true", help="evaluate both arms and write the paired report")

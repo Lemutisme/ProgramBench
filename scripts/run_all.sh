@@ -38,7 +38,7 @@ Options:
   --expected-instances N     Fail before inference unless exactly N are frozen (default: 200)
   --arm MODE                 paired, procontract, or vanilla (default: paired)
   --filter REGEX             Run only instance IDs matching this regex
-  --acknowledge REASON       Resume after cache, auth, soft, or all pause is explicitly resolved
+  --acknowledge REASON       Resume after cache, auth, soft, system, or all pause is explicitly resolved
   --allow-quarantined-key    Explicitly authorize the locally known exposed key
   -h, --help                 Show this help
 
@@ -132,8 +132,8 @@ positive_integer "$WORKERS" || die "--workers must be a positive integer"
 [[ "$SEED" =~ ^-?[0-9]+$ ]] || die "--seed must be an integer"
 positive_integer "$EXPECTED_INSTANCES" || die "--expected-instances must be a positive integer"
 [[ "$ARM" == paired || "$ARM" == procontract || "$ARM" == vanilla ]] || die "--arm must be paired, procontract, or vanilla"
-[[ -z "$ACKNOWLEDGE" || "$ACKNOWLEDGE" == cache || "$ACKNOWLEDGE" == auth || "$ACKNOWLEDGE" == soft || "$ACKNOWLEDGE" == all ]] \
-  || die "--acknowledge must be cache, auth, soft, or all"
+[[ -z "$ACKNOWLEDGE" || "$ACKNOWLEDGE" == cache || "$ACKNOWLEDGE" == auth || "$ACKNOWLEDGE" == soft || "$ACKNOWLEDGE" == system || "$ACKNOWLEDGE" == all ]] \
+  || die "--acknowledge must be cache, auth, soft, system, or all"
 
 if ! command -v bun >/dev/null && [[ -x "$HOME/.bun/bin/bun" ]]; then
   export PATH="$HOME/.bun/bin:$PATH"

@@ -944,8 +944,9 @@ def _launch(
         _require_candidate_ready(manifest)
         _verify_candidate(runner, request.docker, manifest, publish=False)
     if manifest.network_mode == "none":
-        from scripts.campaign_offline import prepare_headless_config
+        from scripts.campaign_offline import prepare_headless_config, prepare_tooling
         prepare_headless_config(manifest)
+        prepare_tooling(manifest)
     launching = replace(manifest, container_id=None, port=None, phase="launching")
     _write_manifest(manifest.manifest_path, launching)
     command = [
