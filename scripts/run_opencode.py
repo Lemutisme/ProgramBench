@@ -139,13 +139,13 @@ _ARM_KEYS = frozenset({"repo", "revision", "mode", "binary", "execution_policy",
 @dataclass(frozen=True)
 class Limits:
     wall_time_seconds: int
-    provider_turns: int
-    procontract_actions: int
+    provider_turns: int | None
+    procontract_actions: int | None
     total_cost_soft: float | None
     total_cost_hard: float | None
 
     def __post_init__(self) -> None:
-        integer_values = (self.wall_time_seconds, self.provider_turns, self.procontract_actions)
+        integer_values = (self.wall_time_seconds, *(value for value in (self.provider_turns, self.procontract_actions) if value is not None))
         if any(type(value) is not int for value in integer_values):
             raise ConfigError("wall time, provider turns, and actions must be int")
         if any(value <= 0 for value in integer_values):
@@ -176,6 +176,10 @@ class Limits:
             and self.total_cost_soft > self.total_cost_hard
         ):
             raise ConfigError("soft cost limit must not exceed hard cost limit")
+
+    @property
+    def deadline_only(self) -> bool:
+        return self.provider_turns is None and self.procontract_actions is None and self.total_cost_soft is None and self.total_cost_hard is None
 
 
 @dataclass(frozen=True)
@@ -208,6 +212,8 @@ class CampaignConfig:
     cache: CacheConfig
     observations: Mapping[str, list[dict[str, object]]] = field(default_factory=dict)
     vanilla_workflow: bool = False
+    # Retained for exact historical manifests; quality=True cannot enter new inference.
+    quality: bool = False
 
 
 @dataclass(frozen=True)
@@ -286,9 +292,11 @@ def load_config(path: Path) -> CampaignConfig:
         raw = yaml.load(source, Loader=_UniqueKeyLoader)
     except (TypeError, yaml.YAMLError) as error:
         raise ConfigError(f"invalid YAML: {error}") from error
-    _require_keys(raw, _TOP_LEVEL_KEYS | {"observations", "vanilla_workflow"}, _TOP_LEVEL_KEYS, "top-level config")
+    _require_keys(raw, _TOP_LEVEL_KEYS | {"observations", "vanilla_workflow", "quality"}, _TOP_LEVEL_KEYS, "top-level config")
     if type(raw.get("vanilla_workflow", False)) is not bool:
         raise ConfigError("vanilla_workflow must be boolean")
+    if type(raw.get("quality", False)) is not bool:
+        raise ConfigError("quality must be boolean")
 
     limits = _load_limits(raw.get("limits"))
     cache = _load_cache(raw.get("cache"))
@@ -313,6 +321,7 @@ def load_config(path: Path) -> CampaignConfig:
         cache=cache,
         observations=admitted,
         vanilla_workflow=raw.get("vanilla_workflow", False),
+        quality=raw.get("quality", False),
     )
 
 
@@ -491,6 +500,8 @@ def _unlink_and_sync_parent(temporary_name: str, parent: Path) -> None:
 
 def _canonical_config(config: CampaignConfig) -> dict[str, object]:
     return {
+        **({"budget_profile": "6h-only"} if config.limits.deadline_only else {}),
+        **({"quality": config.quality} if config.limits.deadline_only or config.quality else {}),
         **({"vanilla_workflow": True} if config.vanilla_workflow else {}),
         "model": config.model,
         "variant": config.variant,

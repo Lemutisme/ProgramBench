@@ -1229,7 +1229,7 @@ def _observe_terminal_usage(
     usage: UsageSummary,
 ) -> None:
     """Publish one exact terminal summary, including bounded turn overshoots."""
-    if usage.provider_turns > MAX_PROVIDER_TURNS:
+    if breaker.provider_turn_limit is not None and usage.provider_turns > breaker.provider_turn_limit:
         breaker.observe_terminal_overshoot(job_id, generation, usage)
         return
     breaker.observe(job_id, generation, usage, terminal=True)
@@ -1242,7 +1242,7 @@ def _reconcile_breaker_usage(
     usage: UsageSummary,
 ) -> None:
     """Restore exact durable job usage before any prompt wake or retry."""
-    if usage.provider_turns > MAX_PROVIDER_TURNS:
+    if breaker.provider_turn_limit is not None and usage.provider_turns > breaker.provider_turn_limit:
         breaker.observe_terminal_overshoot(job_id, generation, usage)
         return
     breaker.observe(job_id, generation, usage, terminal=False)
@@ -1279,8 +1279,6 @@ def _summarize_usage(messages: Mapping[str, object]) -> UsageSummary:
     data = messages.get("data")
     if set(messages) != {"data"} or not isinstance(data, list):
         raise VanillaError("projected messages have an invalid usage schema")
-    if len(data) > MAX_EVIDENCE_MESSAGES:
-        raise VanillaError("projected raw message count exceeds absolute evidence limit")
     if not data:
         return _summarize_evidence(messages)
     legacy = [isinstance(message, Mapping) and "info" in message for message in data]
@@ -1303,8 +1301,9 @@ def _summarize_usage(messages: Mapping[str, object]) -> UsageSummary:
                 {
                     "type": "assistant",
                     "content": "",
-                    "tokens": {"input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}},
-                    "cost": None,
+                    "tokens": message.get("tokens") or {"input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}},
+                    "cost": message.get("cost"),
+                    "usage_incomplete": message.get("tokens") is None or message.get("cost") is None,
                 }
             )
             continue
@@ -1337,6 +1336,7 @@ def _summarize_usage(messages: Mapping[str, object]) -> UsageSummary:
                 "content": "\n".join(text),
                 "tokens": tokens,
                 "cost": message.get("cost"),
+                "usage_incomplete": message.get("tokens") is None or message.get("cost") is None,
             }
         )
     return _summarize_evidence({"data": projected})
@@ -1344,8 +1344,8 @@ def _summarize_usage(messages: Mapping[str, object]) -> UsageSummary:
 
 def _summarize_evidence(messages: Mapping[str, object]) -> UsageSummary:
     data = messages.get("data")
-    if not isinstance(data, list) or len(data) > MAX_EVIDENCE_MESSAGES:
-        raise VanillaError("projected message count exceeds absolute evidence limit")
+    if not isinstance(data, list):
+        raise VanillaError("projected messages must be a list")
     turns: list[TurnUsage] = []
     for message in data:
         turns.extend(summarize_usage({"data": [message]}).turns)

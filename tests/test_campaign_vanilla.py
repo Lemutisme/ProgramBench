@@ -1351,15 +1351,14 @@ def test_overshoot_resume_restores_previous_safe_breaker_snapshot(tmp_path: Path
     assert breaker_usage.provider_turns == 999
 
 
-def test_absolute_evidence_bound_applies_before_v2_nonturn_filtering() -> None:
+def test_projected_usage_has_no_cumulative_message_count_ceiling() -> None:
     messages = {
         "data": [
             {"id": f"msg_system_{index}", "type": "system", "text": "system", "time": {"created": index}}
             for index in range(vanilla_module.MAX_EVIDENCE_MESSAGES + 1)
         ]
     }
-    with pytest.raises(VanillaError, match="absolute evidence limit"):
-        vanilla_module._summarize_usage(messages)
+    assert vanilla_module._summarize_usage(messages).provider_turns == 0
 
 
 def test_failed_interrupt_stops_exact_owned_container_before_freeze(tmp_path: Path) -> None:

@@ -128,8 +128,10 @@ with tempfile.TemporaryDirectory(prefix='programbench-readiness-') as root:
     return json.loads(result.stdout)
 
 
-def prepare_reference_binding(manifest, docker='docker'):
+def prepare_reference_binding(manifest, docker='docker', *, quality=False):
     """Bind a model-visible capability from the immutable task image, outside candidate state."""
+    if quality:
+        raise ValueError('quality treatment is retired; use its archived runner/runtime for historical records')
     result = subprocess.run([
         docker, 'run', '--rm', '--network', 'none', '--cap-drop', 'ALL',
         '--cap-add', 'DAC_OVERRIDE', '--security-opt', 'no-new-privileges', '--user', '0:0',
@@ -194,6 +196,8 @@ def attest_reference(manifest, docker='docker'):
 
 
 def ensure_gateway(request):
+    if getattr(request, 'native_quality', False):
+        raise ValueError('quality treatment is retired; new provider admission is disabled')
     channel = request.state_root / "provider-channel"
     control = request.state_root / "provider-control"
     channel.mkdir(parents=True, exist_ok=True, mode=0o755)
@@ -201,6 +205,12 @@ def ensure_gateway(request):
     control.mkdir(parents=True, exist_ok=True, mode=0o700)
     profile = {'model': request.provider_model, 'effort': request.provider_effort, 'job': str(request.job.root),
                'network': 'none', 'transport': 'unix-model-only-peer-pinned-v1'}
+    if getattr(request, 'deadline_only', False):
+        if request.arm != 'procontract':
+            raise ValueError('deadline-only execution requires the native Contract runtime')
+        profile['budget'] = '6h-only'
+    if getattr(request, 'deadline_only', False):
+        profile['quality'] = False
     profile_path = control / 'profile.json'
     if profile_path.exists() and json.loads(profile_path.read_text()) != profile:
         raise ValueError('offline gateway profile changed')
@@ -221,7 +231,8 @@ def ensure_gateway(request):
     with (control / 'gateway.log').open('ab') as log:
         process = subprocess.Popen([sys.executable, str(Path(__file__).with_name('campaign_provider_gateway.py')),
                                     '--channel',str(channel),'--control',str(control),
-                                    '--model',request.provider_model,'--effort',request.provider_effort],
+                                    '--model',request.provider_model,'--effort',request.provider_effort,
+                                    *(['--issue', str(request.job.root / 'procontract-issue.json')] if getattr(request, 'deadline_only', False) else [])],
                                    stdin=subprocess.DEVNULL,stdout=log,stderr=log,env=environment,start_new_session=True)
     deadline = time.monotonic()+10
     while time.monotonic()<deadline:

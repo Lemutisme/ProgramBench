@@ -262,6 +262,8 @@ def plan_campaign(
     if limit <= 0:
         raise CampaignError("limit must be positive")
     arm_names = _selected_arm_names(arm_selection)
+    if config.limits.deadline_only and arm_names != ("procontract",):
+        raise CampaignError("6h-only requires --arm procontract and a deadline-only native runtime")
     root = Path(output).resolve()
     manifest_path = root / "campaign.json"
     canonical = _config_manifest(config)
@@ -301,6 +303,8 @@ def plan_campaign(
             raise CampaignError("campaign manifest conflicts with requested selection")
         return _plan_from_manifest(config, root, manifest_path, frozen, dry_run, cleanup_only)
 
+    if config.quality:
+        raise CampaignError("quality treatment is retired; new campaigns are disabled")
     validated = tuple(_validate_instance_row(instance) for instance in instances)
     real = tuple(instance for instance in validated if _is_real_instance(instance))
     filtered = tuple(filter_instances([dict(instance) for instance in real], filter_spec=instance_filter or ""))
@@ -604,6 +608,8 @@ def run_job(
     procontract_api_factory: Callable[[object], object] | None = None,
 ) -> JobRunResult:
     """Acquire JobLease then WorkspaceLease and delegate to exactly one arm adapter."""
+    if plan.config.quality and not cleanup_only:
+        raise CampaignError("quality treatment is retired; inference cannot resume under the baseline runner")
     if stop_event is not None and stop_token is not None:
         raise CampaignError("pass only one campaign stop signal")
     stop = stop_token or StopToken(stop_event)
@@ -666,6 +672,8 @@ def run_job(
             isolated=True,
             provider_model=plan.config.model.split("/", 1)[-1],
             provider_effort=plan.config.variant,
+            deadline_only=plan.config.limits.deadline_only,
+            native_quality=plan.config.quality,
         )
         try:
             with WorkspaceLease(request) as workspace_lease:
@@ -697,6 +705,23 @@ def run_job(
                             artifact_hashes=_cleanup_recovery_evidence(paths, workspace),
                         )
                         return JobRunResult(candidate, "completed")
+                    if cleanup_only and plan.config.quality:
+                        if not _bounded_cleanup_stop(
+                            _workspace_cleanup_operation(workspace), _workspace_cleanup_timeout(workspace)
+                        ):
+                            raise CampaignError("retired quality workspace could not be stopped")
+                        workspace_lease.release_handle()
+                        evidence_path = paths.root / "quality-retirement-cleanup.json"
+                        _atomic_json(evidence_path, {
+                            "version": 1, "status": "stopped", "runtime_admitted": False,
+                            "usage_reobserved": False,
+                            "accounting": "Existing native and gateway accounting is preserved; missing usage remains unknown.",
+                        })
+                        _conserve_candidate_artifact(paths, store, workspace, candidate, "retired_quality_cleanup")
+                        _terminalize(store, "interrupted", "retired_quality_cleanup", artifact_hashes={
+                            evidence_path.name: hashlib.sha256(evidence_path.read_bytes()).hexdigest(),
+                        })
+                        return JobRunResult(candidate, "interrupted")
                     if (stop.is_set() or breaker.stop_active) and not cleanup_only:
                         workspace.stop_for_freeze()
                         _conserve_candidate_artifact(paths, store, workspace, candidate, "campaign_stop")
@@ -889,7 +914,7 @@ def run_job(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run a bounded ProgramBench campaign: at most 32 active trajectories, two arms per instance, "
-        "6h/1000 limits."
+        "explicit finite limits or the native 6h-only profile."
     )
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--output", type=Path)
@@ -989,6 +1014,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
         print(f"campaign remains paused after cleanup: {breaker.pause_reason}", file=sys.stderr, flush=True)
         return 1
     terminal_evaluation = args.evaluate and not (args.redo or args.retry_infra) and _selected_jobs_evaluable(plan)
+    if config.quality and not terminal_evaluation:
+        raise CampaignError("quality treatment is retired; only historical cleanup or sealed evaluation is supported")
     required = ("OPENAI_API_KEY", "OPENCODE_SERVER_PASSWORD")
     missing = tuple(name for name in required if not os.environ.get(name))
     if missing and not terminal_evaluation:
@@ -1281,6 +1308,8 @@ def _image_name(instance: Mapping[str, object]) -> str:
 
 def _config_manifest(config: CampaignConfig) -> dict[str, object]:
     return {
+        **({"budget_profile": "6h-only"} if config.limits.deadline_only else {}),
+        **({"quality": config.quality} if config.limits.deadline_only or config.quality else {}),
         **({"vanilla_workflow": True} if config.vanilla_workflow else {}),
         "inference_network": "none-peer-pinned-model-channel-v1",
         "model": config.model,
@@ -1294,6 +1323,7 @@ def _config_manifest(config: CampaignConfig) -> dict[str, object]:
                 "mode": arm.mode,
                 "binary": str(arm.binary) if arm.binary else None,
                 **({"execution_policy": arm.execution_policy} if arm.execution_policy != "behavioral" else {}),
+                **({"runtime_protocol": arm.runtime_protocol} if arm.runtime_protocol is not None else {}),
             }
             for arm in config.arms
         },

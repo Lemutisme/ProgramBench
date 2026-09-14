@@ -893,7 +893,8 @@ def test_cli_limit_and_all_conflict_and_non_dry_requires_output():
         parse_args(["--config", "campaign.yaml", "--redo", "--retry-infra", "--dry-run"])
 
 
-def test_evaluate_only_refuses_nonterminal_jobs_and_never_enters_inference(tmp_path: Path, monkeypatch):
+@pytest.mark.parametrize("quality", [False, True])
+def test_evaluate_only_refuses_nonterminal_jobs_and_never_enters_inference(tmp_path: Path, monkeypatch, quality: bool):
     from scripts import campaign_evaluate, campaign_runner
 
     output = tmp_path / "campaign"
@@ -901,10 +902,11 @@ def test_evaluate_only_refuses_nonterminal_jobs_and_never_enters_inference(tmp_p
     (output / "campaign.json").write_text("{}")
     (output / "breaker.json").write_text(json.dumps(CircuitBreaker().snapshot()))
     candidate = campaign_runner.CampaignJob("one", "procontract", "image")
+    config = SimpleNamespace(quality=quality)
     plan = campaign_runner.CampaignPlan(
         output,
         output / "campaign.json",
-        object(),
+        config,
         ("one",),
         (candidate,),
         {},
@@ -912,7 +914,7 @@ def test_evaluate_only_refuses_nonterminal_jobs_and_never_enters_inference(tmp_p
     )
     store = campaign_runner.StateStore(output / "procontract/one/state.json")
     state = store.write(campaign_runner.JobState("planned"))
-    monkeypatch.setattr(campaign_runner, "load_config", lambda _path: object())
+    monkeypatch.setattr(campaign_runner, "load_config", lambda _path: config)
     monkeypatch.setattr(campaign_runner, "plan_campaign", lambda *_args, **_kwargs: plan)
     monkeypatch.setattr(campaign_runner, "run_campaign", lambda *_args, **_kwargs: pytest.fail("inference entered"))
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
@@ -967,7 +969,8 @@ def test_evaluate_after_inference_preserves_revision_pause_and_scores_only_seale
     (output / "campaign.json").write_text("{}")
     (output / "breaker.json").write_text(json.dumps(CircuitBreaker().snapshot()))
     candidate = campaign_runner.CampaignJob("one", "procontract", "image")
-    plan = campaign_runner.CampaignPlan(output, output / "campaign.json", object(), ("one",), (candidate,), {}, False)
+    config = SimpleNamespace(quality=False)
+    plan = campaign_runner.CampaignPlan(output, output / "campaign.json", config, ("one",), (candidate,), {}, False)
     store = campaign_runner.StateStore(output / "procontract/one/state.json")
     store.write(campaign_runner.JobState("planned"))
     store.transition("preparing", command_identity="test", expected_generation=0)
@@ -997,7 +1000,7 @@ def test_evaluate_after_inference_preserves_revision_pause_and_scores_only_seale
         assert store.read().phase == "awaiting_revision"
         return SimpleNamespace(status="invalid_protocol")
 
-    monkeypatch.setattr(campaign_runner, "load_config", lambda _path: object())
+    monkeypatch.setattr(campaign_runner, "load_config", lambda _path: config)
     monkeypatch.setattr(campaign_runner, "plan_campaign", lambda *_args, **_kwargs: plan)
     monkeypatch.setattr(campaign_runner, "run_campaign", run)
     monkeypatch.setattr(campaign_evaluate, "evaluate_campaign", evaluate)

@@ -533,7 +533,8 @@ class ProContractIssueRequest:
     brief: str
     model: str
     variant: str
-    action_limit: int = MAX_ACTIONS
+    action_limit: int | None = MAX_ACTIONS
+    turn_limit: int | None = MAX_PROVIDER_TURNS
 
     def __post_init__(self) -> None:
         if (
@@ -543,7 +544,7 @@ class ProContractIssueRequest:
             or self.deadline <= 0
             or ORIGINAL_TASK not in self.brief
             or (self.model, self.variant) not in SUPPORTED_MODEL_VARIANTS
-            or self.action_limit not in {MAX_ACTIONS, OFFLINE_ACTION_SENTINEL}
+            or any(value is not None and (type(value) is not int or value <= 0) for value in (self.action_limit, self.turn_limit))
         ):
             raise ProContractError("native Contract issue request is invalid")
         _canonical_bytes(self.to_dict())
@@ -561,7 +562,9 @@ class ProContractIssueRequest:
             "model": {"providerID": provider_id, "id": model_id, "variant": self.variant},
             "trigger": {"type": "immediate"},
             "authority": ["filesystem.read", "filesystem.write", "process.execute"],
-            "budget": {"turns": MAX_PROVIDER_TURNS, "actions": self.action_limit, "deadline": self.deadline},
+            "budget": {**({"turns": self.turn_limit} if self.turn_limit is not None else {}),
+                       **({"actions": self.action_limit} if self.action_limit is not None else {}),
+                       "deadline": self.deadline},
             "evidence": {"type": "principal", "claim": PRINCIPAL_CLAIM, "replay": REPLAY_POLICY},
             "resolution": {"maxAttempts": MAX_CONTRACT_ATTEMPTS, "retryDelay": 0},
         }
@@ -830,6 +833,35 @@ class HttpProContractApi:
         return raw
 
 
+def _deadline_only(workspace: DockerWorkspace) -> bool:
+    root = getattr(workspace.manifest, "state_root", None)
+    if root is None:
+        return False
+    path = Path(root) / "provider-control/profile.json"
+    if not path.exists():
+        return False
+    if path.is_symlink() or not path.is_file():
+        raise ProContractError("invalid trusted gateway profile")
+    profile = _read_json(path)
+    return isinstance(profile, Mapping) and profile.get("budget") == "6h-only"
+
+
+def _require_baseline_profile(workspace: DockerWorkspace) -> None:
+    root = getattr(workspace.manifest, "state_root", None)
+    if root is None:
+        return
+    path = Path(root) / "provider-control/profile.json"
+    if not path.exists() and not path.is_symlink():
+        return
+    if path.is_symlink() or not path.is_file():
+        raise ProContractError("invalid trusted gateway profile")
+    profile = _read_json(path)
+    if not isinstance(profile, Mapping) or "quality" in profile and type(profile["quality"]) is not bool:
+        raise ProContractError("invalid trusted gateway profile")
+    if profile.get("quality") is True:
+        raise ProContractError("quality treatment is retired; required-quality Contracts cannot run as baseline")
+
+
 def build_issue_payload(
     workspace: DockerWorkspace,
     *,
@@ -840,6 +872,7 @@ def build_issue_payload(
     observations: Sequence[Mapping[str, object]] = (),
 ) -> dict[str, object]:
     """Build the exact issue request. Callers must persist it before issuing."""
+    _require_baseline_profile(workspace)
     if isinstance(now, bool) or not isinstance(now, (int, float)) or not math.isfinite(now) or now < 0:
         raise ProContractError("Contract issue time is invalid")
     manifest = workspace.manifest
@@ -852,7 +885,8 @@ def build_issue_payload(
         deadline=int(now * 1000) + MAX_WALL_TIME_SECONDS * 1000,
         model=model,
         variant=variant,
-        action_limit=OFFLINE_ACTION_SENTINEL if getattr(manifest, "network_mode", None) == "none" else MAX_ACTIONS,
+        action_limit=None if _deadline_only(workspace) else OFFLINE_ACTION_SENTINEL if getattr(manifest, "network_mode", None) == "none" else MAX_ACTIONS,
+        turn_limit=None if _deadline_only(workspace) else MAX_PROVIDER_TURNS,
         brief=(
             "ProgramBench native delivery Contract. Complete this exact benchmark task:\n\n"
             f"{ORIGINAL_TASK}\n\n"
@@ -877,7 +911,9 @@ def build_issue_payload(
         payload["authority"].append("reference.run")
         payload["brief"] += (
             " The host exposes reference_run for individually recorded argv/stdin probes and reference_read "
-            "for exact retained bytes. Start with a minimal discriminating input. Nonzero exits may be valid "
+            "for exact retained bytes. Optional reference_run saveTo writes complete generated output directly "
+            "to a Location-relative file under ordinary edit permissions; saving does not execute the file. "
+            "Start with a minimal discriminating input. Nonzero exits may be valid "
             "error observations; a completed shell batch does not prove that its inner probes succeeded. "
             "An unavailable reference is an infrastructure issue, not a basis for claiming reference coverage."
         )
@@ -945,6 +981,7 @@ def run_procontract(
     protocol: ProContractProtocol = "current",
 ) -> ProContractResult:
     """Fail closed around the durable native Contract orchestration."""
+    _require_baseline_profile(workspace)
     _validate_model_variant(model, variant)
     stop = stop_token or StopToken()
     state = state_store.read()
@@ -1323,7 +1360,7 @@ def _run_procontract(
     started_at = issue["startedAt"]
     if isinstance(started_at, bool) or not isinstance(started_at, (int, float)):
         raise ProContractError("persisted Contract start time is invalid")
-    deadline = float(started_at) + MAX_WALL_TIME_SECONDS
+    deadline = int(payload["budget"]["deadline"]) / 1000
     accepted_path = job.job.root / "procontract-issue-response.json"
     marker_path = job.job.root / "procontract-issue-active.json"
     issue_attempts = 0
@@ -1472,7 +1509,7 @@ def _run_procontract(
         messages,
         usage,
     )
-    if (state.provider_turns or state.actions or state.cost) and usage.provider_turns <= MAX_PROVIDER_TURNS:
+    if (state.provider_turns or state.actions or state.cost) and (breaker.provider_turn_limit is None or usage.provider_turns <= breaker.provider_turn_limit):
         breaker.observe(workspace.manifest.job_id, state.generation, usage, terminal=False)
     quiet: Mapping[str, object] = {
         "scope": payload["scope"],
@@ -1768,10 +1805,12 @@ def _run_procontract(
                         poll_interval,
                         quiet,
                     )
-                if turns > MAX_PROVIDER_TURNS or actions > MAX_ACTIONS:
+                turn_limit = payload["budget"].get("turns")
+                action_limit = payload["budget"].get("actions")
+                if (turn_limit is not None and turns > turn_limit) or (action_limit is not None and actions > action_limit):
                     completion = (
                         ProContractCompletion.PROVIDER_TURNS
-                        if turns > MAX_PROVIDER_TURNS
+                        if turn_limit is not None and turns > turn_limit
                         else ProContractCompletion.ACTIONS
                     )
                     return _stop_and_finish(
@@ -2923,9 +2962,9 @@ def _validate_inputs(
     _validate_model_variant(model, variant)
     if (
         getattr(limits, "wall_time_seconds", None) != MAX_WALL_TIME_SECONDS
-        or getattr(limits, "provider_turns", None) != MAX_PROVIDER_TURNS
+        or getattr(limits, "provider_turns", None) != (None if _deadline_only(workspace) else MAX_PROVIDER_TURNS)
         or getattr(limits, "procontract_actions", None) != (
-            OFFLINE_ACTION_SENTINEL if getattr(workspace.manifest, "network_mode", None) == "none" else MAX_ACTIONS
+            None if _deadline_only(workspace) else OFFLINE_ACTION_SENTINEL if getattr(workspace.manifest, "network_mode", None) == "none" else MAX_ACTIONS
         )
     ):
         raise ProContractError("ProContract limits must match its exact native budget")
@@ -3140,6 +3179,7 @@ def _load_or_create_issue(
     clock: Callable[[], float],
     protocol: ProContractProtocol = "current",
 ) -> Mapping[str, object]:
+    _require_baseline_profile(workspace)
     try:
         observations = load_observations(path.parent / "procontract-observations.json")
     except (OSError, TypeError, ValueError) as error:
@@ -3154,7 +3194,7 @@ def _load_or_create_issue(
     payload = build_issue_payload(
         workspace, now=now, model=model, variant=variant, protocol=protocol, observations=observations
     )
-    acceptance_policy = _acceptance_policy(protocol)
+    acceptance_policy = payload.get("executionPolicy", payload.get("policy", _acceptance_policy(protocol)))
     record = {
         "version": 1,
         "contractID": payload["id"],
@@ -3240,7 +3280,7 @@ def _validate_issue_record(
     expected = build_issue_payload(
         workspace, now=float(started), model=model, variant=variant, protocol=protocol, observations=observations
     )
-    acceptance_policy = _acceptance_policy(protocol)
+    acceptance_policy = expected.get("executionPolicy", expected.get("policy", _acceptance_policy(protocol)))
     if (
         raw["contractID"] != expected["id"]
         or raw["payload"] != expected
@@ -3412,11 +3452,7 @@ def _expected_spec(payload: Mapping[str, object]) -> dict[str, object]:
             "brief": payload["brief"],
             "requires": [],
             "authority": list(authority),
-            "budget": {
-                "turns": budget.get("turns"),
-                "actions": budget.get("actions"),
-                "deadline": budget.get("deadline"),
-            },
+            "budget": dict(budget),
             "evidence": payload["evidence"],
             "resolution": {"maxAttempts": MAX_CONTRACT_ATTEMPTS, "retryDelay": 0},
         }
@@ -3627,7 +3663,8 @@ def _ordered_spec(value: object) -> dict[str, object]:
             if isinstance(item, Mapping)
         ],
         "authority": value["authority"],
-        "budget": {"turns": budget["turns"], "actions": budget["actions"], "deadline": budget["deadline"]},
+        "budget": {**({"turns": budget["turns"]} if "turns" in budget else {}),
+                   **({"actions": budget["actions"]} if "actions" in budget else {}), "deadline": budget["deadline"]},
         "evidence": {
             "type": evidence["type"],
             **({"claim": evidence["claim"]} if "claim" in evidence else {}),
@@ -3692,8 +3729,8 @@ def _valid_spec_schema(value: object) -> bool:
         and isinstance(value["authority"], list)
         and all(isinstance(item, str) and item for item in value["authority"])
         and isinstance(budget, Mapping)
-        and set(budget) == {"turns", "actions", "deadline"}
-        and all(type(budget[key]) is int and budget[key] > 0 for key in ("turns", "actions"))
+        and "deadline" in budget and not set(budget) - {"turns", "actions", "deadline"}
+        and all(type(budget[key]) is int and budget[key] > 0 for key in ("turns", "actions") if key in budget)
         and type(budget["deadline"]) is int
         and budget["deadline"] >= 0
         and isinstance(evidence, Mapping)
@@ -4751,9 +4788,9 @@ def _safety_completion(
         return ProContractCompletion.AUTH
     if reason is not None:
         return ProContractCompletion.HARD_COST
-    if turns >= getattr(limits, "provider_turns"):
+    if getattr(limits, "provider_turns") is not None and turns >= getattr(limits, "provider_turns"):
         return ProContractCompletion.PROVIDER_TURNS
-    if actions >= getattr(limits, "procontract_actions"):
+    if getattr(limits, "procontract_actions") is not None and actions >= getattr(limits, "procontract_actions"):
         return ProContractCompletion.ACTIONS
     if clock() >= deadline:
         return ProContractCompletion.WALL_TIME
@@ -5145,7 +5182,7 @@ def _finish_pending_revision(
         clock,
         quiet=quiet,
         interrupt_attempted=interrupted,
-        usage_incomplete=usage_incomplete,
+        usage_incomplete=usage_incomplete or usage.usage_incomplete,
     )
 
 
@@ -5472,7 +5509,7 @@ def _result(
         pending_revision=dict(contract["pendingRevision"])
         if isinstance(contract.get("pendingRevision"), Mapping)
         else None,
-        usage_incomplete=usage_incomplete,
+        usage_incomplete=usage_incomplete or usage.usage_incomplete,
         input_tokens=usage.input,
         output_tokens=usage.output,
         reasoning_tokens=usage.reasoning,

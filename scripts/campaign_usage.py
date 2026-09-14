@@ -44,8 +44,11 @@ class TurnUsage:
     cache_write: int = 0
     prompt_total: int = 0
     cost: Decimal = Decimal(0)
+    usage_incomplete: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.usage_incomplete) is not bool:
+            raise UsageParseError("invalid usage completeness flag")
         for name in ("input", "output", "reasoning", "cache_read", "cache_write", "prompt_total"):
             value = getattr(self, name)
             if type(value) is not int or value < 0 or value > MAX_TOKEN_COUNT:
@@ -146,6 +149,10 @@ class UsageSummary:
             return Decimal(0)
         return Decimal(self.cache_read) / Decimal(self.prompt_total)
 
+    @property
+    def usage_incomplete(self) -> bool:
+        return any(turn.usage_incomplete for turn in self.turns)
+
     def to_dict(self) -> dict[str, object]:
         return {
             "provider_turns": self.provider_turns,
@@ -169,6 +176,7 @@ class UsageSummary:
                     "cache_write": turn.cache_write,
                     "prompt_total": turn.prompt_total,
                     "cost": _decimal_string(turn.cost),
+                    **({"usage_incomplete": True} if turn.usage_incomplete else {}),
                 }
                 for turn in self.turns
             ],
@@ -178,12 +186,12 @@ class UsageSummary:
 UsageTurn = TurnUsage
 
 
-def summarize_usage(messages: Mapping[str, object] | bytes | str) -> UsageSummary:
+def summarize_usage(messages: Mapping[str, object] | bytes | str, *, allow_large: bool = False) -> UsageSummary:
     """Aggregate assistant usage from an OpenCode projected ``{"data": [...]}`` response."""
     payload = _load_json(messages)
     if not isinstance(payload, Mapping) or set(payload) != {"data"} or not isinstance(payload["data"], list):
         raise UsageParseError("projected messages must contain only a data list")
-    if len(payload["data"]) > MAX_MESSAGES_PER_JOB:
+    if not allow_large and len(payload["data"]) > MAX_MESSAGES_PER_JOB:
         raise UsageParseError("projected message count exceeds limit")
 
     turns: list[TurnUsage] = []
@@ -206,6 +214,7 @@ def summarize_usage(messages: Mapping[str, object] | bytes | str) -> UsageSummar
         cost=_sum_decimals(turn.cost for turn in turns),
         telemetry_gap=any(turn.cache_read > 0 and turn.cache_write == 0 for turn in turns),
         turns=tuple(turns),
+        allow_large=allow_large,
     )
 
 
@@ -268,6 +277,7 @@ def _turn_from_source(source: Mapping[str, object]) -> TurnUsage:
         cache_write=cache_write,
         prompt_total=prompt_total,
         cost=cost,
+        usage_incomplete=source.get("cost") is None or source.get("usage_incomplete") is True,
     )
 
 
@@ -377,6 +387,7 @@ class CircuitBreaker:
         provider_failure_threshold: int = 3,
         provider_failure_window: int = 120,
         provider_failure_backoff: int = 60,
+        provider_turn_limit: int | None = MAX_PROVIDER_TURNS,
     ) -> None:
         if minimum_read_ratio is not None:
             minimum_cache_ratio = minimum_read_ratio
@@ -416,6 +427,9 @@ class CircuitBreaker:
         self.consecutive_failures = consecutive_failures
         self.soft_cost_cap = soft
         self.hard_cost_cap = hard
+        if provider_turn_limit is not None and (type(provider_turn_limit) is not int or provider_turn_limit <= 0):
+            raise UsageParseError("provider turn limit must be positive or null")
+        self.provider_turn_limit = provider_turn_limit
         self._clock = clock
         self._retry_after_default = retry_after_default
         self._retry_after_max = retry_after_max
@@ -450,6 +464,7 @@ class CircuitBreaker:
             consecutive_failures=cache.stop_after_consecutive_failures,
             soft_cost_cap=limits.total_cost_soft,
             hard_cost_cap=limits.total_cost_hard,
+            provider_turn_limit=limits.provider_turns,
             **kwargs,
         )
 
@@ -553,7 +568,8 @@ class CircuitBreaker:
         supplied = usage if isinstance(observation, str) else observation
         if (
             isinstance(supplied, UsageSummary)
-            and supplied.provider_turns > MAX_PROVIDER_TURNS
+            and self.provider_turn_limit is not None
+            and supplied.provider_turns > self.provider_turn_limit
             and not _allow_terminal_overshoot
         ):
             raise UsageParseError("normal breaker observation exceeds provider-turn limit")
@@ -562,9 +578,9 @@ class CircuitBreaker:
                 raise UsageParseError("job observations require generation and usage")
             resolved_job = observation
             resolved_generation = generation
-            resolved_usage = _coerce_summary(usage, allow_large=_allow_terminal_overshoot)
+            resolved_usage = _coerce_summary(usage, allow_large=self.provider_turn_limit is None or _allow_terminal_overshoot)
         else:
-            resolved_usage = _coerce_summary(observation, allow_large=_allow_terminal_overshoot)
+            resolved_usage = _coerce_summary(observation, allow_large=self.provider_turn_limit is None or _allow_terminal_overshoot)
             resolved_job = job_id or f"__trajectory_{id(resolved_usage)}"
             if generation is None:
                 resolved_generation = 0
@@ -588,7 +604,7 @@ class CircuitBreaker:
                 or resolved_usage.provider_turns > MAX_TERMINAL_PROVIDER_TURNS
             ):
                 raise UsageParseError("terminal turn overshoot is outside its absolute evidence bound")
-        elif resolved_usage.provider_turns > MAX_PROVIDER_TURNS:
+        elif self.provider_turn_limit is not None and resolved_usage.provider_turns > self.provider_turn_limit:
             raise UsageParseError("normal breaker observation exceeds provider-turn limit")
         with self._lock:
             if resolved_job in self._turn_limit_violations and not _allow_terminal_overshoot:
@@ -869,6 +885,7 @@ class CircuitBreaker:
             violations = set(self._turn_limit_violations)
             state = {
                 "version": 2,
+                **({"provider_turn_limit": self.provider_turn_limit} if self.provider_turn_limit != MAX_PROVIDER_TURNS else {}),
                 "cache_warmup_turns": self.cache_warmup_turns,
                 "minimum_cache_ratio": _decimal_string(self.minimum_cache_ratio),
                 "consecutive_failures": self.consecutive_failures,
@@ -941,11 +958,12 @@ class CircuitBreaker:
             "provider_failure_waves",
             "provider_backoff_fingerprint",
         }
+        budget_keys = {"provider_turn_limit"} if "provider_turn_limit" in raw else set()
         version_value = raw.get("version")
         if version_value == 1:
-            _require_keys(raw, legacy_keys)
+            _require_keys(raw, legacy_keys | budget_keys)
         elif version_value == 2:
-            _require_keys(raw, legacy_keys | provider_keys)
+            _require_keys(raw, legacy_keys | provider_keys | budget_keys)
         else:
             raise UsageParseError("invalid breaker snapshot version or cache failures")
         if (
@@ -978,6 +996,7 @@ class CircuitBreaker:
             provider_failure_threshold=raw.get("provider_failure_threshold", 3),
             provider_failure_window=raw.get("provider_failure_window", 120),
             provider_failure_backoff=raw.get("provider_failure_backoff", 60),
+            provider_turn_limit=raw.get("provider_turn_limit", MAX_PROVIDER_TURNS),
             **kwargs,
         )
         if "soft" in causes and breaker.soft_cost_cap is None:
@@ -1013,10 +1032,10 @@ class CircuitBreaker:
             summary = _summary_from_dict(
                 item["usage"],
                 require_turns=True,
-                allow_large=turn_limit_violation,
+                allow_large=turn_limit_violation or breaker.provider_turn_limit is None,
             )
             if turn_limit_violation != (
-                item["terminal"] and MAX_PROVIDER_TURNS < summary.provider_turns <= MAX_TERMINAL_PROVIDER_TURNS
+                breaker.provider_turn_limit is not None and item["terminal"] and breaker.provider_turn_limit < summary.provider_turns <= MAX_TERMINAL_PROVIDER_TURNS
             ):
                 raise UsageParseError("breaker turn-limit violation is inconsistent")
             restored[job] = (generation, summary, item["terminal"])
@@ -1358,8 +1377,8 @@ def _coerce_summary(value: UsageSummary | Mapping[str, object], *, allow_large: 
             allow_large=allow_large,
         )
     if isinstance(value, Mapping) and "data" in value:
-        return summarize_usage(value)
-    return _summary_from_dict(value)
+        return summarize_usage(value, allow_large=allow_large)
+    return _summary_from_dict(value, allow_large=allow_large)
 
 
 def _summary_from_dict(value: object, *, require_turns: bool = False, allow_large: bool = False) -> UsageSummary:
@@ -1386,7 +1405,7 @@ def _summary_from_dict(value: object, *, require_turns: bool = False, allow_larg
         raise UsageParseError("usage turns must be a list")
     turns: list[TurnUsage] = []
     for item in turns_value:
-        if not isinstance(item, Mapping) or set(item) != {
+        if not isinstance(item, Mapping) or set(item) - {"usage_incomplete"} != {
             "input",
             "output",
             "reasoning",
@@ -1404,6 +1423,7 @@ def _summary_from_dict(value: object, *, require_turns: bool = False, allow_larg
             cache_write=_token(item["cache_write"]),
             prompt_total=_token(item["prompt_total"]),
             cost=_decimal(item["cost"]),
+            usage_incomplete=item.get("usage_incomplete", False),
         )
         if turn.prompt_total != turn.input + turn.cache_read + turn.cache_write:
             raise UsageParseError("usage turn prompt total is inconsistent")

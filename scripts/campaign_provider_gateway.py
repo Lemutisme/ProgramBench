@@ -76,11 +76,12 @@ class Gateway(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
     daemon_threads = True
     block_on_close = False
 
-    def __init__(self, channel: Path, control: Path, model: str, effort: str, *, upstream: str, api_key: str):
+    def __init__(self, channel: Path, control: Path, model: str, effort: str, *, upstream: str, api_key: str, issue: Path | None = None):
         self.channel = channel
         self.control = control
         self.model = model
         self.effort = effort
+        self.issue = issue
         self.api_key = api_key
         self.upstream = urlsplit(upstream.rstrip("/"))
         if self.upstream.scheme not in ("https", "http") or self.upstream.query or self.upstream.fragment or self.upstream.username:
@@ -95,6 +96,7 @@ class Gateway(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
         self.channel.chmod(0o755)
         self.db = sqlite3.connect(control / "requests.db", check_same_thread=False)
         self.db.execute("CREATE TABLE IF NOT EXISTS request (id INTEGER PRIMARY KEY, started REAL, finished REAL, peer_pid INTEGER, body_sha256 TEXT, status INTEGER, outcome TEXT, usage TEXT)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS execution_budget (identity TEXT PRIMARY KEY, deadline REAL)")
         if 'metadata' not in {row[1] for row in self.db.execute('PRAGMA table_info(request)')}:
             self.db.execute('ALTER TABLE request ADD COLUMN metadata TEXT')
         columns = {row[1] for row in self.db.execute('PRAGMA table_info(request)')}
@@ -123,6 +125,31 @@ class Gateway(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
             return None
         return pid
 
+    def deadline(self) -> float | None:
+        """The trusted frozen Contract owns time; gateway restarts never regrant it."""
+        if self.issue is None:
+            return None
+        if self.issue.is_symlink() or not self.issue.is_file() or self.issue.stat().st_size > 1024 * 1024:
+            raise ValueError("contract_budget_unavailable")
+        content = self.issue.read_bytes()
+        record = json.loads(content, object_pairs_hook=unique_object)
+        budget = record["payload"]["budget"]
+        deadline = budget.get("deadline")
+        started = record.get("startedAt")
+        if (set(budget) != {"deadline"} or type(deadline) is not int
+                or not isinstance(started, (float, int)) or isinstance(started, bool)
+                or deadline != int(started * 1000) + 21600 * 1000):
+            raise ValueError("contract_budget_conflict")
+        identity = hashlib.sha256(content).hexdigest()
+        existing = self.db.execute("SELECT identity,deadline FROM execution_budget").fetchone()
+        expected = (identity, deadline / 1000)
+        if existing is not None and existing != expected:
+            raise ValueError("contract_budget_conflict")
+        if existing is None:
+            self.db.execute("INSERT INTO execution_budget(identity,deadline) VALUES (?,?)", expected)
+            self.db.commit()
+        return deadline / 1000
+
     def record(self, pid: int, body: bytes) -> int:
         with self.lock:
             value = json.loads(body)
@@ -130,16 +157,17 @@ class Gateway(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
                         'tool_names': [tool.get('name') for tool in value.get('tools', [])],
                         'prompt_cache_key': value.get('prompt_cache_key')}
             prior = self.db.execute("SELECT min(started),count(*) FROM request WHERE peer_pid IS NOT NULL").fetchone()
-            if prior[0] and time.time() - prior[0] > 21600:
+            deadline = self.deadline()
+            if deadline is not None and time.time() >= deadline or deadline is None and prior[0] and time.time() - prior[0] >= 21600:
                 raise ValueError("wall_time_exhausted")
             # Existing Session code owns the 1000 provider-turn limit. This is a
             # separate ceiling on wire attempts, including its bounded retries.
-            if prior[1] >= 3000:
+            if self.issue is None and prior[1] >= 3000:
                 raise ValueError("transport_attempt_ceiling")
             reserved = self.db.execute(
                 "SELECT count(*) FROM request WHERE peer_pid IS NOT NULL AND (status=200 OR finished IS NULL)"
             ).fetchone()[0]
-            if reserved >= 1000:
+            if self.issue is None and reserved >= 1000:
                 raise ValueError("provider_turn_budget_exhausted")
             cursor = self.db.execute("INSERT INTO request(started,peer_pid,body_sha256,outcome,metadata) VALUES (?,?,?,?,?)",
                                      (time.time(), pid, hashlib.sha256(body).hexdigest(), "admitted", json.dumps(metadata)))
@@ -222,13 +250,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             validate_payload(json.loads(body, object_pairs_hook=unique_object), self.server.model, self.server.effort)
             request_id = self.server.record(peer, body)
-        except (ValueError, TypeError, AttributeError) as error:
+        except (ValueError, TypeError, AttributeError, KeyError, OSError) as error:
             if str(error) in ('provider_turn_budget_exhausted', 'wall_time_exhausted', 'transport_attempt_ceiling'):
                 return self.refuse(str(error), 409)
             return self.refuse("request_not_admitted")
         upstream = self.server.upstream
         cls = http.client.HTTPSConnection if upstream.scheme == "https" else http.client.HTTPConnection
-        connection = cls(upstream.hostname, upstream.port, timeout=900)
+        with self.server.lock:
+            deadline = self.server.deadline()
+        remaining = 900 if deadline is None else min(900, max(0.001, deadline - time.time()))
+        connection = cls(upstream.hostname, upstream.port, timeout=remaining)
+        sockets = [self.connection]
+        expired = threading.Event()
+        def expire():
+            expired.set()
+            for endpoint in sockets:
+                try:
+                    endpoint.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+        timer = None if deadline is None else threading.Timer(max(0, deadline - time.time()), expire)
+        if timer is not None:
+            timer.daemon = True
+            timer.start()
         status = None
         usage = None
         outcome = "transport_failed"
@@ -237,6 +281,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         failure = None
         close_reason = "eof_without_terminal"
         try:
+            connection.connect()
+            sockets.append(connection.sock)
+            if expired.is_set():
+                raise TimeoutError("contract deadline reached")
             self.server.checkpoint(request_id, sent=time.time(), outcome="sending")
             connection.request("POST", upstream.path + "/responses", body=body,
                                headers={"Content-Type": "application/json", "Authorization": "Bearer " + self.server.api_key,
@@ -266,7 +314,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
             self.end_headers()
             began = True
-            self.connection.settimeout(900)
+            self.connection.settimeout(remaining)
             pending = bytearray()
             while chunk := response.read1(64 * 1024):
                 if last_byte is None:
@@ -306,6 +354,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(message)
         finally:
+            if timer is not None:
+                timer.cancel()
+            if expired.is_set():
+                close_reason = "contract_deadline"
+                if usage is None:
+                    outcome = "deadline_usage_unknown"
             self.close_connection = True
             connection.close()
             self.server.finish(request_id, status, outcome, usage, last_byte=last_byte,
@@ -327,11 +381,12 @@ def main():
     parser.add_argument("--control", type=Path, required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--effort", required=True)
+    parser.add_argument("--issue", type=Path)
     args = parser.parse_args()
     os.umask(0o077)
     server = Gateway(args.channel, args.control, args.model, args.effort,
                      upstream=os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1",
-                     api_key=os.environ["OPENAI_API_KEY"])
+                     api_key=os.environ["OPENAI_API_KEY"], issue=args.issue)
     (args.control / "gateway.json").write_text(json.dumps(process_identity(os.getpid())))
     def stop(*_):
         raise SystemExit(0)

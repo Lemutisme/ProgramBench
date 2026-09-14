@@ -422,6 +422,9 @@ class WorkspaceRequest:
     isolated: bool = False
     provider_model: str = "gpt-5.6-sol"
     provider_effort: str = "xhigh"
+    deadline_only: bool = False
+    # Legacy identity only: cleanup may read it, workspace admission rejects True.
+    native_quality: bool = False
     docker: str = "docker"
     docker_runner: _DockerRunner | None = None
     health_probe: _HealthProbe | None = None
@@ -730,6 +733,8 @@ def ensure_workspace(request: WorkspaceRequest, lease: WorkspaceLease | None = N
     Session and Contract adapters must not create or prompt model work before this
     function returns its :class:`DockerWorkspace` handoff token.
     """
+    if request.native_quality:
+        raise WorkspaceError("quality treatment is retired; new workspace admission is disabled")
     if not isinstance(lease, WorkspaceLease):
         raise WorkspaceError("ensure_workspace requires an active matching WorkspaceLease")
     lease.claim_handle(request)
@@ -778,6 +783,8 @@ def reconcile_workspace_for_cleanup(
 
 
 def _ensure_workspace(request: WorkspaceRequest) -> DockerWorkspace:
+    if request.native_quality:
+        raise WorkspaceError("quality treatment is retired; new workspace admission is disabled")
     request = _validate_request(request)
     runner = request.docker_runner or _run_docker
     probe = request.health_probe or _probe_health
@@ -979,7 +986,7 @@ def _launch(
         environment = {**OFFLINE_ENV, "OPENCODE_PROCONTRACT_DISABLED": "1" if launching.arm == "vanilla" else "0"}
         if "OPENCODE_REFERENCE_BINDING" in launching.environment_names:
             from scripts.campaign_offline import prepare_reference_binding
-            environment["OPENCODE_REFERENCE_BINDING"] = prepare_reference_binding(launching, request.docker)
+            environment["OPENCODE_REFERENCE_BINDING"] = prepare_reference_binding(launching, request.docker, quality=request.native_quality)
         command.extend(value for name, setting in environment.items() for value in ("-e", f"{name}={setting}"))
     else:
         command.extend(value for name in launching.credential_env for value in ("-e", name))
@@ -1114,7 +1121,7 @@ def _expected_manifest(
         channel = (MountSpec(directory, CHANNEL_PATH, "bind", True),)
         identities = (PathIdentity.capture("provider-channel", directory),)
         environment = {*image_environment, "OPENCODE_SERVER_PASSWORD", *_FIXED_ENV, *OFFLINE_ENV}
-        if request.arm == "procontract" and os.environ.get("PROGRAMBENCH_GROUNDED_REFERENCE") == "1":
+        if request.arm == "procontract" and (request.deadline_only or request.native_quality or os.environ.get("PROGRAMBENCH_GROUNDED_REFERENCE") == "1"):
             environment.add("OPENCODE_REFERENCE_BINDING")
         entrypoint = ("/usr/bin/python3",)
         command = ("-I", "-S", "-c", BOOTSTRAP, *_COMMAND)
