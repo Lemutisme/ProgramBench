@@ -364,6 +364,93 @@ def ensure_workspace(value: WorkspaceRequest):
     return workspace
 
 
+@pytest.mark.parametrize("failure", ["foreign_container", "cleanroom_copy", "stopped_gateway"])
+@pytest.mark.parametrize("replace_pidfile", [False, True])
+def test_startup_gateway_is_reaped_without_trusting_replaceable_pidfile(tmp_path, monkeypatch, failure, replace_pidfile):
+    import http.client
+    import http.server
+    import signal
+    import socket
+    import sqlite3
+    from scripts.campaign_offline import alive
+    from scripts.campaign_provider_gateway import process_identity
+
+    upstream_requests = []
+
+    class Upstream(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *_):
+            pass
+
+        def do_POST(self):
+            upstream_requests.append(self.path)
+            self.send_error(500)
+
+    upstream = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
+    thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setenv("OPENAI_API_KEY", "startup-cleanup-test-key")
+    monkeypatch.setenv("OPENAI_BASE_URL", f"http://127.0.0.1:{upstream.server_port}/v1")
+    value = replace(request(tmp_path, RecordingDocker()), isolated=True)
+    observed = []
+    foreign = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    foreign_identity = process_identity(foreign.pid)
+
+    def inject(*_):
+        pidfile = value.state_root / "provider-control/gateway.json"
+        observed.append(json.loads(pidfile.read_text()))
+        channel = value.state_root / "provider-channel"
+        descriptor = os.open(channel, os.O_RDONLY)
+        connection = http.client.HTTPConnection("programbench-provider.invalid", timeout=2)
+        connection.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            connection.sock.connect(f"/proc/{os.getpid()}/fd/{descriptor}/provider.sock")
+            connection.request("GET", "/v1/responses")
+            response = connection.getresponse()
+            assert response.status == 403
+            response.read()
+        finally:
+            connection.close()
+            os.close(descriptor)
+        if replace_pidfile:
+            pidfile.write_text(json.dumps(foreign_identity))
+        if failure == "stopped_gateway":
+            os.kill(observed[-1]["pid"], signal.SIGSTOP)
+        if failure == "foreign_container":
+            return {"Id": "f" * 64}
+        raise RuntimeError("injected cleanroom copy failure")
+
+    monkeypatch.setattr(campaign_workspace, "_image_spec", lambda *_: ("sha256:image", "linux/amd64", ()))
+    monkeypatch.setattr(campaign_workspace, "_inspect_container", inject if failure == "foreign_container" else lambda *_: None)
+    monkeypatch.setattr(campaign_workspace, "_copy_cleanroom", inject)
+    started = time.monotonic()
+    try:
+        with pytest.raises(ContainerConflictError if failure == "foreign_container" else RuntimeError):
+            ensure_workspace(value)
+        assert len(observed) == 1
+        assert not alive(observed[0]), "new gateway survived failed workspace admission"
+        assert time.monotonic() - started < 8
+        assert foreign.poll() is None
+        assert upstream_requests == []
+        assert not (value.state_root / "provider-control/runtime.json").exists()
+        with sqlite3.connect(value.state_root / "provider-control/requests.db") as database:
+            assert database.execute("SELECT outcome,peer_pid FROM request").fetchall() == [("method_not_admitted", None)]
+        if replace_pidfile:
+            assert json.loads((value.state_root / "provider-control/gateway.json").read_text()) == foreign_identity
+    finally:
+        for identity in observed:
+            if alive(identity):
+                os.kill(identity["pid"], signal.SIGTERM)
+            try:
+                os.waitpid(identity["pid"], 0)
+            except ChildProcessError:
+                pass
+        foreign.terminate()
+        foreign.wait(timeout=3)
+        upstream.shutdown()
+        upstream.server_close()
+        thread.join(timeout=3)
+
+
 @pytest.fixture(autouse=True)
 def release_workspace_leases():
     yield

@@ -229,11 +229,11 @@ def ensure_gateway(request):
     if not environment.get('OPENAI_API_KEY'):
         raise ValueError('provider credential missing on trusted side')
     with (control / 'gateway.log').open('ab') as log:
-        process = subprocess.Popen([sys.executable, str(Path(__file__).with_name('campaign_provider_gateway.py')),
+        process = request.workspace_lease.start_gateway(request, lambda: subprocess.Popen([sys.executable, str(Path(__file__).with_name('campaign_provider_gateway.py')),
                                     '--channel',str(channel),'--control',str(control),
                                     '--model',request.provider_model,'--effort',request.provider_effort,
                                     *(['--issue', str(request.job.root / 'procontract-issue.json')] if getattr(request, 'deadline_only', False) else [])],
-                                   stdin=subprocess.DEVNULL,stdout=log,stderr=log,env=environment,start_new_session=True)
+                                   stdin=subprocess.DEVNULL,stdout=log,stderr=log,env=environment,start_new_session=True))
     deadline = time.monotonic()+10
     while time.monotonic()<deadline:
         if process.poll() is not None:
@@ -241,7 +241,6 @@ def ensure_gateway(request):
         if target.exists() and pidfile.exists() and json.loads(pidfile.read_text()).get('pid') == process.pid:
             return channel
         time.sleep(.05)
-    process.terminate()
     raise RuntimeError('trusted gateway startup timeout')
 
 

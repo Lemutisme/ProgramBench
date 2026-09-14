@@ -833,6 +833,8 @@ def run_job(
                             ),
                         )
                     exit_class, traceback_hash = _exception_metadata(paths, store, error)
+                    if exit_class == "infrastructure_failed_before_provider" and not stop.is_set():
+                        breaker.observe_system_failure(candidate.key, "workspace_startup")
                     interrupted = stop.is_set()
                     cleanup_deadline = time.monotonic() + _workspace_cleanup_timeout(workspace)
                     attempts = 0
@@ -902,6 +904,8 @@ def run_job(
             if type(error).__name__ == "ProContractConflictError":
                 breaker.observe_system_failure(candidate.instance_id + ":" + candidate.arm, "contract_conflict")
             exit_class, traceback_hash = _exception_metadata(paths, store, error)
+            if exit_class == "infrastructure_failed_before_provider" and not stop.is_set():
+                breaker.observe_system_failure(candidate.key, "workspace_startup")
             _terminalize(
                 store,
                 "interrupted" if stop.is_set() else "failed",
@@ -1449,7 +1453,7 @@ def _wait_for_admission(
         if reason == "campaign hard cost cap reached":
             stop.set("campaign_hard_stop")
             return "interrupted"
-        if reason == "provider authentication failure":
+        if reason in {"provider authentication failure", "repeated execution protocol failure"}:
             return "paused"
         deadline = breaker.backoff_until
         if deadline is None:

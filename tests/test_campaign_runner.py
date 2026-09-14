@@ -22,6 +22,43 @@ def job(index: int):
     return CampaignJob(f"task-{index}", "vanilla" if index % 2 else "procontract", f"image-{index}")
 
 
+def test_repeated_pre_provider_workspace_failures_pause_before_next_job(tmp_path, monkeypatch):
+    from scripts import campaign_runner
+    from scripts.campaign_workspace import ContainerConflictError
+    from scripts.run_opencode import load_config
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config_path = tmp_path / "campaign.yaml"
+    config_path.write_text(_config(repo))
+    plan = campaign_runner.CampaignPlan(
+        tmp_path / "out", tmp_path / "out/campaign.json", load_config(config_path), (), (), {}, False
+    )
+    jobs = tuple(campaign_runner.CampaignJob(f"task-{index}", "vanilla", "image") for index in range(4))
+    admitted = []
+    breaker = CircuitBreaker()
+
+    def reject(request, lease):
+        admitted.append(request.instance_id)
+        raise ContainerConflictError("injected occupied foreign container name")
+
+    monkeypatch.setattr(campaign_runner, "_install_for", lambda *_: object())
+    result = campaign_runner.run_campaign(
+        jobs,
+        workers=1,
+        breaker=breaker,
+        sleeper=lambda _delay: pytest.fail("system pause must not wait through provider backoff"),
+        execute=lambda candidate, stop: campaign_runner.run_job(
+            plan, candidate, breaker=breaker, stop_token=stop, workspace_factory=reject,
+        ),
+    )
+    assert admitted == ["task-0", "task-1", "task-2"]
+    assert result.paused and result.failed == 3
+    assert len(result.pending) == 1
+    assert CircuitBreaker.from_snapshot(breaker.snapshot()).pause_reason == "repeated execution protocol failure"
+    assert not (plan.output / "vanilla/task-3/state.json").exists()
+
+
 def test_scheduler_never_runs_more_than_worker_active_jobs():
     from scripts.campaign_runner import run_campaign
 

@@ -810,7 +810,7 @@ class CircuitBreaker:
 
     def observe_system_failure(self, job_id: str, kind: str, *, now: float | None = None) -> bool:
         """Persistently pause after a protocol fault recurs across distinct jobs."""
-        if kind not in {"transport", "tool_stream", "contract_conflict", "publication_scan"}:
+        if kind not in {"transport", "tool_stream", "contract_conflict", "publication_scan", "workspace_startup"}:
             raise UsageParseError("unknown execution protocol failure kind")
         fingerprint = hashlib.sha256(("execution_protocol:" + kind).encode()).hexdigest()
         with self._lock:

@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import tempfile
 import threading
 import time
@@ -447,6 +448,7 @@ class WorkspaceLease:
         self._owner: tuple[int, int] | None = None
         self._handle_active = False
         self._cleanup_child_pid: int | None = None
+        self._startup_gateway: subprocess.Popen[bytes] | None = None
 
     def __enter__(self) -> "WorkspaceLease":
         if self._lock_context is not None:
@@ -491,18 +493,50 @@ class WorkspaceLease:
     def release_handle(self) -> None:
         self._handle_active = False
 
+    def start_gateway(
+        self, request: WorkspaceRequest, start: Callable[[], subprocess.Popen[bytes]]
+    ) -> subprocess.Popen[bytes]:
+        self.require(request)
+        if not self._handle_active or self._startup_gateway is not None:
+            raise WorkspaceError("gateway startup requires one owned workspace admission")
+        self._startup_gateway = start()
+        return self._startup_gateway
+
+    def handoff_startup_gateway(self, request: WorkspaceRequest) -> None:
+        self.require(request)
+        self._startup_gateway = None
+
+    def _stop_startup_gateway(self) -> None:
+        process = self._startup_gateway
+        if process is None:
+            return
+        if self._owner != (os.getpid(), threading.get_ident()):
+            raise WorkspaceError("startup gateway cleanup is not in its original owner")
+        # This direct-child handle cannot be redirected by a replaced gateway.json.
+        if process.poll() is None:
+            process.terminate()
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=3)
+        self._startup_gateway = None
+
     def authorize_fork_cleanup(self, parent_pid: int) -> None:
         if self._owner is None or self._owner[0] != parent_pid or os.getppid() != parent_pid:
             raise WorkspaceError("forked cleanup does not descend from the workspace lease owner")
         self._cleanup_child_pid = os.getpid()
 
     def __exit__(self, exception_type, exception, traceback) -> None:
-        self._handle_active = False
-        if self._lock_context is not None:
-            self._lock_context.__exit__(exception_type, exception, traceback)
-            self._lock_context = None
-            self._owner = None
-            self._cleanup_child_pid = None
+        try:
+            self._stop_startup_gateway()
+        finally:
+            self._handle_active = False
+            if self._lock_context is not None:
+                self._lock_context.__exit__(exception_type, exception, traceback)
+                self._lock_context = None
+                self._owner = None
+                self._cleanup_child_pid = None
 
 
 class StopCoordinator:
@@ -739,7 +773,9 @@ def ensure_workspace(request: WorkspaceRequest, lease: WorkspaceLease | None = N
         raise WorkspaceError("ensure_workspace requires an active matching WorkspaceLease")
     lease.claim_handle(request)
     try:
-        return _ensure_workspace(replace(request, workspace_lease=lease))
+        workspace = _ensure_workspace(replace(request, workspace_lease=lease))
+        lease.handoff_startup_gateway(request)
+        return workspace
     except BaseException:
         lease.release_handle()
         raise
