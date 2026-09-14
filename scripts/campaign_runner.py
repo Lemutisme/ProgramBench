@@ -51,6 +51,7 @@ from scripts.campaign_stop import StopToken
 from scripts.campaign_usage import CircuitBreaker
 from scripts.campaign_vanilla import HttpOpenCodeApi, VanillaResult, run_vanilla
 from scripts.campaign_workspace import (
+    StartupGatewayCleanupError,
     WorkspaceLease,
     WorkspaceHealthError,
     WorkspaceRequest,
@@ -888,6 +889,20 @@ def run_job(
                     return JobRunResult(candidate, "interrupted" if stop.is_set() else "failed")
                 finally:
                     stop.registry.unregister(active)
+        except StartupGatewayCleanupError as error:
+            # Halt admission even if writing cleanup evidence itself fails.
+            stop.set("workspace_cleanup_failed")
+            _, traceback_hash = _exception_metadata(paths, store, error)
+            evidence_path = paths.root / "startup-gateway-cleanup-failure.json"
+            _atomic_json(evidence_path, error.evidence)
+            _terminalize(
+                store,
+                "failed",
+                "cleanup_failed",
+                traceback_hash=traceback_hash,
+                artifact_hashes={evidence_path.name: hashlib.sha256(evidence_path.read_bytes()).hexdigest()},
+            )
+            return JobRunResult(candidate, "cleanup_failed")
         except WorkspaceHealthError:
             state = store.read()
             if state.phase in {"planned", "preparing", "executing", "frozen", "packaged", "preflighted"}:

@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import traceback
 import uuid
 from dataclasses import dataclass, field, fields, replace
 from pathlib import Path, PurePosixPath
@@ -27,6 +28,28 @@ from scripts.campaign_workspace_fs import PathIdentity, WorkspaceFilesystemError
 
 class WorkspaceError(RuntimeError):
     """Raised when an isolated workspace cannot be safely prepared."""
+
+
+class StartupGatewayCleanupError(WorkspaceError):
+    """Startup failed and exit of its owned gateway could not be confirmed."""
+
+    def __init__(self, admission: BaseException | None, cleanup: BaseException, identity: dict[str, object]) -> None:
+        super().__init__("owned startup gateway cleanup failed")
+        self.evidence = {
+            "version": 1,
+            "status": "cleanup_failed",
+            "gateway": identity,
+            "causes": {
+                name: None if error is None else {
+                    "type": type(error).__name__,
+                    "frames": [
+                        {"file": Path(frame.filename).name, "line": frame.lineno, "function": frame.name}
+                        for frame in traceback.extract_tb(error.__traceback__)[-12:]
+                    ],
+                }
+                for name, error in (("admission", admission), ("cleanup", cleanup))
+            },
+        }
 
 
 class ContainerConflictError(WorkspaceError):
@@ -449,6 +472,7 @@ class WorkspaceLease:
         self._handle_active = False
         self._cleanup_child_pid: int | None = None
         self._startup_gateway: subprocess.Popen[bytes] | None = None
+        self._startup_gateway_identity: dict[str, object] | None = None
 
     def __enter__(self) -> "WorkspaceLease":
         if self._lock_context is not None:
@@ -500,11 +524,14 @@ class WorkspaceLease:
         if not self._handle_active or self._startup_gateway is not None:
             raise WorkspaceError("gateway startup requires one owned workspace admission")
         self._startup_gateway = start()
+        from scripts.campaign_provider_gateway import process_identity
+        self._startup_gateway_identity = process_identity(self._startup_gateway.pid)
         return self._startup_gateway
 
     def handoff_startup_gateway(self, request: WorkspaceRequest) -> None:
         self.require(request)
         self._startup_gateway = None
+        self._startup_gateway_identity = None
 
     def _stop_startup_gateway(self) -> None:
         process = self._startup_gateway
@@ -521,6 +548,7 @@ class WorkspaceLease:
             process.kill()
             process.wait(timeout=3)
         self._startup_gateway = None
+        self._startup_gateway_identity = None
 
     def authorize_fork_cleanup(self, parent_pid: int) -> None:
         if self._owner is None or self._owner[0] != parent_pid or os.getppid() != parent_pid:
@@ -530,6 +558,12 @@ class WorkspaceLease:
     def __exit__(self, exception_type, exception, traceback) -> None:
         try:
             self._stop_startup_gateway()
+        except BaseException as cleanup:
+            identity = self._startup_gateway_identity or {
+                "pid": self._startup_gateway.pid if self._startup_gateway is not None else None,
+                "start_ticks": None,
+            }
+            raise StartupGatewayCleanupError(exception, cleanup, identity) from cleanup
         finally:
             self._handle_active = False
             if self._lock_context is not None:

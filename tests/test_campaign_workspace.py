@@ -451,6 +451,126 @@ def test_startup_gateway_is_reaped_without_trusting_replaceable_pidfile(tmp_path
         thread.join(timeout=3)
 
 
+def test_successful_handoff_and_failed_borrower_leave_existing_gateway_alive(tmp_path, monkeypatch):
+    from scripts.campaign_offline import alive, ensure_gateway
+
+    monkeypatch.setenv("OPENAI_API_KEY", "startup-cleanup-test-key")
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://127.0.0.1:1/v1")
+    value = replace(request(tmp_path, RecordingDocker()), isolated=True)
+    token = object()
+    identities = []
+
+    def admit(request):
+        ensure_gateway(request)
+        identities.append(json.loads((request.state_root / "provider-control/gateway.json").read_text()))
+        return token
+
+    def reject(request):
+        ensure_gateway(request)
+        identities.append(json.loads((request.state_root / "provider-control/gateway.json").read_text()))
+        raise ContainerConflictError("failed after borrowing an existing gateway")
+
+    # The lower Docker admission is a seam here; the lease, gateway and handoff are real.
+    monkeypatch.setattr(campaign_workspace, "_ensure_workspace", admit)
+    try:
+        with WorkspaceLease(value) as lease:
+            assert ensure_workspace_impl(value, lease) is token
+        assert alive(identities[0])
+        monkeypatch.setattr(campaign_workspace, "_ensure_workspace", reject)
+        with WorkspaceLease(value) as lease:
+            with pytest.raises(ContainerConflictError):
+                ensure_workspace_impl(value, lease)
+        assert identities == [identities[0], identities[0]]
+        assert alive(identities[0])
+        assert not (value.state_root / "provider-control/runtime.json").exists()
+    finally:
+        if identities and alive(identities[0]):
+            os.kill(identities[0]["pid"], 15)
+            os.waitpid(identities[0]["pid"], 0)
+
+
+@pytest.mark.parametrize("failure", ["terminate", "kill", "final_wait"])
+def test_startup_cleanup_failure_preserves_both_causes_and_stops_next_job(tmp_path, monkeypatch, failure):
+    import sqlite3
+    from types import SimpleNamespace
+    from scripts import campaign_runner
+    from scripts.campaign_usage import CircuitBreaker
+
+    monkeypatch.setenv("OPENAI_API_KEY", "startup-cleanup-test-key")
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://127.0.0.1:1/v1")
+    value = replace(request(tmp_path, RecordingDocker()), isolated=True)
+    plan = campaign_runner.CampaignPlan(
+        value.job.root.parent.parent,
+        tmp_path / "campaign.json",
+        SimpleNamespace(quality=False, model="openai/gpt-5.6-luna", variant="max", limits=SimpleNamespace(deadline_only=False)),
+        (), (), {}, False,
+    )
+    jobs = tuple(campaign_runner.CampaignJob(f"task-{index}", "vanilla", "example/task") for index in range(2))
+    breaker = CircuitBreaker()
+    leases = []
+    patched = []
+    outcomes = []
+
+    def inject(*_):
+        process = leases[-1]._startup_gateway
+        assert process is not None
+        if failure == "terminate":
+            patched.append((process, "terminate", process.terminate))
+            process.terminate = lambda: (_ for _ in ()).throw(PermissionError("private cleanup diagnostic"))
+        else:
+            patched.append((process, "wait", process.wait))
+            process.wait = lambda **_kwargs: (_ for _ in ()).throw(subprocess.TimeoutExpired("private command", 3))
+            if failure == "kill":
+                patched.append((process, "kill", process.kill))
+                process.kill = lambda: (_ for _ in ()).throw(PermissionError("private kill diagnostic"))
+        raise ContainerConflictError("private admission diagnostic")
+
+    def factory(request, lease):
+        leases.append(lease)
+        return ensure_workspace_impl(replace(request, docker_runner=RecordingDocker()), lease)
+
+    def execute(candidate, stop):
+        outcome = campaign_runner.run_job(
+            plan, candidate, breaker=breaker, stop_token=stop, workspace_factory=factory,
+        )
+        outcomes.append(outcome)
+        return outcome
+
+    monkeypatch.setattr(campaign_runner, "_install_for", lambda *_: value.install)
+    monkeypatch.setattr(campaign_workspace, "_image_spec", lambda *_: ("sha256:image", "linux/amd64", ()))
+    monkeypatch.setattr(campaign_workspace, "_inspect_container", inject)
+    started = time.monotonic()
+    try:
+        with pytest.raises(campaign_runner.CampaignShutdownError, match="1 active job"):
+            campaign_runner.run_campaign(jobs, workers=1, breaker=breaker, execute=execute)
+        assert len(outcomes) == 1 and outcomes[0].status == "cleanup_failed"
+        assert len(leases) == 1 and time.monotonic() - started < 8
+        job_root = plan.output / "vanilla/task-0"
+        state = campaign_runner.StateStore(job_root / "state.json").read()
+        assert state.exit_class == "cleanup_failed"
+        evidence_path = job_root / "startup-gateway-cleanup-failure.json"
+        evidence = json.loads(evidence_path.read_text())
+        assert evidence["causes"]["admission"]["type"] == "ContainerConflictError"
+        assert evidence["causes"]["admission"]["frames"]
+        assert evidence["causes"]["cleanup"]["type"] == ("TimeoutExpired" if failure == "final_wait" else "PermissionError")
+        assert evidence["causes"]["cleanup"]["frames"]
+        assert evidence["gateway"]["pid"] == leases[0]._startup_gateway.pid
+        assert "private" not in evidence_path.read_text()
+        assert state.artifact_hashes[evidence_path.name] == hashlib.sha256(evidence_path.read_bytes()).hexdigest()
+        assert not (plan.output / "vanilla/task-1/state.json").exists()
+        with sqlite3.connect(job_root / "workspace-state/provider-control/requests.db") as database:
+            assert database.execute("SELECT count(*) FROM request").fetchone()[0] == 0
+    finally:
+        for process, name, method in reversed(patched):
+            setattr(process, name, method)
+        for lease in leases:
+            process = lease._startup_gateway
+            if process is not None:
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=3)
+
+
 @pytest.fixture(autouse=True)
 def release_workspace_leases():
     yield
