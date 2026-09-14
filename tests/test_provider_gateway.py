@@ -1,5 +1,6 @@
 import http.client
 import http.server
+import hashlib
 import json
 import os
 import socket
@@ -50,6 +51,12 @@ def test_gateway_streams_only_for_admitted_process_and_keeps_secret_on_host(tmp_
         response=connection.getresponse(); data=response.read();connection.close()
         return response.status,data
     try:
+        server.db.execute("CREATE TRIGGER reject_capture BEFORE INSERT ON initial_request BEGIN SELECT RAISE(ABORT, 'injected capture failure'); END")
+        assert request('POST','/v1/responses',payload)[0]==503
+        assert received==[]
+        assert not server.db.in_transaction
+        assert server.db.execute("SELECT count(*) FROM request").fetchone()[0]==0
+        server.db.execute("DROP TRIGGER reject_capture")
         status,data=request('POST','/v1/responses',payload)
         assert status==200 and b'response.completed' in data and b'trusted-test-secret' not in data
         assert received[0][0]=='/v1/responses' and received[0][1]=='Bearer trusted-test-secret'
@@ -63,6 +70,14 @@ c=http.client.HTTPConnection('programbench-provider.invalid');c.sock=socket.sock
         assert denied.stdout.strip()=='403'
         assert len(received)==1
         assert server.db.execute("SELECT count(*) FROM request WHERE outcome='response.completed'").fetchone()[0]==1
+        assert request('POST','/v1/responses',payload|{'input':'later context'})[0]==200
+        captured=server.db.execute(
+            "SELECT initial_request.body,request.body_sha256 FROM initial_request JOIN request ON request.id=initial_request.request_id"
+        ).fetchall()
+        assert len(captured)==1
+        assert json.loads(captured[0][0])==payload
+        assert hashlib.sha256(captured[0][0]).hexdigest()==captured[0][1]
+        assert b'trusted-test-secret' not in captured[0][0]
     finally:
         server.shutdown();server.server_close();os.close(server.directory_fd);server.db.close()
         upstream.shutdown();upstream.server_close()

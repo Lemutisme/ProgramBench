@@ -1410,7 +1410,9 @@ def test_adaptive_policy_changes_search_without_changing_contract_terms(tmp_path
     assert _validate_execution(_execution(adaptive), adaptive, 1)["executionPolicy"] == ADAPTIVE_POLICY
 
 
-@pytest.mark.parametrize("protocol", ["policy-split-v1", "policy-split-none-v1", "policy-split-adaptive-v1"])
+@pytest.mark.parametrize("protocol", [
+    "policy-split-v1", "policy-split-none-v1", "policy-split-adaptive-v1", "policy-split-fit-v1", "policy-split-search-v1",
+])
 def test_persisted_policy_split_issue_reloads_with_canonical_payload_order(tmp_path: Path, protocol: str) -> None:
     from scripts.campaign_procontract import _load_or_create_issue
 
@@ -1441,7 +1443,8 @@ def test_persisted_policy_split_issue_reloads_with_canonical_payload_order(tmp_p
     )
 
 
-def test_persisted_issue_rejects_a_search_policy_swap(tmp_path: Path) -> None:
+@pytest.mark.parametrize("replacement", ["policy-split-adaptive-v1", "policy-split-fit-v1", "policy-split-search-v1"])
+def test_persisted_issue_rejects_a_search_policy_swap(tmp_path: Path, replacement: str) -> None:
     from scripts.campaign_procontract import ProContractConflictError, _load_or_create_issue
 
     paths = JobPaths(tmp_path / "job")
@@ -1451,7 +1454,7 @@ def test_persisted_issue_rejects_a_search_policy_swap(tmp_path: Path) -> None:
     _load_or_create_issue(issue_path, workspace, "openai/gpt-5.6-luna", "max", FakeClock(), "policy-split-v1")
     with pytest.raises(ProContractConflictError, match="conflicts with this job"):
         _load_or_create_issue(
-            issue_path, workspace, "openai/gpt-5.6-luna", "max", FakeClock(), "policy-split-adaptive-v1"
+            issue_path, workspace, "openai/gpt-5.6-luna", "max", FakeClock(), replacement
         )
 
 
@@ -1466,11 +1469,49 @@ def test_durable_policy_split_runtime_keeps_behavioral_policy_outside_spec() -> 
 
 
 @pytest.mark.parametrize("policy,expected", [
-    ("behavioral", "policy-split-v1"), ("none", "policy-split-none-v1"), ("adaptive", "policy-split-adaptive-v1")
+    ("behavioral", "policy-split-v1"), ("none", "policy-split-none-v1"), ("adaptive", "policy-split-adaptive-v1"),
+    ("fit", "policy-split-fit-v1"), ("search", "policy-split-search-v1"),
 ])
 def test_new_runtime_commit_uses_explicit_protocol_without_a_revision_allowlist(policy, expected):
     from scripts.campaign_procontract import protocol_for_revision
     assert protocol_for_revision("a" * 40, policy, runtime_protocol="policy-split-v1") == expected
+
+
+@pytest.mark.parametrize("profile", ["fit", "search"])
+def test_capability_policy_preserves_deadline_only_terms_and_binding(tmp_path: Path, profile: str):
+    from scripts.campaign_policy import POLICY_TEXT
+    from scripts.campaign_procontract import (
+        _expected_spec, _validate_execution, build_issue_payload, protocol_for_revision,
+    )
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    _, workspace = _workspace(tmp_path, paths)
+    workspace.manifest.state_root = tmp_path / "workspace-state"
+    workspace.manifest.environment_names = ("OPENCODE_REFERENCE_BINDING",)
+    control = workspace.manifest.state_root / "provider-control"
+    control.mkdir(parents=True)
+    (control / "profile.json").write_text(json.dumps({"budget": "6h-only"}))
+    baseline = build_issue_payload(workspace, now=100.0, protocol="policy-split-none-v1")
+    selected = build_issue_payload(
+        workspace, now=100.0,
+        protocol=protocol_for_revision("a" * 40, profile, runtime_protocol="policy-split-v1"),
+    )
+
+    assert {key: value for key, value in selected.items() if key != "executionPolicy"} == baseline
+    assert _expected_spec(selected) == _expected_spec(baseline)
+    assert "turns" not in selected["budget"] and "actions" not in selected["budget"]
+    assert "reference.run" in selected["authority"]
+    assert selected["executionPolicy"] == POLICY_TEXT[profile]
+    assert _validate_execution(_execution(selected), selected, 1)["executionPolicy"] == POLICY_TEXT[profile]
+
+
+@pytest.mark.parametrize("profile", ["none", "fit", "search"])
+@pytest.mark.parametrize("runtime", [None, "current", "semantic-v0"])
+def test_capability_policy_rejects_a_runtime_that_cannot_bind_it(profile: str, runtime: str | None):
+    from scripts.campaign_procontract import ProContractError, protocol_for_revision
+    with pytest.raises(ProContractError, match="requires a policy-split runtime"):
+        protocol_for_revision("a" * 40, profile, runtime_protocol=runtime)
 
 
 def test_reference_authority_survives_canonical_issue_and_contract_validation(tmp_path: Path):
@@ -1484,6 +1525,8 @@ def test_reference_authority_survives_canonical_issue_and_contract_validation(tm
     workspace.manifest.environment_names = ("OPENCODE_REFERENCE_BINDING",)
     payload = build_issue_payload(workspace, now=100.0, protocol="policy-split-v1")
     expected = _expected_spec(payload)
+    assert "/candidate/reference" in payload["brief"]
+    assert "reference_run" not in payload["brief"] and "reference_read" not in payload["brief"]
     assert expected["authority"] == payload["authority"]
     assert expected["authority"][-1] == "reference.run"
     assert _ordered_issue_payload(payload)["authority"] == payload["authority"]

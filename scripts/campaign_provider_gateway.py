@@ -96,6 +96,7 @@ class Gateway(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
         self.channel.chmod(0o755)
         self.db = sqlite3.connect(control / "requests.db", check_same_thread=False)
         self.db.execute("CREATE TABLE IF NOT EXISTS request (id INTEGER PRIMARY KEY, started REAL, finished REAL, peer_pid INTEGER, body_sha256 TEXT, status INTEGER, outcome TEXT, usage TEXT)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS initial_request (request_id INTEGER PRIMARY KEY, body BLOB NOT NULL)")
         self.db.execute("CREATE TABLE IF NOT EXISTS execution_budget (identity TEXT PRIMARY KEY, deadline REAL)")
         if 'metadata' not in {row[1] for row in self.db.execute('PRAGMA table_info(request)')}:
             self.db.execute('ALTER TABLE request ADD COLUMN metadata TEXT')
@@ -151,7 +152,7 @@ class Gateway(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
         return deadline / 1000
 
     def record(self, pid: int, body: bytes) -> int:
-        with self.lock:
+        with self.lock, self.db:
             value = json.loads(body)
             metadata = {'model': value['model'], 'reasoning': value['reasoning'],
                         'tool_names': [tool.get('name') for tool in value.get('tools', [])],
@@ -171,7 +172,10 @@ class Gateway(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
                 raise ValueError("provider_turn_budget_exhausted")
             cursor = self.db.execute("INSERT INTO request(started,peer_pid,body_sha256,outcome,metadata) VALUES (?,?,?,?,?)",
                                      (time.time(), pid, hashlib.sha256(body).hexdigest(), "admitted", json.dumps(metadata)))
-            self.db.commit()
+            if prior[1] == 0:
+                # Keep the exact initial model context in host-only control storage.
+                # Headers and the upstream credential are never part of this body.
+                self.db.execute("INSERT INTO initial_request(request_id,body) VALUES (?,?)", (cursor.lastrowid, body))
             return cursor.lastrowid
 
     def checkpoint(self, request_id: int, **fields):
@@ -220,8 +224,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *_args):
         pass  # Never write headers, prompts, paths, credentials, or provider bodies to stderr.
 
-    def refuse(self, reason: str, status: int = 403):
-        self.server.deny(reason, status)
+    def refuse(self, reason: str, status: int = 403, *, record: bool = True):
+        if record:
+            self.server.deny(reason, status)
         body = json.dumps({"error": {"message": reason, "type": "offline_gateway_denied"}}).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -250,6 +255,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             validate_payload(json.loads(body, object_pairs_hook=unique_object), self.server.model, self.server.effort)
             request_id = self.server.record(peer, body)
+        except sqlite3.Error:
+            return self.refuse("request_ledger_unavailable", 503, record=False)
         except (ValueError, TypeError, AttributeError, KeyError, OSError) as error:
             if str(error) in ('provider_turn_budget_exhausted', 'wall_time_exhausted', 'transport_attempt_ceiling'):
                 return self.refuse(str(error), 409)

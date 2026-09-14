@@ -48,7 +48,7 @@ class ArmConfig:
     revision: str
     mode: Literal["procontract", "vanilla"]
     binary: Path | None = None
-    execution_policy: Literal["behavioral", "none", "adaptive"] = "behavioral"
+    execution_policy: Literal["behavioral", "none", "adaptive", "fit", "search"] = "behavioral"
     runtime_protocol: Literal["current", "semantic-v0", "policy-split-v1"] | None = None
 
 

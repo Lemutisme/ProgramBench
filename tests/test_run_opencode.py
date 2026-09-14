@@ -142,7 +142,7 @@ excluded:
     assert result.excluded == frozenset({"old.instance"})
 
 
-@pytest.mark.parametrize("policy", ["none", "adaptive"])
+@pytest.mark.parametrize("policy", ["none", "adaptive", "fit", "search"])
 def test_load_config_freezes_policy_ablation_outside_binary_identity(tmp_path: Path, policy: str):
     repo = tmp_path / "repo"
     repo.mkdir()

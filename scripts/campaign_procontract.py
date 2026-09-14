@@ -19,6 +19,7 @@ from urllib.parse import quote, urlencode, urlparse
 
 from programbench.candidate import CandidateError, PreflightResult, package_workspace, preflight_candidate
 from scripts import campaign_process
+from scripts.campaign_policy import POLICY_PROFILES, POLICY_TEXT
 from scripts.campaign_observations import behavioral_replay, load_observations
 from scripts.campaign_freeze import (
     MAX_FREEZE_BYTES,
@@ -82,8 +83,10 @@ POLICY_SPLIT_REVISIONS = frozenset(
     }
 )
 ProContractProtocol = Literal[
-    "current", "semantic-v0", "policy-split-v1", "policy-split-none-v1", "policy-split-adaptive-v1"
+    "current", "semantic-v0", "policy-split-v1", "policy-split-none-v1", "policy-split-adaptive-v1",
+    "policy-split-fit-v1", "policy-split-search-v1",
 ]
+POLICY_PROTOCOLS: dict[str, ProContractProtocol] = {"fit": "policy-split-fit-v1", "search": "policy-split-search-v1"}
 MODEL = "openai/gpt-5.6-luna"
 VARIANT = "max"
 SUPPORTED_MODEL_VARIANTS = frozenset(
@@ -188,6 +191,9 @@ def _acceptance_policy(protocol: ProContractProtocol) -> str:
         return ACCEPTANCE_POLICY
     if protocol == "policy-split-adaptive-v1":
         return ADAPTIVE_POLICY
+    for profile, candidate in POLICY_PROTOCOLS.items():
+        if protocol == candidate:
+            return POLICY_TEXT[profile]
     if protocol == "policy-split-none-v1":
         return ""
     if protocol == "semantic-v0":
@@ -198,7 +204,7 @@ def _acceptance_policy(protocol: ProContractProtocol) -> str:
 def protocol_for_revision(
     revision: str, execution_policy: str = "behavioral", *, runtime_protocol: str | None = None
 ) -> ProContractProtocol:
-    if execution_policy not in {"behavioral", "none", "adaptive"}:
+    if execution_policy not in {"behavioral", "none", "adaptive"} | POLICY_PROFILES:
         raise ProContractError("unknown execution policy")
     if runtime_protocol not in {None, "current", "semantic-v0", "policy-split-v1"}:
         raise ProContractError("unknown runtime protocol")
@@ -208,6 +214,12 @@ def protocol_for_revision(
         "semantic-v0" if revision == SEMANTIC_ATTEMPTS_REVISION
         else "policy-split-v1" if revision in POLICY_SPLIT_REVISIONS else "current"
     )
+    if execution_policy == "none" and runtime != "policy-split-v1":
+        raise ProContractError("none execution policy requires a policy-split runtime")
+    if execution_policy in POLICY_PROFILES:
+        if runtime != "policy-split-v1":
+            raise ProContractError(f"{execution_policy} execution policy requires a policy-split runtime")
+        return POLICY_PROTOCOLS[execution_policy]
     if execution_policy == "adaptive":
         if runtime != "policy-split-v1":
             raise ProContractError("adaptive execution policy requires a policy-split runtime")
@@ -910,9 +922,9 @@ def build_issue_payload(
     if "OPENCODE_REFERENCE_BINDING" in getattr(manifest, "environment_names", ()):
         payload["authority"].append("reference.run")
         payload["brief"] += (
-            " The host exposes reference_run for individually recorded argv/stdin probes and reference_read "
-            "for exact retained bytes. Optional reference_run saveTo writes complete generated output directly "
-            "to a Location-relative file under ordinary edit permissions; saving does not execute the file. "
+            " The host keeps the reference executable separate from the candidate at /candidate/reference. "
+            "Use bash to run it through its normal CLI and stdin interface. Retain stdout and stderr bytes, "
+            "exit status, and invocation conditions for comparisons with your implementation. "
             "Start with a minimal discriminating input. Nonzero exits may be valid "
             "error observations; a completed shell batch does not prove that its inner probes succeeded. "
             "An unavailable reference is an infrastructure issue, not a basis for claiming reference coverage."
@@ -935,7 +947,7 @@ def build_issue_payload(
         )
     if protocol == "current":
         return payload
-    if protocol in {"policy-split-v1", "policy-split-adaptive-v1"}:
+    if protocol in {"policy-split-v1", "policy-split-adaptive-v1", *POLICY_PROTOCOLS.values()}:
         payload.pop("policy")
         payload["executionPolicy"] = _acceptance_policy(protocol)
         return payload

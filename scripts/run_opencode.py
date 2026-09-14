@@ -32,6 +32,7 @@ from scripts.campaign_install import (
     run_checked,
 )
 from scripts.campaign_observations import observation_record
+from scripts.campaign_policy import POLICY_PROFILES
 
 from scripts.campaign_state import (
     AmbiguousStateCommitError,
@@ -421,8 +422,8 @@ def _load_arms(raw: object, config_dir: Path) -> tuple[ArmConfig, ArmConfig]:
             raise ConfigError(f"arm {name} revision must be a nonempty string")
         binary = value.get("binary")
         execution_policy = value.get("execution_policy", "behavioral")
-        if execution_policy not in {"behavioral", "none", "adaptive"}:
-            raise ConfigError(f"arm {name} execution_policy must be behavioral, none, or adaptive")
+        if execution_policy not in {"behavioral", "none", "adaptive"} | POLICY_PROFILES:
+            raise ConfigError(f"arm {name} execution_policy must be behavioral, none, adaptive, fit, or search")
         runtime_protocol = value.get("runtime_protocol")
         if runtime_protocol is not None and (
             name != "procontract"
