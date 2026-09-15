@@ -182,6 +182,54 @@ def test_load_config_freezes_explicit_runtime_protocol(tmp_path: Path):
         load_config(path)
 
 
+def test_policy_file_is_frozen_by_content_in_both_campaign_manifests(tmp_path: Path):
+    import base64
+    import hashlib
+    from scripts.campaign_runner import _config_manifest
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    data = "Find a counterexample.\r\n修复后重新运行。\n".encode()
+    policy = tmp_path / "policy.txt"
+    policy.write_bytes(data)
+    digest = hashlib.sha256(data).hexdigest()
+    path = tmp_path / "campaign.yaml"
+    path.write_text(campaign_yaml(repo).replace(
+        "    mode: procontract\n",
+        "    mode: procontract\n    runtime_protocol: policy-split-v1\n"
+        f"    execution_policy: artifact\n    policy_file: policy.txt\n    policy_sha256: {digest}\n",
+    ))
+    config = load_config(path)
+    manifest = tmp_path / "campaign.json"
+    freeze_campaign_config(config, manifest)
+    artifact = json.loads(manifest.read_text())["arms"]["procontract"]["policy_artifact"]
+    assert base64.b64decode(artifact["utf8_base64"]) == data
+    assert artifact["sha256"] == digest
+    assert _config_manifest(config)["arms"]["procontract"]["policy_artifact"] == artifact
+    policy.write_bytes(b"Use another strategy.")
+    with pytest.raises(ConfigError, match="SHA256"):
+        load_config(path)
+    replacement = hashlib.sha256(policy.read_bytes()).hexdigest()
+    path.write_text(path.read_text().replace(digest, replacement))
+    with pytest.raises(ConfigError, match="conflicts"):
+        freeze_campaign_config(load_config(path), manifest)
+
+
+@pytest.mark.parametrize("extra", [
+    "    policy_file: missing.txt\n",
+    "    execution_policy: artifact\n",
+    "    execution_policy: artifact\n    runtime_protocol: current\n",
+    "    execution_policy: artifact\n    runtime_protocol: policy-split-v1\n    policy_file: missing.txt\n",
+])
+def test_policy_artifact_config_fails_before_planning_on_missing_or_conflicting_identity(tmp_path: Path, extra: str):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    path = tmp_path / "campaign.yaml"
+    path.write_text(campaign_yaml(repo).replace("    mode: procontract\n", "    mode: procontract\n" + extra))
+    with pytest.raises(ConfigError):
+        load_config(path)
+
+
 def test_load_config_allows_cost_caps_to_be_disabled(tmp_path: Path):
     repo = tmp_path / "repo"
     repo.mkdir()

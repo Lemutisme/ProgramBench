@@ -74,7 +74,8 @@ def main():
              instance_id=plan.selected_ids[0],arm=arm,image=plan.jobs[0].image,install=install,
              candidate_root=job.root/'candidates',state_root=job.root/'workspace-state',log_dir=job.root/'logs',
              credential_env=tuple(k for k in ('OPENAI_API_KEY','OPENAI_BASE_URL','OPENCODE_SERVER_PASSWORD') if os.environ.get(k)),
-             isolated=True,health_timeout=45,provider_model=config.model.split('/',1)[1],provider_effort=config.variant)
+             isolated=True,health_timeout=45,provider_model=config.model.split('/',1)[1],provider_effort=config.variant,
+             deadline_only=config.limits.deadline_only)
     with WorkspaceLease(request) as lease:
         workspace=ensure_workspace(request,lease)
         try:
@@ -103,13 +104,16 @@ def main():
                 )
                 selected=next(item for item in config.arms if item.name=='procontract')
                 protocol=protocol_for_revision(install.revision, selected.execution_policy,
-                                               runtime_protocol=selected.runtime_protocol)
+                                               runtime_protocol=selected.runtime_protocol,
+                                               policy_artifact=selected.policy_artifact)
                 payload=build_issue_payload(workspace,now=time.time(),model=config.model,
                                             variant=config.variant,protocol=protocol)
                 api=HttpProContractApi(workspace.base_url,expected_port=workspace.port,
                                        http_client=DockerHttpClient(workspace.container_id))
                 response=_validate_issue_response(api.issue(payload),payload)
-                admitted={'protocol':protocol,'contract_id':response['data']['id'],
+                admitted={'protocol':protocol if isinstance(protocol,str) else 'policy-split-v1',
+                          **({'policy_artifact_sha256':selected.policy_artifact.sha256} if selected.policy_artifact else {}),
+                          'contract_id':response['data']['id'],
                           'spec_hash':response['data']['specHash'],'authority':response['data']['spec']['authority'],
                           'execution_policy_matches':response['execution'].get('executionPolicy')==payload.get('executionPolicy'),
                           'real_provider_calls_enabled':False}

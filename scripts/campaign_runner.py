@@ -778,6 +778,7 @@ def run_job(
                                 getattr(install, "revision", ""),
                                 selected_arm.execution_policy,
                                 runtime_protocol=selected_arm.runtime_protocol,
+                                policy_artifact=selected_arm.policy_artifact,
                             ),
                         )
                     state = store.read_optional()
@@ -1343,6 +1344,7 @@ def _config_manifest(config: CampaignConfig) -> dict[str, object]:
                 "binary": str(arm.binary) if arm.binary else None,
                 **({"execution_policy": arm.execution_policy} if arm.execution_policy != "behavioral" else {}),
                 **({"runtime_protocol": arm.runtime_protocol} if arm.runtime_protocol is not None else {}),
+                **({"policy_artifact": arm.policy_artifact.manifest()} if arm.policy_artifact is not None else {}),
             }
             for arm in config.arms
         },

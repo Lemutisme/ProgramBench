@@ -32,7 +32,7 @@ from scripts.campaign_install import (
     run_checked,
 )
 from scripts.campaign_observations import observation_record
-from scripts.campaign_policy import POLICY_PROFILES
+from scripts.campaign_policy import POLICY_PROFILES, load_policy_artifact
 
 from scripts.campaign_state import (
     AmbiguousStateCommitError,
@@ -134,7 +134,7 @@ _LIMIT_KEYS = frozenset(
     {"wall_time_seconds", "provider_turns", "procontract_actions", "total_cost_soft", "total_cost_hard"}
 )
 _CACHE_KEYS = frozenset({"warmup_turns", "minimum_read_ratio", "stop_after_consecutive_failures"})
-_ARM_KEYS = frozenset({"repo", "revision", "mode", "binary", "execution_policy", "runtime_protocol"})
+_ARM_KEYS = frozenset({"repo", "revision", "mode", "binary", "execution_policy", "runtime_protocol", "policy_file", "policy_sha256"})
 
 
 @dataclass(frozen=True)
@@ -422,8 +422,8 @@ def _load_arms(raw: object, config_dir: Path) -> tuple[ArmConfig, ArmConfig]:
             raise ConfigError(f"arm {name} revision must be a nonempty string")
         binary = value.get("binary")
         execution_policy = value.get("execution_policy", "behavioral")
-        if execution_policy not in {"behavioral", "none", "adaptive"} | POLICY_PROFILES:
-            raise ConfigError(f"arm {name} execution_policy must be behavioral, none, adaptive, fit, or search")
+        if not isinstance(execution_policy, str) or execution_policy not in {"behavioral", "none", "adaptive", "artifact"} | POLICY_PROFILES:
+            raise ConfigError(f"arm {name} execution_policy must be behavioral, none, adaptive, fit, search, or artifact")
         runtime_protocol = value.get("runtime_protocol")
         if runtime_protocol is not None and (
             name != "procontract"
@@ -431,6 +431,18 @@ def _load_arms(raw: object, config_dir: Path) -> tuple[ArmConfig, ArmConfig]:
             or runtime_protocol not in {"current", "semantic-v0", "policy-split-v1"}
         ):
             raise ConfigError("runtime_protocol must identify a supported ProContract wire protocol")
+        policy_artifact = None
+        if execution_policy == "artifact":
+            if name != "procontract" or runtime_protocol != "policy-split-v1":
+                raise ConfigError("policy artifacts require a ProContract policy-split-v1 runtime")
+            if "policy_file" not in value or "policy_sha256" not in value:
+                raise ConfigError("artifact execution_policy requires policy_file and policy_sha256")
+            try:
+                policy_artifact = load_policy_artifact(_path_value(value, "policy_file", config_dir), value["policy_sha256"])
+            except (OSError, ValueError) as error:
+                raise ConfigError(f"arm {name} policy artifact is invalid: {error}") from error
+        elif "policy_file" in value or "policy_sha256" in value:
+            raise ConfigError("policy_file and policy_sha256 require artifact execution_policy")
         result.append(
             ArmConfig(
                 name=name,
@@ -440,6 +452,7 @@ def _load_arms(raw: object, config_dir: Path) -> tuple[ArmConfig, ArmConfig]:
                 binary=_path_value(value, "binary", config_dir) if binary is not None else None,
                 execution_policy=execution_policy,
                 runtime_protocol=runtime_protocol,
+                policy_artifact=policy_artifact,
             )
         )
     return result[0], result[1]
@@ -526,6 +539,7 @@ def _canonical_config(config: CampaignConfig) -> dict[str, object]:
                 "binary": str(arm.binary.resolve()) if arm.binary else None,
                 **({"execution_policy": arm.execution_policy} if arm.execution_policy != "behavioral" else {}),
                 **({"runtime_protocol": arm.runtime_protocol} if arm.runtime_protocol is not None else {}),
+                **({"policy_artifact": arm.policy_artifact.manifest()} if arm.policy_artifact is not None else {}),
             }
             for arm in config.arms
         },

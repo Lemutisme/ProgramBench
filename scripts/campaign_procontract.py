@@ -19,7 +19,7 @@ from urllib.parse import quote, urlencode, urlparse
 
 from programbench.candidate import CandidateError, PreflightResult, package_workspace, preflight_candidate
 from scripts import campaign_process
-from scripts.campaign_policy import POLICY_PROFILES, POLICY_TEXT
+from scripts.campaign_policy import POLICY_PROFILES, POLICY_TEXT, PolicyArtifact
 from scripts.campaign_observations import behavioral_replay, load_observations
 from scripts.campaign_freeze import (
     MAX_FREEZE_BYTES,
@@ -85,7 +85,7 @@ POLICY_SPLIT_REVISIONS = frozenset(
 ProContractProtocol = Literal[
     "current", "semantic-v0", "policy-split-v1", "policy-split-none-v1", "policy-split-adaptive-v1",
     "policy-split-fit-v1", "policy-split-search-v1",
-]
+] | PolicyArtifact
 POLICY_PROTOCOLS: dict[str, ProContractProtocol] = {"fit": "policy-split-fit-v1", "search": "policy-split-search-v1"}
 MODEL = "openai/gpt-5.6-luna"
 VARIANT = "max"
@@ -187,6 +187,8 @@ DELIVERY_CONTROL_PATHS = (".git", ".programbench-cleanroom.json", "reference")
 
 
 def _acceptance_policy(protocol: ProContractProtocol) -> str:
+    if isinstance(protocol, PolicyArtifact):
+        return protocol.text
     if protocol in {"current", "policy-split-v1"}:
         return ACCEPTANCE_POLICY
     if protocol == "policy-split-adaptive-v1":
@@ -202,10 +204,17 @@ def _acceptance_policy(protocol: ProContractProtocol) -> str:
 
 
 def protocol_for_revision(
-    revision: str, execution_policy: str = "behavioral", *, runtime_protocol: str | None = None
+    revision: str, execution_policy: str = "behavioral", *, runtime_protocol: str | None = None,
+    policy_artifact: PolicyArtifact | None = None,
 ) -> ProContractProtocol:
-    if execution_policy not in {"behavioral", "none", "adaptive"} | POLICY_PROFILES:
+    if execution_policy not in {"behavioral", "none", "adaptive", "artifact"} | POLICY_PROFILES:
         raise ProContractError("unknown execution policy")
+    if execution_policy == "artifact":
+        if runtime_protocol != "policy-split-v1" or not isinstance(policy_artifact, PolicyArtifact):
+            raise ProContractError("policy artifacts require exact bytes and an explicit policy-split-v1 runtime")
+        return policy_artifact
+    if policy_artifact is not None:
+        raise ProContractError("policy artifact conflicts with the selected execution policy")
     if runtime_protocol not in {None, "current", "semantic-v0", "policy-split-v1"}:
         raise ProContractError("unknown runtime protocol")
     # Explicit campaign identity is stable across new source commits. Retain
@@ -947,7 +956,7 @@ def build_issue_payload(
         )
     if protocol == "current":
         return payload
-    if protocol in {"policy-split-v1", "policy-split-adaptive-v1", *POLICY_PROTOCOLS.values()}:
+    if isinstance(protocol, PolicyArtifact) or protocol in {"policy-split-v1", "policy-split-adaptive-v1", *POLICY_PROTOCOLS.values()}:
         payload.pop("policy")
         payload["executionPolicy"] = _acceptance_policy(protocol)
         return payload

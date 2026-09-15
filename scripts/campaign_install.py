@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Callable, Literal, Mapping, Sequence
 
 from scripts import campaign_process
+from scripts.campaign_policy import PolicyArtifact
 
 
 class InstallError(RuntimeError):
@@ -48,8 +49,9 @@ class ArmConfig:
     revision: str
     mode: Literal["procontract", "vanilla"]
     binary: Path | None = None
-    execution_policy: Literal["behavioral", "none", "adaptive", "fit", "search"] = "behavioral"
+    execution_policy: Literal["behavioral", "none", "adaptive", "fit", "search", "artifact"] = "behavioral"
     runtime_protocol: Literal["current", "semantic-v0", "policy-split-v1"] | None = None
+    policy_artifact: PolicyArtifact | None = None
 
 
 @dataclass(frozen=True)

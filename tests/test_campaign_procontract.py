@@ -1506,6 +1506,41 @@ def test_capability_policy_preserves_deadline_only_terms_and_binding(tmp_path: P
     assert _validate_execution(_execution(selected), selected, 1)["executionPolicy"] == POLICY_TEXT[profile]
 
 
+def test_external_policy_preserves_native_terms_and_rejects_swap_on_resume(tmp_path: Path):
+    import hashlib
+    from scripts.campaign_policy import PolicyArtifact
+    from scripts.campaign_procontract import (
+        ProContractConflictError, _expected_spec, _load_or_create_issue,
+        _validate_execution, build_issue_payload, protocol_for_revision,
+    )
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    _, workspace = _workspace(tmp_path, paths)
+    workspace.manifest.state_root = tmp_path / "workspace-state"
+    workspace.manifest.environment_names = ("OPENCODE_REFERENCE_BINDING",)
+    control = workspace.manifest.state_root / "provider-control"
+    control.mkdir(parents=True)
+    (control / "profile.json").write_text(json.dumps({"budget": "6h-only"}))
+    data = "Inspect a novel counterexample.\r\n保留退出状态。\n".encode()
+    artifact = PolicyArtifact(data.decode(), hashlib.sha256(data).hexdigest())
+    protocol = protocol_for_revision("a" * 40, "artifact", runtime_protocol="policy-split-v1", policy_artifact=artifact)
+    baseline = build_issue_payload(workspace, now=100.0, protocol="policy-split-none-v1")
+    selected = build_issue_payload(workspace, now=100.0, protocol=protocol)
+    assert {k: v for k, v in selected.items() if k != "executionPolicy"} == baseline
+    assert _expected_spec(selected) == _expected_spec(baseline)
+    assert set(selected["budget"]) == {"deadline"}
+    assert _validate_execution(_execution(selected), selected, 1)["executionPolicy"].encode() == data
+    issue_path = paths.root / "procontract-issue.json"
+    first = _load_or_create_issue(issue_path, workspace, "openai/gpt-5.6-luna", "max", lambda: 100.0, protocol)
+    assert first["acceptanceHash"] == artifact.sha256
+    assert _load_or_create_issue(issue_path, workspace, "openai/gpt-5.6-luna", "max", lambda: 500.0, protocol) == first
+    replacement = PolicyArtifact("Other", hashlib.sha256(b"Other").hexdigest())
+    with pytest.raises(ProContractConflictError, match="conflicts"):
+        _load_or_create_issue(issue_path, workspace, "openai/gpt-5.6-luna", "max", lambda: 500.0, replacement)
+    assert json.loads(issue_path.read_text()) == first
+
+
 @pytest.mark.parametrize("profile", ["none", "fit", "search"])
 @pytest.mark.parametrize("runtime", [None, "current", "semantic-v0"])
 def test_capability_policy_rejects_a_runtime_that_cannot_bind_it(profile: str, runtime: str | None):
