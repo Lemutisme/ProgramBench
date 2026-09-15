@@ -1,13 +1,17 @@
 import json
 import sys
 
+import pytest
 import yaml
 
-from scripts.growth_loop import policy, record, seal, sha256
+from scripts.growth_loop import GrowthError, policy, record, seal, sha256
 from scripts.growth_native import ProgramBenchBackend
 
 
-def test_production_evaluate_preserves_coordinates_and_namespaces_full_output(tmp_path):
+def test_production_evaluate_preserves_coordinates_and_namespaces_full_output(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "namespace-fixture-only")
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://127.0.0.1:9")
+    monkeypatch.setenv("OPENCODE_SERVER_PASSWORD", "namespace-fixture-only")
     runner = tmp_path / "runner"
     (runner / "scripts").mkdir(parents=True)
     (runner / "scripts/run_opencode.py").write_text(
@@ -16,6 +20,7 @@ def test_production_evaluate_preserves_coordinates_and_namespaces_full_output(tm
         "phase='scoring' if '--evaluate-only' in args else 'inference'\n"
         "(root/(phase+'.json')).write_text(json.dumps(args))\n"
         "(root/(phase+'-environment.json')).write_text(json.dumps({k:os.environ.get(k) for k in ['PROGRAMBENCH_EVAL_WHEELHOUSE','PROGRAMBENCH_SAFE_REPORTING']}))\n"
+        "(root/(phase+'-credentials.json')).write_text(json.dumps({k:bool(os.environ.get(k)) for k in ['OPENAI_API_KEY','OPENAI_BASE_URL','OPENCODE_SERVER_PASSWORD']}))\n"
     )
     original = policy(tmp_path, b"Original namespace test policy\n")
     changed = policy(tmp_path, b"Changed namespace test policy\n")
@@ -42,7 +47,8 @@ def test_production_evaluate_preserves_coordinates_and_namespaces_full_output(tm
     names = []
     for directory, artifact, seed in cases:
         output = tmp_path / directory
-        result = backend.evaluate(output, {"solver_policy": artifact, "instances": ["same-task"], "seed": seed})
+        specification = {"solver_policy": artifact, "instances": ["same-task"], "seed": seed}
+        result = backend.evaluate(output, specification)
         assert result["status"] == "missing-evaluation"
         invocation = json.loads((output / "inference-invocation.json").read_text())
         arguments = invocation["argv"]
@@ -55,6 +61,13 @@ def test_production_evaluate_preserves_coordinates_and_namespaces_full_output(tm
         assert json.loads((campaign / "scoring-environment.json").read_text()) == {
             "PROGRAMBENCH_EVAL_WHEELHOUSE": str(wheels), "PROGRAMBENCH_SAFE_REPORTING": "1"}
         assert json.loads((output / "evaluator-inputs.json").read_text()) == evaluator
+        assert all(json.loads((campaign / "inference-credentials.json").read_text()).values())
+        assert not any(json.loads((campaign / "scoring-credentials.json").read_text()).values())
+        original = (output / "scoring-exit.json").stat().st_mtime_ns
+        assert backend.validate_evaluation(output, specification, result) == result
+        assert (output / "scoring-exit.json").stat().st_mtime_ns == original
+        with pytest.raises(GrowthError, match="cached canonical"):
+            backend.validate_evaluation(output, specification, {**result, "known_cost": "0"})
         assert arguments[arguments.index("--seed") + 1] == str(seed)
         assert arguments[arguments.index("--filter") + 1] == "^(same\\-task)$"
         assert arguments[arguments.index("--workers") + 1] == "3"

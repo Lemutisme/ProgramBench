@@ -148,6 +148,9 @@ class ProgramBenchBackend:
 
     def generate(self, output, specification, block):
         evaluator_environment(self.study)
+        from scripts.growth_feedback import install_feedback
+        previous = closed_feedback(self.study, self.root, specification["generation"])
+        record(output / "feedback.json", previous)
         from scripts.campaign_install import prepare_install
         from scripts.campaign_offline import DockerHttpClient
         from scripts.campaign_procontract import HttpProContractApi
@@ -181,8 +184,9 @@ class ProgramBenchBackend:
                     raise GrowthError("generator workspace network isolation absent")
                 api = HttpProContractApi(workspace.base_url, expected_port=workspace.port,
                                          http_client=DockerHttpClient(workspace.container_id))
-                previous = closed_feedback(self.study, self.root, specification["generation"])
-                record(output / "feedback.json", previous)
+                feedback = install_feedback(self.study, self.root, specification["generation"], workspace)
+                if feedback is not None:
+                    record(output / "feedback-install.json", feedback)
                 context = (self.root / "generator-context.txt").read_text() + "\n" + json.dumps(previous)
                 started_at = time.time()
                 payload = generator_payload(output, specification, self.study["generator"]["instruction"], context, config.model, config.variant,
@@ -217,6 +221,8 @@ class ProgramBenchBackend:
         # The solver gets only its exact policy and its original task workspace.
         # Neither generation artifacts nor score/adoption directories are mounted.
         evaluator_environment(self.study)
+        if (self.root / "CANCEL").exists():
+            raise KeyboardInterrupt("explicit study cancellation before evaluation")
         record(output / "evaluator-inputs.json", self.study["evaluator"])
         raw = yaml.safe_load((self.root / "config.yaml").read_bytes())
         raw["arms"]["procontract"].update(execution_policy="artifact", runtime_protocol="policy-split-v1",
@@ -230,17 +236,20 @@ class ProgramBenchBackend:
                      "--filter", "^(" + "|".join(re.escape(task) for task in specification["instances"]) + ")$",
                      "--limit", str(len(specification["instances"])), "--seed", str(specification["seed"]),
                      "--workers", str(self.study.get("workers", 1))]
-        codes = []
         for phase, options in [("inference", []), ("scoring", ["--resume", "--evaluate-only"])]:
             scoring_environment = evaluator_environment(self.study)
+            if (self.root / "CANCEL").exists():
+                raise KeyboardInterrupt("explicit study cancellation before runner phase")
             record(output / f"{phase}-invocation.json", {"argv": arguments + options, "cwd": self.study["runner"]["path"],
                 **({"evaluator_environment": scoring_environment,
                     "evaluator_inputs_sha256": sha256((output / "evaluator-inputs.json").read_bytes())} if phase == "scoring" else {})})
             with (output / f"{phase}.log").open("wb") as log:
                 runner = Path(self.study["runner"]["path"])
+                environment = dict(os.environ) if phase == "inference" else {key: value for key, value in os.environ.items()
+                    if key in ["PATH", "HOME", "LANG", "LC_ALL", "SSL_CERT_FILE", "SSL_CERT_DIR", "TMPDIR", "XDG_CACHE_HOME", "DOCKER_HOST", "PROGRAMBENCH_BLOB_DIR"]}
                 process = subprocess.Popen(arguments + options, cwd=self.study["runner"]["path"], stdout=log, stderr=log,
                                            stdin=subprocess.DEVNULL, start_new_session=True,
-                                           env={**os.environ, "PYTHONPATH": os.pathsep.join([str(runner), str(runner / "src")]),
+                                           env={**environment, "PYTHONPATH": os.pathsep.join([str(runner), str(runner / "src")]),
                                                 "PYTHONDONTWRITEBYTECODE": "1",
                                                 **(scoring_environment if phase == "scoring" else {})})
                 try:
@@ -248,7 +257,6 @@ class ProgramBenchBackend:
                         if (self.root / "CANCEL").exists():
                             raise KeyboardInterrupt("explicit study cancellation")
                         time.sleep(0.2)
-                    codes.append(process.returncode)
                 finally:
                     if process.poll() is None:
                         os.killpg(process.pid, signal.SIGINT)
@@ -259,13 +267,30 @@ class ProgramBenchBackend:
                             process.wait(timeout=10)
             record(output / f"{phase}-exit.json", {"exit_code": process.returncode})
         evaluator_environment(self.study)
-        from scripts.campaign_runner import _config_manifest
-        from scripts.run_opencode import load_config
-        expected_config = _config_manifest(load_config(output / "config.yaml"))
         record(output / "accounting.json", {"rows": [{"instance_id": task, **native_accounting(campaign / "procontract" / task)}
                                                        for task in specification["instances"]],
                                             "scope": "all assigned solver jobs, including failures without a score report"})
-        return independent_scores(campaign, specification, codes, read(self.root / "metadata.json"), expected_config)
+        return self.validate_evaluation(output, specification, None)
+
+    def validate_evaluation(self, output, specification, result):
+        """Revalidate a cached canonical score without model, tools or grading."""
+        from scripts.campaign_runner import _config_manifest
+        from scripts.run_opencode import load_config
+
+        evaluator_environment(self.study)
+        expected = yaml.safe_load((self.root / "config.yaml").read_bytes())
+        expected["arms"]["procontract"].update(execution_policy="artifact", runtime_protocol="policy-split-v1",
+            policy_file=specification["solver_policy"]["path"], policy_sha256=specification["solver_policy"]["sha256"])
+        if (yaml.safe_load((output / "config.yaml").read_bytes()) != expected
+                or read(output / "evaluator-inputs.json") != self.study["evaluator"]):
+            raise GrowthError("cached evaluation changed its frozen configuration or evaluator inputs")
+        campaign = output / ("growth-eval-" + sha256(str(output.resolve()).encode()))
+        codes = [read(output / f"{phase}-exit.json")["exit_code"] for phase in ["inference", "scoring"]]
+        actual = independent_scores(campaign, specification, codes, read(self.root / "metadata.json"),
+                                    _config_manifest(load_config(output / "config.yaml")))
+        if result is not None and encode(actual) != encode(result):
+            raise GrowthError("cached canonical evaluation no longer matches its sealed result")
+        return actual
 
 
 def independent_scores(campaign, specification, exit_codes, metadata, expected_config):
@@ -409,13 +434,15 @@ def native_accounting(root):
 
 def closed_feedback(study, root, generation):
     """Explicitly expose closed D/P_g and archived proposals, never future P_g."""
+    from scripts.growth_feedback import prepare_feedback
+    publication = prepare_feedback(study, root, generation)
     previous = []
     for earlier in study["rounds"][:generation]:
         decision = read(root / earlier["id"] / "decision.json")
         proposals = {}
         for name, result in decision["generation_results"].items():
             proposals[name] = {"status": result["status"], "error_type": result.get("error_type"),
-                               "adopted": decision["winner"] == name,
+                               **({"adopted": decision["winner"] == name} if publication is None else {}),
                                "artifacts": {key: {"sha256": artifact["sha256"], "text": frozen_input(artifact).decode()}
                                              for key, artifact in result.get("artifacts", {}).items()}}
         previous.append({"generation": earlier["id"], "proposals_including_rejected": proposals,
@@ -425,7 +452,12 @@ def closed_feedback(study, root, generation):
             "consumed_confirmation": {"instances": earlier["confirmation_instances"], "consumed": True, "fresh_for_future_use": False,
                 "winner": decision["winner"], "results": {name: {key: value for key, value in item.items() if key != "rows"}
                                                           for name, item in decision["comparisons"].items()}}
-                if decision["confirmation_consumed"] else None,
+                if decision["confirmation_consumed"] and publication is None else None,
             "decision_sha256": sha256((root / earlier["id"] / "decision.json").read_bytes())})
+    if publication is not None:
+        return {"generations": [{key: value for key, value in item.items() if key != "consumed_confirmation"} for item in previous],
+                "tool_feedback": read(publication["path"])["public"],
+                "exposure": "closed D aggregates and native tool-only archives, proposal text; no explicit P results, decisions, trajectories, assistant prose or reasoning",
+                "binding_note": "The current pi/rho binding is supplied separately by the controller; this feedback makes no claim about how that binding was selected"}
     return {"generations": previous, "exposure": "completed D and consumed P_g aggregates, proposal text; no reasoning or private test assertions",
             "parent_selection": "current incumbent only; archived proposals inform generation but no multiple-lineage search is implemented"}

@@ -100,6 +100,8 @@ def evaluator_environment(study):
 def freeze(study_path, root):
     study = read(study_path)
     evaluator_environment(study)
+    from scripts.growth_feedback import validate_config
+    validate_config(study)
     if study.get("version") != 1 or study.get("mode") not in {"recursive", "fixed-generator"}:
         raise GrowthError("study requires version 1 and an explicit generator control arm")
     if study.get("mutable_objects") not in [["solver_policy"], ["solver_policy", "generator_policy"]]:
@@ -176,7 +178,7 @@ def freeze(study_path, root):
     seal(root / "metadata.json", frozen_input(study["metadata"]))
     initial = {key: policy(root, frozen_input(value)) for key, value in study["initial"].items()}
     code = {name: sha256(Path(__file__).with_name(name).read_bytes())
-            for name in ("growth_loop.py", "growth_native.py")}
+            for name in ("growth_loop.py", "growth_native.py", "growth_feedback.py")}
     record(root / "frozen.json", {"study_sha256": sha256(encode(study)), "initial": initial,
                                  "controller_sources": code, "scope": "policy-text-only"})
     return study, initial

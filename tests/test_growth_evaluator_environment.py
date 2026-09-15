@@ -59,6 +59,14 @@ def test_reporting_and_directory_are_explicit(tmp_path):
         evaluator_environment(study)
 
 
+def test_cancellation_prevents_native_evaluation_before_phase_admission(tmp_path):
+    backend = ProgramBenchBackend(binding(tmp_path), tmp_path)
+    (tmp_path / "CANCEL").write_text("explicit cancellation")
+    with pytest.raises(KeyboardInterrupt, match="before evaluation"):
+        backend.evaluate(tmp_path / "evaluation", {})
+    assert not (tmp_path / "evaluation").exists()
+
+
 def test_real_offline_evaluator_reproduces_missing_wheelhouse_before_docker(tmp_path):
     # This reaches the original failing branch; it cannot admit a container.
     code = """
