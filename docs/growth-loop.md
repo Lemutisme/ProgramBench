@@ -57,6 +57,10 @@ only the explicitly permitted generator material, not private evaluation data.
   },
   "config": {"path": "/absolute/runner.yaml", "sha256": "..."},
   "runtime_sha256": "<SHA256 of the supplied native binary in runner.yaml>",
+  "evaluator": {
+    "safe_reporting": true,
+    "wheelhouse": {"path": "/absolute/frozen-wheelhouse", "files": {"package-version.whl": "<SHA256>"}}
+  },
   "metadata": {"path": "/absolute/frozen-task-metadata.json", "sha256": "..."},
   "test_map": "strict",
   "generator": {
@@ -126,6 +130,27 @@ The second command performs actual generation and ProgramBench evaluation;
 configuration freezing alone does not. Qualify the generator image, gateway,
 runtime and evaluation environment before starting a paid cohort. This change
 does not modify or restart any historical or running cohort.
+
+The evaluator wheelhouse is an explicit study input, including every wheel's
+hash. Freezing and native backend admission reject missing or changed inputs
+before model work; each evaluation phase rechecks them. Scoring receives
+`PROGRAMBENCH_EVAL_WHEELHOUSE` and `PROGRAMBENCH_SAFE_REPORTING=1` from this
+binding even when the launcher strips inherited environment variables. The
+scoring invocation records these nonsecret values and its input receipt hash.
+Hash preflight verifies identity, not package compatibility; qualify the chosen
+wheelhouse with the frozen evaluator before a paid study. Old studies are not
+migrated or resumed by adding these fields after execution.
+
+For the already completed generation-0 pilot with unscored D archives,
+`scripts.recover_growth_scoring` prepares a separate, explicitly post hoc
+infrastructure recovery. Its default action only copies and verifies the eight
+original submissions, terminal evidence, metadata, blob identities, images,
+accounting and dependency wheel hashes. `--run` is a separate explicit action
+that invokes the original frozen evaluator without inference credentials.
+It records process identities, honors its own retained `CANCEL`, and never
+changes the old decision, opens P, generates another policy, or promotes one.
+The original missing results remain missing; any later scores belong to the
+derived recovery and retain their source hashes.
 
 The controller freezes study/context/config/scoring metadata/initial policies and its own source
 hashes before work. It records generation/opportunity bindings, native issue and

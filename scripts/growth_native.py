@@ -17,7 +17,7 @@ from urllib.parse import urlencode
 import yaml
 
 from scripts.campaign_policy import load_policy_artifact
-from scripts.growth_loop import GrowthError, encode, frozen_input, read, record, seal, sha256
+from scripts.growth_loop import GrowthError, encode, evaluator_environment, frozen_input, read, record, seal, sha256
 
 
 def generator_payload(output, specification, instruction, context, model, variant, directory="/candidate", *, started_at=None):
@@ -143,9 +143,11 @@ def native_generation(api, output, specification, payload, export, cancelled=lam
 
 class ProgramBenchBackend:
     def __init__(self, study, root):
+        evaluator_environment(study)
         self.study, self.root = study, root
 
     def generate(self, output, specification, block):
+        evaluator_environment(self.study)
         from scripts.campaign_install import prepare_install
         from scripts.campaign_offline import DockerHttpClient
         from scripts.campaign_procontract import HttpProContractApi
@@ -214,6 +216,8 @@ class ProgramBenchBackend:
     def evaluate(self, output, specification):
         # The solver gets only its exact policy and its original task workspace.
         # Neither generation artifacts nor score/adoption directories are mounted.
+        evaluator_environment(self.study)
+        record(output / "evaluator-inputs.json", self.study["evaluator"])
         raw = yaml.safe_load((self.root / "config.yaml").read_bytes())
         raw["arms"]["procontract"].update(execution_policy="artifact", runtime_protocol="policy-split-v1",
             policy_file=specification["solver_policy"]["path"], policy_sha256=specification["solver_policy"]["sha256"])
@@ -228,13 +232,17 @@ class ProgramBenchBackend:
                      "--workers", str(self.study.get("workers", 1))]
         codes = []
         for phase, options in [("inference", []), ("scoring", ["--resume", "--evaluate-only"])]:
-            record(output / f"{phase}-invocation.json", {"argv": arguments + options, "cwd": self.study["runner"]["path"]})
+            scoring_environment = evaluator_environment(self.study)
+            record(output / f"{phase}-invocation.json", {"argv": arguments + options, "cwd": self.study["runner"]["path"],
+                **({"evaluator_environment": scoring_environment,
+                    "evaluator_inputs_sha256": sha256((output / "evaluator-inputs.json").read_bytes())} if phase == "scoring" else {})})
             with (output / f"{phase}.log").open("wb") as log:
                 runner = Path(self.study["runner"]["path"])
                 process = subprocess.Popen(arguments + options, cwd=self.study["runner"]["path"], stdout=log, stderr=log,
                                            stdin=subprocess.DEVNULL, start_new_session=True,
                                            env={**os.environ, "PYTHONPATH": os.pathsep.join([str(runner), str(runner / "src")]),
-                                                "PYTHONDONTWRITEBYTECODE": "1"})
+                                                "PYTHONDONTWRITEBYTECODE": "1",
+                                                **(scoring_environment if phase == "scoring" else {})})
                 try:
                     while process.poll() is None:
                         if (self.root / "CANCEL").exists():
@@ -250,6 +258,7 @@ class ProgramBenchBackend:
                             os.killpg(process.pid, signal.SIGKILL)
                             process.wait(timeout=10)
             record(output / f"{phase}-exit.json", {"exit_code": process.returncode})
+        evaluator_environment(self.study)
         from scripts.campaign_runner import _config_manifest
         from scripts.run_opencode import load_config
         expected_config = _config_manifest(load_config(output / "config.yaml"))

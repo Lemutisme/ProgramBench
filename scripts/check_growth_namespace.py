@@ -66,13 +66,14 @@ def main():
     parser.add_argument("--binary", type=Path)
     parser.add_argument("--binary-sha256")
     parser.add_argument("--rg", type=Path)
+    parser.add_argument("--wheelhouse", type=Path)
     parser.add_argument("--instance", default="sharkdp__fd.40d8eb3")
     parser.add_argument("--image", default="sha256:1421747c477203b974cb870829baf7a711bf64c7de2299c67952c294537359a3")
     args = parser.parse_args()
     if args.case:
         execute_case(args.case)
         return
-    assert all([args.output, args.old_controller, args.runner, args.runtime_repo, args.runtime_commit, args.binary, args.binary_sha256, args.rg])
+    assert all([args.output, args.old_controller, args.runner, args.runtime_repo, args.runtime_commit, args.binary, args.binary_sha256, args.rg, args.wheelhouse])
     root = args.output.resolve()
     root.mkdir(parents=True, exist_ok=False, mode=0o700)
     os.umask(0o077)
@@ -176,7 +177,9 @@ def main():
             (control / "metadata.json").write_bytes((root / "metadata.json").read_bytes())
             active_case.update(root=control, release=threading.Event())
             case = {"root": str(control), "controller_source": str(controller), "output": str(output),
-                    "study": {"runner": {"path": str(args.runner.resolve()), "commit": runner_commit, "python": sys.executable}, "workers": 3},
+                    "study": {"runner": {"path": str(args.runner.resolve()), "commit": runner_commit, "python": sys.executable}, "workers": 3,
+                        "evaluator": {"safe_reporting": True, "wheelhouse": {"path": str(args.wheelhouse.resolve()),
+                            "files": {path.name: sha(path) for path in sorted(args.wheelhouse.glob("*.whl"))}}}},
                     "specification": {"solver_policy": {"path": str(artifact), "sha256": sha(artifact)}, "instances": [task], "seed": seed,
                                       "runner": {"path": str(args.runner.resolve()), "commit": runner_commit}, "runtime_sha256": args.binary_sha256, "test_map": "official-full-map-v1"}}
             save(root / "cases" / (name + ".json"), case)

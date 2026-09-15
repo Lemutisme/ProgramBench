@@ -297,6 +297,7 @@ def main():
     parser.add_argument("--runner", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--runtime-uid", type=int, default=1000)
+    parser.add_argument("--wheelhouse", type=Path, required=True)
     args = parser.parse_args()
     assert sha256(args.binary.read_bytes()) == args.binary_sha256
     root = args.output.resolve()
@@ -326,6 +327,8 @@ def main():
     modes = {}
     for mode in ("recursive", "fixed-generator"):
         study = {"version": 1, "mode": mode, "mutable_objects": ["solver_policy", "generator_policy"],
+                 "evaluator": {"safe_reporting": True, "wheelhouse": {"path": str(args.wheelhouse.resolve()),
+                     "files": {path.name: sha256(path.read_bytes()) for path in sorted(args.wheelhouse.glob("*.whl"))}}},
                  "initial": {"solver_policy": input_file("pi"), "generator_policy": input_file("rho")},
                  "runner": {"path": str(args.runner), "commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=args.runner, text=True).strip()},
                  "config": input_file("config.yaml"), "generator": {"image": "fixture@sha256:" + "a" * 64,

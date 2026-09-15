@@ -80,8 +80,26 @@ def frozen_input(value):
     return data
 
 
+def evaluator_environment(study):
+    """Bind offline scoring dependencies before any native work is admitted."""
+    evaluator = study.get("evaluator", {})
+    wheelhouse = evaluator.get("wheelhouse", {})
+    path = Path(wheelhouse.get("path", ""))
+    expected = wheelhouse.get("files")
+    if (evaluator.get("safe_reporting") is not True or not path.is_absolute()
+            or path.resolve() != path or not path.is_dir() or not isinstance(expected, dict) or not expected):
+        raise GrowthError("study requires an explicit hash-bound evaluator wheelhouse and safe reporting")
+    entries = sorted(path.iterdir())
+    if any(item.is_symlink() or not item.is_file() or item.suffix != ".whl" for item in entries):
+        raise GrowthError("evaluator wheelhouse must contain only regular wheel files")
+    if {item.name: sha256(item.read_bytes()) for item in entries} != expected:
+        raise GrowthError("frozen evaluator wheelhouse changed")
+    return {"PROGRAMBENCH_EVAL_WHEELHOUSE": str(path), "PROGRAMBENCH_SAFE_REPORTING": "1"}
+
+
 def freeze(study_path, root):
     study = read(study_path)
+    evaluator_environment(study)
     if study.get("version") != 1 or study.get("mode") not in {"recursive", "fixed-generator"}:
         raise GrowthError("study requires version 1 and an explicit generator control arm")
     if study.get("mutable_objects") not in [["solver_policy"], ["solver_policy", "generator_policy"]]:
