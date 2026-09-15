@@ -218,7 +218,9 @@ class ProgramBenchBackend:
         raw["arms"]["procontract"].update(execution_policy="artifact", runtime_protocol="policy-split-v1",
             policy_file=specification["solver_policy"]["path"], policy_sha256=specification["solver_policy"]["sha256"])
         seal(output / "config.yaml", yaml.safe_dump(raw, sort_keys=False).encode())
-        campaign = output / "campaign"
+        # The frozen runner derives Docker ownership from the campaign basename.
+        # Bind it to the full evaluation directory, including study/stage/subject/seed.
+        campaign = output / ("growth-eval-" + sha256(str(output.resolve()).encode()))
         arguments = [self.study["runner"].get("python", sys.executable), "-m", "scripts.run_opencode",
                      "--config", str(output / "config.yaml"), "--output", str(campaign), "--arm", "procontract",
                      "--filter", "^(" + "|".join(re.escape(task) for task in specification["instances"]) + ")$",

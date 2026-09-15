@@ -135,6 +135,13 @@ rows, rejection reasons, and next-generation bindings. Rejected candidates are
 retained and returned as generation context; automatic parent selection is the
 current incumbent only. Multiple-lineage search is not implemented.
 
+Each solver campaign uses `growth-eval-<sha256(canonical evaluation directory)>`
+as its directory basename. The frozen runner uses that basename for Docker
+ownership, so a repeated task in another study, stage, policy subject, or seed
+cannot reuse the same container name. The same canonical evaluation directory
+keeps the same namespace. Existing frozen `campaign` directories are never
+renamed or migrated; use this layout only with newly frozen controller source.
+
 Each assigned task/repeat contributes to the fixed denominator. Missing or
 invalid evidence prevents adoption; `mean_missing_as_zero` is a supplementary
 failure-sensitive statistic and does not turn missing results into measured
