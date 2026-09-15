@@ -5,7 +5,7 @@ import sys
 import pytest
 
 from scripts.growth_loop import GrowthError, read, sha256
-from scripts.recover_growth_scoring import copied, execute, fingerprint, identity, prepare
+from scripts.recover_growth_scoring import copied, execute, fingerprint, identity, prepare, verify_blobs
 
 
 def test_opaque_copy_preserves_original_bytes_and_prevents_replacement(tmp_path):
@@ -67,3 +67,15 @@ def test_actual_child_identity_and_exit_receipts_survive_cancellation(tmp_path, 
     assert ended["completion"] == ("interrupted" if cancel else "completed")
     assert ended["cancel_marker_retained"] is cancel
     assert (tmp_path / "CANCEL").exists() is cancel
+
+
+def test_official_test_blob_scope_and_complete_inventory_are_both_bound(tmp_path):
+    (tmp_path / "task/tests").mkdir(parents=True)
+    (tmp_path / "task/tests/branch.tar.gz").write_bytes(b"opaque test archive")
+    (tmp_path / "task/LICENSE").write_bytes(b"license")
+    official = {"task/tests/branch.tar.gz": sha256(b"opaque test archive")}
+    blobs = {"blob_root": str(tmp_path), "blob_sha256": official}
+    assert verify_blobs(blobs, ["task"]) == {**official, "task/LICENSE": sha256(b"license")}
+    (tmp_path / "task/tests/extra.tar.gz").write_bytes(b"extra")
+    with pytest.raises(GrowthError, match="blob tree changed"):
+        verify_blobs(blobs, ["task"])

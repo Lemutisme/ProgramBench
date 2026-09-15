@@ -82,6 +82,8 @@ def copied(source, destination):
 
 
 def verify_blobs(blobs, instances):
+    from scripts.campaign_evaluate import _blob_hashes
+
     root = Path(blobs["blob_root"])
     if not root.is_absolute() or root.resolve() != root or not root.is_dir():
         raise GrowthError("original evaluator blob directory changed")
@@ -89,8 +91,11 @@ def verify_blobs(blobs, instances):
     if any(path.is_symlink() for path in entries):
         raise GrowthError("original evaluator blob tree contains a symlink")
     actual = {str(path.relative_to(root)): fingerprint(path)["sha256"] for path in entries if path.is_file()}
-    if actual != blobs["blob_sha256"]:
+    # The official invocation hashes tests/ only; materialization also preserves
+    # licensing files. Bind that complete opaque inventory in the recovery plan.
+    if _blob_hashes(root, instances) != blobs["blob_sha256"]:
         raise GrowthError("original opaque evaluator blob tree changed")
+    return actual
 
 
 def prepare(source, panel_path, output):
@@ -161,13 +166,13 @@ def prepare(source, panel_path, output):
         blobs = read(campaign / "evaluation-inputs.json")
         if blobs["blob_sha256"] != state["invocation"]["blob_sha256"] or blobs["commit"] != state["invocation"]["hf_commit"]:
             raise GrowthError("original evaluator blob identity changed")
-        verify_blobs(blobs, specification["instances"])
+        inventory = verify_blobs(blobs, specification["instances"])
         identities.append(copied(campaign / "evaluation-inputs.json", output / "original" / name / "evaluation-inputs.json"))
         subjects.append({"name": name, "source_campaign": str(campaign), "campaign": str(target),
                          "instances": specification["instances"], "seed": specification["seed"],
                          "specification": str(output / "original" / name / "specification.json"),
                          "accounting": str(output / "original" / name / "accounting.json"),
-                         "images": state["invocation"]["evaluator_images"], "blob_inputs": blobs,
+                         "images": state["invocation"]["evaluator_images"], "blob_inputs": blobs, "blob_inventory_sha256": inventory,
                          "argv": [study["runner"].get("python", sys.executable), str(output / "runner-entry.py"),
                                   str(output / "RECOVERY.json"), str(len(subjects))]})
         if manifest["programbench"] != {"sha": study["runner"]["commit"], "dirty": False}:
@@ -221,7 +226,8 @@ def check(output):
                     str(output / "RECOVERY.json"), str(plan["subjects"].index(subject))]
         if subject["argv"] != expected:
             raise GrowthError("recovery invocation changed")
-        verify_blobs(subject["blob_inputs"], subject["instances"])
+        if verify_blobs(subject["blob_inputs"], subject["instances"]) != subject["blob_inventory_sha256"]:
+            raise GrowthError("original opaque blob inventory changed")
         for image in subject["images"].values():
             actual = subprocess.check_output(["docker", "image", "inspect", "--format", "{{.Id}}", image["source_reference"]],
                                              text=True, timeout=30).strip()
