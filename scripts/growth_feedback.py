@@ -30,6 +30,11 @@ TOOL_SQL = """SELECT m.id, m.session_id, m.seq, j.key,
  AND json_extract(j.value, '$.type') = 'tool'
  ORDER BY m.time_created, m.session_id, m.seq, j.key"""
 
+# Metadata only: never select compaction summaries, diagnostics or assistant prose.
+CHECKPOINT_SQL = """SELECT COUNT(*) FROM session_message AS m
+ JOIN pro_contract_opencode_session AS s ON s.session_id = m.session_id
+ WHERE s.contract_id = ? AND m.type = 'compaction'"""
+
 
 def reference(path):
     path = Path(path)
@@ -180,6 +185,7 @@ def project_tools(job, instance):
             if result["session_id"] not in sessions:
                 raise GrowthError("native Contract/Session mapping does not match terminal identity")
             rows = list(connection.execute(TOOL_SQL, (result["contract_id"],)))
+            checkpoints = connection.execute(CHECKPOINT_SQL, (result["contract_id"],)).fetchone()[0]
         finally:
             connection.close()
     if any(reference(item["path"]) != item for item in database + evidence):
@@ -208,6 +214,14 @@ def project_tools(job, instance):
     return actions, {"instance_id": instance, "job": str(job), "source_kind": kind, "sessions": sessions,
                      "contract_id": result["contract_id"], "native_actions_reported": result.get("actions"),
                      "native_completion": result.get("completion"), "database": database, "evidence": evidence,
+                     "operational_observations": {"stored_compaction_checkpoints": checkpoints,
+                         "retained_tool_conditions": {
+                             "pruned_timestamp": sum(bool(action["time"].get("pruned")) for action in actions),
+                             "structured_truncated": sum(bool(action["structured"].get("truncated")) for action in actions),
+                             "pending_or_running": sum(action["status"] in {"pending", "running"} for action in actions)},
+                         "scope": "Persisted checkpoint rows for this Contract, not compaction attempts, provider use or benefit. "
+                                  "Zero does not rule out aborted attempts. Pruned tool bodies do not establish compaction. "
+                                  "Tool conditions count truthy flags/statuses on retained records, can overlap, and do not measure lost information."},
                      "terminal_outcome": {"phase": state["phase"], "completion": result.get("completion"),
                          "workspace_frozen": result.get("workspace_frozen"),
                          "outstanding_count": len(result["outstanding"]) if isinstance(result.get("outstanding"), list) else None,
@@ -295,6 +309,8 @@ def extract_source(study_ref, execution_root, round_id, subject, seed, output):
                 "body_availability": dict(Counter(item["body_availability"] for item in actions)),
                 "terminal_outcomes": [{"instance_id": job["instance_id"], **job["terminal_outcome"]}
                                       for job in jobs if "terminal_outcome" in job],
+                "operational_observations": [{"instance_id": job["instance_id"], **job["operational_observations"]}
+                                             for job in jobs if "operational_observations" in job],
                 "observed_nonzero_exits": sum(item["observed_nonzero_exit"] for item in index),
                 "unavailable": [{"scope": "subject", "reason": "campaign_not_created", "task_outcome": "not_inferred"}] if not campaigns else
                     [{"instance_id": job["instance_id"], "reason": job["availability"], "task_outcome": "not_inferred"} for job in jobs if job["source_kind"] == "unavailable"],
@@ -305,6 +321,7 @@ def extract_source(study_ref, execution_root, round_id, subject, seed, output):
         "source_study": study_ref, "solver_policy_sha256": policy.sha256, "runtime_sha256": runtime_sha256,
         "instances": study["development_instances"], "source_files": sources, "jobs": jobs, "files": files, "campaign_present": bool(campaigns),
         "extractor": reference(Path(__file__).resolve()), "sql_sha256": sha256(TOOL_SQL.encode()), "summary": overview,
+        "checkpoint_sql_sha256": sha256(CHECKPOINT_SQL.encode()),
         "excluded": ["assistant text", "reasoning", "verification records", "grader", "P trajectories"]})
     result = {"path": str(output / "manifest.json"), "sha256": sha256((output / "manifest.json").read_bytes())}
     verify_bundle(result, study["development_instances"])
@@ -318,6 +335,9 @@ def verify_bundle(value, allowed_instances):
         raise GrowthError("feedback archive includes an instance outside the declared D allowlist")
     if manifest["sql_sha256"] != sha256(TOOL_SQL.encode()) or reference(manifest["extractor"]["path"]) != manifest["extractor"]:
         raise GrowthError("feedback extractor identity changed")
+    # Historical bundles have no checkpoint measurement: absence is never zero.
+    if "checkpoint_sql_sha256" in manifest and manifest["checkpoint_sql_sha256"] != sha256(CHECKPOINT_SQL.encode()):
+        raise GrowthError("feedback checkpoint SQL identity changed")
     source = json.loads(frozen_input(manifest["source_study"]))
     if set(source["development_instances"]) != set(manifest["instances"]):
         raise GrowthError("feedback archive contains a cross-stage source")
@@ -443,6 +463,7 @@ def prepare_feedback(study, root, generation):
     for value, manifest in zip(values, manifests):
         public["sources"].append({"manifest_sha256": value["sha256"],
             "solver_policy_sha256": manifest["solver_policy_sha256"],
+            "runtime_sha256": manifest.get("runtime_sha256"),
             "coordinate": {key: item for key, item in manifest["coordinate"].items() if key != "execution_root"},
             "files": {name: {**info, "path": f'/candidate/feedback/{value["sha256"]}/{name}'} for name, info in manifest["files"].items()},
             "context": windows(value, per_source)})

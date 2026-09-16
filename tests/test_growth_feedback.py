@@ -135,9 +135,12 @@ def test_legacy_bundle_without_new_outcome_fields_remains_verifiable(tmp_path):
     bundle = extract_source(reference, root, "first", "incumbent", 7, tmp_path / "bundle")
     manifest = json.loads(Path(bundle["path"]).read_bytes())
     manifest.pop("runtime_sha256")
+    manifest.pop("checkpoint_sql_sha256")
     for job in manifest["jobs"]:
         job.pop("terminal_outcome")
+        job.pop("operational_observations")
     manifest["summary"].pop("terminal_outcomes")
+    manifest["summary"].pop("operational_observations")
     summary = tmp_path / "bundle/summary.json"
     summary.chmod(0o600)
     write(summary, manifest["summary"])
@@ -146,6 +149,71 @@ def test_legacy_bundle_without_new_outcome_fields_remains_verifiable(tmp_path):
     path.chmod(0o600)
     write(path, manifest)
     assert verify_bundle({"path": str(path), "sha256": sha256(path.read_bytes())}, study["development_instances"])["summary"]["actions"] == 10
+    public = materialize_feedback({**study, "feedback": {**study["feedback"], "sources": [
+        {"path": str(path), "sha256": sha256(path.read_bytes())}]}}, root, 0, tmp_path / "public")["public"]
+    assert public["sources"][0]["runtime_sha256"] is None
+    assert "operational_observations" not in public["sources"][0]["context"]["summary"]
+
+
+def test_checkpoint_metadata_is_contract_bound_without_reading_checkpoint_prose(tmp_path):
+    from scripts.growth_feedback import CHECKPOINT_SQL
+
+    study, root, reference, jobs = source(tmp_path)
+    db = Path(json.loads((jobs[0] / "tool-feedback-native.json").read_bytes())["db_path"])
+    with sqlite3.connect(db) as connection:
+        connection.execute("INSERT INTO pro_contract_opencode_session VALUES (?, ?)", ("continued", "contract-task-a"))
+        for number, session in enumerate(["session-task-a", "continued", "unbound"]):
+            connection.execute("INSERT INTO session_message VALUES(?,?,?,?,?,?,?)", (
+                f"checkpoint-{number}", session, "compaction", 200 + number, 200, 200,
+                json.dumps({"summary": "COMPACTION_SUMMARY_SECRET", "recent": "RECENT_PROSE_SECRET",
+                            "diagnostic": "DIAGNOSTIC_PROSE_SECRET"})))
+        connection.commit()
+        # The production scalar query must still work when SQLite denies payload reads.
+        connection.set_authorizer(lambda operation, table, column, *_: sqlite3.SQLITE_DENY
+                                  if operation == sqlite3.SQLITE_READ and table == "session_message" and column == "data"
+                                  else sqlite3.SQLITE_OK)
+        assert connection.execute(CHECKPOINT_SQL, ("contract-task-a",)).fetchone() == (2,)
+    before = db.read_bytes()
+    bundle = extract_source(reference, root, "first", "incumbent", 7, tmp_path / "bundle")
+    manifest = verify_bundle(bundle, study["development_instances"])
+    observations = manifest["summary"]["operational_observations"]
+    assert [(row["instance_id"], row["stored_compaction_checkpoints"]) for row in observations] == [("task-a", 2), ("task-b", 0)]
+    assert "aborted attempts" in observations[1]["scope"]
+    assert "Pruned tool bodies do not establish compaction" in observations[1]["scope"]
+    assert observations[1]["retained_tool_conditions"] == {
+        "pruned_timestamp": 1, "structured_truncated": 1, "pending_or_running": 0}
+    public = materialize_feedback(study, root, 1, tmp_path / "public")["public"]
+    assert public["sources"][0]["runtime_sha256"] == study["runtime_sha256"]
+    assert public["sources"][0]["context"]["summary"]["operational_observations"] == observations
+    for path in (tmp_path / "public").rglob("*"):
+        if path.is_file():
+            assert all(secret not in path.read_text() for secret in [
+                "COMPACTION_SUMMARY_SECRET", "RECENT_PROSE_SECRET", "DIAGNOSTIC_PROSE_SECRET", "REASONING_SECRET"])
+    assert db.read_bytes() == before
+
+
+def test_checkpoint_sql_identity_drift_is_rejected(tmp_path):
+    study, root, reference, jobs = source(tmp_path)
+    bundle = extract_source(reference, root, "first", "incumbent", 7, tmp_path / "bundle")
+    path = Path(bundle["path"])
+    manifest = json.loads(path.read_bytes())
+    path.chmod(0o600)
+    write(path, {**manifest, "checkpoint_sql_sha256": "0" * 64})
+    with pytest.raises(GrowthError, match="checkpoint SQL identity"):
+        verify_bundle({"path": str(path), "sha256": sha256(path.read_bytes())}, study["development_instances"])
+
+
+def test_truncated_read_does_not_imply_pruning_or_a_compaction(tmp_path):
+    study, root, reference, jobs = source(tmp_path)
+    db = Path(json.loads((jobs[0] / "tool-feedback-native.json").read_bytes())["db_path"])
+    with sqlite3.connect(db) as connection:
+        connection.execute("UPDATE session_message SET data = json_remove(data, '$.content[1].time.pruned') WHERE id = 'message-2'")
+        connection.execute("UPDATE session_message SET data = json_set(data, '$.content[1].name', 'read') WHERE id = 'message-2'")
+    actions, proof = project_tools(jobs[0], study["development_instances"][0])
+    assert sum(action["body_availability"] == "partial" for action in actions) == 1
+    assert proof["operational_observations"]["stored_compaction_checkpoints"] == 0
+    assert proof["operational_observations"]["retained_tool_conditions"] == {
+        "pruned_timestamp": 0, "structured_truncated": 1, "pending_or_running": 0}
 
 
 def test_full_revision_feedback_binds_candidate_binary_instead_of_initial_binary(tmp_path, initial):
