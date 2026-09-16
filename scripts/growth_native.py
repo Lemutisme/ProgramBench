@@ -186,6 +186,11 @@ def _source_import_process(argv, payload, output, *, timeout=250):
     return result, bytes(streams["stdout"])
 
 
+def generator_context(root, output):
+    # Admission and cached validation must consume the same sealed bytes, including key order.
+    return (root / "generator-context.txt").read_text() + "\n" + (output / "feedback.json").read_text()
+
+
 def generator_payload(output, specification, instruction, context, model, variant, directory="/candidate", *, started_at=None):
     """Native proposal production; host builds and evaluation stay outside this Contract."""
     identity = sha256(encode([str(output), specification]))
@@ -528,7 +533,7 @@ class ProgramBenchBackend:
                 feedback = install_feedback(self.study, self.root, specification["generation"], workspace)
                 if feedback is not None:
                     record(output / "feedback-install.json", feedback)
-                context = (self.root / "generator-context.txt").read_text() + "\n" + json.dumps(previous)
+                context = generator_context(self.root, output)
                 started_at = time.time()
                 payload = generator_payload(output, specification, self.study["generator"]["instruction"], context, config.model, config.variant,
                                             started_at=started_at)
@@ -581,11 +586,11 @@ class ProgramBenchBackend:
         campaign = "generator-" + sha256(str(output).encode())[:12]
         job = output / campaign / "procontract/policy-generator"
         envelope = read(job / "procontract-issue.json")
-        context = (self.root / "generator-context.txt").read_text() + "\n" + json.dumps(read(output / "feedback.json"))
+        context = generator_context(self.root, output)
         payload = generator_payload(output, specification, self.study["generator"]["instruction"], context,
             config["model"], config["variant"], started_at=envelope["startedAt"])
         if envelope != {"payload": payload, "startedAt": envelope["startedAt"]}:
-            raise GrowthError("native generator gateway envelope changed its original six-hour deadline")
+            raise GrowthError("native generator gateway envelope no longer matches its frozen payload or original deadline")
         validate_native_handoff(output, specification, payload, result)
         workspace = read(job / "workspace-state/workspace.json")
         image = read(output / "generator-image.json")

@@ -6,7 +6,7 @@ import sys
 import pytest
 
 from scripts.growth_loop import GrowthError, encode, policy, read, record, seal, sha256
-from scripts.growth_native import REVISION_ARTIFACTS, closed_feedback, generator_payload, native_generation
+from scripts.growth_native import REVISION_ARTIFACTS, closed_feedback, generator_context, generator_payload, native_generation
 
 
 def proposal(tmp_path):
@@ -31,6 +31,28 @@ def proposal(tmp_path):
 def replay(payload, directory):
     check = payload["evidence"]["replay"]["checks"][0]
     return subprocess.run([sys.executable, *check["argv"][1:]], cwd=directory, capture_output=True, timeout=10)
+
+
+def test_generator_context_survives_sealed_feedback_roundtrip(tmp_path):
+    specification, _, _ = proposal(tmp_path)
+    output = tmp_path / "operation"
+    feedback = {"generations": [], "tool_feedback": {"z": 1, "a": "\u8bc1\u636e"}, "exposure": "closed only", "binding_note": "exact parent"}
+    seal(tmp_path / "generator-context.txt", b"Frozen development context.\n")
+    record(output / "feedback.json", feedback)
+    before = generator_payload(output, specification, "Produce a revision.", generator_context(tmp_path, output),
+                               "openai/gpt-5.6-luna", "max", started_at=1234.5)
+    reloaded = read(output / "feedback.json")
+    assert reloaded == feedback and list(reloaded) != list(feedback)
+    assert list(reloaded["tool_feedback"]) != list(feedback["tool_feedback"])
+    record(output / "feedback.json", reloaded)
+    after = generator_payload(output, specification, "Produce a revision.", generator_context(tmp_path, output),
+                              "openai/gpt-5.6-luna", "max", started_at=1234.5)
+    assert before == after
+    assert (output / "feedback.json").read_text() in before["brief"]
+    feedback["tool_feedback"]["z"] = 2
+    assert generator_context(tmp_path, output).endswith(encode(reloaded).decode())
+    with pytest.raises(GrowthError, match="immutable record conflicts"):
+        record(output / "feedback.json", feedback)
 
 
 class NativeHandoff:
