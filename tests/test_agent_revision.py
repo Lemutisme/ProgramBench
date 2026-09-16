@@ -240,27 +240,43 @@ def test_recipe_cannot_use_unpinned_image_or_self_qualification(initial):
         validate_recipe({**recipe, "qualifications": [{**recipe["qualifications"][0], "argv": ["/source/tests.sh"]}]})
 
 
-def test_native_generator_imports_exact_source_without_host_git_metadata(initial):
+def test_native_generator_imports_exact_source_without_host_git_metadata(initial, tmp_path):
     from types import SimpleNamespace
     from scripts.growth_native import install_revision_source
 
     _, reference, recipe, _ = initial
     revision = validate_revision(reference, recipe)
     files = json.loads(artifact_bytes(revision["source"]["files"]))
-    container = subprocess.check_output(["docker", "run", "-d", "--network=none", "--entrypoint", "/bin/sleep",
-                                         recipe["image"], "300"], text=True, timeout=30).strip()
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    candidate.chmod(0o777)
+    container = subprocess.check_output(["docker", "run", "-d", "--network=none", "--cap-drop=ALL",
+                                         "--security-opt=no-new-privileges", "--user", "agent",
+                                         "--mount", f"type=bind,src={candidate},dst=/candidate",
+                                         "--entrypoint", "/bin/sleep", recipe["image"], "300"], text=True, timeout=30).strip()
     try:
-        subprocess.run(["docker", "exec", "--user", "0", container, "mkdir", "-p", "/candidate"],
-                       capture_output=True, check=True, timeout=15)
-        receipt = install_revision_source(SimpleNamespace(container_id=container), reference)
+        receipt = install_revision_source(SimpleNamespace(container_id=container), reference, output=tmp_path / "import")
         assert receipt["verified"]["tree_sha256"] == revision["source"]["tree_sha256"]
         assert receipt["host_git_metadata_copied"] is False and receipt["host_checkout_mounted"] is False
+        assert receipt["execution_user"] == "agent" and receipt["verified"]["uid"] > 0
+        ownership = subprocess.check_output(["docker", "exec", container, "python3", "-I", "-S", "-c",
+            "import os,pathlib; assert all(p.lstat().st_uid==os.getuid() for p in pathlib.Path('/candidate/agent-source').rglob('*')); "
+            "assert 'CapEff:\\t0000000000000000' in pathlib.Path('/proc/self/status').read_text()"], timeout=15)
+        assert ownership == b""
         tracked = subprocess.check_output(["docker", "exec", "--user", "agent", container,
                                             "git", "-C", "/candidate/agent-source", "ls-files", "-z"], timeout=15)
         assert set(tracked.decode().strip("\0").split("\0")) == set(files)
         git_config = subprocess.check_output(["docker", "exec", container, "cat", "/candidate/agent-source/.git/config"],
                                              text=True, timeout=15)
         assert "remote" not in git_config and str(initial[0]) not in git_config
+        from scripts.growth_loop import GrowthInfrastructureError
+
+        with pytest.raises(GrowthInfrastructureError, match="source import failed"):
+            install_revision_source(SimpleNamespace(container_id=container), reference, output=tmp_path / "repeat-import")
+        failure = json.loads((tmp_path / "repeat-import/process.json").read_text())
+        assert failure["exit_code"] != 0 and not failure["timed_out"]
+        assert b"FileExistsError" in (tmp_path / "repeat-import/stderr.log").read_bytes()
+        assert (tmp_path / "repeat-import/failure.json").is_file()
     finally:
         subprocess.run(["docker", "rm", "--force", container], capture_output=True, check=True, timeout=30)
 

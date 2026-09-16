@@ -170,3 +170,148 @@ def test_revision_feedback_exposes_source_change_without_host_build_or_receipt_p
     assert artifact["source_patch"]["text"] == "diff --git a/runtime.py b/runtime.py\n"
     assert artifact["metadata"]["expected_effect"] == "Better recovery."
     assert "/private/" not in json.dumps(result) and str(tmp_path) not in json.dumps(result)
+
+
+@pytest.mark.parametrize('failure_type', [RuntimeError, TypeError, KeyError])
+def test_parent_import_fault_is_infrastructure_and_retains_cause(tmp_path, monkeypatch, failure_type):
+    from types import SimpleNamespace
+    from scripts import agent_revision
+    from scripts.growth_loop import GrowthInfrastructureError
+    from scripts.growth_native import install_revision_source
+
+    error = failure_type('trusted parent failed')
+    def fail(_):
+        raise error
+    monkeypatch.setattr(agent_revision, 'validate_revision', fail)
+    with pytest.raises(GrowthInfrastructureError) as caught:
+        install_revision_source(SimpleNamespace(container_id='owned-container'), {'sha256': 'a' * 64}, output=tmp_path)
+    assert caught.value.__cause__ is error
+    assert read(tmp_path / 'failure.json')['phase'] == 'validate-parent'
+
+
+def test_import_diagnostics_keep_both_streams_and_nonzero_exit(tmp_path):
+    from scripts.growth_native import _source_import_process
+
+    result, output = _source_import_process([sys.executable, '-c',
+        "import sys;print('observed');print('source failure',file=sys.stderr);sys.exit(7)"], subprocess.DEVNULL, tmp_path)
+    assert result['exit_code'] == 7 and not result['timed_out'] and not result['output_limited']
+    assert output == (tmp_path / 'stdout.log').read_bytes() == b'observed\n'
+    assert (tmp_path / 'stderr.log').read_bytes() == b'source failure\n'
+    assert read(tmp_path / 'process.json') == result
+
+
+@pytest.mark.parametrize('descriptor', [1, 2])
+def test_import_diagnostics_bound_each_output_stream(tmp_path, descriptor):
+    from scripts.growth_native import _source_import_process
+
+    result, _ = _source_import_process([sys.executable, '-c', f'import os;os.write({descriptor},b"x"*1000000)'],
+                                       subprocess.DEVNULL, tmp_path)
+    assert result['output_limited'] and not result['timed_out']
+    assert (tmp_path / ('stdout.log' if descriptor == 1 else 'stderr.log')).stat().st_size == 65536
+    assert max((tmp_path / name).stat().st_size for name in ['stdout.log', 'stderr.log']) <= 65536
+
+
+def test_import_watchdog_terminates_child_after_leader_exits(tmp_path):
+    import time
+    from scripts.growth_native import _source_import_process
+
+    child = tmp_path / 'child-pid'
+    script = 'import os,sys,time\nchild=os.fork()\nif child:\n open(sys.argv[1],"w").write(str(child))\n os._exit(0)\ntime.sleep(30)'
+    result, _ = _source_import_process([sys.executable, '-c', script, str(child)], subprocess.DEVNULL, tmp_path, timeout=1)
+    assert result['timed_out']
+    pid = int(child.read_text())
+    for _ in range(50):
+        status = Path(f'/proc/{pid}/stat')
+        if not status.exists() or status.read_text().split()[2] == 'Z':
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail('import watchdog left an executing descendant')
+
+
+@pytest.mark.parametrize(('stop_fails', 'accounting_fails'), [(True, False), (False, True), (True, True)])
+def test_generator_cleanup_fault_cannot_mask_import_infrastructure(tmp_path, monkeypatch, stop_fails, accounting_fails):
+    from types import SimpleNamespace
+    from scripts import growth_native
+    from scripts.growth_loop import GrowthInfrastructureError
+
+    calls = []
+    def stop():
+        calls.append('stop')
+        if stop_fails:
+            raise OSError('cannot confirm container stop')
+    def account(_):
+        calls.append('accounting')
+        if accounting_fails:
+            raise OSError('ledger unavailable')
+        return {'gateway': {'present': True, 'open': 0, 'missing_usage': 0}}
+    monkeypatch.setattr(growth_native, 'native_accounting', account)
+    record(tmp_path / 'usage.json', {'known_cost': '0.03', 'complete': True})
+    original = GrowthInfrastructureError('source import failed with retained evidence')
+    with pytest.raises(GrowthInfrastructureError) as caught:
+        growth_native._close_generator_workspace(SimpleNamespace(stop=stop), tmp_path, tmp_path, original=original)
+    assert caught.value.__cause__ is original
+    assert calls == ['stop', 'accounting']
+    assert read(tmp_path / 'accounting.json')['known_cost'] == '0.03'
+    assert read(tmp_path / 'accounting.json')['usage_incomplete'] is True
+    failure = read(tmp_path / 'cleanup-failure.json')
+    assert failure['original']['type'] == 'GrowthInfrastructureError'
+    assert len(failure['errors']) == int(stop_fails) + int(accounting_fails)
+
+
+def test_cleanup_evidence_publication_fault_remains_infrastructure(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from scripts import growth_native
+    from scripts.growth_loop import GrowthInfrastructureError
+
+    def fail(*_):
+        raise OSError('evidence volume unavailable')
+    monkeypatch.setattr(growth_native, 'record', fail)
+    monkeypatch.setattr(growth_native, 'native_accounting', lambda _: {'gateway': {'present': True}})
+    original = GrowthInfrastructureError('source import failed')
+    with pytest.raises(GrowthInfrastructureError, match='publication also failed') as caught:
+        growth_native._close_generator_workspace(SimpleNamespace(stop=lambda: None), tmp_path, tmp_path, original=original)
+    assert caught.value.__cause__ is original
+
+
+def test_stop_interruption_still_attempts_accounting_before_propagating(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from scripts import growth_native
+
+    calls = []
+    interruption = KeyboardInterrupt()
+    def stop():
+        calls.append('stop')
+        raise interruption
+    def account(_):
+        calls.append('accounting')
+        return {'gateway': {'present': True}}
+    monkeypatch.setattr(growth_native, 'native_accounting', account)
+    with pytest.raises(KeyboardInterrupt) as caught:
+        growth_native._close_generator_workspace(SimpleNamespace(stop=stop), tmp_path, tmp_path)
+    assert caught.value is interruption and calls == ['stop', 'accounting']
+    assert (tmp_path / 'accounting.json').is_file()
+    assert read(tmp_path / 'cleanup-failure.json')['errors'][0]['type'] == 'KeyboardInterrupt'
+
+
+def test_workspace_lease_exit_fault_cannot_mask_import_infrastructure(tmp_path, monkeypatch):
+    from scripts import campaign_workspace
+    from scripts.growth_loop import GrowthInfrastructureError
+    from scripts.growth_native import _generator_workspace_lease
+
+    original = GrowthInfrastructureError('source import failed')
+    cleanup = campaign_workspace.StartupGatewayCleanupError(original, OSError('cleanup not confirmed'), {'pid': 123})
+    class Lease:
+        def __init__(self, _):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, kind, error, traceback):
+            assert error is original
+            raise cleanup
+    monkeypatch.setattr(campaign_workspace, 'WorkspaceLease', Lease)
+    with pytest.raises(GrowthInfrastructureError, match='workspace boundary') as caught:
+        with _generator_workspace_lease(object(), tmp_path):
+            raise original
+    assert caught.value.__cause__ is cleanup and cleanup.__context__ is original
+    assert read(tmp_path / 'workspace-failure.json')['type'] == 'StartupGatewayCleanupError'

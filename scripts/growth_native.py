@@ -1,11 +1,13 @@
 """Small native generation adapter and the existing frozen campaign entrypoint."""
 
+from contextlib import contextmanager
 from decimal import Decimal
 from fractions import Fraction
 import json
 import os
 from pathlib import Path
 import re
+import selectors
 import signal
 import sqlite3
 import stat
@@ -18,7 +20,7 @@ from urllib.parse import urlencode
 import yaml
 
 from scripts.campaign_policy import load_policy_artifact
-from scripts.growth_loop import GrowthError, encode, evaluator_environment, frozen_input, read, record, seal, sha256
+from scripts.growth_loop import GrowthError, GrowthInfrastructureError, encode, evaluator_environment, frozen_input, read, record, seal, sha256
 
 
 REVISION_ARTIFACTS = {
@@ -35,56 +37,152 @@ def generator_artifacts(specification):
     return {key: (key.replace("_", "-") + ".txt", 65536, False) for key in specification["mutable_objects"]}
 
 
-def install_revision_source(workspace, reference):
-    """Copy verified parent files only; never mount its host checkout or metadata."""
-    from scripts.agent_revision import export_source, validate_revision
+def install_revision_source(workspace, reference, *, output=None):
+    """Create a verified parent tree as the container agent, without ownership repair."""
+    from scripts.agent_revision import artifact_bytes, validate_revision
 
-    revision = validate_revision(reference)
-    files = json.loads(frozen_input(revision["source"]["files"]))
-    with tempfile.TemporaryDirectory(prefix="generator-parent-source-") as temporary:
-        directory = Path(temporary) / "agent-source"
-        export_source(reference, directory)
-        subprocess.run(["docker", "cp", str(directory), workspace.container_id + ":/candidate/agent-source"],
-                       check=True, capture_output=True, timeout=120)
-    checker = """import hashlib,json,os,pathlib,pwd,stat,subprocess,sys
-root=pathlib.Path('/candidate/agent-source');expected=json.load(sys.stdin);actual={}
-owner=pwd.getpwnam('agent')
+    output = Path(output) if output is not None else Path(tempfile.mkdtemp(prefix="generator-source-import-"))
+    phase = "validate-parent"
+    try:
+        revision = validate_revision(reference)
+        files = json.loads(frozen_input(revision["source"]["files"]))
+        checker = """import hashlib,json,os,pathlib,pwd,stat,subprocess,sys,tarfile
+os.umask(0o022)
+owner=pwd.getpwnam('agent');assert os.getuid()==owner.pw_uid and os.getuid()!=0
+root=pathlib.Path('/candidate/agent-source');stream=sys.stdin.buffer
+size=int.from_bytes(stream.read(8),'big');assert 0<size<=16777216
+expected=json.loads(stream.read(size));assert type(expected) is dict
+links={name for name,item in expected.items() if item['mode']=='120000'}
+for name in expected:
+ path=pathlib.PurePosixPath(name)
+ assert not path.is_absolute() and str(path)==name and not set(path.parts)&{'.','..','.git'}
+ assert not any(str(parent) in links for parent in path.parents)
+root.mkdir(mode=0o755,exist_ok=False);seen=set()
+with tarfile.open(fileobj=stream,mode='r|') as archive:
+ for member in archive:
+  assert member.name in expected and member.name not in seen
+  seen.add(member.name);item=expected[member.name]
+  if item['mode']=='120000':
+   assert member.issym() and member.linkname==item['target'];continue
+  assert item['mode'] in {'100644','100755'} and member.isfile() and member.size==item['size']
+  assert bool(member.mode&0o111)==(item['mode']=='100755')
+  path=root/member.name;path.parent.mkdir(parents=True,exist_ok=True)
+  digest=hashlib.sha256();length=0
+  with archive.extractfile(member) as source,path.open('xb') as target:
+   while data:=source.read(1048576):
+    length+=len(data);assert length<=item['size'];digest.update(data);target.write(data)
+  assert length==item['size'] and digest.hexdigest()==item['sha256']
+  path.chmod(0o755 if item['mode']=='100755' else 0o644)
+assert seen==set(expected)
+for name in links:
+ path=root/name;target=expected[name]['target']
+ assert not pathlib.PurePosixPath(target).is_absolute()
+ path.parent.mkdir(parents=True,exist_ok=True);path.symlink_to(target)
+ assert path.resolve().is_relative_to(root)
+actual={}
 for path in root.rglob('*'):
- relative=path.relative_to(root).as_posix();info=path.lstat()
- if stat.S_ISDIR(info.st_mode):
-  os.chown(path,owner.pw_uid,owner.pw_gid);continue
- assert relative in expected and '.git' not in path.relative_to(root).parts
- item=expected[relative]
+ name=path.relative_to(root).as_posix();info=path.lstat();assert info.st_uid==os.getuid()
+ if stat.S_ISDIR(info.st_mode):continue
+ assert name in expected
  if stat.S_ISLNK(info.st_mode):
-  target=os.readlink(path);data=target.encode();mode='120000'
-  assert item['target']==target and not pathlib.PurePosixPath(target).is_absolute()
-  assert path.resolve().is_relative_to(root)
-  actual[relative]={'mode':mode,'sha256':hashlib.sha256(data).hexdigest(),'size':len(data),'target':target}
+  target=os.readlink(path);data=target.encode()
+  actual[name]={'mode':'120000','sha256':hashlib.sha256(data).hexdigest(),'size':len(data),'target':target}
  else:
   assert stat.S_ISREG(info.st_mode)
-  data=path.read_bytes();mode='100755' if info.st_mode & 0o111 else '100644'
-  actual[relative]={'mode':mode,'sha256':hashlib.sha256(data).hexdigest(),'size':len(data)}
- os.chown(path,owner.pw_uid,owner.pw_gid,follow_symlinks=False)
+  actual[name]={'mode':'100755' if info.st_mode&0o111 else '100644','sha256':hashlib.sha256(path.read_bytes()).hexdigest(),'size':info.st_size}
 assert actual==expected
-os.chown(root,owner.pw_uid,owner.pw_gid)
-os.setgid(owner.pw_gid);os.setuid(owner.pw_uid)
+assert all((root/name).resolve().is_relative_to(root) for name in links)
 env={'PATH':'/usr/local/bin:/usr/bin:/bin','HOME':'/tmp','GIT_CONFIG_GLOBAL':'/dev/null','GIT_CONFIG_NOSYSTEM':'1',
  'GIT_AUTHOR_NAME':'AgentRevision','GIT_AUTHOR_EMAIL':'revision@localhost','GIT_COMMITTER_NAME':'AgentRevision',
  'GIT_COMMITTER_EMAIL':'revision@localhost','GIT_AUTHOR_DATE':'2000-01-01T00:00:00+00:00','GIT_COMMITTER_DATE':'2000-01-01T00:00:00+00:00'}
 for args in [['init','-q'],['add','--force','--all'],['commit','-q','--allow-empty','-m','Frozen parent source']]:
  subprocess.run(['git','-c','core.hooksPath=/dev/null','-c','commit.gpgsign=false','-c','core.autocrlf=false',*args],
-  cwd=root,env=env,check=True,capture_output=True,timeout=60)
-print(json.dumps({'passed':True,'files':len(actual),'tree_sha256':hashlib.sha256((json.dumps(actual,sort_keys=True,indent=2)+'\\n').encode()).hexdigest()}))
+  cwd=root,env=env,check=True,timeout=60)
+tracked=subprocess.check_output(['git','ls-files','-z'],cwd=root,env=env,timeout=60)
+assert set(tracked.decode().rstrip('\\0').split('\\0'))==set(expected)
+print(json.dumps({'passed':True,'files':len(actual),'uid':os.getuid(),'gid':os.getgid(),
+ 'tree_sha256':hashlib.sha256((json.dumps(actual,sort_keys=True,indent=2)+'\\n').encode()).hexdigest()}))
 """
-    checked = subprocess.run(["docker", "exec", "--user", "0", "-i", workspace.container_id,
-                              "python3", "-I", "-S", "-c", checker],
-                             input=encode(files), capture_output=True, check=True, timeout=240)
-    verified = json.loads(checked.stdout)
-    if verified.get("passed") is not True or verified.get("tree_sha256") != revision["source"]["tree_sha256"]:
-        raise GrowthError("generator parent source import changed its frozen tree")
-    return {"agent_revision_sha256": reference["sha256"], "source_archive_sha256": revision["source"]["archive"]["sha256"],
-            "container": workspace.container_id, "destination": "/candidate/agent-source", "verified": verified,
-            "host_checkout_mounted": False, "host_git_metadata_copied": False}
+        phase = "agent-import"
+        with tempfile.TemporaryFile() as payload:
+            header = encode(files)
+            payload.write(len(header).to_bytes(8, "big"))
+            payload.write(header)
+            payload.write(artifact_bytes(revision["source"]["archive"]))
+            payload.seek(0)
+            result, stdout = _source_import_process([
+                "docker", "exec", "--user", "agent", "-i", workspace.container_id,
+                "timeout", "--signal=TERM", "--kill-after=5s", "240s", "python3", "-I", "-S", "-c", checker,
+            ], payload, output)
+        if result["exit_code"] != 0 or result["timed_out"] or result["output_limited"]:
+            raise GrowthError("container source import did not complete successfully")
+        phase = "verify-import"
+        verified = json.loads(stdout)
+        if (verified.get("passed") is not True or verified.get("tree_sha256") != revision["source"]["tree_sha256"]
+                or verified.get("files") != len(files) or type(verified.get("uid")) is not int or verified["uid"] <= 0):
+            raise GrowthError("generator parent source import changed its frozen tree or execution identity")
+        return {"agent_revision_sha256": reference["sha256"], "source_archive_sha256": revision["source"]["archive"]["sha256"],
+                "container": workspace.container_id, "destination": "/candidate/agent-source", "verified": verified,
+                "execution_user": "agent", "host_checkout_mounted": False, "host_git_metadata_copied": False,
+                "diagnostic": {"path": str(output / "process.json"), "sha256": sha256(encode(result))}}
+    except Exception as error:
+        try:
+            record(output / "failure.json", {"phase": phase, "agent_revision": reference, "container": workspace.container_id,
+                   "error_type": type(error).__name__, "error": str(error)[:4096]})
+        except Exception as publication:
+            raise GrowthInfrastructureError(f"generator source import failed; evidence publication also failed: {type(publication).__name__}") from error
+        raise GrowthInfrastructureError(f"generator source import failed during {phase}; evidence {output}") from error
+
+
+def _source_import_process(argv, payload, output, *, timeout=250):
+    """Drain both Docker streams with bounded diagnostics and a host watchdog."""
+    started = time.monotonic()
+    streams = {"stdout": bytearray(), "stderr": bytearray()}
+    process = None
+    timed_out = output_limited = False
+    try:
+        process = subprocess.Popen(argv, stdin=payload, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+        with selectors.DefaultSelector() as selector:
+            selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+            selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+            while selector.get_map():
+                timed_out = time.monotonic() - started >= timeout
+                if timed_out or output_limited:
+                    break
+                for key, _ in selector.select(timeout=0.05):
+                    data = os.read(key.fileobj.fileno(), 65536)
+                    if not data:
+                        selector.unregister(key.fileobj)
+                        continue
+                    remaining = 65536 - len(streams[key.data])
+                    streams[key.data].extend(data[:remaining])
+                    output_limited = len(data) > remaining
+                    if output_limited:
+                        break
+            if not timed_out and not output_limited:
+                try:
+                    process.wait(timeout=max(0.1, min(10, timeout - (time.monotonic() - started))))
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+    finally:
+        if process is not None:
+            if timed_out or output_limited or process.poll() is None or sys.exc_info()[1] is not None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            process.wait(timeout=10)
+            process.stdout.close()
+            process.stderr.close()
+        for name, data in streams.items():
+            seal(output / f"{name}.log", bytes(data))
+        result = record(output / "process.json", {
+            "argv": argv, "exit_code": process.returncode if process is not None else None,
+            "timeout_seconds": timeout, "timed_out": timed_out, "output_limited": output_limited,
+            "stdout": {"path": str(output / "stdout.log"), "sha256": sha256(bytes(streams["stdout"]))},
+            "stderr": {"path": str(output / "stderr.log"), "sha256": sha256(bytes(streams["stderr"]))},
+        })
+    return result, bytes(streams["stdout"])
 
 
 def generator_payload(output, specification, instruction, context, model, variant, directory="/candidate", *, started_at=None):
@@ -250,6 +348,61 @@ def native_generation(api, output, specification, payload, export, cancelled=lam
                 api.interrupt(session_id)
 
 
+def _close_generator_workspace(workspace, job, output, *, original=None):
+    """Cleanup faults remain infrastructure failures, including during another failure."""
+    errors = []
+    try:
+        workspace.stop()
+    except BaseException as error:
+        errors.append(("workspace-stop", error))
+    usage, accounting = {}, {}
+    try:
+        if (output / "usage.json").exists():
+            usage = read(output / "usage.json")
+    except Exception as error:
+        errors.append(("native-usage", error))
+    try:
+        accounting = native_accounting(job)
+    except Exception as error:
+        errors.append(("gateway-accounting", error))
+    try:
+        gateway = accounting.get("gateway", {})
+        record(output / "accounting.json", {**accounting, "native_projection": usage,
+            "known_cost": usage.get("known_cost"),
+            "usage_incomplete": bool(errors) or not usage.get("complete", False) or not gateway.get("present")
+                or gateway.get("unreadable", False) or bool(gateway.get("open") or gateway.get("missing_usage")),
+            "scope": "generation accounting retained on success, failure and cancellation; projection and gateway overlap"})
+    except Exception as error:
+        errors.append(("accounting-publication", error))
+    if errors:
+        try:
+            record(output / "cleanup-failure.json", {
+                "original": None if original is None else {"type": type(original).__name__, "error": str(original)[:4096]},
+                "errors": [{"phase": phase, "type": type(error).__name__, "error": str(error)[:4096]} for phase, error in errors],
+            })
+        except Exception as publication:
+            raise GrowthInfrastructureError(f"generator cleanup failed; evidence publication also failed: {type(publication).__name__}") from (original or errors[0][1])
+        for _, error in errors:
+            if not isinstance(error, Exception):
+                raise error
+        raise GrowthInfrastructureError(f"generator cleanup or accounting failed; evidence {output}") from (original or errors[0][1])
+
+
+@contextmanager
+def _generator_workspace_lease(request, output):
+    from scripts.campaign_workspace import WorkspaceError, WorkspaceLease
+
+    try:
+        with WorkspaceLease(request) as lease:
+            yield lease
+    except WorkspaceError as error:
+        try:
+            record(output / "workspace-failure.json", {"type": type(error).__name__, "error": str(error)[:4096]})
+        except Exception as publication:
+            raise GrowthInfrastructureError(f"generator workspace failed; evidence publication also failed: {type(publication).__name__}") from error
+        raise GrowthInfrastructureError(f"generator workspace boundary failed; evidence {output}") from error
+
+
 def runtime_configuration(study, root, binding):
     """Change only the bound Agent implementation and policy within frozen study coordinates."""
     raw = yaml.safe_load((root / "config.yaml").read_bytes())
@@ -324,7 +477,7 @@ class ProgramBenchBackend:
         from scripts.campaign_offline import DockerHttpClient
         from scripts.campaign_procontract import HttpProContractApi
         from scripts.campaign_state import JobPaths
-        from scripts.campaign_workspace import WorkspaceLease, WorkspaceRequest, ensure_workspace
+        from scripts.campaign_workspace import WorkspaceRequest, ensure_workspace
         from scripts.run_opencode import load_config
 
         if (self.root / "CANCEL").exists():
@@ -354,7 +507,7 @@ class ProgramBenchBackend:
                     candidate_root=job.root / "candidates", state_root=job.root / "workspace-state", log_dir=job.root / "logs",
                     credential_env=tuple(key for key in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENCODE_SERVER_PASSWORD") if os.environ.get(key)),
                     isolated=True, deadline_only=True, health_timeout=45, provider_model=config.model.split("/", 1)[1], provider_effort=config.variant)
-        with WorkspaceLease(request) as lease:
+        with _generator_workspace_lease(request, output) as lease:
             from scripts.campaign_admission import disk_admission, study_disk_minimum
             while not disk_admission(self.root, study_disk_minimum(self.study), output / "disk-admission.json"):
                 if (self.root / "CANCEL").exists():
@@ -368,7 +521,7 @@ class ProgramBenchBackend:
                     raise GrowthError("generator workspace network isolation absent")
                 if "agent_revision" in specification["binding"]:
                     record(output / "source-install.json", install_revision_source(
-                        workspace, specification["binding"]["agent_revision"]))
+                        workspace, specification["binding"]["agent_revision"], output=output / "source-import"))
                 api = HttpProContractApi(workspace.base_url, expected_port=workspace.port,
                                          http_client=DockerHttpClient(workspace.container_id))
                 feedback = install_feedback(self.study, self.root, specification["generation"], workspace)
@@ -392,17 +545,7 @@ class ProgramBenchBackend:
                           "usage_incomplete": not usage["complete"] or not gateway.get("present") or gateway.get("unreadable", False)
                               or bool(gateway.get("open") or gateway.get("missing_usage"))}
             finally:
-                try:
-                    workspace.stop()
-                finally:
-                    usage = read(output / "usage.json") if (output / "usage.json").exists() else {}
-                    accounting = native_accounting(job.root)
-                    gateway = accounting["gateway"]
-                    record(output / "accounting.json", {**accounting, "native_projection": usage,
-                        "known_cost": usage.get("known_cost"),
-                        "usage_incomplete": not usage.get("complete", False) or not gateway.get("present") or gateway.get("unreadable", False)
-                            or bool(gateway.get("open") or gateway.get("missing_usage")),
-                        "scope": "generation accounting retained on success, failure and cancellation; projection and gateway overlap"})
+                _close_generator_workspace(workspace, job.root, output, original=sys.exc_info()[1])
         if specification["mutable_objects"] == ["agent_revision"]:
             from scripts.agent_revision import build_revision, validate_revision
 
@@ -454,6 +597,8 @@ class ProgramBenchBackend:
                 or imported.get("source_archive_sha256") != parent["source"]["archive"]["sha256"]
                 or imported.get("container") != workspace["container_id"]
                 or imported.get("destination") != "/candidate/agent-source"
+                or imported.get("execution_user") != "agent"
+                or type(imported.get("verified", {}).get("uid")) is not int or imported["verified"]["uid"] <= 0
                 or imported.get("verified", {}).get("passed") is not True
                 or imported["verified"].get("tree_sha256") != parent["source"]["tree_sha256"]
                 or imported.get("host_checkout_mounted") is not False or imported.get("host_git_metadata_copied") is not False):
