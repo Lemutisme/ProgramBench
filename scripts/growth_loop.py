@@ -144,6 +144,8 @@ def freeze(study_path, root):
     study_disk_minimum(study)
     system = study.get("version") == 2
     comparison = study.get("mode") == "external-comparison"
+    from scripts import growth_research_parent
+    growth_research_parent.validate_config(study)
     if study.get("version") not in {1, 2} or study.get("mode") not in {"recursive", "fixed-generator", "external-comparison"}:
         raise GrowthError("study requires a supported version and explicit control arm")
     external = None
@@ -255,6 +257,7 @@ def freeze(study_path, root):
     }
     code = {name: sha256(Path(__file__).with_name(name).read_bytes())
             for name in ("growth_loop.py", "growth_native.py", "growth_feedback.py", "growth_submission_feedback.py",
+                         "growth_research_parent.py",
                          *(("growth_compare.py",) if comparison else ()),
                          *(("agent_revision.py", "campaign_install.py", "run_opencode.py", "campaign_runner.py",
                             "campaign_experiments.py", "campaign_offline.py", "campaign_workspace.py") if system else ()),
@@ -302,11 +305,11 @@ def operation(root, kind, specification, perform):
     return result
 
 
-def choose(block, evaluations, generated, criteria, *, required_status="completed"):
+def measure(block, evaluations, names):
     """Every preassigned instance/repeat remains in the comparison denominator."""
     coordinates = [(task, seed) for task in block["instances"] for seed in block["seeds"]]
     table, exact = {}, {}
-    for name in ["incumbent", *generated]:
+    for name in names:
         rows = {(row["instance_id"], result["seed"]): row
                 for result in evaluations.get(name, []) for row in result.get("rows", [])}
         if len(rows) != sum(len(result.get("rows", [])) for result in evaluations.get(name, [])):
@@ -328,6 +331,12 @@ def choose(block, evaluations, generated, criteria, *, required_status="complete
                        "mean": float(sum(exact[name]) / len(assigned)) if complete else None,
                        "mean_missing_as_zero": sum(row["score"] for row in assigned if row.get("status") == "valid"
                                                    and type(row.get("score")) in {int, float}) / len(assigned)}
+    return table, exact
+
+
+def choose(block, evaluations, generated, criteria, *, required_status="completed"):
+    coordinates = [(task, seed) for task in block["instances"] for seed in block["seeds"]]
+    table, exact = measure(block, evaluations, ["incumbent", *generated])
     winner, best = None, None
     for name, result in generated.items():
         candidate, baseline = table[name], table["incumbent"]
@@ -398,42 +407,50 @@ def run(study_path, root, backend=None):
     with (root / ".lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         study, initial = freeze(study_path, root)
+        from scripts import growth_research_parent
+        research_parent = growth_research_parent.validate_config(study)
         if backend is None:
             from scripts.growth_native import ProgramBenchBackend
             backend = ProgramBenchBackend(study, root)
         binding = initial
+        research_binding = initial
         for index, block in enumerate(study["rounds"]):
             if (root / "CANCEL").exists():
                 raise GrowthError("explicit study cancellation requested")
             directory = root / block["id"]
-            record(directory / "binding.json", {"generation": index, "mode": study["mode"], **binding})
+            record(directory / "binding.json", {"generation": index, "mode": study["mode"], **binding,
+                **({"research_binding": research_binding} if research_parent else {})})
+            parent = research_binding if research_parent else binding
             generated = {}
             for opportunity in range(block["opportunities"]):
                 if (root / "CANCEL").exists():
                     raise GrowthError("explicit study cancellation requested before generation")
                 name = f"candidate-{opportunity:03d}"
                 output = directory / name
-                spec = {"generation": index, "opportunity": opportunity, "binding": binding,
-                        "study_sha256": sha256(encode(study)), "mutable_objects": study["mutable_objects"]}
+                spec = {"generation": index, "opportunity": opportunity, "binding": parent,
+                        "study_sha256": sha256(encode(study)), "mutable_objects": study["mutable_objects"],
+                        **({"binding_role": "research-parent"} if research_parent else {})}
                 def propose():
                     result = backend.generate(output, spec, block)
                     if study["version"] == 2:
-                        validate_revision_proposal(output, result, binding, study["revision_recipe"])
+                        validate_revision_proposal(output, result, parent, study["revision_recipe"])
                         backend.validate_generation(output, spec, result)
                     return result
                 generated[name] = operation(output, "generation", spec, propose)
                 result = generated[name]
                 if result["status"] == "completed":
                     if study["version"] == 2:
-                        validate_revision_proposal(output, result, binding, study["revision_recipe"])
+                        validate_revision_proposal(output, result, parent, study["revision_recipe"])
                         backend.validate_generation(output, spec, result)
                     else:
                         result["artifacts"] = {key: policy(root, frozen_input(value)) for key, value in result["artifacts"].items()}
-                    required = set(binding) if study["version"] == 2 else set(study["mutable_objects"])
+                    required = set(parent) if study["version"] == 2 else set(study["mutable_objects"])
                     if set(result["artifacts"]) != required:
                         raise GrowthError("native generation returned the wrong artifact set")
             subjects = {"incumbent": binding, **{
-                name: {**binding, **result["artifacts"]} for name, result in generated.items() if result["status"] == "completed"}}
+                name: {**parent, **result["artifacts"]} for name, result in generated.items() if result["status"] == "completed"}}
+            if research_parent and research_binding != binding:
+                subjects["research-parent"] = research_binding
             record(directory / "proposals-frozen.json", {
                 "subjects": subjects, "results": {name: sha256(encode(value)) for name, value in generated.items()}
             })
@@ -453,6 +470,8 @@ def run(study_path, root, backend=None):
                         from scripts.agent_revision import validate_revision
                         spec["agent_revision"] = selected[name]["agent_revision"]
                         spec["runtime_sha256"] = validate_revision(spec["agent_revision"], study["revision_recipe"])["binary"]["sha256"]
+                    if research_parent:
+                        spec["subject_roles"] = growth_research_parent.roles(name, research_binding == binding)
                     cached = (output / "result.json").exists()
                     value = operation(output, "evaluation", spec, lambda: backend.evaluate(output, spec))
                     if cached and any(row.get("status") == "valid" for row in value.get("rows", [])):
@@ -463,6 +482,9 @@ def run(study_path, root, backend=None):
             screening = {"instances": study["development_instances"], "seeds": block["seeds"]}
             screen = choose(screening, evaluate(subjects, "development", screening["instances"]), generated, study["criteria"])
             record(directory / "screen.json", screen)
+            if research_parent:
+                research = growth_research_parent.decide(study, root, index, binding, research_binding, generated)
+                record(directory / "research-decision.json", research)
             finalist = screen["winner"]
             decision = {**screen, "confirmation_consumed": False}
             if finalist:
@@ -494,9 +516,16 @@ def run(study_path, root, backend=None):
                                          "Full-system revision study; improver ability needs matched descendants" if study["version"] == 2
                                          else "Harness and tool code search are not connected",
                                          "Development selection is not held-out confirmation"])
+            if research_parent:
+                decision.update(previous_research_binding=research_binding,
+                    next_research_binding=research["next_research_binding"],
+                    research_decision={"path": str(directory / "research-decision.json"), "sha256": sha256(encode(research))})
             record(directory / "decision.json", decision)
+            if research_parent:
+                research_binding = growth_research_parent.closed(study, root, index)["next_research_binding"]
             binding = next_binding
         return record(root / "completed.json", {"rounds": len(study["rounds"]), "final_binding": binding,
+                                                **({"final_research_binding": research_binding} if research_parent else {}),
                                                 "status": "completed", "performance_claim": None})
 
 

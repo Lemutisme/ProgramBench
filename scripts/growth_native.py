@@ -259,7 +259,8 @@ def generator_payload(output, specification, instruction, context, model, varian
                  "These are proposals. You cannot alter evaluation, scores, study assignments or adoption. "
                  "Use contract_check and report ready when these artifacts are complete. "
                  "Your obligation ends with this artifact handoff; future scoring is out of scope.\n\n"
-                 "Incumbent solver policy (an artifact to improve, distinct from your execution policy):\n"
+                 + ("Research-parent" if specification.get("binding_role") == "research-parent" else "Incumbent")
+                 + " solver policy (an artifact to improve, distinct from your execution policy):\n"
                  + frozen_input(specification["binding"]["solver_policy"]).decode() + "\n\n"
                  "Frozen development context and completed development feedback:\n" + context,
         "executionPolicy": frozen_input(specification["binding"]["generator_policy"]).decode(),
@@ -963,6 +964,9 @@ def closed_feedback(study, root, generation):
     previous = []
     for earlier in study["rounds"][:generation]:
         decision = read(root / earlier["id"] / "decision.json")
+        from scripts import growth_research_parent
+        research = (growth_research_parent.closed(study, root, study["rounds"].index(earlier))
+                    if growth_research_parent.validate_config(study) else None)
         proposals = {}
         for name, result in decision["generation_results"].items():
             artifacts = {}
@@ -983,6 +987,7 @@ def closed_feedback(study, root, generation):
                                **({"adopted": decision["winner"] == name} if publication is None else {}),
                                "artifacts": artifacts}
         previous.append({"generation": earlier["id"], "proposals_including_rejected": proposals,
+            **({"research_parent": growth_research_parent.public(research)} if research is not None else {}),
             "development_screen": {"instances": study["development_instances"], "reusable": True,
                 "results": {name: {key: value for key, value in item.items() if key != "rows"}
                             for name, item in decision["screen"]["comparisons"].items()}},

@@ -253,14 +253,19 @@ def extract_source(study_ref, execution_root, round_id, subject, seed, output):
             raise GrowthError("feedback output already belongs to another source")
         return existing
     block = next((item for item in study["rounds"] if item["id"] == round_id), None)
-    if block is None or seed not in block["seeds"] or not re.fullmatch(r"(?:incumbent|candidate-\d+)", subject):
+    from scripts import growth_research_parent
+    research_enabled = growth_research_parent.validate_config(study)
+    if (block is None or seed not in block["seeds"] or not (
+            re.fullmatch(r"(?:incumbent|candidate-\d+)", subject) or research_enabled and subject == "research-parent")):
         raise GrowthError("feedback source is not an assigned development coordinate")
     operation = root / round_id / "evaluation/development" / subject / str(seed)
     if operation.resolve() != operation:
         raise GrowthError("feedback source path redirects outside its D coordinate")
     frozen, decision, specification = read(root / "frozen.json"), read(root / round_id / "decision.json"), read(operation / "specification.json")
+    research = growth_research_parent.closed(study, root, study["rounds"].index(block)) if research_enabled else None
     if (frozen["study_sha256"] != sha256(encode(study)) or not frozen.get("controller_sources")
-            or subject not in decision["screen"]["comparisons"] or not (operation / "result.json").is_file()
+            or subject not in (research["subjects"] if research is not None else decision["screen"]["comparisons"])
+            or not (operation / "result.json").is_file()
             or specification["study_sha256"] != frozen["study_sha256"] or specification["seed"] != seed
             or set(specification["instances"]) != set(study["development_instances"])):
         raise GrowthError("feedback source is unclosed or disagrees with frozen D assignment")
@@ -271,6 +276,8 @@ def extract_source(study_ref, execution_root, round_id, subject, seed, output):
         raise GrowthError("feedback source has an ambiguous campaign")
     sources = [reference(Path(study_ref["path"])), reference(root / "frozen.json"), reference(root / round_id / "decision.json"),
                reference(operation / "specification.json"), reference(operation / "result.json"), reference(Path(specification["solver_policy"]["path"]))]
+    if research is not None:
+        sources.append(reference(root / round_id / "research-decision.json"))
     actions, jobs = [], []
     if not campaigns and read(operation / "result.json").get("status") != "failed":
         raise GrowthError("missing campaign has no closed infrastructure failure receipt")
@@ -319,6 +326,7 @@ def extract_source(study_ref, execution_root, round_id, subject, seed, output):
     files = {name: {"sha256": sha256((output / name).read_bytes()), "bytes": (output / name).stat().st_size} for name in ["actions.jsonl", "index.jsonl", "summary.json"]}
     record(output / "manifest.json", {"protocol": PROTOCOL, "coordinate": {"study_sha256": study_ref["sha256"], "execution_root": str(root), "round_id": round_id, "subject": subject, "seed": seed},
         "source_study": study_ref, "solver_policy_sha256": policy.sha256, "runtime_sha256": runtime_sha256,
+        **({"research_assignment": growth_research_parent.public(research)["subjects"][subject]} if research is not None else {}),
         "instances": study["development_instances"], "source_files": sources, "jobs": jobs, "files": files, "campaign_present": bool(campaigns),
         "extractor": reference(Path(__file__).resolve()), "sql_sha256": sha256(TOOL_SQL.encode()), "summary": overview,
         "checkpoint_sql_sha256": sha256(CHECKPOINT_SQL.encode()),
@@ -342,6 +350,17 @@ def verify_bundle(value, allowed_instances):
     if set(source["development_instances"]) != set(manifest["instances"]):
         raise GrowthError("feedback archive contains a cross-stage source")
     coordinate = manifest["coordinate"]
+    from scripts import growth_research_parent
+    if growth_research_parent.validate_config(source):
+        generation = next((index for index, block in enumerate(source["rounds"]) if block["id"] == coordinate["round_id"]), None)
+        if generation is None:
+            raise GrowthError("research feedback has an unknown round")
+        research = growth_research_parent.closed(source, Path(coordinate["execution_root"]), generation)
+        assignment = growth_research_parent.public(research)["subjects"].get(coordinate["subject"])
+        if assignment is None or manifest.get("research_assignment") != assignment:
+            raise GrowthError("research feedback changed its subject role or complete revision source")
+    elif "research_assignment" in manifest:
+        raise GrowthError("legacy feedback cannot claim an unassigned research role")
     expected = Path(coordinate["execution_root"]) / coordinate["round_id"] / "evaluation/development" / coordinate["subject"] / str(coordinate["seed"])
     campaigns = list(expected.glob("growth-eval-*")) + ([expected / "campaign"] if (expected / "campaign").is_dir() else [])
     if len(campaigns) != int(manifest["campaign_present"]):
@@ -471,7 +490,10 @@ def prepare_feedback(study, root, generation):
     unavailable = []
     for block in study["rounds"][:generation]:
         decision = read(root / block["id"] / "decision.json")
-        for subject in sorted(decision["screen"]["comparisons"]):
+        from scripts import growth_research_parent
+        research = (growth_research_parent.closed(study, root, study["rounds"].index(block))
+                    if growth_research_parent.validate_config(study) else None)
+        for subject in sorted(research["comparisons"] if research is not None else decision["screen"]["comparisons"]):
             for seed in block["seeds"]:
                 operation = root / block["id"] / "evaluation/development" / subject / str(seed)
                 if not (operation / "result.json").exists():
@@ -496,6 +518,7 @@ def prepare_feedback(study, root, generation):
             "solver_policy_sha256": manifest["solver_policy_sha256"],
             "runtime_sha256": manifest.get("runtime_sha256"),
             "coordinate": {key: item for key, item in manifest["coordinate"].items() if key != "execution_root"},
+            **({"research_assignment": manifest["research_assignment"]} if "research_assignment" in manifest else {}),
             "files": {name: {**info, "path": f'/candidate/feedback/{value["sha256"]}/{name}'} for name, info in manifest["files"].items()},
             "context": windows(value, per_source),
             **({"submitted_sources": public_submissions(submitted, INLINE_PREVIEW_BYTES // max(1, len(values)))}
