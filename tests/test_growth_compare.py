@@ -6,7 +6,7 @@ import pytest
 
 from scripts.agent_revision import build_revision
 from scripts import growth_loop
-from scripts.growth_compare import freeze_compare, run
+from scripts.growth_compare import freeze_compare, inventory, run
 from scripts.growth_loop import GrowthError, encode, read, record, sha256
 from scripts.growth_native import runtime_configuration
 from tests import test_agent_revision, test_growth_revision
@@ -91,6 +91,25 @@ def test_external_full_revisions_are_frozen_compared_confirmed_and_cached(compar
     assert len({item["runtime_sha256"] for item in backend.evaluations}) == 2
     assert run(path, root, backend) == result
     assert len(backend.evaluations) == len(backend.validations) == 4
+
+
+@pytest.mark.parametrize("cost,incomplete", [("1.25", False), ("0", False), (None, True)])
+def test_independent_score_rows_use_the_separate_native_accounting_receipt(tmp_path, cost, incomplete):
+    slot = {"stage": "development", "subject": "incumbent", "seed": 7,
+            "path": "matched/evaluation/development/incumbent/7", "specification_sha256": "a" * 64,
+            "instances": ["fixture"]}
+    output = tmp_path / slot["path"]
+    record(output / "started.json", {"kind": "external-revision-evaluation"})
+    # Production independent_scores intentionally returns scores separately
+    # from ProgramBenchBackend.evaluate's native accounting.json.
+    record(output / "result.json", {"rows": [{"instance_id": "fixture", "status": "valid",
+                                               "resolved": 3, "total": 4, "score": 0.75}]})
+    record(output / "accounting.json", {"rows": [{"instance_id": "fixture", "known_cost": cost,
+                                                   "usage_incomplete": incomplete}]})
+    result = inventory(tmp_path, [slot])
+    assert result["rows"][0]["score_status"] == "valid"
+    assert result["known_cost"] == cost
+    assert result["usage_incomplete"] is incomplete
 
 
 @pytest.mark.parametrize("gain,missing", [(2, None), (-5, None), (5, "development")])

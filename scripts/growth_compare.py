@@ -74,7 +74,9 @@ def inventory(root, slots):
         retained = retained_json(output / "accounting.json")
         for task in slot["instances"]:
             observed = next((row for row in receipt_rows(result or {}) if row.get("instance_id") == task), None)
-            accounting = observed or next((row for row in receipt_rows(retained) if row.get("instance_id") == task), None)
+            accounting = next((row for row in receipt_rows(retained) if row.get("instance_id") == task), None)
+            if accounting is None and observed is not None and "known_cost" in observed:
+                accounting = observed
             if accounting is None and started:
                 campaign = output / ("growth-eval-" + sha256(str(output.resolve()).encode()))
                 try:
