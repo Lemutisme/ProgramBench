@@ -3,7 +3,7 @@ import os
 
 import pytest
 
-from scripts.growth_loop import GrowthError, choose, operation, record, seal
+from scripts.growth_loop import GrowthError, GrowthInfrastructureError, choose, operation, record, seal
 
 
 def results(values, seed=1):
@@ -87,6 +87,27 @@ def test_failure_retains_usage_and_never_becomes_zero_cost(tmp_path):
     assert result["known_cost"] is None
     assert result["retained_usage"]["unknown_cost_messages"] == 2
     assert "provider secret" not in (tmp_path / "failure.json").read_text()
+
+
+def test_infrastructure_failure_closes_accounting_and_stops_fresh_and_cached_execution(tmp_path):
+    record(tmp_path / "accounting.json", {"gateway": {"admitted": 0}, "known_cost": None})
+    calls = []
+
+    def fail():
+        calls.append("import")
+        raise GrowthInfrastructureError("source import failed")
+
+    for _ in range(2):
+        with pytest.raises(GrowthInfrastructureError):
+            operation(tmp_path, "generation", {}, fail)
+            calls.append("later generation or evaluation")
+    assert calls == ["import"]
+    result = json.loads((tmp_path / "result.json").read_bytes())
+    assert result == json.loads((tmp_path / "failure.json").read_bytes())
+    assert result["status"] == "failed" and result["failure_classification"] == "infrastructure"
+    assert result["retained_accounting"]["gateway"]["admitted"] == 0
+    assert result["known_cost"] is None and result["usage_incomplete"] is True
+    assert "source import failed" in (tmp_path / "failure-traceback.txt").read_text()
 
 
 def test_immutable_record_cannot_be_replaced(tmp_path):

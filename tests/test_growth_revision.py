@@ -9,7 +9,7 @@ import yaml
 
 from scripts.agent_revision import build_revision, runtime_config, validate_revision
 from scripts.campaign_install import isolated_binary_probes
-from scripts.growth_loop import GrowthError, encode, freeze, read, record, revision_binding, run, sha256
+from scripts.growth_loop import GrowthError, GrowthInfrastructureError, encode, freeze, read, record, revision_binding, run, sha256
 from scripts.growth_native import runtime_configuration
 from tests import test_agent_revision
 from tests.test_agent_revision import artifact, git, proposal
@@ -147,3 +147,22 @@ def test_v2_rejects_an_extra_task_regression_objective_before_freeze(study, tmp_
     record(path, specification)
     with pytest.raises(GrowthError, match="no implicit per-task"):
         freeze(path, tmp_path / "rejected")
+
+
+def test_generator_infrastructure_failure_never_admits_later_proposals_or_solver(study):
+    specification, path, root = study
+
+    class FailedImport(ExecutableFixture):
+        def generate(self, output, specification, block):
+            self.generations.append(specification)
+            raise GrowthInfrastructureError("production source import failed before model admission")
+
+    backend = FailedImport(specification, root)
+    for _ in range(2):
+        with pytest.raises(GrowthInfrastructureError):
+            run(path, root, backend)
+    assert len(backend.generations) == 1
+    assert backend.evaluations == []
+    assert read(root / "first/candidate-000/result.json")["failure_classification"] == "infrastructure"
+    assert not (root / "first/proposals-frozen.json").exists()
+    assert not (root / "second").exists()

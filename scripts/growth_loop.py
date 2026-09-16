@@ -20,6 +20,10 @@ class GrowthError(ValueError):
     pass
 
 
+class GrowthInfrastructureError(GrowthError):
+    """Trusted execution failed; do not spend later research slots on this fault."""
+
+
 def sha256(data):
     return hashlib.sha256(data).hexdigest()
 
@@ -222,7 +226,10 @@ def operation(root, kind, specification, perform):
     root.mkdir(parents=True, exist_ok=True)
     record(root / "specification.json", specification)
     if (root / "result.json").exists():
-        return read(root / "result.json")
+        result = read(root / "result.json")
+        if result.get("failure_classification") == "infrastructure":
+            raise GrowthInfrastructureError(f"recorded infrastructure failure requires reconciliation: {root}")
+        return result
     if (root / "started.json").exists():
         raise GrowthError(f"in-flight {kind} requires native/campaign recovery, not a fresh model run: {root}")
     record(root / "started.json", {"kind": kind, "time": time.time(), "specification_sha256": sha256(encode(specification))})
@@ -236,12 +243,17 @@ def operation(root, kind, specification, perform):
         seal(root / "failure-traceback.txt", diagnostic[-65536:].encode())
         result = {"status": "failed", "error_type": type(error).__name__, "known_cost": None,
                   "usage_incomplete": True, "details": "see operation logs and native receipts"}
+        if isinstance(error, GrowthInfrastructureError):
+            result["failure_classification"] = "infrastructure"
         if (root / "usage.json").exists():
             result["retained_usage"] = read(root / "usage.json")
         if (root / "accounting.json").exists():
             result["retained_accounting"] = read(root / "accounting.json")
         record(root / "failure.json", result)
-    return record(root / "result.json", result)
+    record(root / "result.json", result)
+    if result.get("failure_classification") == "infrastructure":
+        raise GrowthInfrastructureError(f"infrastructure failure stopped downstream admission: {root}")
+    return result
 
 
 def choose(block, evaluations, generated, criteria):
