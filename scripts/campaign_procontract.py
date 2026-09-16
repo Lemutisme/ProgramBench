@@ -173,6 +173,7 @@ CONTROL_ARTIFACT_NAMES = (
     "procontract-package.json",
     "procontract-preflight.json",
     "procontract-delivery-error.json",
+    "procontract-terminal-error.json",
     "verifier-report.json",
     "procontract-attestation-request.json",
     "procontract-attestation.json",
@@ -5304,7 +5305,7 @@ def _finish_without_delivery(
         diagnostic = str(
             _sanitize_control(str(delivery_error), _all_credential_names(workspace.manifest.credential_env))
         )
-        _write_json(
+        _write_or_verify_json(
             job.job.root / "procontract-delivery-error.json",
             {
                 "version": 1,
@@ -5317,15 +5318,39 @@ def _finish_without_delivery(
                 "diagnostic": diagnostic[:MAX_DELIVERY_DIAGNOSTIC_CHARS],
                 "truncated": len(diagnostic) > MAX_DELIVERY_DIAGNOSTIC_CHARS,
             },
+            "native delivery failure diagnostic",
         )
     try:
         _scan_terminal_credentials(job.job.root, workspace, str(payload["id"]))
     except VanillaError as scan_error:
-        _write_json(job.job.root / "procontract-delivery-error.json", _sanitize_control({
+        # A secondary scan failure must not overwrite the original delivery
+        # diagnostic or discard usage. This receipt grants no delivery status.
+        terminal = job.job.root / "procontract-terminal-error.json"
+        primary = job.job.root / "procontract-delivery-error.json"
+        names = _all_credential_names(workspace.manifest.credential_env)
+        diagnostic = str(_sanitize_control(str(scan_error), names))
+        cost = str(usage.cost) if usage.cost or any(not turn.usage_incomplete for turn in usage.turns) else None
+        _write_or_verify_json(terminal, _sanitize_control({
             "version": 1, "phase": state.phase, "contractID": payload["id"],
+            "sessionID": execution["sessionID"], "commandIdentity": command_identity,
+            "processGeneration": state.process_generation, "resetAt": state.reset_at,
+            "containerID": workspace.container_id,
+            "issueHash": _sha256(job.job.root / "procontract-issue.json"),
+            "containerStopped": True, "deliveryAccepted": False,
             "primaryCompletion": completion.value, "primaryError": error,
-            "errorType": type(scan_error).__name__, "diagnostic": str(scan_error)[:MAX_DELIVERY_DIAGNOSTIC_CHARS],
-        }, _all_credential_names(workspace.manifest.credential_env)))
+            "primaryDiagnosticSHA256": _sha256(primary) if primary.is_file() else None,
+            "errorType": type(scan_error).__name__, "diagnostic": diagnostic[:MAX_DELIVERY_DIAGNOSTIC_CHARS],
+            "truncated": len(diagnostic) > MAX_DELIVERY_DIAGNOSTIC_CHARS,
+            "usage": {"cost": cost,
+                      "provider_turns": max(usage.provider_turns, int(execution.get("turnsUsed", 0))),
+                      "actions": max(actions, int(execution.get("actionsUsed", 0))),
+                      "usage_incomplete": (usage_incomplete or usage.usage_incomplete or cost is None
+                                           or usage.provider_turns < int(execution.get("turnsUsed", 0)))},
+        }, names), "native terminal failure receipt")
+        state_store.record_artifacts(expected_generation=state.generation, artifact_hashes={
+            terminal.name: _sha256(terminal),
+            **({primary.name: _sha256(primary)} if primary.is_file() else {}),
+        })
         raise
     discharge_path = job.job.root / "procontract-discharge.json"
     effective_contract = contract

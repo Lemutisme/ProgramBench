@@ -845,7 +845,15 @@ def independent_scores(campaign, specification, exit_codes, metadata, expected_c
 
 
 def native_accounting(root):
-    result = read(root / "procontract-result.json") if (root / "procontract-result.json").is_file() else {}
+    present = (root / "procontract-result.json").is_file()
+    result = read(root / "procontract-result.json") if present else {}
+    accounting_source = "native-result" if present else "unavailable"
+    if not present and (root / "procontract-terminal-error.json").exists():
+        try:
+            result = terminal_failure_accounting(root)
+            accounting_source = "terminal-error-receipt"
+        except (OSError, ValueError, TypeError, KeyError, ArithmeticError):
+            accounting_source = "unavailable-terminal-error-receipt"
     ledger = root / "workspace-state/provider-control/requests.db"
     gateway = {"present": ledger.is_file()}
     if ledger.is_file():
@@ -862,7 +870,55 @@ def native_accounting(root):
     return {"known_cost": result.get("cost"), "usage_incomplete": result.get("usage_incomplete"),
             "completion": result.get("completion"), "gateway": gateway,
             "provider_turns": result.get("provider_turns"), "actions": result.get("actions"),
+            "accounting_source": accounting_source,
             "accounting_note": "Native known cost and gateway requests overlap; unknown usage is never zero-filled"}
+
+
+def terminal_failure_accounting(root):
+    """Recover only usage from an issuer-bound failed finalization, never a score."""
+    path = root / "procontract-terminal-error.json"
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("terminal failure receipt is not a regular file")
+    data = path.read_bytes()
+    receipt = json.loads(data)
+    state = read(root / "state.json")
+    issue = (root / "procontract-issue.json").read_bytes()
+    declared = json.loads(issue)
+    if (not isinstance(receipt, dict) or not isinstance(state, dict)
+            or not isinstance(state.get("artifact_hashes"), dict)
+            or not isinstance(declared, dict) or not isinstance(declared.get("payload"), dict)):
+        raise ValueError("terminal failure binding is malformed")
+    if (receipt.get("version") != 1 or receipt.get("deliveryAccepted") is not False
+            or receipt.get("containerStopped") is not True
+            or state.get("phase") not in {"failed", "interrupted"}
+            or receipt.get("phase") not in {"executing", "frozen", "packaged", "preflighted"}
+            or type(receipt.get("processGeneration")) is not int
+            or receipt["processGeneration"] != state.get("process_generation")
+            or receipt.get("resetAt") != state.get("reset_at")
+            or receipt.get("containerID") not in state.get("container_ids", [])
+            or not isinstance(receipt.get("sessionID"), str) or not receipt["sessionID"]
+            or state.get("artifact_hashes", {}).get(path.name) != sha256(data)
+            or not receipt.get("commandIdentity")
+            or receipt["commandIdentity"] != state.get("command_identity")
+            or receipt.get("issueHash") != sha256(issue)
+            or receipt.get("contractID") != declared["payload"].get("id")):
+        raise ValueError("terminal failure receipt is unbound")
+    primary = receipt.get("primaryDiagnosticSHA256")
+    if primary is not None:
+        path = root / "procontract-delivery-error.json"
+        if (path.is_symlink() or not path.is_file() or sha256(path.read_bytes()) != primary
+                or state.get("artifact_hashes", {}).get(path.name) != primary):
+            raise ValueError("primary failure diagnostic changed")
+    usage = receipt["usage"]
+    if not isinstance(usage, dict):
+        raise ValueError("terminal failure usage is malformed")
+    cost = None if usage.get("cost") is None else Decimal(usage["cost"]) if isinstance(usage["cost"], str) else Decimal("NaN")
+    if (cost is None and usage.get("usage_incomplete") is not True
+            or cost is not None and (not cost.is_finite() or cost < 0)
+            or type(usage.get("usage_incomplete")) is not bool
+            or any(type(usage.get(key)) is not int or usage[key] < 0 for key in ("provider_turns", "actions"))):
+        raise ValueError("terminal failure usage is invalid")
+    return {**usage, "completion": "terminal_scan_failed"}
 
 
 def closed_feedback(study, root, generation):

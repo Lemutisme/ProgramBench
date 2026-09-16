@@ -4579,9 +4579,105 @@ def test_native_failure_scans_published_subject_credentials_before_terminal_resu
     assert _tree_identity(workspace.candidate) == before
     assert Path(workspace.manifest.subject_dir).joinpath("private.log").read_text() == secret
     assert not paths.root.joinpath("procontract-result.json").exists()
-    diagnostic = json.loads((paths.root / "procontract-delivery-error.json").read_text())
+    diagnostic = json.loads((paths.root / "procontract-terminal-error.json").read_text())
     assert diagnostic["primaryCompletion"] == "challenged"
     assert diagnostic["errorType"] == "CredentialLeakError"
+    assert diagnostic["primaryDiagnosticSHA256"] is None
+    assert diagnostic["deliveryAccepted"] is False
+
+
+@pytest.mark.parametrize("usage_case", ["complete", "zero", "partial", "absent"])
+def test_terminal_scan_keeps_primary_diagnostic_and_bound_accounting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, usage_case: str
+) -> None:
+    from programbench.candidate import CandidateError
+    from scripts.campaign_freeze import CredentialLeakError
+    from scripts.campaign_procontract import build_issue_payload, run_procontract
+    from scripts.growth_native import native_accounting
+
+    secret = "isolated-test-control-credential"
+    monkeypatch.setenv("OPENCODE_SERVER_PASSWORD", secret)
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    store = _state(paths)
+    _, workspace = _workspace(tmp_path, paths, contained=True)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock())
+
+    class AccountingApi(FakeApi):
+        def messages(self, session_id: str) -> dict[str, object]:
+            if usage_case == "absent":
+                return {"data": []}
+            messages = _settlement_messages(terminal=True)
+            messages["data"][0]["content"] = []
+            if usage_case == "zero":
+                messages["data"][0]["cost"] = 0
+            if usage_case == "partial":
+                messages["data"].append({"id": "msg_missing_usage", "type": "assistant", "content": [],
+                                         "finish": "error", "time": {"created": 100002, "completed": 100003}})
+            return messages
+
+    api = AccountingApi(_contract(payload), _execution(payload))
+
+    def preflight(archive: Path, iid: str) -> SimpleNamespace:
+        subject = Path(workspace.manifest.subject_dir)
+        subject.chmod(0o755)
+        (subject / "private.log").write_text(secret)
+        raise CandidateError("primary preflight diagnostic " + secret)
+
+    with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+        workspace.lease._handle_active = True
+        with pytest.raises(CredentialLeakError):
+            run_procontract(job, store, workspace, model="openai/gpt-5.6-luna", variant="max",
+                limits=_limits(), breaker=CircuitBreaker(), api=api, clock=clock, sleeper=clock.sleep,
+                package=lambda subject, run_dir, iid: _package(run_dir, iid), preflight=preflight)
+
+    primary_path = paths.root / "procontract-delivery-error.json"
+    terminal_path = paths.root / "procontract-terminal-error.json"
+    primary = json.loads(primary_path.read_text())
+    terminal = json.loads(terminal_path.read_text())
+    assert primary["errorType"] == "CandidateError"
+    assert primary["diagnostic"] == "primary preflight diagnostic [REDACTED]"
+    assert primary["specHash"] == api.contract["specHash"]
+    assert terminal["errorType"] == "CredentialLeakError"
+    assert terminal["primaryCompletion"] == "delivery_failed"
+    assert terminal["primaryDiagnosticSHA256"] == _file_hash(primary_path)
+    assert terminal["containerStopped"] is True and terminal["deliveryAccepted"] is False
+    assert secret not in primary_path.read_text() + terminal_path.read_text()
+    assert not (paths.root / "procontract-result.json").exists()
+    assert (Path(workspace.manifest.subject_dir) / "private.log").read_text() == secret
+    assert api.attestations == [] and workspace.stops == 1
+    for path in (primary_path, terminal_path):
+        assert store.read().artifact_hashes[path.name] == _file_hash(path)
+
+    assert native_accounting(paths.root)["known_cost"] is None
+    state = store.read()
+    store.transition("failed", command_identity=state.command_identity, expected_generation=state.generation,
+                     exit_class="execution_failed")
+    accounting = native_accounting(paths.root)
+    assert accounting["known_cost"] == (None if usage_case == "absent" else "0" if usage_case == "zero" else "2")
+    assert accounting["usage_incomplete"] is (usage_case in {"partial", "absent"})
+    assert accounting["provider_turns"] == (2 if usage_case == "partial" else 1)
+    assert accounting["completion"] == "terminal_scan_failed"
+    assert accounting["accounting_source"] == "terminal-error-receipt"
+
+    (paths.root / "procontract-result.json").write_text("{}")
+    assert native_accounting(paths.root)["accounting_source"] == "native-result"
+    assert native_accounting(paths.root)["known_cost"] is None
+    (paths.root / "procontract-result.json").unlink()
+
+    primary_path.write_text(primary_path.read_text() + "\n")
+    unbound = native_accounting(paths.root)
+    assert unbound["known_cost"] is None
+    assert unbound["accounting_source"] == "unavailable-terminal-error-receipt"
+    primary_path.write_text(primary_path.read_text().removesuffix("\n"))
+    state = store.reset_for_rerun(redo=True, retry_infra=False, expected_generation=store.read().generation)
+    assert native_accounting(paths.root)["known_cost"] is None
+    state = store.begin_process(expected_generation=state.generation, pid=123)
+    store.transition("failed", command_identity=state.command_identity, expected_generation=state.generation,
+                     exit_class="execution_failed")
+    assert native_accounting(paths.root)["known_cost"] is None
+    assert _file_hash(terminal_path) == state.artifact_hashes[terminal_path.name]
 
 
 def test_verification_ignores_unpublished_probe_credentials(
