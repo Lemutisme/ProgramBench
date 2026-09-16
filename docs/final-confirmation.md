@@ -51,8 +51,56 @@ The trusted external owner explicitly initializes one SQLite registry and retain
 
 Tests exercise real multiprocess concurrency, process exit after commit, missing/corrupt registries, damaged allocation high-water marks, changed registration inputs, and malformed schedules. They use synthetic manifests and catalogs; no real final attempt is allocated. Manifest envelope checks are not recursive `validate_revision` qualification, and a hash-bound catalog is not by itself proof that the catalog is official. Actual configuration/deadline enforcement remains external. The registry cannot detect a privileged owner restoring a consistent old backup or creating a separate ledger; retaining the single authoritative registry is an external trust requirement.
 
+## Execute registered pairs without exposing partial quality
+
+`scripts.growth_final_execution.run` consumes an `execution.json` binding an already committed registry receipt,
+the frozen registration, and all 800 native specifications. Each entry binds its full registered slot, the unique
+relative output `slots/000001` through `slots/000800`, one task, and the exact revision assigned to that arm.
+The original absolute root and registry identity are retained in `invocation.json`; moving files to another root
+does not authorize another native campaign.
+
+Each active task/repeat block owns two worker positions until both arms finish. The two arms are submitted in
+registered position order; this defines host dispatch order, not provider arrival, first-token or tool order.
+Execution uses the existing `growth_loop.operation`, `ProgramBenchBackend.evaluate` and cached-result
+revalidation. It adds no provider loop, solver-turn limit or cost cap. A required external `qualify(slot, spec,
+output)` callback must recheck the actual native inputs before admission and cached-result use. Registration's
+manifest envelope is insufficient for that check. The backend must use the same root's cancellation signal.
+
+The cohort lock remains held until owned workers finish cancellation cleanup. Infrastructure faults stop further
+admission and preserve their cause separately from user cancellation. Durable halt records and registry
+cancellation/failure events prevent removing `CANCEL` from silently reauthorizing work. An admitted operation
+without a result remains ambiguous; neither a cancellation marker nor a caller-supplied closed flag permits
+a solver rerun. A canonical operation failure stays closed and invalid. A prior execution-error marker blocks
+ordinary cache acceptance; this path does not implement the separately specified evaluation-only recovery.
+Progress and execution inventories expose only states and counts, never scores or available-only means.
+
+## Collect the complete cohort with exact official counts
+
+`scripts.growth_final_collect.collect` shares the execution lock and verifies the externally designated execution
+hash, committed registration and original absolute root. It first checks the presence of all 800 original result
+files. If any is missing, it returns counts without reading even one result file. Once all are present, it checks
+all slot/specification/admission identities and calls the trusted qualifier before opening any scores.
+
+The collector preserves the initial identity hashes and rechecks them before reading results and before publishing.
+It also rejects callbacks that mutate frozen arguments, subsequent execution-error markers, changed invocation
+identity, and results that differ from the trusted backend's independent revalidation. Each valid row must retain
+the exact integer `resolved` and `total`, consistent with the official numeric score. Canonical operation failures
+and official invalid evaluations supply no score. Retained costs remain separate from their completeness flags;
+missing, malformed or incomplete gateway observations cannot prove complete accounting.
+
+After all checks pass, `disclosure/scalars.json` contains the analyzer's exact-count input, `accounting.json`
+preserves per-slot known costs and uncertainty, and `receipt.json` binds the consumed operation artifacts and
+collector source. Exact repeated collection verifies these files rather than replacing them. This is a collection
+receipt, not approval or a numerical performance decision. The caller and filesystem owner must continue to
+protect the underlying per-operation score files from researchers and solvers before disclosure.
+
+Neither module has a launch CLI. Synthetic callbacks/backends in their tests qualify scheduling and collection
+behavior only; they do not authenticate a real catalog, frozen model/runtime configuration, or actual deadline
+enforcement. The native integration and its external authority must be qualified before these components are
+used in a real final attempt.
+
 ## Work still required before an actual final attempt
 
-A complete final execution path still needs the bound official catalog and evaluator inventory, qualified candidate and baseline, resource configuration, original six-hour deadline verification, a scheduler executing the registered pair order, actual lifecycle/closure receipts, raw result retention with a full-cohort disclosure barrier, and a tested evaluation-only recovery path. All 800 assignments and all failed/cancelled attempts must remain in the external accounting.
+A complete final execution path still needs the bound official catalog and evaluator inventory, qualified candidate and baseline, resource configuration, original six-hour deadline verification, the trusted native qualification adapter and real lifecycle/cleanup verification for these components, protected raw-result storage, and a tested evaluation-only recovery path. All 800 assignments and all failed/cancelled attempts must remain in the external accounting. Collection of a complete cohort is not a full accounting of all prior research or final attempts.
 
 No final attempt has been registered or started by this change. Existing running and frozen studies are unchanged. Final adoption still requires independent checks of execution, provenance and the stated inference assumptions in addition to the numerical result.
