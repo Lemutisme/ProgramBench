@@ -84,6 +84,40 @@ def frozen_input(value):
     return data
 
 
+def generator_context_input(study):
+    """Publish explicitly selected build inputs, without exposing qualification files."""
+    context = frozen_input(study["generator"]["context"])
+    names = study["generator"].get("build_context_dependencies")
+    if names is None:
+        return context
+    if (study.get("version") != 2 or not isinstance(names, list) or not names
+            or any(not isinstance(name, str) for name in names) or len(set(names)) != len(names)):
+        raise GrowthError("build context requires distinct dependency names for a full AgentRevision study")
+    from scripts.agent_revision import artifact_bytes
+    recipe = study["revision_recipe"]
+    inputs = []
+    for name in names:
+        if name not in recipe["dependencies"]:
+            raise GrowthError("build context names a file outside the frozen recipe dependencies")
+        reference = recipe["dependencies"][name]
+        data = artifact_bytes(reference, 65536)
+        try:
+            source = data.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise GrowthError("build context dependency must be UTF-8 source") from error
+        if "\0" in source:
+            raise GrowthError("build context dependency must be text without NUL")
+        inputs.append({"dependency": name, "sha256": reference["sha256"], "bytes": len(data), "source": source})
+    publication = {"recipe_sha256": sha256(encode(recipe)), "build": recipe["build"], "inputs": inputs,
+        "scope": "Exact externally frozen build inputs, not editable candidate source. Build-time defines can override runtime defaults. "
+                 "A file being loaded by a build does not prove that its code executes in the native Contract path. "
+                 "Trace the relevant production call path and configuration before proposing a mechanism. "
+                 "Only explicitly selected dependency contents are included; qualification and evaluator files are not automatically exposed."}
+    if len(encode(publication)) > 131072:
+        raise GrowthError("build context exceeds its context transport size")
+    return context + b"\n\nFrozen build context:\n" + encode(publication)
+
+
 def evaluator_environment(study):
     """Bind offline scoring dependencies before any native work is admitted."""
     evaluator = study.get("evaluator", {})
@@ -214,13 +248,13 @@ def freeze(study_path, root):
     # All caller-controlled bytes become immutable before any candidate runs.
     record(root / "study.json", study)
     seal(root / "config.yaml", config_data)
-    seal(root / "generator-context.txt", frozen_input(study["generator"]["context"]))
+    seal(root / "generator-context.txt", generator_context_input(study))
     seal(root / "metadata.json", frozen_input(study["metadata"]))
     initial = revision_binding(study["initial"]["agent_revision"], study["revision_recipe"]) if system else {
         key: policy(root, frozen_input(value)) for key, value in study["initial"].items()
     }
     code = {name: sha256(Path(__file__).with_name(name).read_bytes())
-            for name in ("growth_loop.py", "growth_native.py", "growth_feedback.py",
+            for name in ("growth_loop.py", "growth_native.py", "growth_feedback.py", "growth_submission_feedback.py",
                          *(("growth_compare.py",) if comparison else ()),
                          *(("agent_revision.py", "campaign_install.py", "run_opencode.py", "campaign_runner.py",
                             "campaign_experiments.py", "campaign_offline.py", "campaign_workspace.py") if system else ()),

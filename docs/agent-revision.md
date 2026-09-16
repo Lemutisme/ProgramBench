@@ -54,7 +54,48 @@ The generator receives a copied, independently verified source tree with a new
 local Git index. Its source view includes tracked files ignored by `.gitignore`
 and safe relative symlinks. It receives neither host Git metadata nor the
 issuer's study, score or adoption files as writable mounts. Archived revision
-feedback strips host paths and build/check details.
+feedback strips host paths and build/check details. New studies can separately
+publish selected build source and delivered development programs as described below.
+
+## Give the improver the evidence needed to locate an executable change
+
+Two independent opt-ins extend generator input:
+
+```json
+{
+  "generator": {
+    "build_context_dependencies": ["trusted-build.ts"]
+  },
+  "feedback": {
+    "submitted_sources": true
+  }
+}
+```
+
+These are additions to the ordinary generator and feedback objects. The first
+field names explicitly selected UTF-8 dependencies in the frozen build recipe.
+Their exact source, hashes and build command enter `generator-context.txt` at
+freeze time. This makes compile-time overrides visible without changing the
+recipe or granting the candidate permission to edit it. Unselected dependencies
+and qualification contents are not automatically published. A module appearing
+in a bundle still does not establish that the native Contract calls it.
+
+The second field adds a separate submitted-program archive to each verified,
+closed development feedback source. It binds the original package to the native
+delivery and publishes the exact archive, complete member index and bounded
+`compile.sh` preview. The generator sees program identities and archive read
+locations inline. These are the programs produced for development tasks, distinct
+from `/candidate/agent-source`, which contains the Agent implementation.
+Archive links remain metadata; publication never extracts or executes them.
+Undelivered and unavailable programs retain explicit availability records.
+Original tool bundles keep their three-file format and are not rewritten.
+
+Without the opt-ins, the previous generator input is preserved. Both features
+change information supplied to the improver; neither demonstrates higher task
+scores. Confirm the generated change reaches the actual native call path, then
+compare complete descendants against the same-condition incumbent on development
+and independent confirmation tasks. Keep context transport limits distinct from
+the unchanged six-hour deadline-only execution budget.
 
 ## External build and execution boundary
 
