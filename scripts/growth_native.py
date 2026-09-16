@@ -858,8 +858,19 @@ def independent_scores(campaign, specification, exit_codes, metadata, expected_c
 
 def native_accounting(root):
     present = (root / "procontract-result.json").is_file()
-    result = read(root / "procontract-result.json") if present else {}
-    accounting_source = "native-result" if present else "unavailable"
+    result = {}
+    accounting_source = "unavailable"
+    error_type = None
+    if present:
+        try:
+            result = read(root / "procontract-result.json")
+            if not isinstance(result, dict):
+                raise ValueError("native result is not an object")
+            accounting_source = "native-result"
+        except (OSError, ValueError, TypeError) as error:
+            result = {}
+            accounting_source = "unavailable-native-result"
+            error_type = type(error).__name__
     if not present and (root / "procontract-terminal-error.json").exists():
         try:
             result = terminal_failure_accounting(root)
@@ -879,11 +890,23 @@ def native_accounting(root):
                 connection.close()
         except (sqlite3.Error, OSError):
             gateway["unreadable"] = True
-    return {"known_cost": result.get("cost"), "usage_incomplete": result.get("usage_incomplete"),
+    accounting = {"known_cost": result.get("cost"), "usage_incomplete": result.get("usage_incomplete"),
+            "native_usage_incomplete": result.get("usage_incomplete"),
             "completion": result.get("completion"), "gateway": gateway,
             "provider_turns": result.get("provider_turns"), "actions": result.get("actions"),
-            "accounting_source": accounting_source,
+            "accounting_source": accounting_source, "accounting_error_type": error_type,
             "accounting_note": "Native known cost and gateway requests overlap; unknown usage is never zero-filled"}
+    return {**accounting, "usage_incomplete": accounting_incomplete(accounting)}
+
+
+def accounting_incomplete(accounting):
+    """Native completeness cannot close a retained gateway usage gap."""
+    gateway = accounting.get("gateway")
+    if gateway is None:
+        gateway = {}
+    return (accounting.get("usage_incomplete") is not False
+            or not isinstance(gateway, dict) or gateway.get("unreadable") is True
+            or bool(gateway.get("open")) or bool(gateway.get("missing_usage")))
 
 
 def terminal_failure_accounting(root):

@@ -64,7 +64,7 @@ def freeze_compare(study_path, root):
 
 def inventory(root, slots):
     """Keep every allocation and unknown cost, including interrupted backend work."""
-    from scripts.growth_native import native_accounting
+    from scripts.growth_native import accounting_incomplete, native_accounting
 
     rows = []
     for slot in slots:
@@ -85,7 +85,7 @@ def inventory(root, slots):
                     accounting = {"accounting_source": "unavailable", "usage_incomplete": True}
             accounting = {key: (accounting or {}).get(key) for key in (
                 "known_cost", "usage_incomplete", "gateway", "provider_turns", "actions", "completion",
-                "accounting_source", "accounting_note",
+                "accounting_source", "accounting_note", "native_usage_incomplete", "accounting_error_type",
             )}
             cost = accounting["known_cost"]
             try:
@@ -99,7 +99,7 @@ def inventory(root, slots):
                 "score_status": observed.get("status") if observed else None,
                 "canonical_result_sha256": sha256(encode(result)) if result else None,
                 "known_cost": str(amount) if valid_cost else None,
-                "usage_incomplete": accounting["usage_incomplete"] is not False or not valid_cost,
+                "usage_incomplete": accounting_incomplete(accounting) or not valid_cost,
                 "accounting": accounting,
             })
     started_rows = [row for row in rows if row["execution"] != "not-started"]
