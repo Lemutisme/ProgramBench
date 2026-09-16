@@ -109,12 +109,19 @@ def freeze(study_path, root):
     from scripts.campaign_admission import study_disk_minimum
     study_disk_minimum(study)
     system = study.get("version") == 2
-    if study.get("version") not in {1, 2} or study.get("mode") not in {"recursive", "fixed-generator"}:
+    comparison = study.get("mode") == "external-comparison"
+    if study.get("version") not in {1, 2} or study.get("mode") not in {"recursive", "fixed-generator", "external-comparison"}:
         raise GrowthError("study requires a supported version and explicit control arm")
+    external = None
+    if comparison:
+        from scripts.growth_compare import validate_comparison
+        external = validate_comparison(study)
+    elif "comparison" in study:
+        raise GrowthError("comparison protocol requires external-comparison mode")
     if system:
         from scripts.agent_revision import validate_recipe
         validate_recipe(study["revision_recipe"])
-        if study.get("mode") != "recursive" or study.get("mutable_objects") != ["agent_revision"]:
+        if study.get("mode") not in {"recursive", "external-comparison"} or study.get("mutable_objects") != ["agent_revision"]:
             raise GrowthError("version 2 evolves one complete agent_revision per proposal")
         if set(study.get("initial", {})) != {"agent_revision"}:
             raise GrowthError("version 2 requires one qualified initial AgentRevision")
@@ -214,11 +221,15 @@ def freeze(study_path, root):
     }
     code = {name: sha256(Path(__file__).with_name(name).read_bytes())
             for name in ("growth_loop.py", "growth_native.py", "growth_feedback.py",
+                         *(("growth_compare.py",) if comparison else ()),
                          *(("agent_revision.py", "campaign_install.py", "run_opencode.py", "campaign_runner.py",
                             "campaign_experiments.py", "campaign_offline.py", "campaign_workspace.py") if system else ()),
                          *(("campaign_admission.py",) if study.get("infrastructure_guard") is not None else ()))}
     record(root / "frozen.json", {"study_sha256": sha256(encode(study)), "initial": initial,
-                                 "controller_sources": code, "scope": "agent-system" if system else "policy-text-only"})
+                                 "controller_sources": code,
+                                 "scope": "external-revision-comparison" if comparison else "agent-system" if system else "policy-text-only",
+                                 **({"external_subjects": external, "native_generation_count": 0,
+                                     "generator_executed": False} if comparison else {})})
     return study, initial
 
 
@@ -257,7 +268,7 @@ def operation(root, kind, specification, perform):
     return result
 
 
-def choose(block, evaluations, generated, criteria):
+def choose(block, evaluations, generated, criteria, *, required_status="completed"):
     """Every preassigned instance/repeat remains in the comparison denominator."""
     coordinates = [(task, seed) for task in block["instances"] for seed in block["seeds"]]
     table, exact = {}, {}
@@ -286,7 +297,7 @@ def choose(block, evaluations, generated, criteria):
     winner, best = None, None
     for name, result in generated.items():
         candidate, baseline = table[name], table["incumbent"]
-        if result["status"] != "completed" or not candidate["complete"] or not baseline["complete"]:
+        if result["status"] != required_status or not candidate["complete"] or not baseline["complete"]:
             candidate["decision"] = "reject-incomplete"
             continue
         gain = (sum(exact[name]) - sum(exact["incumbent"])) / len(coordinates)
@@ -346,6 +357,8 @@ def validate_revision_proposal(output, result, binding, recipe):
 
 
 def run(study_path, root, backend=None):
+    if read(study_path).get("mode") == "external-comparison":
+        raise GrowthError("external comparison must use growth_compare; no native generation is assigned")
     root = Path(root).resolve()
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     with (root / ".lock").open("a") as lock:
