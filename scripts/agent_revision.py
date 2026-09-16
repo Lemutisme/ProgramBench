@@ -343,8 +343,8 @@ def _docker(root: Path, phase: str, command: dict, recipe: dict, source: dict,
             "--cap-drop=ALL", "--security-opt=no-new-privileges", "--user", f"{os.getuid()}:{os.getgid()}",
             "--pids-limit", str(recipe.get("pids_limit", 256)), "--memory", f"{recipe.get('memory_mb', 8192)}m",
             "--memory-swap", f"{recipe.get('memory_mb', 8192)}m",
-            "--tmpfs", f"/tmp:rw,nosuid,nodev,mode=1777,size={recipe.get('tmpfs_mb', 8192)}m",
-            "--tmpfs", f"/work:rw,nosuid,nodev,uid={os.getuid()},gid={os.getgid()},mode=0700,size={recipe.get('tmpfs_mb', 8192)}m",
+            "--tmpfs", f"/tmp:rw,exec,nosuid,nodev,mode=1777,size={recipe.get('tmpfs_mb', 8192)}m",
+            "--tmpfs", f"/work:rw,exec,nosuid,nodev,uid={os.getuid()},gid={os.getgid()},mode=0700,size={recipe.get('tmpfs_mb', 8192)}m",
             "--workdir", "/work", "--env", "HOME=/tmp", "--env", "TMPDIR=/tmp",
             "--mount", f"type=bind,src={source['repo']},dst=/source,readonly"]
     if binary is None:

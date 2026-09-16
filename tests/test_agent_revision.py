@@ -8,7 +8,7 @@ import pytest
 import yaml
 
 from scripts.agent_revision import (
-    GrowthError, _git, _links, _path, artifact_bytes, build_revision, changed_components,
+    GrowthError, _docker, _git, _links, _path, artifact_bytes, build_revision, changed_components,
     export_source, freeze_initial, runtime_config, validate_recipe, validate_revision,
 )
 from scripts.growth_loop import encode, seal, sha256
@@ -146,6 +146,49 @@ def test_actual_offline_revision_build_and_independent_qualification(initial, tm
     assert configured["arms"]["procontract"]["revision"] == candidate["source"]["commit"]
     assert configured["limits"] == original["limits"]
     assert original["arms"]["procontract"]["revision"] == "old"
+
+
+@pytest.mark.parametrize("directory", ["/work", "/tmp"])
+@pytest.mark.parametrize("phase", ["build", "check-scratch"])
+def test_scratch_exec_runs_real_scripts_and_native_programs_with_isolation(initial, tmp_path, directory, phase):
+    _, reference, recipe, _ = initial
+    manifest = validate_revision(reference, recipe)
+    program = """import json,os,pathlib,shutil,subprocess
+directory=pathlib.Path(DIRECTORY)
+script=directory/'generated-program'
+script.write_text("#!/bin/sh\\nprintf 'scratch-script-ok\\\\n'\\n")
+script.chmod(0o755)
+mounts={line.split()[1]:set(line.split()[3].split(',')) for line in pathlib.Path('/proc/mounts').read_text().splitlines()}
+if 'noexec' in mounts[DIRECTORY]:
+    print(json.dumps({'directory':DIRECTORY,'noexec':True,'mode':oct(script.stat().st_mode & 0o777)}),flush=True)
+assert subprocess.check_output([str(script)],timeout=5)==b'scratch-script-ok\\n'
+native=directory/'native-program'
+shutil.copyfile('/bin/echo',native)
+native.chmod(0o755)
+assert subprocess.check_output([str(native),'scratch-native-ok'],timeout=5)==b'scratch-native-ok\\n'
+status=dict(line.split(':',1) for line in pathlib.Path('/proc/self/status').read_text().splitlines())
+assert os.getuid()==UID and int(status['CapEff'].strip(),16)==0 and status['NoNewPrivs'].strip()=='1'
+assert 'ro' in mounts['/'] and {'nosuid','nodev'} <= mounts[DIRECTORY] and 'noexec' not in mounts[DIRECTORY]
+assert os.listdir('/sys/class/net')==['lo']
+print(json.dumps({'directory':DIRECTORY,'script':True,'native':True,'uid':os.getuid(),'root_read_only':True,'network_none':True,'capabilities':0,'no_new_privileges':True}))
+""".replace("DIRECTORY", repr(directory)).replace("UID", str(os.getuid()))
+    if phase == "build":
+        program += "shutil.copyfile('/source/agent.sh','/output/opencode')\nos.chmod('/output/opencode',0o755)\n"
+        command = {"argv": ["python3", "-c", program], "timeout_seconds": 30}
+        recipe = recipe | {"build": command}
+    else:
+        command = {"argv": ["python3", "/trusted/check"], "timeout_seconds": 30,
+                   "script": artifact(tmp_path, "scratch-check.py", program.encode()), "name": "scratch"}
+        recipe = recipe | {"qualifications": [command]}
+    validate_recipe(recipe)
+    output = tmp_path / "operation"
+    output.mkdir()
+    receipt = json.loads(artifact_bytes(_docker(output, phase, command, recipe, manifest["source"],
+        manifest["binary"] if phase != "build" else None, lambda: False,
+        runtime_options=manifest["runtime_options_file"] if phase != "build" else None)))
+    assert json.loads(artifact_bytes(receipt["log"])) == {"directory": directory, "script": True, "native": True,
+        "uid": os.getuid(), "root_read_only": True, "network_none": True, "capabilities": 0, "no_new_privileges": True}
+    assert receipt["cleanup_confirmed"] is True and receipt["exit_code"] == 0
 
 
 def test_runtime_options_bind_inheritance_disable_and_qualification_input(initial, tmp_path):

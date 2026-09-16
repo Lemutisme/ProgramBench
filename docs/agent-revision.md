@@ -96,6 +96,9 @@ Build and qualification run in separate Docker containers with no network,
 credentials, Docker socket or writable host mounts. Source and dependencies are
 read-only; build scratch and output use bounded tmpfs. The host streams only the
 specified regular executable as bounded data and qualifies those frozen bytes.
+Scratch `/work` and `/tmp` explicitly allow execution so compilers and native
+checks can run generated programs; both retain `nosuid`, `nodev` and their size
+bounds. The separate output tmpfs keeps its original mount options.
 Timeout, output overflow, failed checks and cancellation retain evidence and
 prevent qualification. Ambiguous builds are not silently rerun.
 
