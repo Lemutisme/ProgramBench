@@ -31,7 +31,7 @@ Run the component with an already closed external table:
 python -m scripts.growth_final_analysis --input closed-scalars.json --output analysis.json
 ```
 
-It refuses to overwrite the output and binds the input and analyzer hashes in the result. The `research` dependency group pins the numerical dependency. Qualification tests use synthetic tasks, including exact-count boundary cases and the prototype's independent near-critical and tiny-variance counterexamples.
+It refuses to overwrite the output and binds the input and analyzer hashes in the result. The `research` dependency group pins the numerical dependency; the `dev` group includes it so normal test collection has the required library. Qualification tests use synthetic tasks, including exact-count boundary cases and the prototype's independent near-critical and tiny-variance counterexamples.
 
 ## Reuse the native execution and scoring boundary
 
@@ -41,8 +41,18 @@ A future final controller can use `ProgramBenchBackend.evaluate` with one assign
 
 The existing `growth_compare.run` is not itself the final controller: it schedules full arms and has D/P screening semantics. Also, `growth_loop.operation` deliberately refuses an ambiguous started operation instead of silently rerunning solver work. Final integration must preserve that behavior and specify any evaluation-only recovery before admission.
 
+## External registration and paired schedule
+
+`scripts.growth_final_registry` binds the two distinct revision manifest hashes, a separately designated 200-ID catalog, analyzer, configuration, model/effort, original six-hour deadline declaration and fixed resource coordinates. `freeze_registration` builds 800 slots in 400 task/repeat blocks: the first repeat's arm order is randomized per task and the second repeat reverses it; each repeat independently shuffles task order. The SHA256/Fisher-Yates algorithm and seed are recorded. They specify scheduling, not deterministic provider sampling.
+
+Registration fixes `score_encoding` to `official-resolved-total-v1`. The future input assembler must enforce it when supplying the count objects described above.
+
+The trusted external owner explicitly initializes one SQLite registry and retains its returned identity across attempts. `register` never creates a missing registry. It checks immutable input hashes, audits the retained allocation chain, and uses a FULL-synchronous transaction to assign `j`. Exact retries recover the same committed receipt, including after the caller loses the response. Cancellation and failure declarations append records without refunding a number. The API returns no launch authority. Reading an old registration again does not authorize restarting cancelled solver work.
+
+Tests exercise real multiprocess concurrency, process exit after commit, missing/corrupt registries, damaged allocation high-water marks, changed registration inputs, and malformed schedules. They use synthetic manifests and catalogs; no real final attempt is allocated. Manifest envelope checks are not recursive `validate_revision` qualification, and a hash-bound catalog is not by itself proof that the catalog is official. Actual configuration/deadline enforcement remains external. The registry cannot detect a privileged owner restoring a consistent old backup or creating a separate ledger; retaining the single authoritative registry is an external trust requirement.
+
 ## Work still required before an actual final attempt
 
-Registration/schedule components are under separate implementation. A complete final execution path still needs the bound official catalog and evaluator inventory, qualified candidate and baseline, resource configuration, original six-hour deadline verification, a scheduler using the registered pair order, raw result retention with a full-cohort disclosure barrier, and a tested evaluation-only recovery path. All 800 assignments and all failed/cancelled attempts must remain in the external accounting.
+A complete final execution path still needs the bound official catalog and evaluator inventory, qualified candidate and baseline, resource configuration, original six-hour deadline verification, a scheduler executing the registered pair order, actual lifecycle/closure receipts, raw result retention with a full-cohort disclosure barrier, and a tested evaluation-only recovery path. All 800 assignments and all failed/cancelled attempts must remain in the external accounting.
 
 No final attempt has been registered or started by this change. Existing running and frozen studies are unchanged. Final adoption still requires independent checks of execution, provenance and the stated inference assumptions in addition to the numerical result.

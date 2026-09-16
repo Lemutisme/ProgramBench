@@ -381,6 +381,7 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "mpmath" },
     { name = "pytest" },
     { name = "pytest-rerunfailures" },
     { name = "pytest-timeout" },
@@ -404,6 +405,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "mpmath", specifier = "==1.4.1" },
     { name = "pytest", specifier = "==8.4.2" },
     { name = "pytest-rerunfailures", specifier = "==16.1" },
     { name = "pytest-timeout", specifier = "==2.4.0" },
