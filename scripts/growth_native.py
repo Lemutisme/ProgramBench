@@ -96,7 +96,8 @@ env={'PATH':'/usr/local/bin:/usr/bin:/bin','HOME':'/tmp','GIT_CONFIG_GLOBAL':'/d
  'GIT_AUTHOR_NAME':'AgentRevision','GIT_AUTHOR_EMAIL':'revision@localhost','GIT_COMMITTER_NAME':'AgentRevision',
  'GIT_COMMITTER_EMAIL':'revision@localhost','GIT_AUTHOR_DATE':'2000-01-01T00:00:00+00:00','GIT_COMMITTER_DATE':'2000-01-01T00:00:00+00:00'}
 for args in [['init','-q'],['add','--force','--all'],['commit','-q','--allow-empty','-m','Frozen parent source']]:
- subprocess.run(['git','-c','core.hooksPath=/dev/null','-c','commit.gpgsign=false','-c','core.autocrlf=false',*args],
+ subprocess.run(['git','-c','core.hooksPath=/dev/null','-c','commit.gpgsign=false','-c','core.autocrlf=false',
+  '-c','gc.auto=0','-c','maintenance.auto=false',*args],
   cwd=root,env=env,check=True,timeout=60)
 tracked=subprocess.check_output(['git','ls-files','-z'],cwd=root,env=env,timeout=60)
 assert set(tracked.decode().rstrip('\\0').split('\\0'))==set(expected)

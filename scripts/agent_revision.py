@@ -115,6 +115,8 @@ def _git(repo: Path, *arguments: str, data: bytes | None = None) -> bytes:
                    "GIT_COMMITTER_NAME": "Agent Revision", "GIT_COMMITTER_EMAIL": "revision@localhost",
                    "GIT_AUTHOR_DATE": "2000-01-01T00:00:00+0000", "GIT_COMMITTER_DATE": "2000-01-01T00:00:00+0000"}
     result = subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+                             # Detached maintenance can delete loose objects while the build copies this tree.
+                             "-c", "gc.auto=0", "-c", "maintenance.auto=false",
                              "-c", "protocol.file.allow=never", *arguments], cwd=repo, input=data,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment, timeout=120)
     if result.returncode:

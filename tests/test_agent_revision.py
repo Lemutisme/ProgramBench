@@ -7,7 +7,7 @@ import subprocess
 import pytest
 
 from scripts.agent_revision import (
-    GrowthError, _links, _path, artifact_bytes, build_revision, changed_components,
+    GrowthError, _git, _links, _path, artifact_bytes, build_revision, changed_components,
     export_source, freeze_initial, runtime_config, validate_recipe, validate_revision,
 )
 from scripts.growth_loop import encode, seal, sha256
@@ -21,6 +21,35 @@ def artifact(root, name, data):
 
 def git(repo, *args):
     return subprocess.check_output(["git", "-c", "core.hooksPath=/dev/null", *args], cwd=repo).decode().strip()
+
+
+@pytest.mark.parametrize("maintenance", ["gc", "loose-objects"])
+def test_trusted_git_does_not_start_maintenance_before_source_copy(tmp_path, maintenance):
+    repo = tmp_path / "source"
+    repo.mkdir()
+    _git(repo, "init", "--quiet")
+    # Keep the unprotected control synchronous so this regression needs no sleeps.
+    for key, value in {"gc.auto": "1", "gc.autoDetach": "false", "maintenance.auto": "true",
+                       "maintenance.autoDetach": "false", "maintenance.gc.enabled": str(maintenance == "gc").lower(),
+                       "maintenance.loose-objects.enabled": str(maintenance == "loose-objects").lower(),
+                       "maintenance.loose-objects.auto": "1"}.items():
+        git(repo, "config", "--local", key, value)
+    for index in range(1024):
+        (repo / f"item-{index}.txt").write_text(f"Source-copy maintenance regression {index}\n")
+    _git(repo, "add", "--all")
+    _git(repo, "commit", "--quiet", "-m", "Frozen source")
+    tree = _git(repo, "rev-parse", "HEAD^{tree}")
+    assert not list((repo / ".git/objects/pack").iterdir())
+    assert not (repo / ".git/gc.pid").exists()
+    copied = tmp_path / "copied"
+    subprocess.run(["cp", "-a", str(repo), str(copied)], check=True, capture_output=True, timeout=15)
+    assert _git(copied, "rev-parse", "HEAD^{tree}") == tree
+    _git(copied, "fsck", "--full")
+    # The same repository actually packs objects when command-level protection is absent.
+    git(repo, "-c", "user.name=Fixture", "-c", "user.email=fixture@localhost", "commit",
+        "--quiet", "--allow-empty", "-m", "Unprotected maintenance control")
+    assert list((repo / ".git/objects/pack").glob("*.pack"))
+    assert _git(repo, "rev-parse", "HEAD^{tree}") == tree
 
 
 @pytest.fixture(scope="module")
@@ -278,7 +307,13 @@ def test_native_generator_imports_exact_source_without_host_git_metadata(initial
         assert b"FileExistsError" in (tmp_path / "repeat-import/stderr.log").read_bytes()
         assert (tmp_path / "repeat-import/failure.json").is_file()
     finally:
-        subprocess.run(["docker", "rm", "--force", container], capture_output=True, check=True, timeout=30)
+        try:
+            cleaned = subprocess.run(["docker", "exec", "--user", "agent", container, "python3", "-I", "-S", "-c",
+                "import pathlib,shutil; path=pathlib.Path('/candidate/agent-source'); "
+                "shutil.rmtree(path) if path.exists() else None"], capture_output=True, timeout=30)
+        finally:
+            subprocess.run(["docker", "rm", "--force", container], capture_output=True, check=True, timeout=30)
+        assert cleaned.returncode == 0, cleaned.stderr.decode(errors="replace")
 
 
 def test_clean_alternate_head_does_not_requalify_old_source(initial):
