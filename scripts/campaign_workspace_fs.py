@@ -69,7 +69,9 @@ def snapshot_binary(source: Path, destination: Path, expected_sha256: str) -> Pa
     if _sha256(source) != expected_sha256:
         raise WorkspaceFilesystemError("installed binary changed before snapshot")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    mode = 0o444 | (source.stat().st_mode & 0o111)
+    # The task container runs as its own UID; private host artifacts still need
+    # an executable read-only snapshot for that UID.
+    mode = 0o555 if source.stat().st_mode & 0o111 else 0o444
     if destination.exists():
         if (
             destination.is_symlink()

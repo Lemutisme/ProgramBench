@@ -930,6 +930,39 @@ def test_binary_snapshot_rejects_source_replacement_during_copy(
     assert not tmp_path.joinpath("snapshot/opencode").exists()
 
 
+@pytest.mark.parametrize("mode", [0o500, 0o700, 0o750, 0o755, 0o400, 0o600])
+def test_binary_snapshot_permissions_allow_container_uid_without_mutating_source(tmp_path: Path, mode: int) -> None:
+    source = tmp_path / "source"
+    source.write_bytes(b"frozen runtime")
+    source.chmod(mode)
+    expected = hashlib.sha256(source.read_bytes()).hexdigest()
+    destination = tmp_path / "snapshot" / "opencode"
+
+    identity = campaign_workspace_fs.snapshot_binary(source, destination, expected)
+
+    assert destination.read_bytes() == source.read_bytes() == b"frozen runtime"
+    assert stat.S_IMODE(source.stat().st_mode) == mode
+    assert stat.S_IMODE(destination.stat().st_mode) == (0o555 if mode & 0o111 else 0o444)
+    assert campaign_workspace_fs.snapshot_binary(source, destination, expected) == identity
+
+
+def test_binary_snapshot_rejects_existing_owner_only_executable_without_chmod(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.write_bytes(b"frozen runtime")
+    source.chmod(0o500)
+    destination = tmp_path / "snapshot" / "opencode"
+    destination.parent.mkdir()
+    destination.write_bytes(source.read_bytes())
+    destination.chmod(0o544)
+
+    with pytest.raises(campaign_workspace_fs.WorkspaceFilesystemError, match="conflicts"):
+        campaign_workspace_fs.snapshot_binary(source, destination, hashlib.sha256(source.read_bytes()).hexdigest())
+
+    assert stat.S_IMODE(source.stat().st_mode) == 0o500
+    assert stat.S_IMODE(destination.stat().st_mode) == 0o544
+    assert destination.read_bytes() == b"frozen runtime"
+
+
 def test_workspace_rejects_uncontained_or_unclaimed_roots_without_deleting_data(tmp_path: Path) -> None:
     docker = RecordingDocker()
     value = request(tmp_path, docker)
