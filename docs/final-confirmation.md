@@ -85,7 +85,12 @@ The collector preserves the initial identity hashes and rechecks them before rea
 It also rejects callbacks that mutate frozen arguments, subsequent execution-error markers, changed invocation
 identity, and results that differ from the trusted backend's independent revalidation. Each valid row must retain
 the exact integer `resolved` and `total`, consistent with the official numeric score. Canonical operation failures
-and official invalid evaluations supply no score. Retained costs remain separate from their completeness flags;
+and official invalid evaluations supply no score. The native `missing-evaluation` result is also retained as
+an invalid assignment with a null score, preserving all 800 assigned rows, only when its single row has
+`status: missing`, `score: null`, `errors: [comparison_missing]`, and no counts, with the original native
+missing-evaluation envelope, two integer phase exit codes, and incomplete-usage flag. Its operation proof retains this native classification;
+the original result is neither rewritten nor rescored. Other missing shapes and unknown row statuses are rejected.
+Retained costs remain separate from their completeness flags;
 missing, malformed or incomplete gateway observations cannot prove complete accounting.
 
 After all checks pass, `disclosure/scalars.json` contains the analyzer's exact-count input, `accounting.json`

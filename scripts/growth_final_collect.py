@@ -107,9 +107,18 @@ def collect(root, *, registry_ref, backend, qualify, expected_execution_sha256, 
                         or rows[0].get("instance_id") != entry["slot"]["task_id"]):
                     raise GrowthError("revalidated evaluation does not contain its single assigned task")
                 row = rows[0]
-                if row.get("status") not in {"valid", "invalid"}:
+                missing = actual.get("status") == "missing-evaluation" or row.get("status") == "missing"
+                if missing and (set(actual) != {"status", "rows", "exit_codes", "known_cost", "usage_incomplete"}
+                        or actual["status"] != "missing-evaluation" or row.get("status") != "missing"
+                        or not isinstance(actual["exit_codes"], list) or len(actual["exit_codes"]) != 2
+                        or any(type(code) is not int for code in actual["exit_codes"])
+                        or "score" not in row or row["score"] is not None
+                        or row.get("errors") != ["comparison_missing"] or {"resolved", "total"}.intersection(row)
+                        or actual["known_cost"] is not None or actual["usage_incomplete"] is not True):
+                    raise GrowthError("native missing evaluation has an invalid shape")
+                if not missing and row.get("status") not in {"valid", "invalid"}:
                     raise GrowthError("revalidated evaluation has an unknown scoring status")
-                score = {"status": row["status"], "score": None}
+                score = {"status": "invalid" if missing else row["status"], "score": None}
                 if row["status"] == "valid":
                     resolved, total = row.get("resolved"), row.get("total")
                     if (type(resolved) is not int or type(total) is not int or total <= 0
@@ -120,12 +129,17 @@ def collect(root, *, registry_ref, backend, qualify, expected_execution_sha256, 
                 elif row.get("score") is not None:
                     raise GrowthError("invalid evaluation must not carry an official score")
                 usage = _accounting(row)
+                if missing:
+                    usage = {**usage, "usage_incomplete": True}
             table["rows"].append({"task_id": entry["slot"]["task_id"], "arm": entry["slot"]["arm"],
                                   "repeat": entry["slot"]["repeat"], "closed": True, **score})
             accounting.append({"slot": entry["slot"]["slot"], **usage})
             proofs.append({"slot": entry["slot"], "output": entry["output"],
                            "specification_sha256": digest, "result_sha256": sha256(encode(value)),
                            "retained_operation_failure": failed,
+                           **({"native_missing_evaluation": {"status": "missing-evaluation", "row_status": "missing",
+                                                              "errors": ["comparison_missing"]}}
+                              if value.get("status") == "missing-evaluation" else {}),
                            "artifacts": artifacts})
 
         # Recheck the trusted inputs and every consumed result before publication.

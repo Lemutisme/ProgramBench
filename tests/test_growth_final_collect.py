@@ -1,5 +1,6 @@
 from copy import deepcopy
 from decimal import Decimal
+import sqlite3
 
 import pytest
 
@@ -194,6 +195,89 @@ def test_exact_score_validation_and_invalid_retention(cohort):
     usage = read(root / "disclosure/accounting.json")
     assert usage["rows"][0]["known_cost"] is None and usage["usage_incomplete"] is True
     assert Decimal(usage["known_cost_subtotal"]) == Decimal("7.99")
+
+
+@pytest.mark.parametrize("known_cost", [None, "0.25"])
+def test_native_missing_comparison_remains_an_unscored_assignment(cohort, known_cost):
+    from scripts.growth_native import independent_scores
+
+    root, execution, backend, calls, kwargs = cohort
+    populate(root, execution)
+    entry = execution["slots"][0]
+    output = root / entry["output"]
+    campaign = output / "synthetic-campaign"
+    if known_cost is not None:
+        native = campaign / "procontract" / entry["slot"]["task_id"]
+        record(native / "procontract-result.json", {"cost": known_cost, "usage_incomplete": False})
+        ledger = native / "workspace-state/provider-control/requests.db"
+        ledger.parent.mkdir(parents=True)
+        with sqlite3.connect(ledger) as connection:
+            connection.execute("CREATE TABLE request(finished INTEGER,usage TEXT,sent INTEGER,terminal_at INTEGER,peer_pid INTEGER)")
+    value = independent_scores(campaign, entry["specification"], [0, 1], {}, {})
+    assert value["status"] == "missing-evaluation" and value["rows"][0]["status"] == "missing"
+    assert value["rows"][0]["known_cost"] == known_cost
+    assert value["rows"][0]["usage_incomplete"] is (known_cost is None)
+    assert value["usage_incomplete"] is True
+    replace(output / "result.json", value)
+    original = (output / "result.json").read_bytes()
+
+    result = collect(root, **kwargs)
+    table = read(root / "disclosure/scalars.json")
+    assert len(table["rows"]) == len(backend.calls) == len(calls) == 800
+    assert table["rows"][0]["status"] == "invalid" and table["rows"][0]["score"] is None
+    assert sum(row["status"] == "valid" for row in table["rows"]) == 799
+    assert analyze(table)["analysis_status"] == "incomplete_official_scores"
+    assert analyze(table)["numeric_criteria_met"] is False
+    usage = read(root / "disclosure/accounting.json")
+    assert usage["rows"][0]["known_cost"] == known_cost and usage["rows"][0]["usage_incomplete"] is True
+    assert usage["rows"][0]["reported_usage_incomplete"] is (known_cost is None)
+    assert usage["usage_incomplete"] is True
+    assert Decimal(usage["known_cost_subtotal"]) == Decimal("7.99" if known_cost is None else "8.24")
+    receipt = read(root / "disclosure/receipt.json")
+    proof = receipt["operation_proofs"][0]
+    assert proof["native_missing_evaluation"] == {
+        "status": "missing-evaluation", "row_status": "missing", "errors": ["comparison_missing"],
+    }
+    assert proof["result_sha256"] == proof["artifacts"]["result.json"] == sha256(original)
+    assert proof["retained_operation_failure"] is False
+    assert not any("native_missing_evaluation" in proof for proof in receipt["operation_proofs"][1:])
+    assert result["performance_adopted"] is False and result["formal_acceptance_authority"] is False
+    assert (output / "result.json").read_bytes() == original == encode(value)
+    assert not (campaign / "comparison.json").exists()
+
+
+def test_rejects_inconsistent_native_missing_evaluation(cohort):
+    from scripts.growth_native import independent_scores
+
+    root, execution, backend, calls, kwargs = cohort
+    populate(root, execution)
+    entry = execution["slots"][0]
+    output = root / entry["output"]
+    original = independent_scores(output / "synthetic-campaign", entry["specification"], [0, 1], {}, {})
+    changes = [({"status": "completed"}, {}), ({}, {"status": "valid"}), ({}, {"status": "invalid"}),
+               ({}, {"score": 0}), ({}, {"errors": []}), ({}, {"errors": ["different_error"]}),
+               ({}, {"errors": ["comparison_missing", "different_error"]}),
+               ({}, {"resolved": 0, "total": 1}), ({"known_cost": "0"}, {}),
+               ({"usage_incomplete": False}, {}), ({"comparison_sha256": "a" * 64}, {}),
+               ({"status": "completed"}, {"status": "unknown"}),
+               *[({"exit_codes": codes}, {}) for codes in
+                 (None, False, "0,1", [0], [0, 1, 2], [False, 1], [None, 1], ["0", 1], [0, 1.0])]]
+    for outer, inner in changes:
+        value = deepcopy(original)
+        value.update(outer)
+        value["rows"][0].update(inner)
+        replace(output / "result.json", value)
+        with pytest.raises(GrowthError, match="missing evaluation|unknown scoring status"):
+            collect(root, **kwargs)
+        assert (output / "result.json").read_bytes() == encode(value)
+        assert not (root / "disclosure").exists()
+    for missing in ("score", "errors", "known_cost", "usage_incomplete", "exit_codes"):
+        value = deepcopy(original)
+        del (value["rows"][0] if missing in {"score", "errors"} else value)[missing]
+        replace(output / "result.json", value)
+        with pytest.raises(GrowthError, match="missing evaluation"):
+            collect(root, **kwargs)
+        assert not (root / "disclosure").exists()
 
 
 def test_canonical_failure_is_closed_invalid_with_retained_unknowns(cohort):
