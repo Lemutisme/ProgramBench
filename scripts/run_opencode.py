@@ -10,6 +10,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import sys
 import tempfile
 from dataclasses import dataclass, field
@@ -134,7 +135,7 @@ _LIMIT_KEYS = frozenset(
     {"wall_time_seconds", "provider_turns", "procontract_actions", "total_cost_soft", "total_cost_hard"}
 )
 _CACHE_KEYS = frozenset({"warmup_turns", "minimum_read_ratio", "stop_after_consecutive_failures"})
-_ARM_KEYS = frozenset({"repo", "revision", "mode", "binary", "execution_policy", "runtime_protocol", "policy_file", "policy_sha256"})
+_ARM_KEYS = frozenset({"repo", "revision", "mode", "binary", "execution_policy", "runtime_protocol", "policy_file", "policy_sha256", "binary_probe_image"})
 
 
 @dataclass(frozen=True)
@@ -421,6 +422,12 @@ def _load_arms(raw: object, config_dir: Path) -> tuple[ArmConfig, ArmConfig]:
         if not isinstance(revision, str) or not revision:
             raise ConfigError(f"arm {name} revision must be a nonempty string")
         binary = value.get("binary")
+        binary_probe_image = value.get("binary_probe_image")
+        if binary_probe_image is not None and (
+            binary is None or not isinstance(binary_probe_image, str)
+            or not re.fullmatch(r"(?:.+@)?sha256:[0-9a-f]{64}", binary_probe_image)
+        ):
+            raise ConfigError("binary_probe_image requires a supplied binary and digest-pinned image")
         execution_policy = value.get("execution_policy", "behavioral")
         if not isinstance(execution_policy, str) or execution_policy not in {"behavioral", "none", "adaptive", "artifact"} | POLICY_PROFILES:
             raise ConfigError(f"arm {name} execution_policy must be behavioral, none, adaptive, fit, search, or artifact")
@@ -453,6 +460,7 @@ def _load_arms(raw: object, config_dir: Path) -> tuple[ArmConfig, ArmConfig]:
                 execution_policy=execution_policy,
                 runtime_protocol=runtime_protocol,
                 policy_artifact=policy_artifact,
+                binary_probe_image=binary_probe_image,
             )
         )
     return result[0], result[1]
@@ -537,6 +545,7 @@ def _canonical_config(config: CampaignConfig) -> dict[str, object]:
                 "revision": arm.revision,
                 "mode": arm.mode,
                 "binary": str(arm.binary.resolve()) if arm.binary else None,
+                **({"binary_probe_image": arm.binary_probe_image} if arm.binary_probe_image is not None else {}),
                 **({"execution_policy": arm.execution_policy} if arm.execution_policy != "behavioral" else {}),
                 **({"runtime_protocol": arm.runtime_protocol} if arm.runtime_protocol is not None else {}),
                 **({"policy_artifact": arm.policy_artifact.manifest()} if arm.policy_artifact is not None else {}),

@@ -1,5 +1,8 @@
 # Frozen policy search with native candidate generation
 
+This document describes the version-1 policy study. Version 2 supports complete
+externally rebuilt native Agent revisions; see [Executable AgentRevision research](agent-revision.md).
+
 `scripts.growth_loop` runs a small, issuer-owned search loop. A native Contract
 produces policy text, the existing pinned ProgramBench runner evaluates candidate
 and incumbent on reusable development block D. Only its unique finalist proceeds

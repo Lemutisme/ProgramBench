@@ -163,6 +163,18 @@ class ScriptedBackend:
         self.sessions += 1
         return NativeServer(self.binary, directory, output, policy, files, self.uid)
 
+    def validate_evaluation(self, output, specification, result):
+        """Recheck the same independent executable-score receipts on local replay."""
+        from scripts.campaign_policy import load_policy_artifact
+
+        campaign = output / "campaign"
+        artifact = load_policy_artifact(Path(specification["solver_policy"]["path"]), specification["solver_policy"]["sha256"])
+        actual = independent_scores(campaign, specification, [0, 0], read(self.root / "metadata.json"),
+                                    {"arms": {"procontract": {"policy_artifact": artifact.manifest()}}})
+        if encode(actual) != encode(result):
+            raise ValueError("cached native fixture evaluation no longer matches its independent receipts")
+        return actual
+
     def generate(self, output, specification, block):
         index = specification["generation"]
         # First proposal improves pi; the next is a deliberately bad proposal.

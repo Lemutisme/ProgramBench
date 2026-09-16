@@ -52,6 +52,7 @@ class ArmConfig:
     execution_policy: Literal["behavioral", "none", "adaptive", "fit", "search", "artifact"] = "behavioral"
     runtime_protocol: Literal["current", "semantic-v0", "policy-split-v1"] | None = None
     policy_artifact: PolicyArtifact | None = None
+    binary_probe_image: str | None = None
 
 
 @dataclass(frozen=True)
@@ -209,6 +210,17 @@ def prepare_install(arm: ArmConfig, root: Path, run_command: _RunCommand = run_c
     root = root.resolve()
     _mkdir_and_sync(root)
     with _ArmLock(root, arm.name):
+        isolation = root / ".isolation" / f"{arm.name}.json"
+        if isolation.exists() or arm.binary_probe_image is not None:
+            expected = {"image": arm.binary_probe_image, "protocol": "isolated-binary-probes-v1"}
+            if isolation.exists():
+                if isolation.is_symlink() or json.loads(isolation.read_bytes()) != expected:
+                    raise InstallError("binary probe isolation changed during installation reuse")
+            else:
+                _mkdir_and_sync(isolation.parent)
+                _atomic_write_json(isolation, expected)
+        if arm.binary_probe_image is not None:
+            run_command = isolated_binary_probes(arm.binary_probe_image, run_command)
         manifest = root / arm.name / "install.json"
         state_path = _state_path(root, arm.name)
         _require_no_symlink_components(root, manifest.parent, allow_missing_leaf=True)
@@ -1517,6 +1529,43 @@ def _validate_arm(arm: ArmConfig) -> None:
         raise InstallError("revision must be a safe nonempty Git selector")
     if any(character in arm.revision for character in ("\x00", "\n", "\r")):
         raise InstallError("revision must be a safe nonempty Git selector")
+    if arm.binary_probe_image is not None and (
+        arm.binary is None or not re.fullmatch(r"(?:.+@)?sha256:[0-9a-f]{64}", arm.binary_probe_image)
+    ):
+        raise InstallError("isolated binary probes require a supplied binary and digest-pinned image")
+
+
+def isolated_binary_probes(image: str, run_command: _RunCommand = run_checked) -> _RunCommand:
+    """Untrusted supplied runtimes are never executed in the issuer's process namespace."""
+    def run(command: Sequence[str], cwd: Path | None) -> subprocess.CompletedProcess[str]:
+        if command[0] == "git":
+            return _run_optional(run_command, command, cwd, "rev-parse")
+        if len(command) != 2 or command[1] not in {"--version", "models"}:
+            raise InstallError("unexpected host command while installing an untrusted runtime")
+        binary = Path(command[0])
+        if not binary.is_absolute() or not binary.is_file() or binary.is_symlink():
+            raise InstallError("isolated probe requires a regular absolute binary")
+        name = "programbench-probe-" + uuid.uuid4().hex
+        argv = (
+            "docker", "run", "--rm", "--pull=never", "--name", name,
+            "--network=none", "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
+            "--user", f"{os.getuid()}:{os.getgid()}", "--pids-limit=256",
+            "--memory=2048m", "--memory-swap=2048m",
+            "--tmpfs", "/tmp:rw,nosuid,size=128m", "--env", "HOME=/tmp",
+            "--mount", f"type=bind,src={binary},dst=/candidate-runtime,readonly",
+            "--entrypoint", "/candidate-runtime", image, command[1],
+        )
+        try:
+            return _run_optional(run_command, argv, None, "catalog" if command[1] == "models" else "smoke")
+        finally:
+            # Killing a Docker CLI alone does not terminate its container.
+            try:
+                cleanup = _run_optional(run_command, ("docker", "rm", "--force", name), None, "remove")
+            except (InstallError, subprocess.SubprocessError, OSError) as error:
+                raise InstallCleanupError("isolated runtime probe cleanup could not be confirmed") from error
+            if cleanup.returncode and "No such container" not in cleanup.stderr:
+                raise InstallCleanupError("isolated runtime probe container could not be removed")
+    return run
 
 
 def _crash_after(phase: str) -> None:

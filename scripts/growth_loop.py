@@ -102,16 +102,30 @@ def freeze(study_path, root):
     evaluator_environment(study)
     from scripts.growth_feedback import validate_config
     validate_config(study)
-    if study.get("version") != 1 or study.get("mode") not in {"recursive", "fixed-generator"}:
-        raise GrowthError("study requires version 1 and an explicit generator control arm")
-    if study.get("mutable_objects") not in [["solver_policy"], ["solver_policy", "generator_policy"]]:
-        raise GrowthError("only explicit solver/generator policy text search is connected")
-    if set(study.get("initial", {})) != {"solver_policy", "generator_policy"}:
-        raise GrowthError("solver policy pi and generator policy rho require separate initial artifacts")
+    system = study.get("version") == 2
+    if study.get("version") not in {1, 2} or study.get("mode") not in {"recursive", "fixed-generator"}:
+        raise GrowthError("study requires a supported version and explicit control arm")
+    if system:
+        from scripts.agent_revision import validate_recipe
+        validate_recipe(study["revision_recipe"])
+        if study.get("mode") != "recursive" or study.get("mutable_objects") != ["agent_revision"]:
+            raise GrowthError("version 2 evolves one complete agent_revision per proposal")
+        if set(study.get("initial", {})) != {"agent_revision"}:
+            raise GrowthError("version 2 requires one qualified initial AgentRevision")
+        revision_binding(study["initial"]["agent_revision"], study["revision_recipe"])
+    else:
+        if study.get("mutable_objects") not in [["solver_policy"], ["solver_policy", "generator_policy"]]:
+            raise GrowthError("version 1 only supports explicit solver/generator policy text search")
+        if set(study.get("initial", {})) != {"solver_policy", "generator_policy"}:
+            raise GrowthError("solver policy pi and generator policy rho require separate initial artifacts")
     if study.get("criteria", {}).get("missing") != "reject":
         raise GrowthError("missing or invalid assigned scores must prevent adoption")
     for criteria in (study["criteria"], study["confirmation_criteria"]):
-        for key in ("min_mean_gain", "max_task_regression"):
+        if system and set(criteria) != {"min_mean_gain", "missing"}:
+            raise GrowthError("version 2 selects task-equal mean; no implicit per-task regression gate")
+        if criteria.get("missing") != "reject":
+            raise GrowthError("missing or invalid scores must prevent adoption")
+        for key in (("min_mean_gain",) if system else ("min_mean_gain", "max_task_regression")):
             value = criteria[key]
             if type(value) not in {int, float} or not 0 <= value <= 1:
                 raise GrowthError(f"invalid {key}")
@@ -160,9 +174,17 @@ def freeze(study_path, root):
     if config.limits.total_cost_hard is not None or config.limits.total_cost_soft is not None:
         raise GrowthError("new studies must not add a cumulative money cap")
     if config.observations or config.quality:
-        raise GrowthError("this controller evaluates policy text with the unchanged benchmark replay")
+        raise GrowthError("this controller requires the unchanged benchmark replay")
     import yaml
     configured = yaml.safe_load(config_data)
+    if system:
+        from scripts.agent_revision import runtime_config
+        if runtime_config(configured, study["initial"]["agent_revision"], study["revision_recipe"]) != configured:
+            raise GrowthError("initial configuration must exactly bind the qualified AgentRevision")
+        if sha256((runner / "scripts" / "campaign_install.py").read_bytes()) != sha256(
+            Path(__file__).with_name("campaign_install.py").read_bytes()
+        ):
+            raise GrowthError("version 2 runner must include the qualified isolated binary installation path")
     for arm in configured["arms"].values():
         for key in ("repo", "binary", "policy_file"):
             if arm.get(key) is not None and not Path(arm[key]).is_absolute():
@@ -176,11 +198,14 @@ def freeze(study_path, root):
     seal(root / "config.yaml", config_data)
     seal(root / "generator-context.txt", frozen_input(study["generator"]["context"]))
     seal(root / "metadata.json", frozen_input(study["metadata"]))
-    initial = {key: policy(root, frozen_input(value)) for key, value in study["initial"].items()}
+    initial = revision_binding(study["initial"]["agent_revision"], study["revision_recipe"]) if system else {
+        key: policy(root, frozen_input(value)) for key, value in study["initial"].items()
+    }
     code = {name: sha256(Path(__file__).with_name(name).read_bytes())
-            for name in ("growth_loop.py", "growth_native.py", "growth_feedback.py")}
+            for name in ("growth_loop.py", "growth_native.py", "growth_feedback.py",
+                         *(("agent_revision.py", "campaign_install.py", "run_opencode.py", "campaign_runner.py") if system else ()))}
     record(root / "frozen.json", {"study_sha256": sha256(encode(study)), "initial": initial,
-                                 "controller_sources": code, "scope": "policy-text-only"})
+                                 "controller_sources": code, "scope": "agent-system" if system else "policy-text-only"})
     return study, initial
 
 
@@ -249,12 +274,54 @@ def choose(block, evaluations, generated, criteria):
                        for task in block["instances"]}
         candidate.update(mean_gain=float(gain), exact_mean_gain={"numerator": gain.numerator, "denominator": gain.denominator},
                          task_deltas={task: float(value) for task, value in task_deltas.items()})
-        qualifies = gain > Fraction(str(criteria["min_mean_gain"])) and min(task_deltas.values()) >= -Fraction(str(criteria["max_task_regression"]))
+        qualifies = gain > Fraction(str(criteria["min_mean_gain"])) and (
+            "max_task_regression" not in criteria
+            or min(task_deltas.values()) >= -Fraction(str(criteria["max_task_regression"]))
+        )
         candidate["decision"] = "eligible" if qualifies else "reject-performance"
         if qualifies and (best is None or gain > best):
             winner, best = name, gain
     return {"winner": winner, "comparisons": table, "tie_break": "earliest_predeclared_opportunity",
             "evidence_scope": "development solver performance only; generator ability unmeasured"}
+
+
+def revision_binding(reference, recipe):
+    """The host derives policies from the same full revision that owns the runtime."""
+    from scripts.agent_revision import validate_revision
+    revision = validate_revision(reference, recipe)
+    return {"agent_revision": reference, "solver_policy": revision["solver_policy"],
+            "generator_policy": revision["generator_policy"]}
+
+
+def validate_revision_proposal(output, result, binding, recipe):
+    if result["status"] != "completed":
+        return
+    from scripts.agent_revision import validate_revision
+    expected = revision_binding(result["artifacts"]["agent_revision"], recipe)
+    if result["artifacts"] != expected:
+        raise GrowthError("candidate policy/runtime binding differs from its full revision")
+    candidate = validate_revision(expected["agent_revision"], recipe)
+    if candidate["parent"] != binding["agent_revision"]:
+        raise GrowthError("candidate revision does not descend from the assigned parent")
+    if (result.get("parent_revision") != binding["agent_revision"]
+            or result.get("generator_binding") != binding["generator_policy"]
+            or result.get("solver_input") != binding["solver_policy"]
+            or not all(result.get(key) for key in ("contract_id", "session_id", "subject_hash"))):
+        raise GrowthError("complete revision proposal lacks its assigned native generation binding")
+    origin = read(output / "revision-origin.json")
+    if (sha256(encode(origin)) != result.get("revision_origin_sha256")
+            or origin != {"parent_revision": binding["agent_revision"], "contract_id": result["contract_id"],
+                          "subject_hash": result["subject_hash"], "proposal_artifacts": result["proposal_artifacts"],
+                          "agent_revision": expected["agent_revision"]}):
+        raise GrowthError("revision build no longer matches the original native artifact handoff")
+    for key, target in (("source_patch", "source_patch"), ("solver_policy", "solver_policy"),
+                        ("generator_policy", "generator_policy")):
+        if frozen_input(result["proposal_artifacts"][key]) != frozen_input(candidate[target]):
+            raise GrowthError("revision changed the native proposal artifact bytes")
+    if json.loads(frozen_input(result["proposal_artifacts"]["revision_proposal"])) != json.loads(
+        frozen_input(candidate["proposal"])
+    ):
+        raise GrowthError("revision changed the native proposal explanation or requested authority")
 
 
 def run(study_path, root, backend=None):
@@ -280,16 +347,28 @@ def run(study_path, root, backend=None):
                 output = directory / name
                 spec = {"generation": index, "opportunity": opportunity, "binding": binding,
                         "study_sha256": sha256(encode(study)), "mutable_objects": study["mutable_objects"]}
-                generated[name] = operation(output, "generation", spec,
-                    lambda: backend.generate(output, spec, block))
+                def propose():
+                    result = backend.generate(output, spec, block)
+                    if study["version"] == 2:
+                        validate_revision_proposal(output, result, binding, study["revision_recipe"])
+                        backend.validate_generation(output, spec, result)
+                    return result
+                generated[name] = operation(output, "generation", spec, propose)
                 result = generated[name]
                 if result["status"] == "completed":
-                    result["artifacts"] = {key: policy(root, frozen_input(value)) for key, value in result["artifacts"].items()}
-                    required = set(study["mutable_objects"])
+                    if study["version"] == 2:
+                        validate_revision_proposal(output, result, binding, study["revision_recipe"])
+                        backend.validate_generation(output, spec, result)
+                    else:
+                        result["artifacts"] = {key: policy(root, frozen_input(value)) for key, value in result["artifacts"].items()}
+                    required = set(binding) if study["version"] == 2 else set(study["mutable_objects"])
                     if set(result["artifacts"]) != required:
                         raise GrowthError("native generation returned the wrong artifact set")
-            subjects = {"incumbent": binding["solver_policy"], **{
-                name: result["artifacts"]["solver_policy"] for name, result in generated.items() if result["status"] == "completed"}}
+            subjects = {"incumbent": binding, **{
+                name: {**binding, **result["artifacts"]} for name, result in generated.items() if result["status"] == "completed"}}
+            record(directory / "proposals-frozen.json", {
+                "subjects": subjects, "results": {name: sha256(encode(value)) for name, value in generated.items()}
+            })
 
             def evaluate(selected, stage, instances):
                 evaluations = {name: [] for name in selected}
@@ -299,10 +378,17 @@ def run(study_path, root, backend=None):
                     if (root / "CANCEL").exists():
                         raise GrowthError("explicit study cancellation requested")
                     output = directory / "evaluation" / stage / name / str(seed)
-                    spec = {"instances": instances, "seed": seed, "solver_policy": selected[name],
+                    spec = {"instances": instances, "seed": seed, "solver_policy": selected[name]["solver_policy"],
                             "runner": study["runner"], "study_sha256": sha256(encode(study)), "test_map": study["test_map"],
                             "runtime_sha256": study["runtime_sha256"]}
+                    if study["version"] == 2:
+                        from scripts.agent_revision import validate_revision
+                        spec["agent_revision"] = selected[name]["agent_revision"]
+                        spec["runtime_sha256"] = validate_revision(spec["agent_revision"], study["revision_recipe"])["binary"]["sha256"]
+                    cached = (output / "result.json").exists()
                     value = operation(output, "evaluation", spec, lambda: backend.evaluate(output, spec))
+                    if cached and any(row.get("status") == "valid" for row in value.get("rows", [])):
+                        backend.validate_evaluation(output, spec, value)
                     evaluations[name].append({**value, "seed": seed})
                 return evaluations
 
@@ -313,7 +399,9 @@ def run(study_path, root, backend=None):
             decision = {**screen, "confirmation_consumed": False}
             if finalist:
                 record(directory / "confirmation-consumed.json", {"instances": block["confirmation_instances"], "finalist": finalist,
-                                                                  "solver_policy": subjects[finalist]})
+                                                                  "solver_policy": subjects[finalist]["solver_policy"],
+                                                                  **({"agent_revision": subjects[finalist]["agent_revision"]}
+                                                                     if study["version"] == 2 else {})})
                 confirmation = {"instances": block["confirmation_instances"], "seeds": block["seeds"]}
                 selected = {name: subjects[name] for name in ("incumbent", finalist)}
                 decision = choose(confirmation, evaluate(selected, "confirmation", confirmation["instances"]),
@@ -328,12 +416,15 @@ def run(study_path, root, backend=None):
                 "generator_policy": initial["generator_policy"] if study["mode"] == "fixed-generator"
                     else adopted.get("generator_policy", binding["generator_policy"]),
             }
+            if study["version"] == 2:
+                next_binding = adopted or binding
             decision.update(previous_binding=binding, next_binding=next_binding,
                             generation_results=generated,
                             generator_policy_changed=next_binding["generator_policy"] != binding["generator_policy"],
                             recursive_participation="requires a subsequent native generation receipt with this rho binding",
                             limitations=["No evidence of improved generator ability from solver scores",
-                                         "Harness and tool code search are not connected",
+                                         "Full-system revision study; improver ability needs matched descendants" if study["version"] == 2
+                                         else "Harness and tool code search are not connected",
                                          "Development selection is not held-out confirmation"])
             record(directory / "decision.json", decision)
             binding = next_binding

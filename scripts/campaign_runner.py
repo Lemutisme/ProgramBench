@@ -1342,6 +1342,7 @@ def _config_manifest(config: CampaignConfig) -> dict[str, object]:
                 "revision": arm.revision,
                 "mode": arm.mode,
                 "binary": str(arm.binary) if arm.binary else None,
+                **({"binary_probe_image": arm.binary_probe_image} if arm.binary_probe_image is not None else {}),
                 **({"execution_policy": arm.execution_policy} if arm.execution_policy != "behavioral" else {}),
                 **({"runtime_protocol": arm.runtime_protocol} if arm.runtime_protocol is not None else {}),
                 **({"policy_artifact": arm.policy_artifact.manifest()} if arm.policy_artifact is not None else {}),

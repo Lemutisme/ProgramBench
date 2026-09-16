@@ -11,6 +11,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from urllib.parse import urlencode
 
@@ -20,23 +21,122 @@ from scripts.campaign_policy import load_policy_artifact
 from scripts.growth_loop import GrowthError, encode, evaluator_environment, frozen_input, read, record, seal, sha256
 
 
+REVISION_ARTIFACTS = {
+    "revision_proposal": ("agent-revision.json", 65536, False),
+    "source_patch": ("source.patch", 16 * 1024 * 1024, True),
+    "solver_policy": ("solver-policy.txt", 65536, False),
+    "generator_policy": ("generator-policy.txt", 65536, False),
+}
+
+
+def generator_artifacts(specification):
+    if specification["mutable_objects"] == ["agent_revision"]:
+        return REVISION_ARTIFACTS
+    return {key: (key.replace("_", "-") + ".txt", 65536, False) for key in specification["mutable_objects"]}
+
+
+def install_revision_source(workspace, reference):
+    """Copy verified parent files only; never mount its host checkout or metadata."""
+    from scripts.agent_revision import export_source, validate_revision
+
+    revision = validate_revision(reference)
+    files = json.loads(frozen_input(revision["source"]["files"]))
+    with tempfile.TemporaryDirectory(prefix="generator-parent-source-") as temporary:
+        directory = Path(temporary) / "agent-source"
+        export_source(reference, directory)
+        subprocess.run(["docker", "cp", str(directory), workspace.container_id + ":/candidate/agent-source"],
+                       check=True, capture_output=True, timeout=120)
+    checker = """import hashlib,json,os,pathlib,pwd,stat,subprocess,sys
+root=pathlib.Path('/candidate/agent-source');expected=json.load(sys.stdin);actual={}
+owner=pwd.getpwnam('agent')
+for path in root.rglob('*'):
+ relative=path.relative_to(root).as_posix();info=path.lstat()
+ if stat.S_ISDIR(info.st_mode):
+  os.chown(path,owner.pw_uid,owner.pw_gid);continue
+ assert relative in expected and '.git' not in path.relative_to(root).parts
+ item=expected[relative]
+ if stat.S_ISLNK(info.st_mode):
+  target=os.readlink(path);data=target.encode();mode='120000'
+  assert item['target']==target and not pathlib.PurePosixPath(target).is_absolute()
+  assert path.resolve().is_relative_to(root)
+  actual[relative]={'mode':mode,'sha256':hashlib.sha256(data).hexdigest(),'size':len(data),'target':target}
+ else:
+  assert stat.S_ISREG(info.st_mode)
+  data=path.read_bytes();mode='100755' if info.st_mode & 0o111 else '100644'
+  actual[relative]={'mode':mode,'sha256':hashlib.sha256(data).hexdigest(),'size':len(data)}
+ os.chown(path,owner.pw_uid,owner.pw_gid,follow_symlinks=False)
+assert actual==expected
+os.chown(root,owner.pw_uid,owner.pw_gid)
+os.setgid(owner.pw_gid);os.setuid(owner.pw_uid)
+env={'PATH':'/usr/local/bin:/usr/bin:/bin','HOME':'/tmp','GIT_CONFIG_GLOBAL':'/dev/null','GIT_CONFIG_NOSYSTEM':'1',
+ 'GIT_AUTHOR_NAME':'AgentRevision','GIT_AUTHOR_EMAIL':'revision@localhost','GIT_COMMITTER_NAME':'AgentRevision',
+ 'GIT_COMMITTER_EMAIL':'revision@localhost','GIT_AUTHOR_DATE':'2000-01-01T00:00:00+00:00','GIT_COMMITTER_DATE':'2000-01-01T00:00:00+00:00'}
+for args in [['init','-q'],['add','--force','--all'],['commit','-q','--allow-empty','-m','Frozen parent source']]:
+ subprocess.run(['git','-c','core.hooksPath=/dev/null','-c','commit.gpgsign=false','-c','core.autocrlf=false',*args],
+  cwd=root,env=env,check=True,capture_output=True,timeout=60)
+print(json.dumps({'passed':True,'files':len(actual),'tree_sha256':hashlib.sha256((json.dumps(actual,sort_keys=True,indent=2)+'\\n').encode()).hexdigest()}))
+"""
+    checked = subprocess.run(["docker", "exec", "--user", "0", "-i", workspace.container_id,
+                              "python3", "-I", "-S", "-c", checker],
+                             input=encode(files), capture_output=True, check=True, timeout=240)
+    verified = json.loads(checked.stdout)
+    if verified.get("passed") is not True or verified.get("tree_sha256") != revision["source"]["tree_sha256"]:
+        raise GrowthError("generator parent source import changed its frozen tree")
+    return {"agent_revision_sha256": reference["sha256"], "source_archive_sha256": revision["source"]["archive"]["sha256"],
+            "container": workspace.container_id, "destination": "/candidate/agent-source", "verified": verified,
+            "host_checkout_mounted": False, "host_git_metadata_copied": False}
+
+
 def generator_payload(output, specification, instruction, context, model, variant, directory="/candidate", *, started_at=None):
-    """A policy-production Contract; pi is input data, rho is execution guidance."""
+    """Native proposal production; host builds and evaluation stay outside this Contract."""
     identity = sha256(encode([str(output), specification]))
     started_at = time.time() if started_at is None else started_at
-    artifacts = [key.replace("_", "-") + ".txt" for key in specification["mutable_objects"]]
-    check = ("import os,stat\n"
-             f"for name in {artifacts!r}:\n"
+    revision = specification["mutable_objects"] == ["agent_revision"]
+    files = generator_artifacts(specification)
+    artifacts = [item[0] for item in files.values()]
+    check = ("import json,os,stat\n"
+             f"for name,limit,empty in {list(files.values())!r}:\n"
              " fd=os.open(name,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)\n"
              " with os.fdopen(fd,'rb') as f:\n"
-             "  s=os.fstat(f.fileno()); assert stat.S_ISREG(s.st_mode) and 0<s.st_size<=65536\n"
-             "  data=f.read(65537); assert len(data)<=65536 and b'\\0' not in data\n"
-             "  assert data.decode('utf-8').strip()\n")
+             "  s=os.fstat(f.fileno()); assert stat.S_ISREG(s.st_mode) and (empty or s.st_size>0) and s.st_size<=limit\n"
+             "  data=f.read(limit+1); assert len(data)<=limit and b'\\0' not in data\n"
+             "  assert data.decode('utf-8').strip() or empty\n")
+    if revision:
+        check += ("with open('agent-revision.json',encoding='utf-8') as f: proposal=json.load(f)\n"
+                  "assert type(proposal) is dict and set(proposal)=={'parent_sha256','rationale','metadata'}\n"
+                  f"assert proposal['parent_sha256']=={specification['binding']['agent_revision']['sha256']!r}\n"
+                  "assert type(proposal['rationale']) is str and proposal['rationale'].strip() and '\\0' not in proposal['rationale']\n"
+                  "metadata=proposal['metadata']\n"
+                  "assert type(metadata) is dict and set(metadata)=={'expected_effect','failure_modes','permission_changes','state_migration','recovery'}\n"
+                  "for key in ['expected_effect','recovery']:\n"
+                  " assert type(metadata[key]) is str and metadata[key].strip() and '\\0' not in metadata[key]\n"
+                  "for key in ['failure_modes','permission_changes']:\n"
+                  " assert type(metadata[key]) is list and all(type(item) is str and item.strip() and '\\0' not in item for item in metadata[key])\n"
+                  "assert metadata['failure_modes']\n"
+                  "migration=metadata['state_migration']\n"
+                  "assert migration is None or (type(migration) is str and migration.strip() and '\\0' not in migration)\n")
+    instructions = (
+        "Write agent-revision.json containing exactly parent_sha256, a nonempty rationale, and metadata; parent_sha256 must be "
+        + specification["binding"]["agent_revision"]["sha256"] + ". Write source.patch as a UTF-8 git patch against "
+        "the exact parent checkout at /candidate/agent-source. You may edit that checkout; only the patch and the "
+        "two policy artifacts are proposed outputs. Include new files in the patch. An empty patch is allowed. "
+        "The patch may be at most 16777216 bytes; the JSON and each policy at most 65536 bytes. "
+        "All files must be regular UTF-8 files without NUL; both policies must be nonempty. "
+        "metadata must contain exactly expected_effect (nonempty text), failure_modes (nonempty list of nonempty text), "
+        "permission_changes (list of nonempty text, empty when none), state_migration (nonempty text or null), "
+        "and recovery (nonempty text describing how to withdraw the change). Requested permission or state changes "
+        "remain proposals and cannot authorize their own execution. "
+        "Do not put build outputs or test claims in the JSON. External trusted execution reconstructs, builds, "
+        "qualifies and evaluates a proposed revision. Source edits cannot alter this production Contract, "
+        "the host build recipe, task goals, authority, evaluation rules or version adoption. "
+        if revision else "Each must be nonempty UTF-8 without NUL, at most 65536 bytes. "
+    )
     return {
         "id": "pct_" + identity, "scope": "growth-" + identity,
-        "goal": "Produce the requested candidate policy text artifacts for independent development evaluation.",
-        "brief": instruction + "\n\nWrite exactly these required policy artifacts in the working directory: "
-                 + ", ".join(artifacts) + ". Each must be nonempty UTF-8 without NUL, at most 65536 bytes. "
+        "goal": "Produce the requested candidate AgentRevision artifacts for independent development evaluation." if revision
+                else "Produce the requested candidate policy text artifacts for independent development evaluation.",
+        "brief": instruction + "\n\nWrite exactly these required artifacts in the working directory: "
+                 + ", ".join(artifacts) + ". " + instructions +
                  "These are proposals. You cannot alter evaluation, scores, study assignments or adoption. "
                  "Use contract_check and report ready when these artifacts are complete. "
                  "Your obligation ends with this artifact handoff; future scoring is out of scope.\n\n"
@@ -49,7 +149,7 @@ def generator_payload(output, specification, instruction, context, model, varian
         "trigger": {"type": "immediate"},
         "authority": ["filesystem.read", "filesystem.write", "process.execute"],
         "budget": {"deadline": int(started_at * 1000) + 21600000},
-        "evidence": {"type": "principal", "claim": "The frozen native handoff contains syntactically valid candidate policy artifacts; no performance claim.",
+        "evidence": {"type": "principal", "claim": "The frozen native handoff contains syntactically valid proposal artifacts; no build, qualification, adoption or performance claim.",
                      "replay": {"checks": [{"argv": ["python3", "-I", "-c", check], "cwd": ".", "timeout": 10000, "exit": 0}],
                                 "protected": [], "artifacts": artifacts}},
         "resolution": {"maxAttempts": 3, "retryDelay": 0},
@@ -89,15 +189,22 @@ def native_generation(api, output, specification, payload, export, cancelled=lam
         if receipt["contractID"] != payload["id"] or receipt["subjectHash"] != contract["handoff"]["subjectHash"]:
             raise GrowthError("export does not match native handoff")
         artifacts = {}
-        for key in specification["mutable_objects"]:
-            source = destination / (key.replace("_", "-") + ".txt")
+        for key, (name, limit, empty) in generator_artifacts(specification).items():
+            source = destination / name
             descriptor = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
             with os.fdopen(descriptor, "rb") as stream:
                 info = os.fstat(stream.fileno())
-                if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= 65536:
-                    raise GrowthError("exported policy must be a bounded regular file")
-                data = stream.read(65537)
-            load_policy_artifact(source, sha256(data))
+                if not stat.S_ISREG(info.st_mode) or not (empty or info.st_size > 0) or info.st_size > limit:
+                    raise GrowthError("exported proposal must be a bounded regular file")
+                data = stream.read(limit + 1)
+            if len(data) > limit or b"\0" in data or not (data.decode("utf-8").strip() or empty):
+                raise GrowthError("exported proposal violates its UTF-8 artifact bounds")
+            if key in {"solver_policy", "generator_policy"}:
+                load_policy_artifact(source, sha256(data))
+            if key == "revision_proposal":
+                from scripts.agent_revision import validate_proposal
+
+                validate_proposal(json.loads(data), specification["binding"]["agent_revision"]["sha256"])
             path = output / "artifacts" / source.name
             seal(path, data)
             artifacts[key] = {"path": str(path), "sha256": sha256(data)}
@@ -107,11 +214,13 @@ def native_generation(api, output, specification, payload, export, cancelled=lam
         record(output / "attestation.json", api.attest(payload["id"], sha256(encode(evidence))))
         final = api.get_contract(payload["id"])
         if final["status"] != "discharged":
-            raise GrowthError("native policy-production Contract did not discharge")
+            raise GrowthError("native proposal-production Contract did not discharge")
         record(output / "final-contract.json", final)
         return {"status": "completed", "artifacts": artifacts, "contract_id": payload["id"],
                 "session_id": session_id, "generator_binding": specification["binding"]["generator_policy"],
                 "solver_input": specification["binding"]["solver_policy"],
+                **({"parent_revision": specification["binding"]["agent_revision"]}
+                   if "agent_revision" in specification["binding"] else {}),
                 "subject_hash": receipt["subjectHash"], "deadline": payload["budget"]["deadline"]}
     finally:
         if session_id:
@@ -141,6 +250,66 @@ def native_generation(api, output, specification, payload, export, cancelled=lam
                 api.interrupt(session_id)
 
 
+def runtime_configuration(study, root, binding):
+    """Change only the bound Agent implementation and policy within frozen study coordinates."""
+    raw = yaml.safe_load((root / "config.yaml").read_bytes())
+    if "agent_revision" in binding:
+        from scripts.agent_revision import runtime_config, validate_revision
+
+        revision = validate_revision(binding["agent_revision"], study["revision_recipe"])
+        for key in ("solver_policy", "generator_policy"):
+            if key in binding and binding[key] != revision[key]:
+                raise GrowthError("runtime revision and policy binding disagree")
+        if "runtime_sha256" in binding and binding["runtime_sha256"] != revision["binary"]["sha256"]:
+            raise GrowthError("runtime revision and score runtime identity disagree")
+        raw = runtime_config(raw, binding["agent_revision"], study["revision_recipe"])
+    raw["arms"]["procontract"].update(execution_policy="artifact", runtime_protocol="policy-split-v1",
+        policy_file=binding["solver_policy"]["path"], policy_sha256=binding["solver_policy"]["sha256"])
+    return raw
+
+
+def validate_native_handoff(output, specification, payload, result):
+    """Recheck sealed native receipts without admitting a Session or issuing provider work."""
+    issue = read(output / "issue.json")
+    terminal = read(output / "native-terminal.json")
+    admission = read(output / "admission.json")
+    exported = read(output / "export.json")
+    evidence = read(output / "handoff-evidence.json")
+    final = read(output / "final-contract.json")
+    attestation = read(output / "attestation.json")
+    artifacts = result.get("proposal_artifacts", result["artifacts"])
+    if issue != payload or result["contract_id"] != payload["id"] or result["deadline"] != payload["budget"]["deadline"]:
+        raise GrowthError("native generation no longer matches its admitted payload or original deadline")
+    if (result.get("parent_revision") != specification["binding"].get("agent_revision")
+            or result.get("generator_binding") != specification["binding"]["generator_policy"]
+            or result.get("solver_input") != specification["binding"]["solver_policy"]):
+        raise GrowthError("native generation result changed its parent or policy input binding")
+    expected_spec = {key: payload[key] for key in ("goal", "brief", "requires", "trigger", "authority", "budget", "evidence", "resolution")}
+    for contract in (admission["data"], terminal["contract"], final):
+        if (contract["id"] != payload["id"] or contract["revision"] != 1 or contract.get("pendingRevision")
+                or contract["scope"] != payload["scope"] or contract["spec"] != expected_spec
+                or contract["specHash"] != terminal["contract"]["specHash"]):
+            raise GrowthError("native generation Contract receipts changed their fixed terms")
+    execution = terminal["execution"]
+    if (not execution or execution["contractID"] != payload["id"] or execution["revision"] != 1
+            or execution["sessionID"] != result["session_id"] or execution["executionPolicy"] != payload["executionPolicy"]
+            or execution["location"] != payload["location"] or execution["model"] != payload["model"]):
+        raise GrowthError("native generation execution does not match the bound revision and Session")
+    handoff = terminal["contract"].get("handoff", {})
+    if (terminal["contract"]["status"] != "verification" or handoff.get("replay", {}).get("passed") is not True
+            or handoff.get("subjectHash") != result["subject_hash"] or final["status"] != "discharged"
+            or final.get("handoff") != handoff or not final.get("attestationID")
+            or exported.get("contractID") != payload["id"] or exported.get("subjectHash") != result["subject_hash"]
+            or set(artifacts) != set(generator_artifacts(specification))
+            or evidence != {"contractID": payload["id"], "handoff": handoff, "artifacts": artifacts}
+            or not re.fullmatch(r"[0-9a-f]{64}", attestation.get("hash", ""))
+            or type(attestation.get("frontier")) is not int or attestation["frontier"] < 0):
+        raise GrowthError("native generation lacks a matching replayed, exported and discharged handoff")
+    for artifact in artifacts.values():
+        frozen_input(artifact)
+    return result
+
+
 class ProgramBenchBackend:
     def __init__(self, study, root):
         evaluator_environment(study)
@@ -160,9 +329,19 @@ class ProgramBenchBackend:
 
         if (self.root / "CANCEL").exists():
             raise GrowthError("generation cancelled before workspace preparation")
-        config = load_config(self.root / "config.yaml")
+        record(output / "generator-runtime.json", {
+            "parent_revision": specification["binding"].get("agent_revision"),
+            "solver_policy": specification["binding"]["solver_policy"],
+            "generator_policy": specification["binding"]["generator_policy"],
+        })
+        seal(output / "generator-config.yaml", yaml.safe_dump(
+            runtime_configuration(self.study, self.root, specification["binding"]), sort_keys=False).encode())
+        config = load_config(output / "generator-config.yaml")
         arm = next(arm for arm in config.arms if arm.name == "procontract")
-        install = prepare_install(arm, self.root / "generator-installs")
+        install_root = self.root / "generator-installs"
+        if "agent_revision" in specification["binding"]:
+            install_root /= specification["binding"]["agent_revision"]["sha256"]
+        install = prepare_install(arm, install_root)
         campaign = "generator-" + sha256(str(output).encode())[:12]
         job = JobPaths(output / campaign / "procontract/policy-generator")
         image = subprocess.check_output(["docker", "image", "inspect", "--format", "{{.Id}}", self.study["generator"]["image"]],
@@ -182,6 +361,9 @@ class ProgramBenchBackend:
             try:
                 if workspace.manifest.network_mode != "none":
                     raise GrowthError("generator workspace network isolation absent")
+                if "agent_revision" in specification["binding"]:
+                    record(output / "source-install.json", install_revision_source(
+                        workspace, specification["binding"]["agent_revision"]))
                 api = HttpProContractApi(workspace.base_url, expected_port=workspace.port,
                                          http_client=DockerHttpClient(workspace.container_id))
                 feedback = install_feedback(self.study, self.root, specification["generation"], workspace)
@@ -201,9 +383,9 @@ class ProgramBenchBackend:
                 result = native_generation(api, output, specification, payload, export, lambda: (self.root / "CANCEL").exists())
                 usage = read(output / "usage.json")
                 gateway = native_accounting(job.root)["gateway"]
-                return {**result, **usage, "gateway": gateway,
-                        "usage_incomplete": not usage["complete"] or not gateway.get("present") or gateway.get("unreadable", False)
-                            or bool(gateway.get("open") or gateway.get("missing_usage"))}
+                result = {**result, **usage, "gateway": gateway,
+                          "usage_incomplete": not usage["complete"] or not gateway.get("present") or gateway.get("unreadable", False)
+                              or bool(gateway.get("open") or gateway.get("missing_usage"))}
             finally:
                 try:
                     workspace.stop()
@@ -216,6 +398,68 @@ class ProgramBenchBackend:
                         "usage_incomplete": not usage.get("complete", False) or not gateway.get("present") or gateway.get("unreadable", False)
                             or bool(gateway.get("open") or gateway.get("missing_usage")),
                         "scope": "generation accounting retained on success, failure and cancellation; projection and gateway overlap"})
+        if specification["mutable_objects"] == ["agent_revision"]:
+            from scripts.agent_revision import build_revision, validate_revision
+
+            reference = build_revision(output / "revision", specification["binding"]["agent_revision"],
+                result["artifacts"], self.study["revision_recipe"], cancelled=lambda: (self.root / "CANCEL").exists())
+            revision = validate_revision(reference, self.study["revision_recipe"], executable=False)
+            origin = record(output / "revision-origin.json", {"parent_revision": result["parent_revision"],
+                "contract_id": result["contract_id"], "subject_hash": result["subject_hash"],
+                "proposal_artifacts": result["artifacts"], "agent_revision": reference})
+            result = {**result, "status": "completed" if revision["status"] == "qualified" else "proposal-only",
+                      "proposal_artifacts": result["artifacts"],
+                      "artifacts": {"solver_policy": revision["solver_policy"],
+                                    "generator_policy": revision["generator_policy"], "agent_revision": reference},
+                      "revision_origin_sha256": sha256(encode(origin))}
+        return result
+
+    def validate_generation(self, output, specification, result):
+        from scripts.agent_revision import artifact_bytes, validate_revision
+
+        if result["status"] != "completed":
+            return result
+        evaluator_environment(self.study)
+        parent = validate_revision(specification["binding"]["agent_revision"], self.study["revision_recipe"])
+        config = runtime_configuration(self.study, self.root, specification["binding"])
+        if yaml.safe_load((output / "generator-config.yaml").read_bytes()) != config:
+            raise GrowthError("native generator configuration changed its frozen runtime coordinates")
+        runtime = {"parent_revision": specification["binding"]["agent_revision"],
+                   "solver_policy": specification["binding"]["solver_policy"],
+                   "generator_policy": specification["binding"]["generator_policy"]}
+        if read(output / "generator-runtime.json") != runtime:
+            raise GrowthError("native generator changed its assigned full parent revision")
+        campaign = "generator-" + sha256(str(output).encode())[:12]
+        job = output / campaign / "procontract/policy-generator"
+        envelope = read(job / "procontract-issue.json")
+        context = (self.root / "generator-context.txt").read_text() + "\n" + json.dumps(read(output / "feedback.json"))
+        payload = generator_payload(output, specification, self.study["generator"]["instruction"], context,
+            config["model"], config["variant"], started_at=envelope["startedAt"])
+        if envelope != {"payload": payload, "startedAt": envelope["startedAt"]}:
+            raise GrowthError("native generator gateway envelope changed its original six-hour deadline")
+        validate_native_handoff(output, specification, payload, result)
+        workspace = read(job / "workspace-state/workspace.json")
+        image = read(output / "generator-image.json")
+        if (workspace["binary_sha256"] != parent["binary"]["sha256"] or workspace["network_mode"] != "none"
+                or workspace["image"] != image["local_image_id"] or image["requested"] != self.study["generator"]["image"]
+                or workspace["phase"] != "stopped"):
+            raise GrowthError("native generator workspace used a different runtime or isolation boundary")
+        imported = read(output / "source-install.json")
+        if (imported.get("agent_revision_sha256") != specification["binding"]["agent_revision"]["sha256"]
+                or imported.get("source_archive_sha256") != parent["source"]["archive"]["sha256"]
+                or imported.get("container") != workspace["container_id"]
+                or imported.get("destination") != "/candidate/agent-source"
+                or imported.get("verified", {}).get("passed") is not True
+                or imported["verified"].get("tree_sha256") != parent["source"]["tree_sha256"]
+                or imported.get("host_checkout_mounted") is not False or imported.get("host_git_metadata_copied") is not False):
+            raise GrowthError("native generator source import does not match its full parent revision")
+        exported = read(output / "export.json")
+        destination = Path(workspace["state_dir"]) / "growth-export"
+        if exported.get("directory") != "/state/growth-export":
+            raise GrowthError("native generator exported a different bound state destination")
+        for key, (name, limit, _) in generator_artifacts(specification).items():
+            artifact_bytes({"path": str(destination / name), "sha256": result["proposal_artifacts"][key]["sha256"]}, limit)
+        return result
 
     def evaluate(self, output, specification):
         # The solver gets only its exact policy and its original task workspace.
@@ -224,9 +468,7 @@ class ProgramBenchBackend:
         if (self.root / "CANCEL").exists():
             raise KeyboardInterrupt("explicit study cancellation before evaluation")
         record(output / "evaluator-inputs.json", self.study["evaluator"])
-        raw = yaml.safe_load((self.root / "config.yaml").read_bytes())
-        raw["arms"]["procontract"].update(execution_policy="artifact", runtime_protocol="policy-split-v1",
-            policy_file=specification["solver_policy"]["path"], policy_sha256=specification["solver_policy"]["sha256"])
+        raw = runtime_configuration(self.study, self.root, specification)
         seal(output / "config.yaml", yaml.safe_dump(raw, sort_keys=False).encode())
         # The frozen runner derives Docker ownership from the campaign basename.
         # Bind it to the full evaluation directory, including study/stage/subject/seed.
@@ -278,9 +520,7 @@ class ProgramBenchBackend:
         from scripts.run_opencode import load_config
 
         evaluator_environment(self.study)
-        expected = yaml.safe_load((self.root / "config.yaml").read_bytes())
-        expected["arms"]["procontract"].update(execution_policy="artifact", runtime_protocol="policy-split-v1",
-            policy_file=specification["solver_policy"]["path"], policy_sha256=specification["solver_policy"]["sha256"])
+        expected = runtime_configuration(self.study, self.root, specification)
         if (yaml.safe_load((output / "config.yaml").read_bytes()) != expected
                 or read(output / "evaluator-inputs.json") != self.study["evaluator"]):
             raise GrowthError("cached evaluation changed its frozen configuration or evaluator inputs")
@@ -441,10 +681,23 @@ def closed_feedback(study, root, generation):
         decision = read(root / earlier["id"] / "decision.json")
         proposals = {}
         for name, result in decision["generation_results"].items():
+            artifacts = {}
+            for key, artifact in result.get("artifacts", {}).items():
+                if key != "agent_revision":
+                    artifacts[key] = {"sha256": artifact["sha256"], "text": frozen_input(artifact).decode()}
+                    continue
+                revision = json.loads(frozen_input(artifact))
+                proposal = json.loads(frozen_input(revision["proposal"]))
+                artifacts[key] = {"sha256": artifact["sha256"], "kind": "agent-revision",
+                    "parent_sha256": revision["parent"]["sha256"] if revision["parent"] else None,
+                    "source_sha256": revision["source"]["tree_sha256"], "changed_paths": revision["changed_paths"],
+                    "rationale": proposal["rationale"] if proposal else None,
+                    "metadata": proposal["metadata"] if proposal else None,
+                    "source_patch": {"sha256": revision["source_patch"]["sha256"],
+                                     "text": frozen_input(revision["source_patch"]).decode()}}
             proposals[name] = {"status": result["status"], "error_type": result.get("error_type"),
                                **({"adopted": decision["winner"] == name} if publication is None else {}),
-                               "artifacts": {key: {"sha256": artifact["sha256"], "text": frozen_input(artifact).decode()}
-                                             for key, artifact in result.get("artifacts", {}).items()}}
+                               "artifacts": artifacts}
         previous.append({"generation": earlier["id"], "proposals_including_rejected": proposals,
             "development_screen": {"instances": study["development_instances"], "reusable": True,
                 "results": {name: {key: value for key, value in item.items() if key != "rows"}
