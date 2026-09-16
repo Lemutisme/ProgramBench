@@ -454,6 +454,24 @@ def runtime_configuration(study, root, binding):
     return raw
 
 
+def generator_runtime(binding, experiments):
+    """Normalize the revision request and its fixed generator-role projection."""
+    from scripts.campaign_experiments import validate_runtime_options
+
+    try:
+        requested = validate_runtime_options({"experiments": experiments})
+    except ValueError as error:
+        raise GrowthError(f"invalid generator runtime options: {error}") from error
+    return {
+        "parent_revision": binding.get("agent_revision"),
+        "solver_policy": binding["solver_policy"],
+        "generator_policy": binding["generator_policy"],
+        "requested_runtime_options": requested,
+        "effective_runtime_options": {"experiments": None},
+        "runtime_options_reason": "generator_contract_has_no_reference_authority",
+    }
+
+
 def validate_native_handoff(output, specification, payload, result):
     """Recheck sealed native receipts without admitting a Session or issuing provider work."""
     issue = read(output / "issue.json")
@@ -518,14 +536,7 @@ class ProgramBenchBackend:
         seal(output / "generator-config.yaml", yaml.safe_dump(
             runtime_configuration(self.study, self.root, specification["binding"]), sort_keys=False).encode())
         config = load_config(output / "generator-config.yaml")
-        record(output / "generator-runtime.json", {
-            "parent_revision": specification["binding"].get("agent_revision"),
-            "solver_policy": specification["binding"]["solver_policy"],
-            "generator_policy": specification["binding"]["generator_policy"],
-            "requested_runtime_options": {"experiments": config.experiments},
-            "effective_runtime_options": {"experiments": None},
-            "runtime_options_reason": "generator_contract_has_no_reference_authority",
-        })
+        record(output / "generator-runtime.json", generator_runtime(specification["binding"], config.experiments))
         arm = next(arm for arm in config.arms if arm.name == "procontract")
         install_root = self.root / "generator-installs"
         if "agent_revision" in specification["binding"]:
@@ -609,13 +620,11 @@ class ProgramBenchBackend:
         evaluator_environment(self.study)
         parent = validate_revision(specification["binding"]["agent_revision"], self.study["revision_recipe"])
         config = runtime_configuration(self.study, self.root, specification["binding"])
-        if yaml.safe_load((output / "generator-config.yaml").read_bytes()) != config:
+        if encode(yaml.safe_load((output / "generator-config.yaml").read_bytes())) != encode(config):
             raise GrowthError("native generator configuration changed its frozen runtime coordinates")
-        runtime = {"parent_revision": specification["binding"]["agent_revision"],
-                   "solver_policy": specification["binding"]["solver_policy"],
-                   "generator_policy": specification["binding"]["generator_policy"]}
-        if read(output / "generator-runtime.json") != runtime:
-            raise GrowthError("native generator changed its assigned full parent revision")
+        runtime = generator_runtime(specification["binding"], config.get("experiments"))
+        if encode(read(output / "generator-runtime.json")) != encode(runtime):
+            raise GrowthError("native generator changed its assigned full parent revision or effective runtime options")
         campaign = "generator-" + sha256(str(output).encode())[:12]
         job = output / campaign / "procontract/policy-generator"
         envelope = read(job / "procontract-issue.json")
@@ -629,6 +638,9 @@ class ProgramBenchBackend:
         image = read(output / "generator-image.json")
         if (workspace["binary_sha256"] != parent["binary"]["sha256"] or workspace["network_mode"] != "none"
                 or workspace["image"] != image["local_image_id"] or image["requested"] != self.study["generator"]["image"]
+                or not isinstance(workspace.get("environment_names"), list)
+                or not all(isinstance(name, str) for name in workspace["environment_names"])
+                or "OPENCODE_REFERENCE_BINDING" in workspace["environment_names"]
                 or workspace["phase"] != "stopped"):
             raise GrowthError("native generator workspace used a different runtime or isolation boundary")
         imported = read(output / "source-install.json")

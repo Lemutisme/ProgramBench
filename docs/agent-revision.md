@@ -264,6 +264,14 @@ or protocol field is added. `generator-runtime.json` records the revision's
 qualification must also observe the generator catalog without reference or
 experiment tools.
 
+Receipt production and cached-generation validation share one normalized runtime
+record. Validation checks all fields and numeric types, then verifies that the
+recorded workspace environment contains no reference binding. A historical
+three-field `generator-runtime.json`, or a workspace receipt missing environment
+names, cannot establish this role projection and is rejected by this runner.
+Keep those historical results with their original frozen runner; do not fill in
+missing evidence during replay.
+
 A configuration binding is not proof that a runtime implements its tools.
 Trusted qualification must inspect the actual native tool definitions and
 execute the intended path with a scripted provider; it must reject an enabled
