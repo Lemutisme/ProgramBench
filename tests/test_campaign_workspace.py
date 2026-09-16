@@ -347,6 +347,35 @@ def request(tmp_path: Path, docker: RecordingDocker) -> WorkspaceRequest:
 _ACTIVE_WORKSPACES: dict[str, object] = {}
 
 
+def test_workspace_role_suppresses_reference_binding_and_freezes_the_difference(tmp_path, monkeypatch):
+    from scripts import campaign_offline
+    value = request(tmp_path, RecordingDocker())
+    job = JobPaths(value.campaign_root / value.campaign / "procontract" / value.instance_id)
+    value = campaign_workspace._validate_request(replace(value, job=job, arm="procontract", isolated=True,
+        deadline_only=True, candidate_root=job.root / "candidates", state_root=job.root / "workspace-state",
+        log_dir=job.root / "logs"))
+    channel = value.state_root / "provider-channel"
+    channel.mkdir()
+    monkeypatch.setattr(campaign_offline, "ensure_gateway", lambda _: channel)
+    monkeypatch.setenv("PROGRAMBENCH_GROUNDED_REFERENCE", "1")
+    solver = campaign_workspace._expected_manifest(value, "sha256:fixed", "linux/amd64", ("PATH",))
+    generator = campaign_workspace._expected_manifest(replace(value, reference_binding=False),
+                                                     "sha256:fixed", "linux/amd64", ("PATH",))
+    assert "OPENCODE_REFERENCE_BINDING" in solver.environment_names
+    assert "OPENCODE_REFERENCE_BINDING" not in generator.environment_names
+    with pytest.raises(ContainerConflictError):
+        campaign_workspace._require_manifest_identity(solver, generator)
+    with pytest.raises(WorkspaceError, match="image declares"):
+        campaign_workspace._expected_manifest(replace(value, reference_binding=False),
+            "sha256:fixed", "linux/amd64", ("OPENCODE_REFERENCE_BINDING",))
+
+
+@pytest.mark.parametrize("invalid", [None, 0, 1, "false"])
+def test_workspace_reference_binding_requires_explicit_boolean(tmp_path, invalid):
+    with pytest.raises(WorkspaceError, match="reference_binding must be boolean"):
+        campaign_workspace._validate_request(replace(request(tmp_path, RecordingDocker()), reference_binding=invalid))
+
+
 def ensure_workspace(value: WorkspaceRequest):
     key = str(value.job.root.absolute())
     previous = _ACTIVE_WORKSPACES.pop(key, None)
@@ -502,7 +531,7 @@ def test_startup_cleanup_failure_preserves_both_causes_and_stops_next_job(tmp_pa
     plan = campaign_runner.CampaignPlan(
         value.job.root.parent.parent,
         tmp_path / "campaign.json",
-        SimpleNamespace(quality=False, model="openai/gpt-5.6-luna", variant="max", limits=SimpleNamespace(deadline_only=False)),
+        SimpleNamespace(quality=False, experiments=None, model="openai/gpt-5.6-luna", variant="max", limits=SimpleNamespace(deadline_only=False)),
         (), (), {}, False,
     )
     jobs = tuple(campaign_runner.CampaignJob(f"task-{index}", "vanilla", "example/task") for index in range(2))

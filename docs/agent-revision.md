@@ -17,7 +17,8 @@ external research controller, grader, state migrations or Kernel succession.
 
 A native generation hands off exactly four bounded artifacts:
 
-- `agent-revision.json`: the exact parent SHA256, rationale and change metadata;
+- `agent-revision.json`: the exact parent SHA256, rationale, change metadata and
+  optional revision-owned runtime options;
 - `source.patch`: a UTF-8 Git patch relative to the supplied parent source;
 - `solver-policy.txt` and `generator-policy.txt`: nonempty UTF-8 policy artifacts.
 
@@ -187,6 +188,89 @@ not improved improvement ability. A system-level matched shared-prefix fork,
 with descendant quality on independent tasks and complete research costs,
 remains necessary. `growth_rsi` currently implements that comparison for policy
 artifacts only.
+
+## Revision-owned native experiment tools
+
+Native differential experiment tools are opt-in. Their full configuration is
+part of the complete AgentRevision, alongside its runtime and policies. The
+shared build/qualification recipe does not choose which revisions enable them.
+The optional proposal field is:
+
+```json
+{
+  "runtime_options": {
+    "experiments": {
+      "candidate": "executable",
+      "interpreter": "/usr/bin/python3",
+      "timeout": 10000,
+      "maxDuration": 120000,
+      "prepare": {
+        "argv": ["/bin/sh", "./compile.sh"],
+        "timeout": 30000
+      }
+    }
+  }
+}
+```
+
+Omitting `runtime_options` from a child proposal inherits the parent's exact
+configuration. `{"runtime_options":{"experiments":null}}` explicitly disables
+it. A legacy manifest with no runtime-options fields is disabled. An initial
+revision can enable it using the keyword argument
+`freeze_initial(..., runtime_options={"experiments": ...})`; otherwise it starts
+disabled. No fifth generator artifact is introduced.
+
+The validator accepts only the fields shown. Candidate/interpreter paths and
+prepare argv are fixed. All three times are integer milliseconds in
+`1..600000`, and both process timeouts must be at most `maxDuration`. They bound
+individual operations inside the original Contract deadline and impose no
+cumulative provider-turn, tool-action, request or monetary limit. Application
+environment and working-directory choices, when supported by the native
+runtime, belong in individual case files and cannot alter these host options.
+
+The issuer publishes canonical `runtime-options.json`, records its bytes and
+SHA256 in the manifest, and mounts it read-only at
+`/trusted/runtime-options.json` in every qualification container. Each
+qualification receipt binds that SHA256 in addition to binary, source, recipe
+and check identity. Manifest validation rechecks the file, proposal/inheritance
+and receipt binding. Build containers do not consume runtime options. This
+permits the same immutable recipe to qualify disabled, enabled and subsequently
+disabled children independently.
+
+`agent_revision.runtime_config` derives the top-level runner `experiments` field
+from the selected qualified revision and rejects conflicting caller values.
+During a study, the evaluator first verifies that the frozen initial config's
+field matches the initial revision, removes that derived field from its local
+copy, then applies the selected revision. Thus on-to-off and off-to-on selection
+does not rewrite frozen study inputs or allow other coordinate changes.
+
+Enabled experiments require an isolated ProContract workspace and the six-hour
+deadline-only profile. The complete object is frozen in campaign configuration,
+gateway profile and immutable reference binding. Drift and disabling during
+workspace reuse fail. The launcher transports only the derived binding through
+`OPENCODE_REFERENCE_BINDING`; ambient experiment flags cannot enable it.
+Disabled native bindings omit `experiments` rather than sending JSON null.
+
+Task authority still limits the effective configuration. Native generator
+Contracts grant no `reference.run` authority, and the neutral generator image
+does not contain a ProgramBench oracle. Their `WorkspaceRequest` explicitly
+sets the host-only `reference_binding=False`; ordinary solver workspaces keep
+the default `True`. Disabled roles cannot request experiments or inherit an
+image-provided reference binding. The existing manifest's environment names
+freeze this distinction and reject role changes on reuse. No native authority
+or protocol field is added. `generator-runtime.json` records the revision's
+`requested_runtime_options`, its disabled `effective_runtime_options`, and
+`generator_contract_has_no_reference_authority` as the reason. Trusted native
+qualification must also observe the generator catalog without reference or
+experiment tools.
+
+A configuration binding is not proof that a runtime implements its tools.
+Trusted qualification must inspect the actual native tool definitions and
+execute the intended path with a scripted provider; it must reject an enabled
+revision that silently ignores the binding. The gateway does not require a
+tool catalog on every request because native title/compaction calls legitimately
+send no tools. This runner change alone supplies no ProgramBench performance
+measurement and does not promote a candidate or start a model cohort.
 
 ## Qualification evidence
 

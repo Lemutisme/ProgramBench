@@ -10,7 +10,7 @@ import yaml
 from scripts.agent_revision import build_revision, runtime_config, validate_revision
 from scripts.campaign_install import isolated_binary_probes
 from scripts.growth_loop import GrowthError, GrowthInfrastructureError, encode, freeze, read, record, revision_binding, run, sha256
-from scripts.growth_native import runtime_configuration
+from scripts.growth_native import ProgramBenchBackend, generator_payload, runtime_configuration
 from tests import test_agent_revision
 from tests.test_agent_revision import artifact, git, proposal
 
@@ -138,6 +138,52 @@ def test_entire_revision_is_adopted_reused_by_next_generation_and_cached(study):
     assert run(path, root, backend) == result
     assert (len(backend.generations), len(backend.evaluations)) == before
     assert result["performance_claim"] is None
+
+
+def test_generator_records_requested_options_but_keeps_reference_tools_disabled(study, tmp_path, monkeypatch):
+    from scripts import campaign_install, campaign_workspace
+    from scripts.agent_revision import artifact_bytes
+    from tests.test_campaign_experiments import experiments
+
+    specification, path, root = study
+    freeze(path, root)
+    parent = specification["initial"]["agent_revision"]
+    policy = validate_revision(parent)["solver_policy"]
+    artifacts = proposal(tmp_path, parent, policy)
+    document = read(artifacts["revision_proposal"]["path"])
+    document["runtime_options"] = {"experiments": experiments()}
+    artifacts["revision_proposal"] = artifact(tmp_path, "enabled-proposal.json", encode(document))
+    enabled = build_revision(tmp_path / "enabled", parent, artifacts, specification["revision_recipe"])
+    binding = revision_binding(enabled, specification["revision_recipe"])
+    generation = {"binding": binding, "generation": 0, "mutable_objects": ["agent_revision"]}
+    observed = []
+
+    class AdmissionObserved(RuntimeError):
+        pass
+
+    class Lease:
+        def __init__(self, request):
+            observed.append(request)
+        def __enter__(self):
+            raise AdmissionObserved("stop before container/provider admission")
+        def __exit__(self, *_):
+            raise AssertionError("admission did not enter")
+
+    monkeypatch.setattr(campaign_install, "prepare_install", lambda *_: object())
+    monkeypatch.setattr(campaign_workspace, "WorkspaceLease", Lease)
+    output = tmp_path / "generator"
+    with pytest.raises(AdmissionObserved):
+        ProgramBenchBackend(specification, root).generate(output, generation, specification["rounds"][0])
+    assert len(observed) == 1 and observed[0].experiments is None and observed[0].reference_binding is False
+    receipt = read(output / "generator-runtime.json")
+    assert receipt["requested_runtime_options"] == {"experiments": experiments()}
+    assert receipt["effective_runtime_options"] == {"experiments": None}
+    assert receipt["runtime_options_reason"] == "generator_contract_has_no_reference_authority"
+    assert yaml.safe_load((output / "generator-config.yaml").read_bytes())["experiments"] == experiments()
+    payload = generator_payload(output, generation, "Propose a revision.", "Closed feedback only.",
+                                "openai/gpt-5.6-luna", "max", started_at=1234.5)
+    assert "reference.run" not in str(payload["authority"])
+    assert artifact_bytes(validate_revision(enabled)["runtime_options_file"]) == encode({"experiments": experiments()})
 
 
 def test_v2_rejects_an_extra_task_regression_objective_before_freeze(study, tmp_path):

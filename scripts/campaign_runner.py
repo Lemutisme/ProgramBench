@@ -265,6 +265,8 @@ def plan_campaign(
     arm_names = _selected_arm_names(arm_selection)
     if config.limits.deadline_only and arm_names != ("procontract",):
         raise CampaignError("6h-only requires --arm procontract and a deadline-only native runtime")
+    if config.experiments is not None and (arm_names != ("procontract",) or not config.limits.deadline_only):
+        raise CampaignError("native experiments require --arm procontract and the six-hour deadline-only profile")
     root = Path(output).resolve()
     manifest_path = root / "campaign.json"
     canonical = _config_manifest(config)
@@ -694,6 +696,7 @@ def run_job(
             provider_effort=plan.config.variant,
             deadline_only=plan.config.limits.deadline_only,
             native_quality=plan.config.quality,
+            experiments=plan.config.experiments,
         )
         try:
             with WorkspaceLease(request) as workspace_lease:
@@ -1354,6 +1357,7 @@ def _image_name(instance: Mapping[str, object]) -> str:
 
 def _config_manifest(config: CampaignConfig) -> dict[str, object]:
     return {
+        **({"experiments": config.experiments} if config.experiments is not None else {}),
         **({"budget_profile": "6h-only"} if config.limits.deadline_only else {}),
         **({"quality": config.quality} if config.limits.deadline_only or config.quality else {}),
         **({"vanilla_workflow": True} if config.vanilla_workflow else {}),

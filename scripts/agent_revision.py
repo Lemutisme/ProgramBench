@@ -21,6 +21,7 @@ from typing import Callable
 import uuid
 
 from scripts.campaign_policy import load_policy_artifact
+from scripts.campaign_experiments import validate_runtime_options
 from scripts.growth_loop import GrowthError, encode, record, seal, sha256
 
 PATCH_LIMIT = 16 * 1024 * 1024
@@ -331,7 +332,7 @@ def changed_components(paths: list[str]) -> list[str]:
 
 
 def _docker(root: Path, phase: str, command: dict, recipe: dict, source: dict,
-            binary: dict | None, cancelled: Callable[[], bool]) -> dict:
+            binary: dict | None, cancelled: Callable[[], bool], *, runtime_options: dict | None = None) -> dict:
     if cancelled():
         raise GrowthError("revision operation explicitly cancelled before Docker admission")
     name = "agent-revision-" + uuid.uuid4().hex
@@ -351,6 +352,9 @@ def _docker(root: Path, phase: str, command: dict, recipe: dict, source: dict,
     else:
         argv += ["--mount", f"type=bind,src={binary['path']},dst=/artifact/opencode,readonly",
                  "--mount", f"type=bind,src={command['script']['path']},dst=/trusted/check,readonly"]
+        if runtime_options is not None:
+            artifact_bytes(runtime_options, PROPOSAL_LIMIT)
+            argv += ["--mount", f"type=bind,src={runtime_options['path']},dst=/trusted/runtime-options.json,readonly"]
     for key, ref in recipe["dependencies"].items():
         argv += ["--mount", f"type=bind,src={ref['path']},dst=/dependencies/{key},readonly"]
     argv += ["--detach", "--entrypoint", "/bin/sh", recipe["image"], "-c", "exec sleep 21660"]
@@ -430,6 +434,8 @@ def _docker(root: Path, phase: str, command: dict, recipe: dict, source: dict,
                "phase_error": phase_error,
                "isolation": {"network": "none", "credentials": "none", "host_execution": False},
                "log": _publish(root / f"{phase}-sealed.log", (root / f"{phase}.log").read_bytes())}
+    if runtime_options is not None:
+        receipt["runtime_options_sha256"] = runtime_options["sha256"]
     ref = _publish(root / f"{phase}-receipt.json", encode(receipt))
     if interruption is not None:
         raise interruption
@@ -487,16 +493,27 @@ def _copy_output(container: str, name: str, output: Path, environment: dict, can
 
 
 def freeze_initial(root: Path, source: dict, solver_policy: dict, generator_policy: dict, recipe: dict,
-                   cancelled: Callable[[], bool] = lambda: False) -> dict:
-    return _build(Path(root), None, source, solver_policy, generator_policy, b"", None, recipe, cancelled)
+                   cancelled: Callable[[], bool] = lambda: False, *, runtime_options: dict | None = None) -> dict:
+    return _build(Path(root), None, source, solver_policy, generator_policy, b"", None, recipe, cancelled,
+                  runtime_options=runtime_options)
+
+
+def _runtime_options(value: object) -> dict:
+    try:
+        return validate_runtime_options(value)
+    except ValueError as error:
+        raise GrowthError(str(error)) from error
 
 
 def validate_proposal(proposal: dict, parent_sha256: str) -> dict:
-    if (not isinstance(proposal, dict) or set(proposal) != {"parent_sha256", "rationale", "metadata"}
+    required = {"parent_sha256", "rationale", "metadata"}
+    if (not isinstance(proposal, dict) or not required <= set(proposal) or set(proposal) - required - {"runtime_options"}
             or proposal["parent_sha256"] != parent_sha256
             or not isinstance(proposal["rationale"], str) or not proposal["rationale"].strip()
             or "\0" in proposal["rationale"]):
-        raise GrowthError("proposal may only name exact parent, rationale and required metadata")
+        raise GrowthError("proposal may only name exact parent, rationale, required metadata and optional runtime_options")
+    if "runtime_options" in proposal:
+        _runtime_options(proposal["runtime_options"])
     metadata = proposal["metadata"]
     if not isinstance(metadata, dict) or set(metadata) != {
             "expected_effect", "failure_modes", "permission_changes", "state_migration", "recovery"}:
@@ -529,16 +546,22 @@ def build_revision(root: Path, parent_ref: dict, artifacts: dict, recipe: dict,
 
 
 def _build(root: Path, parent_ref: dict | None, base: dict, solver_policy: dict, generator_policy: dict,
-           patch: bytes, proposal: dict | None, recipe: dict, cancelled: Callable[[], bool]) -> dict:
+           patch: bytes, proposal: dict | None, recipe: dict, cancelled: Callable[[], bool], *,
+           runtime_options: dict | None = None) -> dict:
     validate_recipe(recipe)
     if not root.is_absolute() or root.resolve() != root:
         raise GrowthError("revision output requires a canonical absolute root")
     for ref in (solver_policy, generator_policy):
         artifact_bytes(ref, PROPOSAL_LIMIT)
         load_policy_artifact(Path(ref["path"]), ref["sha256"])
+    parent = validate_revision(parent_ref, recipe) if parent_ref else None
+    options = _runtime_options(
+        proposal.get("runtime_options", parent.get("runtime_options", {"experiments": None})) if parent
+        else {"experiments": None} if runtime_options is None else runtime_options
+    )
     specification = {"parent": parent_ref, "base": base, "solver_policy": solver_policy,
                      "generator_policy": generator_policy, "patch_sha256": sha256(patch),
-                     "proposal": proposal, "recipe": recipe}
+                     "proposal": proposal, "recipe": recipe, "runtime_options": options}
     root.mkdir(parents=True, exist_ok=True)
     record(root / "specification.json", specification)
     if (root / "manifest.json").exists():
@@ -550,7 +573,6 @@ def _build(root: Path, parent_ref: dict | None, base: dict, solver_policy: dict,
     if cancelled():
         raise GrowthError("revision operation explicitly cancelled before reconstruction")
     record(root / "started.json", {"time": time.time(), "specification_sha256": sha256(encode(specification))})
-    parent = validate_revision(parent_ref, recipe) if parent_ref else None
     source = _source(root, base, parent, patch)
     previous = json.loads(artifact_bytes(parent["source"]["files"])) if parent else {}
     files = json.loads(artifact_bytes(source["files"]))
@@ -563,7 +585,9 @@ def _build(root: Path, parent_ref: dict | None, base: dict, solver_policy: dict,
                 "generator_policy": _publish(root / "generator-policy.txt", artifact_bytes(generator_policy, PROPOSAL_LIMIT)),
                 "recipe": _publish(root / "recipe.json", encode(recipe)), "changed_paths": paths,
                 "components": components, "status": "proposal-only", "binary": None,
-                "build_receipt": None, "qualification_receipts": [], "adoption_authority": False}
+                "build_receipt": None, "qualification_receipts": [], "adoption_authority": False,
+                "runtime_options": options,
+                "runtime_options_file": _publish(root / "runtime-options.json", encode(options))}
     # This release archives sensitive candidates; Kernel succession is not automated.
     if ("sensitive" in components or (proposal is not None and (proposal["metadata"]["permission_changes"]
             or proposal["metadata"]["state_migration"] is not None))):
@@ -577,7 +601,8 @@ def _build(root: Path, parent_ref: dict | None, base: dict, solver_policy: dict,
                                           "sha256": sha256(output.read_bytes())}), executable=True)
     for check in recipe["qualifications"]:
         manifest["qualification_receipts"].append(_docker(root, "check-" + check["name"], check, recipe,
-                                                         source, manifest["binary"], cancelled))
+                                                         source, manifest["binary"], cancelled,
+                                                         runtime_options=manifest["runtime_options_file"]))
     manifest["status"] = "qualified"
     ref = _publish(root / "manifest.json", encode(manifest))
     validate_revision(ref, recipe)
@@ -593,6 +618,12 @@ def validate_revision(ref: dict, recipe: dict | None = None, executable: bool = 
     if (manifest.get("version") != 1 or manifest.get("kind") != "agent-revision"
             or manifest.get("adoption_authority") is not False):
         raise GrowthError("invalid AgentRevision manifest")
+    options = _runtime_options(manifest.get("runtime_options", {"experiments": None}))
+    if ("runtime_options" in manifest) != ("runtime_options_file" in manifest):
+        raise GrowthError("revision runtime_options require their immutable qualification input")
+    options_ref = manifest.get("runtime_options_file")
+    if "runtime_options_file" in manifest and artifact_bytes(options_ref, PROPOSAL_LIMIT) != encode(options):
+        raise GrowthError("revision runtime_options differ from their immutable qualification input")
     actual_recipe = json.loads(artifact_bytes(manifest["recipe"], PATCH_LIMIT))
     validate_recipe(actual_recipe)
     if recipe is not None and encode(actual_recipe) != encode(recipe):
@@ -617,6 +648,8 @@ def validate_revision(ref: dict, recipe: dict | None = None, executable: bool = 
     proposal = json.loads(artifact_bytes(manifest["proposal"], PROPOSAL_LIMIT))
     if parent:
         validate_proposal(proposal, manifest["parent"]["sha256"])
+        if options != _runtime_options(proposal.get("runtime_options", parent.get("runtime_options", {"experiments": None}))):
+            raise GrowthError("revision runtime_options differ from its proposal or inherited parent")
         if (proposal["parent_sha256"] != manifest["parent"]["sha256"]
                 or source["base"] != parent["source"]["base"]):
             raise GrowthError("revision proposal/source parent binding changed")
@@ -651,7 +684,9 @@ def validate_revision(ref: dict, recipe: dict | None = None, executable: bool = 
                for receipt, command in zip(manifest["qualification_receipts"], actual_recipe["qualifications"], strict=True)]
     for receipt_ref, phase, command, binary_sha in checks:
         receipt = json.loads(artifact_bytes(receipt_ref, PATCH_LIMIT))
+        options_sha256 = options_ref["sha256"] if options_ref is not None and phase != "build" else None
         if (receipt.get("phase") != phase or receipt.get("recipe_sha256") != manifest["recipe"]["sha256"]
+                or receipt.get("runtime_options_sha256") != options_sha256
                 or receipt.get("source_sha256") != source["tree_sha256"] or receipt.get("binary_sha256") != binary_sha
                 or receipt.get("image") != actual_recipe["image"] or receipt.get("argv") != command["argv"]
                 or receipt.get("exit_code") != 0 or receipt.get("timed_out") is not False
@@ -669,6 +704,11 @@ def runtime_config(config: dict, ref: dict, recipe: dict | None = None) -> dict:
     manifest = validate_revision(ref, recipe)
     actual_recipe = json.loads(artifact_bytes(manifest["recipe"], PATCH_LIMIT))
     result = copy.deepcopy(config)
+    experiments = _runtime_options(manifest.get("runtime_options", {"experiments": None}))["experiments"]
+    if "experiments" in result and _runtime_options({"experiments": result["experiments"]})["experiments"] != experiments:
+        raise GrowthError("runtime configuration conflicts with the complete AgentRevision experiments binding")
+    if experiments is not None:
+        result["experiments"] = experiments
     result["arms"]["procontract"].update(repo=manifest["source"]["repo"], revision=manifest["source"]["commit"],
         binary=manifest["binary"]["path"], binary_probe_image=actual_recipe["image"],
         execution_policy="artifact", runtime_protocol="policy-split-v1", policy_file=manifest["solver_policy"]["path"],

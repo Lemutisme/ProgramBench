@@ -128,10 +128,12 @@ with tempfile.TemporaryDirectory(prefix='programbench-readiness-') as root:
     return json.loads(result.stdout)
 
 
-def prepare_reference_binding(manifest, docker='docker', *, quality=False):
+def prepare_reference_binding(manifest, docker='docker', *, quality=False, experiments=None):
     """Bind a model-visible capability from the immutable task image, outside candidate state."""
     if quality:
         raise ValueError('quality treatment is retired; use its archived runner/runtime for historical records')
+    from scripts.campaign_experiments import validate_experiments
+    experiments = validate_experiments(experiments)
     result = subprocess.run([
         docker, 'run', '--rm', '--network', 'none', '--cap-drop', 'ALL',
         '--cap-add', 'DAC_OVERRIDE', '--security-opt', 'no-new-privileges', '--user', '0:0',
@@ -146,6 +148,7 @@ def prepare_reference_binding(manifest, docker='docker', *, quality=False):
         'candidateDirectory': '/candidate', 'directory': '/workspace',
         'executable': '/workspace/executable', 'hash': digest, 'timeout': 120000,
         'attestation': CHANNEL_PATH + '/reference.json',
+        **({'experiments': experiments} if experiments is not None else {}),
     }
     target = manifest.state_root / 'reference-binding.json'
     if target.exists():
@@ -198,6 +201,10 @@ def attest_reference(manifest, docker='docker'):
 def ensure_gateway(request):
     if getattr(request, 'native_quality', False):
         raise ValueError('quality treatment is retired; new provider admission is disabled')
+    from scripts.campaign_experiments import validate_experiments
+    experiments = validate_experiments(getattr(request, 'experiments', None))
+    if experiments is not None and (request.arm != 'procontract' or not getattr(request, 'deadline_only', False)):
+        raise ValueError('native experiments require the six-hour deadline-only ProContract profile')
     channel = request.state_root / "provider-channel"
     control = request.state_root / "provider-control"
     channel.mkdir(parents=True, exist_ok=True, mode=0o755)
@@ -211,6 +218,8 @@ def ensure_gateway(request):
         profile['budget'] = '6h-only'
     if getattr(request, 'deadline_only', False):
         profile['quality'] = False
+    if experiments is not None:
+        profile['experiments'] = experiments
     profile_path = control / 'profile.json'
     if profile_path.exists() and json.loads(profile_path.read_text()) != profile:
         raise ValueError('offline gateway profile changed')

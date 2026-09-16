@@ -5,12 +5,14 @@ import shutil
 import subprocess
 
 import pytest
+import yaml
 
 from scripts.agent_revision import (
     GrowthError, _git, _links, _path, artifact_bytes, build_revision, changed_components,
     export_source, freeze_initial, runtime_config, validate_recipe, validate_revision,
 )
 from scripts.growth_loop import encode, seal, sha256
+from tests.test_campaign_experiments import experiments
 
 
 def artifact(root, name, data):
@@ -75,7 +77,19 @@ def initial(tmp_path_factory):
     git(repo, "add", "--force", ".")
     git(repo, "-c", "user.name=Fixture", "-c", "user.email=fixture@localhost", "commit", "--quiet", "-m", "fixture")
     check = artifact(root, "check.py", b"""import os, subprocess
+import json
 assert not any(name.endswith(('_API_KEY', '_TOKEN')) for name in os.environ)
+with open('/trusted/runtime-options.json') as stream:
+    options = json.load(stream)
+assert set(options) == {'experiments'}
+print(json.dumps({'observed_runtime_options': options}, sort_keys=True), flush=True)
+try:
+    with open('/trusted/runtime-options.json', 'w') as stream:
+        stream.write('untrusted')
+except OSError:
+    pass
+else:
+    raise AssertionError('qualification options input must be read-only')
 result = subprocess.run(['/artifact/opencode'], capture_output=True, check=True)
 assert result.stdout.startswith(b'agent-v'), result.stdout
 assert os.path.exists('/source/agent.sh')
@@ -132,6 +146,103 @@ def test_actual_offline_revision_build_and_independent_qualification(initial, tm
     assert configured["arms"]["procontract"]["revision"] == candidate["source"]["commit"]
     assert configured["limits"] == original["limits"]
     assert original["arms"]["procontract"]["revision"] == "old"
+
+
+def test_runtime_options_bind_inheritance_disable_and_qualification_input(initial, tmp_path):
+    _, parent, recipe, policy = initial
+    root = validate_revision(parent, recipe)
+    assert root["runtime_options"] == {"experiments": None}
+    records = []
+    for index, options in enumerate([{"experiments": experiments()}, "inherit", {"experiments": None}]):
+        directory = tmp_path / str(index)
+        directory.mkdir()
+        artifacts = proposal(directory, parent, policy)
+        if options != "inherit":
+            document = json.loads(artifact_bytes(artifacts["revision_proposal"])) | {"runtime_options": options}
+            artifacts["revision_proposal"] = artifact(directory, "selected.json", encode(document))
+        reference = build_revision(directory / "revision", parent, artifacts, recipe)
+        selected = validate_revision(reference, recipe)
+        expected = {"experiments": experiments()} if index < 2 else {"experiments": None}
+        assert selected["runtime_options"] == expected
+        assert artifact_bytes(selected["runtime_options_file"]) == encode(expected)
+        receipt = json.loads(artifact_bytes(selected["qualification_receipts"][0]))
+        assert receipt["runtime_options_sha256"] == selected["runtime_options_file"]["sha256"]
+        assert json.loads(artifact_bytes(receipt["log"])) == {"observed_runtime_options": expected}
+        configured = runtime_config({"arms": {"procontract": {}}}, reference, recipe)
+        assert configured.get("experiments") == expected["experiments"]
+        records.append((reference, selected))
+        parent = reference
+    enabled, disabled = records[0][0], records[2][0]
+    with pytest.raises(GrowthError, match="conflicts"):
+        runtime_config({"arms": {"procontract": {}}, "experiments": None}, enabled, recipe)
+    with pytest.raises(GrowthError, match="conflicts"):
+        runtime_config({"arms": {"procontract": {}}, "experiments": experiments()}, disabled, recipe)
+
+    from scripts.growth_native import runtime_configuration
+    evaluation = tmp_path / "evaluation"
+    evaluation.mkdir()
+    configured = runtime_config({"arms": {"procontract": {}}}, enabled, recipe)
+    frozen = yaml.safe_dump(configured)
+    (evaluation / "config.yaml").write_text(frozen)
+    study = {"initial": {"agent_revision": enabled}, "revision_recipe": recipe}
+    binding = {"agent_revision": disabled, "solver_policy": records[2][1]["solver_policy"],
+               "generator_policy": records[2][1]["generator_policy"]}
+    assert runtime_configuration(study, evaluation, binding).get("experiments") is None
+    assert (evaluation / "config.yaml").read_text() == frozen
+    configured["experiments"]["timeout"] = 9999
+    (evaluation / "config.yaml").write_text(yaml.safe_dump(configured))
+    with pytest.raises(GrowthError, match="initial configuration"):
+        runtime_configuration(study, evaluation, binding)
+    configured["experiments"]["timeout"] = float(experiments()["timeout"])
+    (evaluation / "config.yaml").write_text(yaml.safe_dump(configured))
+    with pytest.raises(GrowthError, match="invalid initial configuration"):
+        runtime_configuration(study, evaluation, binding)
+
+    changed = dict(records[1][1])
+    changed["runtime_options"] = {"experiments": None}
+    changed["runtime_options_file"] = artifact(tmp_path, "wrong-options.json", encode(changed["runtime_options"]))
+    with pytest.raises(GrowthError, match="inherited parent"):
+        validate_revision(artifact(tmp_path, "wrong-inheritance.json", encode(changed)), recipe)
+
+    changed = dict(records[0][1])
+    receipt = json.loads(artifact_bytes(changed["qualification_receipts"][0]))
+    receipt["runtime_options_sha256"] = "0" * 64
+    changed["qualification_receipts"] = [artifact(tmp_path, "wrong-receipt.json", encode(receipt))]
+    with pytest.raises(GrowthError, match="qualify these exact bytes"):
+        validate_revision(artifact(tmp_path, "wrong-qualification.json", encode(changed)), recipe)
+    changed = dict(records[0][1])
+    changed["runtime_options_file"] = None
+    with pytest.raises(GrowthError, match="artifact requires"):
+        validate_revision(artifact(tmp_path, "null-options-file.json", encode(changed)), recipe)
+
+
+def test_legacy_manifest_without_options_remains_disabled(initial, tmp_path):
+    _, parent, recipe, _ = initial
+    legacy = dict(validate_revision(parent, recipe))
+    legacy.pop("runtime_options")
+    legacy.pop("runtime_options_file")
+    receipts = []
+    for index, ref in enumerate(legacy["qualification_receipts"]):
+        receipt = json.loads(artifact_bytes(ref))
+        receipt.pop("runtime_options_sha256")
+        receipts.append(artifact(tmp_path, f"legacy-check-{index}.json", encode(receipt)))
+    legacy["qualification_receipts"] = receipts
+    reference = artifact(tmp_path, "legacy-manifest.json", encode(legacy))
+    assert "runtime_options" not in validate_revision(reference, recipe)
+    assert "experiments" not in runtime_config({"arms": {"procontract": {}}}, reference, recipe)
+    with pytest.raises(GrowthError, match="conflicts"):
+        runtime_config({"arms": {"procontract": {}}, "experiments": experiments()}, reference, recipe)
+
+
+def test_initial_runtime_options_are_explicitly_frozen_into_qualification(initial, tmp_path):
+    _, parent, recipe, policy = initial
+    selected = freeze_initial(tmp_path / "enabled", validate_revision(parent)["source"]["base"], policy, policy,
+                              recipe, runtime_options={"experiments": experiments()})
+    manifest = validate_revision(selected, recipe)
+    assert manifest["parent"] is None
+    assert manifest["runtime_options"] == {"experiments": experiments()}
+    receipt = json.loads(artifact_bytes(manifest["qualification_receipts"][0]))
+    assert receipt["runtime_options_sha256"] == manifest["runtime_options_file"]["sha256"]
 
 
 def test_sensitive_change_is_archived_without_build_or_execution(initial, tmp_path):

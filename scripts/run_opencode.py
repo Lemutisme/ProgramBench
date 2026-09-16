@@ -216,6 +216,7 @@ class CampaignConfig:
     vanilla_workflow: bool = False
     # Retained for exact historical manifests; quality=True cannot enter new inference.
     quality: bool = False
+    experiments: Mapping[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -294,13 +295,20 @@ def load_config(path: Path) -> CampaignConfig:
         raw = yaml.load(source, Loader=_UniqueKeyLoader)
     except (TypeError, yaml.YAMLError) as error:
         raise ConfigError(f"invalid YAML: {error}") from error
-    _require_keys(raw, _TOP_LEVEL_KEYS | {"observations", "vanilla_workflow", "quality"}, _TOP_LEVEL_KEYS, "top-level config")
+    _require_keys(raw, _TOP_LEVEL_KEYS | {"observations", "vanilla_workflow", "quality", "experiments"}, _TOP_LEVEL_KEYS, "top-level config")
     if type(raw.get("vanilla_workflow", False)) is not bool:
         raise ConfigError("vanilla_workflow must be boolean")
     if type(raw.get("quality", False)) is not bool:
         raise ConfigError("quality must be boolean")
 
     limits = _load_limits(raw.get("limits"))
+    from scripts.campaign_experiments import validate_experiments
+    try:
+        experiments = validate_experiments(raw.get("experiments"))
+    except ValueError as error:
+        raise ConfigError(str(error)) from error
+    if experiments is not None and not limits.deadline_only:
+        raise ConfigError("native experiments require the six-hour deadline-only profile")
     cache = _load_cache(raw.get("cache"))
     arms = _load_arms(raw.get("arms"), path.parent)
     excluded = raw.get("excluded", [])
@@ -324,6 +332,7 @@ def load_config(path: Path) -> CampaignConfig:
         observations=admitted,
         vanilla_workflow=raw.get("vanilla_workflow", False),
         quality=raw.get("quality", False),
+        experiments=experiments,
     )
 
 
@@ -522,6 +531,7 @@ def _unlink_and_sync_parent(temporary_name: str, parent: Path) -> None:
 
 def _canonical_config(config: CampaignConfig) -> dict[str, object]:
     return {
+        **({"experiments": config.experiments} if config.experiments is not None else {}),
         **({"budget_profile": "6h-only"} if config.limits.deadline_only else {}),
         **({"quality": config.quality} if config.limits.deadline_only or config.quality else {}),
         **({"vanilla_workflow": True} if config.vanilla_workflow else {}),

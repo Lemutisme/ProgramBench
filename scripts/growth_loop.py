@@ -214,7 +214,8 @@ def freeze(study_path, root):
     }
     code = {name: sha256(Path(__file__).with_name(name).read_bytes())
             for name in ("growth_loop.py", "growth_native.py", "growth_feedback.py",
-                         *(("agent_revision.py", "campaign_install.py", "run_opencode.py", "campaign_runner.py") if system else ()),
+                         *(("agent_revision.py", "campaign_install.py", "run_opencode.py", "campaign_runner.py",
+                            "campaign_experiments.py", "campaign_offline.py", "campaign_workspace.py") if system else ()),
                          *(("campaign_admission.py",) if study.get("infrastructure_guard") is not None else ()))}
     record(root / "frozen.json", {"study_sha256": sha256(encode(study)), "initial": initial,
                                  "controller_sources": code, "scope": "agent-system" if system else "policy-text-only"})

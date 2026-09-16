@@ -449,6 +449,8 @@ class WorkspaceRequest:
     deadline_only: bool = False
     # Legacy identity only: cleanup may read it, workspace admission rejects True.
     native_quality: bool = False
+    experiments: Mapping[str, object] | None = None
+    reference_binding: bool = True
     docker: str = "docker"
     docker_runner: _DockerRunner | None = None
     health_probe: _HealthProbe | None = None
@@ -1056,7 +1058,9 @@ def _launch(
         environment = {**OFFLINE_ENV, "OPENCODE_PROCONTRACT_DISABLED": "1" if launching.arm == "vanilla" else "0"}
         if "OPENCODE_REFERENCE_BINDING" in launching.environment_names:
             from scripts.campaign_offline import prepare_reference_binding
-            environment["OPENCODE_REFERENCE_BINDING"] = prepare_reference_binding(launching, request.docker, quality=request.native_quality)
+            environment["OPENCODE_REFERENCE_BINDING"] = prepare_reference_binding(
+                launching, request.docker, quality=request.native_quality, experiments=request.experiments,
+            )
         command.extend(value for name, setting in environment.items() for value in ("-e", f"{name}={setting}"))
     else:
         command.extend(value for name in launching.credential_env for value in ("-e", name))
@@ -1187,11 +1191,16 @@ def _expected_manifest(
     command = _COMMAND
     if request.isolated:
         from scripts.campaign_offline import BOOTSTRAP, CHANNEL_PATH, OFFLINE_ENV, ensure_gateway
+        if not request.reference_binding and "OPENCODE_REFERENCE_BINDING" in image_environment:
+            raise WorkspaceError("workspace role disables reference binding but image declares one")
         directory = ensure_gateway(request)
         channel = (MountSpec(directory, CHANNEL_PATH, "bind", True),)
         identities = (PathIdentity.capture("provider-channel", directory),)
         environment = {*image_environment, "OPENCODE_SERVER_PASSWORD", *_FIXED_ENV, *OFFLINE_ENV}
-        if request.arm == "procontract" and (request.deadline_only or request.native_quality or os.environ.get("PROGRAMBENCH_GROUNDED_REFERENCE") == "1"):
+        if request.reference_binding and request.arm == "procontract" and (
+            request.deadline_only or request.native_quality or request.experiments is not None
+            or os.environ.get("PROGRAMBENCH_GROUNDED_REFERENCE") == "1"
+        ):
             environment.add("OPENCODE_REFERENCE_BINDING")
         entrypoint = ("/usr/bin/python3",)
         command = ("-I", "-S", "-c", BOOTSTRAP, *_COMMAND)
@@ -1254,6 +1263,19 @@ def _expected_manifest(
 
 
 def _validate_request(request: WorkspaceRequest) -> WorkspaceRequest:
+    if type(request.reference_binding) is not bool:
+        raise WorkspaceError("reference_binding must be boolean")
+    if request.experiments is not None:
+        from scripts.campaign_experiments import validate_experiments
+        try:
+            experiments = validate_experiments(request.experiments)
+        except ValueError as error:
+            raise WorkspaceError(str(error)) from error
+        if not request.isolated or request.arm != "procontract" or not request.deadline_only:
+            raise WorkspaceError("native experiments require an isolated deadline-only ProContract workspace")
+        if not request.reference_binding:
+            raise WorkspaceError("native experiments require this workspace role to bind a reference")
+        request = replace(request, experiments=experiments)
     if any(
         not isinstance(value, str) or not _NAME.fullmatch(value)
         for value in (request.campaign, request.instance_id, request.arm)

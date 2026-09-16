@@ -206,8 +206,15 @@ def generator_payload(output, specification, instruction, context, model, varian
              "  data=f.read(limit+1); assert len(data)<=limit and b'\\0' not in data\n"
              "  assert data.decode('utf-8').strip() or empty\n")
     if revision:
-        check += ("with open('agent-revision.json',encoding='utf-8') as f: proposal=json.load(f)\n"
-                  "assert type(proposal) is dict and set(proposal)=={'parent_sha256','rationale','metadata'}\n"
+        from inspect import getsource
+        from scripts.campaign_experiments import MAX_OPERATION_MS, validate_experiments, validate_runtime_options
+        # Freeze the same pure validation code into the four-artifact replay;
+        # the candidate never imports mutable host modules during validation.
+        check += (f"MAX_OPERATION_MS={MAX_OPERATION_MS}\n" + getsource(validate_experiments) + "\n"
+                  + getsource(validate_runtime_options) + "\n"
+                  "with open('agent-revision.json',encoding='utf-8') as f: proposal=json.load(f)\n"
+                  "assert type(proposal) is dict and {'parent_sha256','rationale','metadata'} <= set(proposal) and not set(proposal)-{'parent_sha256','rationale','metadata','runtime_options'}\n"
+                  "if 'runtime_options' in proposal: validate_runtime_options(proposal['runtime_options'])\n"
                   f"assert proposal['parent_sha256']=={specification['binding']['agent_revision']['sha256']!r}\n"
                   "assert type(proposal['rationale']) is str and proposal['rationale'].strip() and '\\0' not in proposal['rationale']\n"
                   "metadata=proposal['metadata']\n"
@@ -220,7 +227,7 @@ def generator_payload(output, specification, instruction, context, model, varian
                   "migration=metadata['state_migration']\n"
                   "assert migration is None or (type(migration) is str and migration.strip() and '\\0' not in migration)\n")
     instructions = (
-        "Write agent-revision.json containing exactly parent_sha256, a nonempty rationale, and metadata; parent_sha256 must be "
+        "Write agent-revision.json containing parent_sha256, a nonempty rationale, metadata, and optionally runtime_options; parent_sha256 must be "
         + specification["binding"]["agent_revision"]["sha256"] + ". Write source.patch as a UTF-8 git patch against "
         "the exact parent checkout at /candidate/agent-source. You may edit that checkout; only the patch and the "
         "two policy artifacts are proposed outputs. Include new files in the patch. An empty patch is allowed. "
@@ -230,6 +237,14 @@ def generator_payload(output, specification, instruction, context, model, varian
         "permission_changes (list of nonempty text, empty when none), state_migration (nonempty text or null), "
         "and recovery (nonempty text describing how to withdraw the change). Requested permission or state changes "
         "remain proposals and cannot authorize their own execution. "
+        "Omitting runtime_options inherits the exact parent's tool configuration. To disable native experiments, "
+        "set runtime_options to {\"experiments\":null}. To enable them, its only key experiments must contain exactly "
+        "candidate (\"executable\"), interpreter (\"/usr/bin/python3\"), timeout and maxDuration (integer milliseconds "
+        "from 1 to 600000), and prepare ({\"argv\":[\"/bin/sh\",\"./compile.sh\"],\"timeout\":integer milliseconds}). "
+        "Both process timeouts must not exceed maxDuration. These bound individual operations within the original "
+        "Contract deadline; they do not grant additional time or cumulative budgets. No other runtime option, "
+        "environment setting or execution path is accepted. Enabling requires a runtime that actually provides "
+        "the native experiment tools and passes independent qualification. "
         "Do not put build outputs or test claims in the JSON. External trusted execution reconstructs, builds, "
         "qualifies and evaluates a proposed revision. Source edits cannot alter this production Contract, "
         "the host build recipe, task goals, authority, evaluation rules or version adoption. "
@@ -414,8 +429,20 @@ def runtime_configuration(study, root, binding):
     raw = yaml.safe_load((root / "config.yaml").read_bytes())
     if "agent_revision" in binding:
         from scripts.agent_revision import runtime_config, validate_revision
+        from scripts.campaign_experiments import validate_experiments
 
         revision = validate_revision(binding["agent_revision"], study["revision_recipe"])
+        if "experiments" in raw:
+            initial = validate_revision(study["initial"]["agent_revision"], study["revision_recipe"])
+            try:
+                initial_experiments = validate_experiments(raw["experiments"])
+            except ValueError as error:
+                raise GrowthError(f"invalid initial configuration experiments: {error}") from error
+            if initial_experiments != initial.get("runtime_options", {}).get("experiments"):
+                raise GrowthError("initial configuration experiments differ from its complete AgentRevision")
+            # This is an initial-revision-derived field, not a study-wide option.
+            # The selected revision below supplies its own validated tool configuration.
+            raw.pop("experiments")
         for key in ("solver_policy", "generator_policy"):
             if key in binding and binding[key] != revision[key]:
                 raise GrowthError("runtime revision and policy binding disagree")
@@ -488,14 +515,17 @@ class ProgramBenchBackend:
 
         if (self.root / "CANCEL").exists():
             raise GrowthError("generation cancelled before workspace preparation")
+        seal(output / "generator-config.yaml", yaml.safe_dump(
+            runtime_configuration(self.study, self.root, specification["binding"]), sort_keys=False).encode())
+        config = load_config(output / "generator-config.yaml")
         record(output / "generator-runtime.json", {
             "parent_revision": specification["binding"].get("agent_revision"),
             "solver_policy": specification["binding"]["solver_policy"],
             "generator_policy": specification["binding"]["generator_policy"],
+            "requested_runtime_options": {"experiments": config.experiments},
+            "effective_runtime_options": {"experiments": None},
+            "runtime_options_reason": "generator_contract_has_no_reference_authority",
         })
-        seal(output / "generator-config.yaml", yaml.safe_dump(
-            runtime_configuration(self.study, self.root, specification["binding"]), sort_keys=False).encode())
-        config = load_config(output / "generator-config.yaml")
         arm = next(arm for arm in config.arms if arm.name == "procontract")
         install_root = self.root / "generator-installs"
         if "agent_revision" in specification["binding"]:
@@ -508,11 +538,14 @@ class ProgramBenchBackend:
         if not re.fullmatch(r"sha256:[0-9a-f]{64}", image):
             raise GrowthError("generator image did not resolve to immutable local image bytes")
         record(output / "generator-image.json", {"requested": self.study["generator"]["image"], "local_image_id": image})
+        # Generator Contracts do not grant reference.run and the neutral generator
+        # image is not a ProgramBench oracle. Never activate solver probes here.
         request = WorkspaceRequest(job=job, campaign_root=output, campaign=campaign,
                     instance_id="policy-generator", arm="procontract", image=image, install=install,
                     candidate_root=job.root / "candidates", state_root=job.root / "workspace-state", log_dir=job.root / "logs",
                     credential_env=tuple(key for key in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENCODE_SERVER_PASSWORD") if os.environ.get(key)),
-                    isolated=True, deadline_only=True, health_timeout=45, provider_model=config.model.split("/", 1)[1], provider_effort=config.variant)
+                    isolated=True, deadline_only=True, reference_binding=False, health_timeout=45,
+                    provider_model=config.model.split("/", 1)[1], provider_effort=config.variant)
         with _generator_workspace_lease(request, output) as lease:
             from scripts.campaign_admission import disk_admission, study_disk_minimum
             while not disk_admission(self.root, study_disk_minimum(self.study), output / "disk-admission.json"):

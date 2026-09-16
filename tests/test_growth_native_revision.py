@@ -7,6 +7,8 @@ import pytest
 
 from scripts.growth_loop import GrowthError, encode, policy, read, record, seal, sha256
 from scripts.growth_native import REVISION_ARTIFACTS, closed_feedback, generator_context, generator_payload, native_generation
+from scripts.agent_revision import validate_proposal
+from tests.test_campaign_experiments import experiments
 
 
 def proposal(tmp_path):
@@ -166,6 +168,30 @@ def test_policy_only_native_contract_keeps_existing_artifact_shape(tmp_path):
     assert "parent_revision" not in result
     assert len(api.attestations) == 1 and api.interrupted == ["native-session"]
     assert Path(result["artifacts"]["solver_policy"]["path"]).read_text() == "A changed policy.\n"
+
+
+@pytest.mark.parametrize("options,accepted", [
+    ({"experiments": experiments()}, True), ({"experiments": None}, True),
+    ({"experiments": experiments() | {"timeout": 0}}, False),
+    ({"experiments": experiments() | {"candidate": "../executable"}}, False),
+    ({"experiments": experiments() | {"maxDuration": 600001}}, False),
+    ({"experiments": experiments() | {"env": {"APP_MODE": "other"}}}, False),
+    ({"experiments": None, "env": {"PATH": "/candidate"}}, False),
+    ({"experiment_tools": True}, False), (None, False),
+])
+def test_four_artifact_replay_and_host_agree_on_runtime_options(tmp_path, options, accepted):
+    _, destination, payload = proposal(tmp_path)
+    path = destination / "agent-revision.json"
+    value = json.loads(path.read_text()) | {"runtime_options": options}
+    path.write_text(json.dumps(value))
+    assert set(payload["evidence"]["replay"]["artifacts"]) == {
+        "agent-revision.json", "source.patch", "solver-policy.txt", "generator-policy.txt"}
+    assert (replay(payload, destination).returncode == 0) is accepted
+    if accepted:
+        assert validate_proposal(value, "a" * 64) == value
+        return
+    with pytest.raises(GrowthError):
+        validate_proposal(value, "a" * 64)
 
 
 def test_revision_feedback_exposes_source_change_without_host_build_or_receipt_paths(tmp_path):
