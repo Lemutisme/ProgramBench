@@ -370,6 +370,49 @@ def test_failure_dense_windows_cover_each_task_end_and_start(tmp_path):
     assert len((tmp_path / "bundle/index.jsonl").read_text().splitlines()) == 200
 
 
+def test_large_observations_remain_visible_under_shared_source_quotas(tmp_path):
+    study, root, reference, jobs = source(tmp_path, count=12)
+    for job in jobs:
+        db = Path(json.loads((job / "tool-feedback-native.json").read_bytes())["db_path"])
+        with sqlite3.connect(db) as connection:
+            connection.execute("UPDATE session_message SET data = json_set(data, "
+                "'$.content[1].state.input.command', ?, '$.content[1].state.content[0].text', ?) WHERE id != 'unrelated'",
+                ('COMMAND_SENTINEL ' + 'probe ' * 300, 'OBSERVATION_SENTINEL ' + 'output ' * 3000))
+    bundle = extract_source(reference, root, "first", "incumbent", 7, tmp_path / "bundle")
+    result = windows(bundle, 2200)
+    for task in study['development_instances']:
+        rows = [row for row in result['windows'] if row['instance_id'] == task]
+        assert len(rows) >= 2
+        assert all('OBSERVATION_SENTINEL' in row.get('output_preview', '') for row in rows)
+        assert all('COMMAND_SENTINEL' in row['input_preview'] for row in rows)
+    assert result['inline_bytes'] <= 2200
+    assert 'full records' in result['preview_scope']
+    # Every selected ordinal still resolves to its original identity-bound record.
+    index = [json.loads(line) for line in (tmp_path / 'bundle/index.jsonl').read_text().splitlines()]
+    with (tmp_path / 'bundle/actions.jsonl').open('rb') as stream:
+        for row in result['windows']:
+            entry = index[row['ordinal']]
+            stream.seek(entry['offset'])
+            assert sha256(stream.read(entry['bytes'])) == entry['sha256']
+
+
+def test_structured_only_results_and_escaped_text_have_bounded_visible_previews(tmp_path):
+    study, root, reference, jobs = source(tmp_path, count=2)
+    for job in jobs:
+        db = Path(json.loads((job / 'tool-feedback-native.json').read_bytes())['db_path'])
+        with sqlite3.connect(db) as connection:
+            connection.execute("UPDATE session_message SET data = json_set(data, '$.content[1].name', 'read', "
+                "'$.content[1].state.content', json('[]'), '$.content[1].state.structured', json(?)) WHERE id != 'unrelated'",
+                (json.dumps({'content': 'STRUCTURED_SENTINEL ' + '\x00\t\n\\"中文😀' * 1000, 'truncated': True}),))
+    bundle = extract_source(reference, root, 'first', 'incumbent', 7, tmp_path / 'bundle')
+    result = windows(bundle, 2500)
+    assert len(result['windows']) >= 4
+    assert all('STRUCTURED_SENTINEL' in row['structured_preview'] for row in result['windows'])
+    assert all(row['body_availability'] == 'partial' for row in result['windows'])
+    assert result['inline_bytes'] == len(encode(result['windows'])) <= 2500
+    assert all(secret not in encode(result).decode() for secret in ['REASONING_SECRET', 'ASSISTANT_TEXT_SECRET'])
+
+
 def test_closed_feedback_is_identical_across_forks_and_no_p_payload_reaches_generator(tmp_path):
     study, root, reference, jobs = source(tmp_path)
     first = closed_feedback(study, root, 1)

@@ -410,18 +410,42 @@ def windows(value, byte_limit=32768):
                 if sha256(raw) != entry["sha256"]:
                     raise GrowthError("tool recall index does not match archived action")
                 action = json.loads(raw)
-                preview = {**entry, "input_preview": json.dumps(action["input"], ensure_ascii=False)[:240],
-                           "output_preview": json.dumps(action["content"], ensure_ascii=False)[:400],
-                           "error_preview": json.dumps(action["error"], ensure_ascii=False)[:240]}
+                preview = bounded_preview(action, entry, min(1600, max(0, (quota - 8) // 2)))
+                if preview is None:
+                    continue
                 if len(encode(chosen + [preview])) <= quota and len(encode(selected + chosen + [preview])) <= byte_limit:
                     chosen.append(preview)
             allocations[task] = {"assigned_actions": len(assigned), "selected_actions": len(chosen), "context_byte_quota": quota}
             selected.extend(chosen)
     return {"summary": manifest["summary"], "windows": selected, "per_task_windows": allocations,
-            "window_rule": "equal per-task context quotas; interleaved whole-run quantiles and distributed observed-error/nonzero-exit anchors, then neighbours; full index retained",
+            "window_rule": "equal per-task context quotas; interleaved whole-run quantiles and distributed observed-error/nonzero-exit anchors, then neighbours; previews shrink to fit instead of dropping large observations; full index retained",
+            "preview_scope": "Bounded prefixes of native tool inputs, content, structured results and errors; not full JSON values or proof of task quality. "
+                             "Use ordinal in the source index for original timing, Session/call identity and hash-checked full records.",
             "inline_bytes": len(encode(selected)), "context_transport_limit": byte_limit,
             "omitted_inline_actions": len(index) - len(selected), "archive_complete_for_available_records": True,
             "full_recall": "actions.jsonl offsets/lengths/hashes are in index.jsonl; omitted windows are not missing evidence"}
+
+
+def bounded_preview(action, entry, byte_limit):
+    """Preserve an anchor's identity and share its transport budget across bodies."""
+    identity = {key: entry[key] for key in ["ordinal", "instance_id", "message_seq", "tool", "status", "body_availability", "observed_nonzero_exit"]}
+    fields = [("input_preview", json.dumps(action["input"], ensure_ascii=False), 240)]
+    fields += [(name, json.dumps(value, ensure_ascii=False), limit) for name, value, limit in [
+        ("output_preview", action["content"], 400), ("structured_preview", action["structured"], 400),
+        ("error_preview", action["error"], 240)] if value]
+    # Measured after JSON escaping/indentation, including non-ASCII and control bytes.
+    low, high = 0, 400
+    preview = {**identity, **{name: "" for name, _, _ in fields}}
+    if len(encode([preview])) > byte_limit:
+        return None
+    while low < high:
+        middle = (low + high + 1) // 2
+        candidate = {**identity, **{name: text[:limit * middle // 400] for name, text, limit in fields}}
+        if len(encode([candidate])) <= byte_limit:
+            preview, low = candidate, middle
+            continue
+        high = middle - 1
+    return preview
 
 
 def validate_config(study):
