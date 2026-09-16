@@ -340,12 +340,12 @@ def _docker(root: Path, phase: str, command: dict, recipe: dict, source: dict,
             "--cap-drop=ALL", "--security-opt=no-new-privileges", "--user", f"{os.getuid()}:{os.getgid()}",
             "--pids-limit", str(recipe.get("pids_limit", 256)), "--memory", f"{recipe.get('memory_mb', 8192)}m",
             "--memory-swap", f"{recipe.get('memory_mb', 8192)}m",
-            "--tmpfs", f"/tmp:rw,nosuid,nodev,size={recipe.get('tmpfs_mb', 8192)}m",
-            "--tmpfs", f"/work:rw,nosuid,nodev,size={recipe.get('tmpfs_mb', 8192)}m",
+            "--tmpfs", f"/tmp:rw,nosuid,nodev,mode=1777,size={recipe.get('tmpfs_mb', 8192)}m",
+            "--tmpfs", f"/work:rw,nosuid,nodev,uid={os.getuid()},gid={os.getgid()},mode=0700,size={recipe.get('tmpfs_mb', 8192)}m",
             "--workdir", "/work", "--env", "HOME=/tmp", "--env", "TMPDIR=/tmp",
             "--mount", f"type=bind,src={source['repo']},dst=/source,readonly"]
     if binary is None:
-        argv += ["--tmpfs", f"/output:rw,nosuid,nodev,size={recipe.get('tmpfs_mb', 8192)}m"]
+        argv += ["--tmpfs", f"/output:rw,nosuid,nodev,uid={os.getuid()},gid={os.getgid()},mode=0700,size={recipe.get('tmpfs_mb', 8192)}m"]
     else:
         argv += ["--mount", f"type=bind,src={binary['path']},dst=/artifact/opencode,readonly",
                  "--mount", f"type=bind,src={command['script']['path']},dst=/trusted/check,readonly"]

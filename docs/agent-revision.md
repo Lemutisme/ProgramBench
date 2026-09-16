@@ -147,6 +147,12 @@ Agent revision changes. No cumulative provider, tool, request or monetary cap is
 introduced. Build resource/log guards bound individual infrastructure operations.
 An existing native task always retains its original deadline and runtime.
 
+An optional frozen `infrastructure_guard.minimum_disk_free_bytes` pauses each
+new generator/container or solver-job admission below the host disk floor.
+Active jobs keep running with their original deadlines, and explicit cancellation
+still works while admission is paused. This is a storage protection rule, not a
+cumulative model resource budget.
+
 Development selection uses exact task-equal mean score. Missing or invalid
 assigned measurements prevent adoption. A qualifying finalist must also pass
 the frozen fresh-confirmation mean threshold. Version 2 has no per-task

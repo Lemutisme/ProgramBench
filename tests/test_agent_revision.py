@@ -51,9 +51,12 @@ result = subprocess.run(['/artifact/opencode'], capture_output=True, check=True)
 assert result.stdout.startswith(b'agent-v'), result.stdout
 assert os.path.exists('/source/agent.sh')
 assert not os.path.exists('/var/run/docker.sock')
+os.mkdir('/work/qualification-scratch')
+with open('/work/qualification-scratch/evidence', 'w') as stream:
+    stream.write('candidate check owns writable scratch')
 """)
     recipe = {"version": 1, "image": image.stdout.strip(),
-              "build": {"argv": ["/bin/sh", "-c", "cp /source/agent.sh /output/opencode; chmod 755 /output/opencode"],
+              "build": {"argv": ["/bin/sh", "-c", "mkdir /work/build && cp /source/agent.sh /output/opencode && chmod 755 /output/opencode"],
                         "timeout_seconds": 30},
               "qualifications": [{"name": "independent-smoke", "argv": ["python3", "/trusted/check"],
                                   "script": check, "timeout_seconds": 30}],

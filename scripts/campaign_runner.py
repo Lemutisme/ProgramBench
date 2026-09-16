@@ -364,6 +364,7 @@ def run_campaign(
     interrupt_timeout: float = 20.0,
     clock: Callable[[], float] = time.time,
     sleeper: Callable[[float], None] = time.sleep,
+    admission_check: Callable[[], bool] | None = None,
 ) -> CampaignResult:
     """Run at most ``workers`` active trajectories, admitting one only on completion."""
     if type(workers) is not int or not 0 < workers <= MAX_ACTIVE_JOBS:
@@ -423,9 +424,19 @@ def run_campaign(
                     break
                 continue
             while pending and len(running) < workers and not stop.is_set() and breaker.admission_allowed:
+                if admission_check is not None and not admission_check():
+                    break
                 candidate = pending.popleft()
                 running[executor.submit(execute, candidate, stop)] = candidate
             if not running:
+                if stop.is_set():
+                    interrupted = True
+                    pending.clear()
+                    persist_breaker()
+                    break
+                if pending and not stop.is_set() and breaker.admission_allowed:
+                    sleeper(0.25)
+                    continue
                 break
             done, _ = wait(tuple(running), timeout=0.1, return_when=FIRST_COMPLETED)
             if (stop.is_set() or not breaker.admission_allowed) and not persist_breaker():
@@ -485,6 +496,14 @@ def run_campaign(
         stop.set("keyboard_interrupt")
         pending.clear()
         persist_breaker()
+    except BaseException:
+        # A broken admission probe is an infrastructure fault, not a denial.
+        # Preserve the existing bounded cleanup path instead of orphaning workers.
+        interrupted = True
+        stop.set("scheduler_failed")
+        pending.clear()
+        persist_breaker()
+        raise
     finally:
         if interrupted:
             deadline = time.monotonic() + interrupt_timeout
@@ -939,6 +958,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--workers", type=_positive, default=8, help="active trajectories (1-32; default: 8)")
+    parser.add_argument("--minimum-disk-free-bytes", type=_positive,
+                        help="pause new instance admission below this host free-space floor; active tasks continue")
     parser.add_argument("--limit", type=_positive, default=8, help="instances in the pilot (default: 8; 16 jobs)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--filter")
@@ -1041,6 +1062,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
     if missing and not terminal_evaluation:
         raise CampaignError(f"required credential environment variable(s) are missing: {', '.join(missing)}")
     try:
+        from scripts.campaign_admission import disk_admission
+
         result = (
             CampaignResult(len(plan.jobs), 0, (), 0, breaker.pause_reason)
             if terminal_evaluation
@@ -1049,6 +1072,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 workers=args.workers,
                 breaker=breaker,
                 state_path=breaker_path,
+                admission_check=lambda: disk_admission(
+                    plan.output, args.minimum_disk_free_bytes, plan.output / "disk-admission.json"
+                ),
                 execute=lambda candidate, stop: run_job(
                     plan,
                     candidate,

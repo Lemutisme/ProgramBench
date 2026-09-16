@@ -13,6 +13,9 @@ from scripts.campaign_policy import load_policy_artifact
 from scripts.growth_feedback import PROTOCOL, extract_source, materialize_feedback, process_alive, project_tools, verify_bundle, windows
 from scripts.growth_loop import GrowthError, encode, sha256
 from scripts.growth_native import closed_feedback
+from tests import test_agent_revision
+
+initial = test_agent_revision.initial
 
 
 def write(path, value):
@@ -26,7 +29,7 @@ def process_identity(process):
             "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip()}
 
 
-def source(tmp_path, *, count=5, tasks=("task-a", "task-b")):
+def source(tmp_path, *, count=5, tasks=("task-a", "task-b"), delivered=False):
     root = tmp_path / "study"
     study = {"development_instances": list(tasks), "runner": {"commit": "a" * 40}, "runtime_sha256": "b" * 64,
              "feedback": {"protocol": PROTOCOL, "sources": [], "inline_bytes": 16000},
@@ -77,7 +80,8 @@ def source(tmp_path, *, count=5, tasks=("task-a", "task-b")):
         connection.commit()
         connection.close()
         write(job / "procontract-result.json", {"completion": "failed", "contract_id": "contract-" + task, "session_id": "session-" + task,
-            "actions": count, "workspace_frozen": True, "native_process_stopped": True, "outstanding": []})
+            "actions": count, "workspace_frozen": delivered, "native_process_stopped": True,
+            "outstanding": [] if delivered else ["unfinished-native-obligation"]})
         write(job / "state.json", {"phase": "failed", "artifact_hashes": {"procontract-result.json": sha256((job / "procontract-result.json").read_bytes())}})
         write(job / "tool-feedback-native.json", {"kind": "native-process", "source_kind": "local-native-fixture", "instance_id": task,
             "job_root": str(job), "db_path": str(db), "process": identity})
@@ -97,7 +101,83 @@ def test_real_sql_projection_excludes_other_content_and_preserves_partial_and_fa
     assert manifest["summary"]["observed_nonzero_exits"] == 6
     assert manifest["summary"]["body_availability"]["partial"] == 2
     assert all(job["native_completion"] == "failed" for job in manifest["jobs"])
+    assert all(job["terminal_outcome"] == {"phase": "failed", "completion": "failed", "workspace_frozen": False,
+        "outstanding_count": 1, "delivery": "not_discharged", "score_validity": "not_inferred"} for job in manifest["jobs"])
     assert extract_source(reference, root, "first", "incumbent", 7, tmp_path / "bundle") == bundle
+
+
+@pytest.mark.parametrize("frozen,outstanding", [(False, []), (True, ["unfinished-native-obligation"])])
+def test_discharged_feedback_still_requires_delivery_evidence(tmp_path, frozen, outstanding):
+    study, root, reference, jobs = source(tmp_path)
+    result = json.loads((jobs[0] / "procontract-result.json").read_bytes())
+    write(jobs[0] / "procontract-result.json", {**result, "completion": "discharged", "workspace_frozen": frozen, "outstanding": outstanding})
+    write(jobs[0] / "state.json", {"phase": "done", "artifact_hashes": {"procontract-result.json": sha256((jobs[0] / "procontract-result.json").read_bytes())}})
+    with pytest.raises(GrowthError, match="discharged tool feedback requires"):
+        project_tools(jobs[0], study["development_instances"][0])
+
+
+def test_undelivered_nonterminal_job_and_wrong_contract_session_rejected(tmp_path):
+    study, root, reference, jobs = source(tmp_path)
+    state = json.loads((jobs[0] / "state.json").read_bytes())
+    write(jobs[0] / "state.json", {**state, "phase": "running"})
+    with pytest.raises(GrowthError, match="bound, terminal native job"):
+        project_tools(jobs[0], study["development_instances"][0])
+    write(jobs[0] / "state.json", state)
+    db = Path(json.loads((jobs[0] / "tool-feedback-native.json").read_bytes())["db_path"])
+    with sqlite3.connect(db) as connection:
+        connection.execute("UPDATE pro_contract_opencode_session SET contract_id = 'other-contract'")
+    with pytest.raises(GrowthError, match="Contract/Session mapping"):
+        project_tools(jobs[0], study["development_instances"][0])
+
+
+def test_legacy_bundle_without_new_outcome_fields_remains_verifiable(tmp_path):
+    study, root, reference, jobs = source(tmp_path, delivered=True)
+    bundle = extract_source(reference, root, "first", "incumbent", 7, tmp_path / "bundle")
+    manifest = json.loads(Path(bundle["path"]).read_bytes())
+    manifest.pop("runtime_sha256")
+    for job in manifest["jobs"]:
+        job.pop("terminal_outcome")
+    manifest["summary"].pop("terminal_outcomes")
+    summary = tmp_path / "bundle/summary.json"
+    summary.chmod(0o600)
+    write(summary, manifest["summary"])
+    manifest["files"]["summary.json"] = {"sha256": sha256(summary.read_bytes()), "bytes": summary.stat().st_size}
+    path = Path(bundle["path"])
+    path.chmod(0o600)
+    write(path, manifest)
+    assert verify_bundle({"path": str(path), "sha256": sha256(path.read_bytes())}, study["development_instances"])["summary"]["actions"] == 10
+
+
+def test_full_revision_feedback_binds_candidate_binary_instead_of_initial_binary(tmp_path, initial):
+    from scripts.agent_revision import build_revision, validate_revision
+    from tests.test_agent_revision import proposal
+    _, parent, recipe, policy = initial
+    patch = (b"diff --git a/agent.sh b/agent.sh\n--- a/agent.sh\n+++ b/agent.sh\n@@ -1,2 +1,2 @@\n"
+             b" #!/bin/sh\n-printf 'agent-v1\\n'\n+printf 'agent-v2\\n'\n")
+    candidate_ref = build_revision(tmp_path / "candidate", parent, proposal(tmp_path / "proposal", parent, policy, patch), recipe)
+    candidate = validate_revision(candidate_ref, recipe)
+    study, root, reference, jobs = source(tmp_path / "feedback")
+    study.update(version=2, revision_recipe=recipe, initial={"agent_revision": parent},
+        runtime_sha256=validate_revision(parent, recipe)["binary"]["sha256"])
+    assert candidate["binary"]["sha256"] != study["runtime_sha256"]
+    write(root / "study.json", study)
+    reference["sha256"] = sha256(encode(study))
+    write(root / "frozen.json", {"study_sha256": reference["sha256"], "controller_sources": {"fixture": "c" * 64}})
+    operation = root / "first/evaluation/development/incumbent/7"
+    spec = json.loads((operation / "specification.json").read_bytes())
+    spec.update(study_sha256=reference["sha256"], agent_revision=candidate_ref,
+        runtime_sha256=candidate["binary"]["sha256"], solver_policy=candidate["solver_policy"])
+    write(operation / "specification.json", spec)
+    campaign_path = jobs[0].parent.parent / "campaign.json"
+    campaign = json.loads(campaign_path.read_bytes())
+    campaign["installs"]["procontract"]["binary_sha256"] = candidate["binary"]["sha256"]
+    campaign["config"]["arms"]["procontract"]["policy_artifact"] = load_policy_artifact(Path(policy["path"]), policy["sha256"]).manifest()
+    write(campaign_path, campaign)
+    bundle = extract_source(reference, root, "first", "incumbent", 7, tmp_path / "bundle")
+    assert verify_bundle(bundle, study["development_instances"])["runtime_sha256"] == candidate["binary"]["sha256"]
+    write(operation / "specification.json", {**spec, "runtime_sha256": study["runtime_sha256"]})
+    with pytest.raises(GrowthError, match="assigned full revision"):
+        extract_source(reference, root, "first", "incumbent", 7, tmp_path / "wrong-runtime")
 
 
 @pytest.mark.parametrize("shape", ["dict", "list"])

@@ -355,6 +355,11 @@ class ProgramBenchBackend:
                     credential_env=tuple(key for key in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENCODE_SERVER_PASSWORD") if os.environ.get(key)),
                     isolated=True, deadline_only=True, health_timeout=45, provider_model=config.model.split("/", 1)[1], provider_effort=config.variant)
         with WorkspaceLease(request) as lease:
+            from scripts.campaign_admission import disk_admission, study_disk_minimum
+            while not disk_admission(self.root, study_disk_minimum(self.study), output / "disk-admission.json"):
+                if (self.root / "CANCEL").exists():
+                    raise GrowthError("generation cancelled while disk admission paused")
+                time.sleep(0.25)
             if (self.root / "CANCEL").exists():
                 raise GrowthError("generation cancelled before container admission")
             workspace = ensure_workspace(request, lease)
@@ -478,6 +483,10 @@ class ProgramBenchBackend:
                      "--filter", "^(" + "|".join(re.escape(task) for task in specification["instances"]) + ")$",
                      "--limit", str(len(specification["instances"])), "--seed", str(specification["seed"]),
                      "--workers", str(self.study.get("workers", 1))]
+        from scripts.campaign_admission import study_disk_minimum
+        minimum = study_disk_minimum(self.study)
+        if minimum is not None:
+            arguments += ["--minimum-disk-free-bytes", str(minimum)]
         for phase, options in [("inference", []), ("scoring", ["--resume", "--evaluate-only"])]:
             scoring_environment = evaluator_environment(self.study)
             if (self.root / "CANCEL").exists():

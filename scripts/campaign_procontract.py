@@ -696,6 +696,7 @@ class HttpProContractApi:
 
     def messages(self, session_id: str) -> Mapping[str, object]:
         messages: list[object] = []
+        cursors: set[str] = set()
         cursor = None
         while True:
             query = {"limit": 200, **({"order": "asc"} if cursor is None else {"cursor": cursor})}
@@ -705,6 +706,7 @@ class HttpProContractApi:
             if (
                 set(raw) != {"data", "cursor"}
                 or not isinstance(raw["data"], list)
+                or len(raw["data"]) > 200
                 or not isinstance(raw["cursor"], Mapping)
                 or set(raw["cursor"]) - {"previous", "next"}
                 or any(
@@ -721,13 +723,12 @@ class HttpProContractApi:
             ):
                 raise ProContractError("OpenCode projected messages response is invalid")
             messages.extend(raw["data"])
-            if len(messages) > 10_000:
-                raise ProContractError("OpenCode projected message count exceeds campaign limit")
             next_cursor = raw["cursor"].get("next")
             if not raw["data"] or next_cursor is None:
                 return {"data": messages}
-            if not isinstance(next_cursor, str) or not next_cursor or next_cursor == cursor:
+            if not isinstance(next_cursor, str) or not next_cursor or next_cursor in cursors:
                 raise ProContractError("OpenCode projected message cursor is invalid")
+            cursors.add(next_cursor)
             cursor = next_cursor
 
     def status(self, session_id: str) -> str:

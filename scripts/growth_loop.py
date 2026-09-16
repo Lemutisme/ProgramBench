@@ -102,6 +102,8 @@ def freeze(study_path, root):
     evaluator_environment(study)
     from scripts.growth_feedback import validate_config
     validate_config(study)
+    from scripts.campaign_admission import study_disk_minimum
+    study_disk_minimum(study)
     system = study.get("version") == 2
     if study.get("version") not in {1, 2} or study.get("mode") not in {"recursive", "fixed-generator"}:
         raise GrowthError("study requires a supported version and explicit control arm")
@@ -161,6 +163,11 @@ def freeze(study_path, root):
     dirty = subprocess.check_output(["git", "status", "--porcelain"], cwd=runner, text=True)
     if head != study["runner"]["commit"] or dirty:
         raise GrowthError("frozen evaluation runner must be clean at its recorded commit")
+    if study.get("infrastructure_guard") is not None:
+        for name in ("campaign_admission.py", "campaign_runner.py"):
+            target = runner / "scripts" / name
+            if not target.is_file() or sha256(target.read_bytes()) != sha256(Path(__file__).with_name(name).read_bytes()):
+                raise GrowthError("evaluation runner lacks matching per-instance admission guard support")
     config_data = frozen_input(study["config"])
     from scripts.run_opencode import load_config
     config = load_config(Path(study["config"]["path"]))
@@ -203,7 +210,8 @@ def freeze(study_path, root):
     }
     code = {name: sha256(Path(__file__).with_name(name).read_bytes())
             for name in ("growth_loop.py", "growth_native.py", "growth_feedback.py",
-                         *(("agent_revision.py", "campaign_install.py", "run_opencode.py", "campaign_runner.py") if system else ()))}
+                         *(("agent_revision.py", "campaign_install.py", "run_opencode.py", "campaign_runner.py") if system else ()),
+                         *(("campaign_admission.py",) if study.get("infrastructure_guard") is not None else ()))}
     record(root / "frozen.json", {"study_sha256": sha256(encode(study)), "initial": initial,
                                  "controller_sources": code, "scope": "agent-system" if system else "policy-text-only"})
     return study, initial

@@ -6024,6 +6024,7 @@ def test_active_session_record_rejects_invalid_target_id(session_id: object) -> 
         {"data": [], "cursor": {"next": "not-allowed-on-empty"}},
         {"data": [], "cursor": {}, "extra": True},
         {"data": [{"id": "msg"}], "cursor": {"previous": "same", "next": "same"}},
+        {"data": [{"id": "msg"}] * 201, "cursor": {}},
     ],
 )
 def test_message_pagination_rejects_malformed_cursor_response(response: object) -> None:
@@ -6066,6 +6067,71 @@ def test_message_pagination_accepts_valid_pages_and_empty_cursor() -> None:
         http_client=SequenceHttpClient([{"data": [], "cursor": {"previous": None, "next": None}}]),
     )
     assert empty.messages("session-custom") == {"data": []}
+
+
+def test_message_pagination_retains_more_than_10000_messages_and_usage() -> None:
+    from decimal import Decimal
+    from urllib.parse import parse_qs
+
+    from scripts.campaign_procontract import HttpProContractApi
+    from scripts.campaign_vanilla import _summarize_usage
+
+    messages = [
+        {
+            "type": "assistant",
+            "id": f"msg_{index}",
+            "content": [{"type": "text", "text": f"turn {index}"}],
+            "tokens": {"input": 1, "output": 2, "reasoning": 0, "cache": {"read": 0, "write": 0}},
+            "cost": 0.0001,
+        }
+        for index in range(10_201)
+    ]
+    client = SequenceHttpClient(
+        [
+            {
+                "data": messages[offset : offset + 200],
+                "cursor": {"next": f"page_{offset + 200}"} if offset + 200 < len(messages) else {},
+            }
+            for offset in range(0, len(messages), 200)
+        ]
+    )
+    api = HttpProContractApi(
+        "http://127.0.0.1:4096",
+        expected_port=4096,
+        password="secret",
+        http_client=client,
+    )
+
+    projected = api.messages("ses_long")
+    assert projected == {"data": messages}
+    assert len(client.urls) == 52
+    assert all(parse_qs(urlparse(url).query)["limit"] == ["200"] for url in client.urls)
+    summary = _summarize_usage(projected)
+    assert summary.provider_turns == 10_201
+    assert (summary.input, summary.output, summary.cost) == (10_201, 20_402, Decimal("1.0201"))
+    assert not summary.usage_incomplete
+
+
+def test_message_pagination_rejects_multi_page_cursor_cycle() -> None:
+    from scripts.campaign_procontract import HttpProContractApi, ProContractError
+
+    client = SequenceHttpClient(
+        [
+            {"data": [{"id": "first"}], "cursor": {"next": "a"}},
+            {"data": [{"id": "second"}], "cursor": {"next": "b"}},
+            {"data": [{"id": "third"}], "cursor": {"next": "a"}},
+        ]
+    )
+    api = HttpProContractApi(
+        "http://127.0.0.1:4096",
+        expected_port=4096,
+        password="secret",
+        http_client=client,
+    )
+
+    with pytest.raises(ProContractError, match="cursor is invalid"):
+        api.messages("ses_cycle")
+    assert len(client.urls) == 3
 
 
 def test_run_opencode_reexports_native_contract_surface() -> None:

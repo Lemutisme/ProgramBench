@@ -83,9 +83,13 @@ def quiet_job(job, instance):
     result = read(job / "procontract-result.json")
     from scripts.campaign_evaluate import TERMINAL_PHASES
     state = read(job / "state.json")
-    if (state.get("phase") not in TERMINAL_PHASES or not result.get("workspace_frozen")
-            or result.get("outstanding") != [] or not result.get("contract_id") or not result.get("session_id")):
+    if (state.get("phase") not in TERMINAL_PHASES or not result.get("contract_id") or not result.get("session_id")):
         raise GrowthError("tool feedback requires a bound, terminal native job")
+    delivered = result.get("workspace_frozen") is True and result.get("outstanding") == []
+    if result.get("completion") == "discharged" and not delivered:
+        raise GrowthError("discharged tool feedback requires its frozen delivery and no outstanding work")
+    if not delivered and state.get("phase") not in {"failed", "interrupted"}:
+        raise GrowthError("undelivered tool feedback requires a closed failed or interrupted job")
     expected = state.get("artifact_hashes", {}).get("procontract-result.json")
     if expected != sha256((job / "procontract-result.json").read_bytes()):
         raise GrowthError("native terminal result identity changed")
@@ -164,6 +168,7 @@ def project_tools(job, instance):
     database = [reference(path) for path in paths]
     unlocked(database)
     result = read(job / "procontract-result.json")
+    state = read(job / "state.json")
     with tempfile.TemporaryDirectory(prefix="native-tool-projection-") as temporary:
         snapshot = Path(temporary) / db.name
         for item in database:
@@ -202,7 +207,23 @@ def project_tools(job, instance):
         raise GrowthError("duplicate native tool action identity")
     return actions, {"instance_id": instance, "job": str(job), "source_kind": kind, "sessions": sessions,
                      "contract_id": result["contract_id"], "native_actions_reported": result.get("actions"),
-                     "native_completion": result.get("completion"), "database": database, "evidence": evidence}
+                     "native_completion": result.get("completion"), "database": database, "evidence": evidence,
+                     "terminal_outcome": {"phase": state["phase"], "completion": result.get("completion"),
+                         "workspace_frozen": result.get("workspace_frozen"),
+                         "outstanding_count": len(result["outstanding"]) if isinstance(result.get("outstanding"), list) else None,
+                         "delivery": "discharged" if result.get("completion") == "discharged" else "not_discharged",
+                         "score_validity": "not_inferred"}}
+
+
+def runtime_identity(study, specification):
+    if study.get("version") != 2:
+        return study["runtime_sha256"]
+    from scripts.agent_revision import validate_revision
+    revision = validate_revision(specification["agent_revision"], study["revision_recipe"])
+    if (specification.get("runtime_sha256") != revision["binary"]["sha256"]
+            or specification["solver_policy"] != revision["solver_policy"]):
+        raise GrowthError("native feedback runtime/policy differs from its assigned full revision")
+    return revision["binary"]["sha256"]
 
 
 def extract_source(study_ref, execution_root, round_id, subject, seed, output):
@@ -230,6 +251,7 @@ def extract_source(study_ref, execution_root, round_id, subject, seed, output):
             or set(specification["instances"]) != set(study["development_instances"])):
         raise GrowthError("feedback source is unclosed or disagrees with frozen D assignment")
     policy = load_policy_artifact(Path(specification["solver_policy"]["path"]), specification["solver_policy"]["sha256"])
+    runtime_sha256 = runtime_identity(study, specification)
     campaigns = list(operation.glob("growth-eval-*")) + ([operation / "campaign"] if (operation / "campaign").is_dir() else [])
     if len(campaigns) > 1 or campaigns and campaigns[0].resolve() != campaigns[0]:
         raise GrowthError("feedback source has an ambiguous campaign")
@@ -245,7 +267,7 @@ def extract_source(study_ref, execution_root, round_id, subject, seed, output):
         if (sorted((item["instance_id"], item["arm"]) for item in manifest["jobs"]) != expected_jobs
                 or set(manifest["selected_ids"]) != set(study["development_instances"]) or manifest["seed"] != seed
                 or manifest["programbench"] != {"sha": study["runner"]["commit"], "dirty": False}
-                or manifest["installs"]["procontract"]["binary_sha256"] != study["runtime_sha256"]):
+                or manifest["installs"]["procontract"]["binary_sha256"] != runtime_sha256):
             raise GrowthError("native campaign is not the frozen D/runtime assignment")
         arms = manifest.get("config", {}).get("arms", [])
         selected = [arms.get("procontract")] if isinstance(arms, dict) else [arm for arm in arms if arm.get("name") == "procontract"]
@@ -271,6 +293,8 @@ def extract_source(study_ref, execution_root, round_id, subject, seed, output):
     seal(output / "index.jsonl", b"".join(json.dumps(item, sort_keys=True, separators=(",", ":")).encode() + b"\n" for item in index))
     overview = {"actions": len(actions), "instances": study["development_instances"], "status_counts": dict(Counter(item["status"] for item in actions)),
                 "body_availability": dict(Counter(item["body_availability"] for item in actions)),
+                "terminal_outcomes": [{"instance_id": job["instance_id"], **job["terminal_outcome"]}
+                                      for job in jobs if "terminal_outcome" in job],
                 "observed_nonzero_exits": sum(item["observed_nonzero_exit"] for item in index),
                 "unavailable": [{"scope": "subject", "reason": "campaign_not_created", "task_outcome": "not_inferred"}] if not campaigns else
                     [{"instance_id": job["instance_id"], "reason": job["availability"], "task_outcome": "not_inferred"} for job in jobs if job["source_kind"] == "unavailable"],
@@ -278,7 +302,8 @@ def extract_source(study_ref, execution_root, round_id, subject, seed, output):
     record(output / "summary.json", overview)
     files = {name: {"sha256": sha256((output / name).read_bytes()), "bytes": (output / name).stat().st_size} for name in ["actions.jsonl", "index.jsonl", "summary.json"]}
     record(output / "manifest.json", {"protocol": PROTOCOL, "coordinate": {"study_sha256": study_ref["sha256"], "execution_root": str(root), "round_id": round_id, "subject": subject, "seed": seed},
-        "source_study": study_ref, "solver_policy_sha256": policy.sha256, "instances": study["development_instances"], "source_files": sources, "jobs": jobs, "files": files, "campaign_present": bool(campaigns),
+        "source_study": study_ref, "solver_policy_sha256": policy.sha256, "runtime_sha256": runtime_sha256,
+        "instances": study["development_instances"], "source_files": sources, "jobs": jobs, "files": files, "campaign_present": bool(campaigns),
         "extractor": reference(Path(__file__).resolve()), "sql_sha256": sha256(TOOL_SQL.encode()), "summary": overview,
         "excluded": ["assistant text", "reasoning", "verification records", "grader", "P trajectories"]})
     result = {"path": str(output / "manifest.json"), "sha256": sha256((output / "manifest.json").read_bytes())}
@@ -308,6 +333,10 @@ def verify_bundle(value, allowed_instances):
             raise GrowthError("sealed feedback source identity changed")
     if manifest["solver_policy_sha256"] != read(expected / "specification.json")["solver_policy"]["sha256"]:
         raise GrowthError("feedback solver policy identity changed")
+    # Historical v1 bundles lack runtime/outcome metadata; their existing source
+    # identities and checks remain valid without rewriting those frozen bundles.
+    if "runtime_sha256" in manifest and manifest["runtime_sha256"] != runtime_identity(source, read(expected / "specification.json")):
+        raise GrowthError("feedback full revision runtime identity changed")
     for job in manifest["jobs"]:
         if job["source_kind"] == "unavailable":
             if unavailable_job(Path(job["job"]), job["instance_id"]) != job:
