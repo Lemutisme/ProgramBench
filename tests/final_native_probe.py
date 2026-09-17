@@ -112,8 +112,18 @@ def probe(fixture, root, scenario):
     if scenario == "module_code": growth_native.ProgramBenchBackend.evaluate = lambda *args: None
     try:
         boundary = FinalNativeInputs(registration, expected_catalog_sha256=catalog_ref["sha256"])
+        if scenario.startswith("bulk"):
+            specifications = boundary.specifications()
+            assert len(specifications) == 800
+            for registered_slot, derived in zip(registration["schedule"], specifications, strict=True):
+                assert derived == boundary.specification(registered_slot)
+            if scenario == "bulk_drift":
+                boundary.study["workers"] = 2
+                boundary.specifications()
         slot = deepcopy(registration["schedule"][0])
         specification = deepcopy(boundary.specification(slot))
+        if scenario == "bulk_admission":
+            specification = deepcopy(specifications[-1])
         output = root / f"slots/{slot['slot']:06d}"
         if scenario == "backend":
             require_bound_backend(growth_native.ProgramBenchBackend(study, root), boundary.qualify, root, registration)
@@ -147,7 +157,7 @@ def probe(fixture, root, scenario):
         boundary.qualify(slot, specification, output)
         require_bound_backend(boundary.backend, boundary.qualify, root, registration)
     except GrowthError as error:
-        if scenario in {"valid", "ids_catalog"}: raise
+        if scenario in {"valid", "ids_catalog", "bulk"}: raise
         expected = {
             **{key: "actual native config" for key in ("model", "provider", "effort", "turn_cap", "action_cap",
                                                        "soft_cost", "hard_cost", "deadline")},
@@ -165,10 +175,12 @@ def probe(fixture, root, scenario):
             "backend": "were rebound", "callback": "constructor-bound qualifier", "backend_study": "were rebound",
             "slot_repeat": "registered task/arm/repeat", "contract_reset": "immutable record conflicts",
             "cached_config": "frozen input changed",
+            "bulk_drift": "bound native input identity was mutated",
+            "bulk_admission": "native specification differs",
         }[scenario]
         assert expected in str(error), f"wrong rejection for {scenario}: {error} (expected {expected})"
         return False
-    if scenario not in {"valid", "ids_catalog"}: raise AssertionError("invalid native inputs were accepted: " + scenario)
+    if scenario not in {"valid", "ids_catalog", "bulk"}: raise AssertionError("invalid native inputs were accepted: " + scenario)
     assert not list(root.rglob("started.json"))
     return True
 

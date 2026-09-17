@@ -67,7 +67,7 @@ def native_fixture(tmp_path_factory, initial):
 
 
 @pytest.mark.parametrize("scenario", [
-    "valid", "ids_catalog", "model", "provider", "effort", "turn_cap", "action_cap", "soft_cost", "hard_cost", "deadline",
+    "valid", "ids_catalog", "bulk", "bulk_drift", "bulk_admission", "model", "provider", "effort", "turn_cap", "action_cap", "soft_cost", "hard_cost", "deadline",
     "inner_workers", "outer_workers", "initial_revision", "recipe", "root_config", "metadata", "catalog",
     "task_resource", "extra_real_task", "missing_real_task", "blob", "image", "image_tag", "python", "runner", "source_inventory", "module_origin", "module_code",
     "backend", "callback", "backend_study", "policy", "runtime", "spec_runner", "seed", "test_map", "spec_study",
@@ -89,5 +89,5 @@ def test_real_native_binding_rejects_before_operation_admission(native_fixture, 
                              str(tmp_path / "operation"), scenario], cwd=fixture["repository"]["path"], env=environment,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=90)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert json.loads(result.stdout) == {"scenario": scenario, "accepted": scenario in {"valid", "ids_catalog"}, "native_starts": 0}
+    assert json.loads(result.stdout) == {"scenario": scenario, "accepted": scenario in {"valid", "ids_catalog", "bulk"}, "native_starts": 0}
     assert not list(tmp_path.rglob("started.json"))

@@ -122,6 +122,12 @@ these fields:
   manifest type. Numeric strings and booleans are rejected before operation admission.
 - `resources`, a frozen reference to the resource object described below.
 
+For aggregate preparation, `binding.specifications()` derives the 800 specifications in registered schedule
+order after one fresh complete `check()`. It reuses only that call's verified revisions, rather than rereading
+large runtime bytes separately for every slot. It accepts no caller-supplied validation cache and retains no
+cache between calls. The single-slot `specification` and actual admission through `qualify` retain their
+independent verification; an aggregate inventory does not authorize a slot or bypass later input checks.
+
 The actual `root/study.json`, `root/config.yaml` and `root/metadata.json` must already exist and match the
 referenced study/configuration/metadata. The study supplies `version: 2`, `initial.agent_revision` equal to
 the registered baseline, the exact `revision_recipe`, baseline `runtime_sha256`, `runner` including `python`,

@@ -116,10 +116,22 @@ class FinalNativeInputs:
             raise GrowthError("unknown final slot")
         if encode(slot) != encode(self.registration["schedule"][slot["slot"] - 1]):
             raise GrowthError("slot differs from its registered task/arm/repeat mapping")
-        ref = self.registration["revisions"][slot["arm"]]
-        revision = agent_revision.validate_revision(ref, self.study["revision_recipe"])
+        revision = agent_revision.validate_revision(self.registration["revisions"][slot["arm"]],
+                                                    self.study["revision_recipe"])
+        return self._specification(slot, revision)
+
+    def specifications(self):
+        """Derive the full inventory after one fresh, complete input check.
+
+        No validated revision is cached across calls or accepted from a caller.
+        Actual slot admission still uses qualify and its independent checks.
+        """
+        revisions = self.check()
+        return [self._specification(slot, revisions[slot["arm"]]) for slot in self.registration["schedule"]]
+
+    def _specification(self, slot, revision):
         return {"instances": [slot["task_id"]], "seed": self.inputs["repeat_seeds"][str(slot["repeat"])],
-                "agent_revision": ref, "solver_policy": revision["solver_policy"],
+                "agent_revision": self.registration["revisions"][slot["arm"]], "solver_policy": revision["solver_policy"],
                 "runtime_sha256": revision["binary"]["sha256"], "runner": self.study["runner"],
                 "study_sha256": sha256(encode(self.study)), "test_map": self.study["test_map"]}
 
