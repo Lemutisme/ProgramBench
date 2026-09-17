@@ -214,6 +214,7 @@ class FinalNativeInputs:
         if _path(self.root / "metadata.json").read_bytes() != metadata:
             raise GrowthError("backend metadata differs from frozen scoring metadata")
         from programbench.constants import TASKS_DIR, image_name_from_instance_id
+        from programbench.candidate import DEFAULT_IMAGE_TAG
         from programbench.utils.load_data import load_all_instances
         runner_tasks = Path(self.study["runner"]["path"]) / "src/programbench/data/tasks"
         if TASKS_DIR != Path(self.inputs["controller"]["path"]) / "src/programbench/data/tasks":
@@ -259,7 +260,7 @@ class FinalNativeInputs:
         for task in tasks:
             item = images[task]
             _keys(item, {"name", "sha256"}, "task image")
-            if item["name"] != image_name_from_instance_id(task):
+            if item["name"] != f"{image_name_from_instance_id(task)}:{DEFAULT_IMAGE_TAG}":
                 raise GrowthError("task image name differs from the actual native loader")
             actual = subprocess.check_output(["docker", "image", "inspect", "--format", "{{.Id}}", item["name"]],
                                              text=True, timeout=30).strip()

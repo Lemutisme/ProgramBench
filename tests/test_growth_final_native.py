@@ -65,7 +65,7 @@ def native_fixture(tmp_path_factory, initial):
 @pytest.mark.parametrize("scenario", [
     "valid", "model", "provider", "effort", "turn_cap", "action_cap", "soft_cost", "hard_cost", "deadline",
     "inner_workers", "outer_workers", "initial_revision", "recipe", "root_config", "metadata", "catalog",
-    "task_resource", "blob", "image", "python", "runner", "source_inventory", "module_origin", "module_code",
+    "task_resource", "blob", "image", "image_tag", "python", "runner", "source_inventory", "module_origin", "module_code",
     "backend", "callback", "backend_study", "policy", "runtime", "spec_runner", "seed", "test_map", "spec_study",
     "slot_repeat", "contract_cap", "contract_model", "contract_deadline", "contract_reset", "cached_config",
 ])

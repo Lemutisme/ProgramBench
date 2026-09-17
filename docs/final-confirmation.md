@@ -133,7 +133,9 @@ metadata references must equal their registered/study identities. `task_files` i
 `task.yaml` and `tests.json` for every assigned ID in both loaded-controller and subprocess-runner task
 directories; catalog and metadata must equal the actual native loader's output. `blobs` covers every opaque
 file under each assigned task in the canonical offline blob root. Bytes are hashed without unpacking archives.
-`images` maps each task ID to `{name, sha256}` matching the actual native loader and Docker image identity.
+`images` maps each task ID to `{name, sha256}` matching the actual native workspace image
+(`image_name_from_instance_id(task) + ":task_cleanroom_v6"`) and Docker image identity; an implicit `latest`
+tag does not qualify the image that inference and scoring actually use.
 The evaluator wheelhouse is checked by `evaluator_environment`; both the environment and the already loaded
 blob-store module must use the same frozen blob root. A separately designated hash remains an external trust
 anchor: this code cannot establish that a caller's synthetic catalog is the official benchmark.

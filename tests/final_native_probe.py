@@ -13,6 +13,7 @@ from scripts.growth_final_native import FinalNativeInputs, MODEL, require_bound_
 from scripts.growth_final_registry import ALGORITHM, EXECUTION, SCORE_ENCODING, paired_schedule
 from scripts.growth_loop import GrowthError, encode, record, sha256
 from programbench.constants import TASKS_DIR, image_name_from_instance_id
+from programbench.candidate import DEFAULT_IMAGE_TAG
 from programbench.utils.load_data import load_all_instances
 
 
@@ -64,11 +65,12 @@ def probe(fixture, root, scenario):
                                 for path in sorted(TASKS_DIR.rglob("*")) if path.is_file()],
                  "blobs": [{"path": str(path), "sha256": sha256(path.read_bytes())}
                            for path in sorted(blob.rglob("*")) if path.is_file()],
-                 "images": {entry["instance_id"]: {"name": image_name_from_instance_id(entry["instance_id"]),
+                 "images": {entry["instance_id"]: {"name": f"{image_name_from_instance_id(entry['instance_id'])}:{DEFAULT_IMAGE_TAG}",
                             "sha256": "sha256:" + "a" * 64} for entry in catalog}}
     if scenario == "task_resource": resources["task_files"].pop()
     if scenario == "blob": resources["blobs"].pop()
     if scenario == "image": resources["images"][catalog[0]["instance_id"]]["sha256"] = "sha256:" + "b" * 64
+    if scenario == "image_tag": resources["images"][catalog[0]["instance_id"]]["name"] = image_name_from_instance_id(catalog[0]["instance_id"])
     sources = source_inventory(repository)
     if scenario == "source_inventory": sources.pop()
     native = {"schema_version": 1, "root": str(root), "study": study_ref, "controller": repository,
@@ -136,6 +138,7 @@ def probe(fixture, root, scenario):
             "initial_revision": "registered baseline", "recipe": "externally frozen recipe",
             "root_config": "frozen input changed", "metadata": "frozen input changed", "catalog": "catalog/metadata differ",
             "task_resource": "metadata resource inventory", "blob": "blob inventory", "image": "resource identity",
+            "image_tag": "image name differs",
             "python": "frozen input changed", "runner": "frozen commit", "source_inventory": "native sources omit",
             "module_origin": "outside its frozen", "module_code": "native method code",
             "backend": "were rebound", "callback": "constructor-bound qualifier", "backend_study": "were rebound",
