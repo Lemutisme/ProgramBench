@@ -3,12 +3,14 @@
 from copy import deepcopy
 import json
 from pathlib import Path
+import subprocess
 import sys
 
 import yaml
 
 from scripts import growth_native
 from scripts.agent_revision import runtime_config, validate_revision
+from scripts.campaign_runner import _is_real_instance
 from scripts.growth_final_native import FinalNativeInputs, MODEL, require_bound_backend, source_inventory
 from scripts.growth_final_registry import ALGORITHM, EXECUTION, SCORE_ENCODING, paired_schedule
 from scripts.growth_loop import GrowthError, encode, record, sha256
@@ -42,11 +44,26 @@ def probe(fixture, root, scenario):
                        ("soft_cost", "total_cost_soft"), ("hard_cost", "total_cost_hard"), ("deadline", "wall_time_seconds")):
         if scenario == key: config["limits"][field] = 1000
     config_ref = artifact(root, "config.yaml", yaml.safe_dump(config).encode(), raw=True)
-    catalog = load_all_instances(include_tests=False)
+    catalog = [item for item in load_all_instances(include_tests=False) if _is_real_instance(item)]
     if scenario == "catalog": catalog[0]["language"] = "Different"
+    if scenario == "ids_catalog":
+        catalog = [{"instance_id": item["instance_id"]} for item in catalog]
     catalog_ref = artifact(root, "catalog.json", catalog)
-    metadata = {item["instance_id"]: item for item in load_all_instances()}
+    metadata = {item["instance_id"]: item for item in load_all_instances() if _is_real_instance(item)}
     metadata_ref = artifact(root, "metadata.json", metadata)
+    if scenario in {"extra_real_task", "missing_real_task"}:
+        if scenario == "missing_real_task":
+            (TASKS_DIR / catalog[0]["instance_id"]).rename(root / "removed-task")
+        if scenario == "extra_real_task":
+            task = TASKS_DIR / "synthetic-extra"
+            task.mkdir()
+            (task / "task.yaml").write_text("difficulty: easy\nlanguage: Python\n")
+            (task / "tests.json").write_text('{"branches": {}}\n')
+        subprocess.run(["git", "-C", repository["path"], "add", "."], check=True, capture_output=True)
+        subprocess.run(["git", "-C", repository["path"], "-c", "user.name=Fixture", "-c",
+                        "user.email=fixture@localhost", "commit", "--quiet", "-m", "alter real task inventory"],
+                       check=True, capture_output=True)
+        repository["commit"] = subprocess.check_output(["git", "-C", repository["path"], "rev-parse", "HEAD"], text=True).strip()
     wheel = artifact(root, "wheelhouse/synthetic.whl", b"never loaded or installed", raw=True)
     study = {"version": 2, "workers": 2 if scenario == "inner_workers" else 1,
              "runner": {**repository, "python": sys.executable}, "initial": {"agent_revision": revisions["baseline"]},
@@ -62,7 +79,7 @@ def probe(fixture, root, scenario):
     blob = Path(fixture["blob_root"])
     resources = {"catalog": catalog_ref, "metadata": metadata_ref, "blob_root": str(blob),
                  "task_files": [{"path": str(path), "sha256": sha256(path.read_bytes())}
-                                for path in sorted(TASKS_DIR.rglob("*")) if path.is_file()],
+                                for path in sorted(TASKS_DIR.rglob("*")) if path.is_file() and path.parent.name in metadata],
                  "blobs": [{"path": str(path), "sha256": sha256(path.read_bytes())}
                            for path in sorted(blob.rglob("*")) if path.is_file()],
                  "images": {entry["instance_id"]: {"name": f"{image_name_from_instance_id(entry['instance_id'])}:{DEFAULT_IMAGE_TAG}",
@@ -130,7 +147,7 @@ def probe(fixture, root, scenario):
         boundary.qualify(slot, specification, output)
         require_bound_backend(boundary.backend, boundary.qualify, root, registration)
     except GrowthError as error:
-        if scenario == "valid": raise
+        if scenario in {"valid", "ids_catalog"}: raise
         expected = {
             **{key: "actual native config" for key in ("model", "provider", "effort", "turn_cap", "action_cap",
                                                        "soft_cost", "hard_cost", "deadline")},
@@ -140,6 +157,7 @@ def probe(fixture, root, scenario):
             "initial_revision": "registered baseline", "recipe": "externally frozen recipe",
             "root_config": "frozen input changed", "metadata": "frozen input changed", "catalog": "catalog/metadata differ",
             "task_resource": "metadata resource inventory", "blob": "blob inventory", "image": "resource identity",
+            "extra_real_task": "real-task selection differs", "missing_real_task": "real-task selection differs",
             "image_tag": "image name differs",
             "seed_type": "integer native repeat seeds", "seed_boolean": "integer native repeat seeds",
             "python": "frozen input changed", "runner": "frozen commit", "source_inventory": "native sources omit",
@@ -150,7 +168,7 @@ def probe(fixture, root, scenario):
         }[scenario]
         assert expected in str(error), f"wrong rejection for {scenario}: {error} (expected {expected})"
         return False
-    if scenario != "valid": raise AssertionError("invalid native inputs were accepted: " + scenario)
+    if scenario not in {"valid", "ids_catalog"}: raise AssertionError("invalid native inputs were accepted: " + scenario)
     assert not list(root.rglob("started.json"))
     return True
 

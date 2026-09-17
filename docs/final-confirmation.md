@@ -132,7 +132,12 @@ controller's frozen `scripts/growth_final_analysis.py`.
 The resource object contains `catalog`, `metadata`, `task_files`, `blob_root`, `blobs`, and `images`. Catalog and
 metadata references must equal their registered/study identities. `task_files` is the exact inventory of
 `task.yaml` and `tests.json` for every assigned ID in both loaded-controller and subprocess-runner task
-directories; catalog and metadata must equal the actual native loader's output. `blobs` covers every opaque
+directories; catalog and metadata must equal the actual native loader's output after applying the runner's
+existing `_is_real_instance` fixture exclusion. The repository may retain its `testorg__calculator` fixture;
+the resulting real-task selection must still contain exactly the designated 200 IDs, with no additional or
+missing real task. The designated catalog may contain only `instance_id`; any additional catalog fields must
+match the loader, and full scoring metadata is checked separately against its own frozen reference.
+`blobs` covers every opaque
 file under each assigned task in the canonical offline blob root. Bytes are hashed without unpacking archives.
 `images` maps each task ID to `{name, sha256}` matching the actual native workspace image
 (`image_name_from_instance_id(task) + ":task_cleanroom_v6"`) and Docker image identity; an implicit `latest`

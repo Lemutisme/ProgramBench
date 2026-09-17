@@ -216,12 +216,14 @@ class FinalNativeInputs:
         from programbench.constants import TASKS_DIR, image_name_from_instance_id
         from programbench.candidate import DEFAULT_IMAGE_TAG
         from programbench.utils.load_data import load_all_instances
+        from scripts.campaign_runner import _is_real_instance
         runner_tasks = Path(self.study["runner"]["path"]) / "src/programbench/data/tasks"
         if TASKS_DIR != Path(self.inputs["controller"]["path"]) / "src/programbench/data/tasks":
             raise GrowthError("loaded ProgramBench catalog directory changed")
         catalog_tasks = self.registration["task_ids"]
-        if sorted(path.name for path in runner_tasks.iterdir() if (path / "task.yaml").is_file()) != catalog_tasks:
-            raise GrowthError("actual runner does not contain exactly the designated 200 tasks")
+        if sorted(path.name for path in runner_tasks.iterdir() if (path / "task.yaml").is_file()
+                  and _is_real_instance({"instance_id": path.name})) != catalog_tasks:
+            raise GrowthError("actual runner real-task selection differs from the designated 200 tasks")
         required = {str(root / task / name) for root in (TASKS_DIR, runner_tasks) for task in catalog_tasks
                     for name in ("task.yaml", "tests.json")}
         if {item["path"] for item in resources["task_files"]} != required:
@@ -229,8 +231,16 @@ class FinalNativeInputs:
         for item in resources["task_files"]:
             _reference(item, verify=True)
         for directory in {TASKS_DIR, runner_tasks}:
-            if (encode(load_all_instances(directory, include_tests=False)) != encode(catalog)
-                    or encode({item["instance_id"]: item for item in load_all_instances(directory)}) != encode(json.loads(metadata))):
+            # plan_campaign excludes its test fixtures before selecting a task.
+            # Use that same boundary while retaining an exact 200-task identity.
+            selected = {item["instance_id"]: item for item in load_all_instances(directory, include_tests=False)
+                        if _is_real_instance(item)}
+            if (sorted(selected) != catalog_tasks
+                    or any(not set(item) <= set(selected[item["instance_id"]])
+                           or encode({key: selected[item["instance_id"]][key] for key in item}) != encode(item)
+                           for item in catalog)
+                    or encode({item["instance_id"]: item for item in load_all_instances(directory)
+                               if _is_real_instance(item)}) != encode(json.loads(metadata))):
                 raise GrowthError("actual native catalog/metadata differ from the designated resources")
         blob = _directory(resources["blob_root"])
         if os.environ.get("PROGRAMBENCH_BLOB_DIR") != str(blob):
