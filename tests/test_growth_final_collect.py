@@ -129,7 +129,8 @@ def test_exact_count_bridge_accounting_and_replay(cohort):
     replace(path, result)
     receipt = collect(root, **kwargs)
     table = read(root / "disclosure/scalars.json")
-    assert len(table["rows"]) == len(backend.calls) == len(calls) == 800
+    assert len(table["rows"]) == len(backend.calls) == 800
+    assert len(calls) == 1600
     assert all(isinstance(row["score"], dict) for row in table["rows"])
     analysis = analyze(table)
     assert analysis["numeric_criteria_met"] is False
@@ -142,7 +143,7 @@ def test_exact_count_bridge_accounting_and_replay(cohort):
     assert "payload" not in str(usage)
     assert receipt["performance_adopted"] is False
     assert collect(root, **kwargs) == receipt
-    assert len(backend.calls) == len(calls) == 1600
+    assert len(backend.calls) == 1600 and len(calls) == 3200
 
 
 def test_all_admissions_checked_before_any_result_read(cohort):
@@ -223,7 +224,8 @@ def test_native_missing_comparison_remains_an_unscored_assignment(cohort, known_
 
     result = collect(root, **kwargs)
     table = read(root / "disclosure/scalars.json")
-    assert len(table["rows"]) == len(backend.calls) == len(calls) == 800
+    assert len(table["rows"]) == len(backend.calls) == 800
+    assert len(calls) == 1600
     assert table["rows"][0]["status"] == "invalid" and table["rows"][0]["score"] is None
     assert sum(row["status"] == "valid" for row in table["rows"]) == 799
     assert analyze(table)["analysis_status"] == "incomplete_official_scores"
@@ -376,6 +378,32 @@ def test_backend_cannot_replace_a_previously_verified_result(cohort):
     with pytest.raises(GrowthError, match="frozen input changed"):
         collect(root, **kwargs)
     assert len(backend.calls) == 800
+    assert not (root / "disclosure").exists()
+
+
+def test_real_backend_requires_bound_qualifier_before_partial_collection(cohort):
+    from scripts.growth_native import ProgramBenchBackend
+
+    root, execution, _, _, kwargs = cohort
+    backend = object.__new__(ProgramBenchBackend)
+    backend.root = root
+    with pytest.raises(GrowthError, match="constructor-bound qualifier"):
+        collect(root, **{**kwargs, "backend": backend})
+    assert not (root / "disclosure").exists()
+
+
+def test_late_requalification_cannot_replace_earlier_result(cohort):
+    root, execution, backend, _, kwargs = cohort
+    populate(root, execution)
+    first = root / execution["slots"][0]["output"] / "result.json"
+    original = read(first)
+
+    def mutate_after_native_revalidation(slot, specification, output):
+        if slot["slot"] == 800 and len(backend.calls) == 800:
+            replace(first, {**original, "changed": True})
+
+    with pytest.raises(GrowthError, match="frozen input changed"):
+        collect(root, **{**kwargs, "qualify": mutate_after_native_revalidation})
     assert not (root / "disclosure").exists()
 
 

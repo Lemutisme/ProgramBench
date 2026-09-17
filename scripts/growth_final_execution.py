@@ -131,6 +131,8 @@ def run(root, *, execution, registry_ref, backend, qualify, expected_catalog_sha
     with _lock(root):
         registration = validate_execution(execution, registry_ref=registry_ref,
                                           expected_catalog_sha256=expected_catalog_sha256, require_active=True)
+        from scripts.growth_final_native import require_bound_backend
+        require_bound_backend(backend, qualify, root, registration)
         record(root / "execution.json", execution)
         record(root / "invocation.json", {"schema_version": 1, "execution_sha256": sha256(encode(execution)),
                                           "root": str(root), "registry_ref": registry_ref})

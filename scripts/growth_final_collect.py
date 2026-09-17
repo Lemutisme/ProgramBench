@@ -31,6 +31,8 @@ def collect(root, *, registry_ref, backend, qualify, expected_execution_sha256, 
             raise GrowthError("execution must retain its canonical frozen encoding")
         registration = validate_execution(execution, registry_ref=registry_ref,
                                           expected_catalog_sha256=expected_catalog_sha256)
+        from scripts.growth_final_native import require_bound_backend
+        require_bound_backend(backend, qualify, root, registration)
         invocation = {"schema_version": 1, "execution_sha256": expected_execution_sha256,
                       "root": str(root), "registry_ref": registry_ref}
         _same(root / "invocation.json", invocation)
@@ -148,6 +150,13 @@ def collect(root, *, registry_ref, backend, qualify, expected_execution_sha256, 
         _same(root / "invocation.json", invocation)
         if (root / "execution.json").read_bytes() != raw:
             raise GrowthError("execution identity changed during collection")
+        for entry in execution["slots"]:
+            qualified = deepcopy(entry)
+            qualify(qualified["slot"], qualified["specification"], root / entry["output"])
+            if encode(entry) != encode(qualified):
+                raise GrowthError("trusted qualifier mutated the frozen assignment during collection")
+        # Finish callbacks before rechecking evidence: a late qualification must
+        # not invalidate an earlier file after its last integrity check.
         for entry, proof in zip(execution["slots"], proofs, strict=True):
             validate_slot_binding(root, execution, entry, execution_sha256=expected_execution_sha256)
             for name, digest in proof["artifacts"].items():

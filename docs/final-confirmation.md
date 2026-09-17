@@ -100,12 +100,79 @@ receipt, not approval or a numerical performance decision. The caller and filesy
 protect the underlying per-operation score files from researchers and solvers before disclosure.
 
 Neither module has a launch CLI. Synthetic callbacks/backends in their tests qualify scheduling and collection
-behavior only; they do not authenticate a real catalog, frozen model/runtime configuration, or actual deadline
-enforcement. The native integration and its external authority must be qualified before these components are
-used in a real final attempt.
+behavior only. The native input binding below authenticates the supplied identities; an external owner must
+still designate the official catalog and qualify actual deadline enforcement and the complete lifecycle.
+
+## Bind actual native inputs before admission
+
+`scripts.growth_final_native.FinalNativeInputs(registration, expected_catalog_sha256=...)` constructs one exact
+`ProgramBenchBackend` and its bound `qualify` method. The constructor is read-only. Supply `binding.backend`
+and `binding.qualify` together to the existing execution and collection functions. Both reject a real native
+backend paired with an arbitrary callback, another binding, a changed study, or another root. The generic
+backend seam remains for synthetic tests; it is not a production qualification boundary.
+
+For this adapter, the registration's `configuration` references a canonical native-inputs JSON object with
+these fields:
+
+- `schema_version: 1`, the canonical existing execution `root`, and the frozen `study` reference.
+- `controller: {path, commit}`, plus `sources`: the deduplicated union of `source_inventory(controller)` and
+  `source_inventory(study.runner)`. The helper derives all tracked Python and dependency-coordinate files.
+- `python: {path, resolved: {path, sha256}}`, binding both the invocation path and actual interpreter bytes.
+- `repeat_seeds: {"1": "...", "2": "..."}`, with distinct nonempty native seed strings.
+- `resources`, a frozen reference to the resource object described below.
+
+The actual `root/study.json`, `root/config.yaml` and `root/metadata.json` must already exist and match the
+referenced study/configuration/metadata. The study supplies `version: 2`, `initial.agent_revision` equal to
+the registered baseline, the exact `revision_recipe`, baseline `runtime_sha256`, `runner` including `python`,
+`workers: 1`, `test_map: official-full-map-v1`, the offline `evaluator`, and the existing `infrastructure_guard`.
+The registration still fixes outer `solver_workers = 2 * active_blocks`. The registered analyzer must be this
+controller's frozen `scripts/growth_final_analysis.py`.
+
+The resource object contains `catalog`, `metadata`, `task_files`, `blob_root`, `blobs`, and `images`. Catalog and
+metadata references must equal their registered/study identities. `task_files` is the exact inventory of
+`task.yaml` and `tests.json` for every assigned ID in both loaded-controller and subprocess-runner task
+directories; catalog and metadata must equal the actual native loader's output. `blobs` covers every opaque
+file under each assigned task in the canonical offline blob root. Bytes are hashed without unpacking archives.
+`images` maps each task ID to `{name, sha256}` matching the actual native loader and Docker image identity.
+The evaluator wheelhouse is checked by `evaluator_environment`; both the environment and the already loaded
+blob-store module must use the same frozen blob root. A separately designated hash remains an external trust
+anchor: this code cannot establish that a caller's synthetic catalog is the official benchmark.
+
+Construction recursively calls `validate_revision` for both actual arms and verifies the initial configuration
+against its full revision. `binding.specification(slot)` derives the exact native task/repeat/seed, runner,
+study hash, test-map, revision, solver-policy and binary identity. It does not schedule or register anything.
+Before each `operation.started`, qualification repeats the critical input checks and uses the existing
+`runtime_configuration` and `load_config` on the actual effective arm configuration. Only
+`openai/gpt-5.6-luna`, `max`, `wall_time_seconds: 21600`, and null turn/action/soft-cost/hard-cost limits are
+accepted. The existing disk admission guard runs before a fresh host operation; it does not rebudget work.
+
+Loaded implementation checks bind canonical module paths, tracked file hashes and Python function/method
+code objects, including native backend methods and scoring dependencies. Merely changing `sys.path` or
+reporting a Git commit cannot qualify code already imported from another checkout. Native subprocess
+campaign/configuration/scoring code must match the loaded implementation; final host orchestration may live
+in a newer controller checkout. This is integrity checking within the trusted owner process, not a sandbox
+against a privileged owner replacing the checker itself.
+
+Cached validation and collection repeat the qualifier; collection repeats it again before publication. If a
+native Contract issue exists, its model and deadline-only budget must match `int(startedAt * 1000) + 21600000`.
+The first observed issue hash/deadline is retained in `native-contract.json`, and later changes are rejected.
+Host operation start is not Contract admission. Missing issues remain missing, including infrastructure
+failures before admission. This check neither recreates an issue nor implements evaluation-only recovery.
+
+Focused tests use two actual offline qualified miniature AgentRevisions, a clean copied controller/runner,
+synthetic 200-task metadata and opaque blobs, and a Docker image-inspection fixture. They do not run a model,
+grader, native evaluation operation or formal registration. Negative cases cover model/effort/budget drift,
+revisions and recipe, actual root files, missing resources, runner/Python/module provenance, backend/callback
+mismatch, slot/spec changes, and changed Contract deadlines. These tests do not qualify a production native
+deadline, ownership, cleanup, hidden-result protection or recovery lifecycle.
 
 ## Work still required before an actual final attempt
 
-A complete final execution path still needs the bound official catalog and evaluator inventory, qualified candidate and baseline, resource configuration, original six-hour deadline verification, the trusted native qualification adapter and real lifecycle/cleanup verification for these components, protected raw-result storage, and a tested evaluation-only recovery path. All 800 assignments and all failed/cancelled attempts must remain in the external accounting. Collection of a complete cohort is not a full accounting of all prior research or final attempts.
+A complete final execution path still needs externally designated official resources, the actual qualified
+candidate/baseline and a frozen instance of the native-inputs manifest, real six-hour deadline and
+lifecycle/cleanup verification for this composed path, owner cancellation/failure ledger integration,
+protected raw-result storage/disclosure, and a tested evaluation-only recovery path. All 800 assignments and
+all failed/cancelled attempts must remain in the external accounting. Collection of a complete cohort is not a
+full accounting of all prior research or final attempts.
 
 No final attempt has been registered or started by this change. Existing running and frozen studies are unchanged. Final adoption still requires independent checks of execution, provenance and the stated inference assumptions in addition to the numerical result.

@@ -110,6 +110,17 @@ def launch(prepared, backend, qualify=None):
     return run(**prepared, backend=backend, qualify=qualify or backend.qualify)
 
 
+def test_real_backend_rejects_unbound_callback_before_any_admission(prepared):
+    from scripts.growth_native import ProgramBenchBackend
+
+    backend = object.__new__(ProgramBenchBackend)
+    backend.root = prepared["root"]
+    with pytest.raises(GrowthError, match="constructor-bound qualifier"):
+        launch(prepared, backend, lambda *args: None)
+    assert not list(prepared["root"].rglob("started.json"))
+    assert not (prepared["root"] / "execution.json").exists()
+
+
 def seed_operation(prepared, index, perform):
     entry = prepared["execution"]["slots"][index - 1]
     output = prepared["root"] / entry["output"]
