@@ -89,7 +89,9 @@ The controller verifies that its direct parent is the live recorded supervisor,
 including start ticks, process group and boot identity. It supplies the actual
 native backend and constructor-bound qualifier to `growth_final_execution.run`.
 Closed execution passes to `growth_final_collect.collect`; only a fully
-revalidated collection creates the completion marker. A separate `--collect`
+revalidated collection creates the completion marker. The controller exits zero
+only when owner readout is `closed`; cancellation, failure, halted or incomplete
+execution exits nonzero with its original records and `CANCEL` retained. A separate `--collect`
 never calls `run`, reissues solver work or resets deadlines. Collection-only
 recovery does not turn an ambiguous started operation into a new inference run.
 

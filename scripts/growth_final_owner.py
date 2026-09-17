@@ -356,8 +356,7 @@ def controller_main(root):
         _save(root / "CONTROLLER_ADMISSION.json", {"execution_sha256": config["execution"]["sha256"],
             "supervisor": supervisor, "entrypoint": config["controller_argv"], "assigned": 800,
             "scheduler": "scripts.growth_final_execution.run", "collector": "scripts.growth_final_collect.collect"})
-        _execute_bound(root, config, execution, binding)
-        return 0
+        return 0 if _execute_bound(root, config, execution, binding)["status"] == "closed" else 1
     except BaseException as error:
         _save(root / "CONTROLLER_FAILURE.json", {"error_type": type(error).__name__})
         stop(root, "cancelled" if isinstance(error, KeyboardInterrupt) else "failed", "controller-exception")

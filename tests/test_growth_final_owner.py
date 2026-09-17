@@ -194,7 +194,8 @@ def test_world_accessible_owner_is_rejected(owner):
         growth_final_owner.readout(root)
 
 
-def test_actual_native_prepare_freezes_800_specs_and_controller_entrypoints(native_fixture, tmp_path):
+@pytest.mark.parametrize("scenario", ["bypass", "cancelled"])
+def test_actual_native_prepare_freezes_800_specs_and_controller_entrypoints(native_fixture, tmp_path, scenario):
     path, fixture = native_fixture
     environment = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1",
         "PYTHONPATH": fixture["repository"]["path"] + os.pathsep + fixture["repository"]["path"] + "/src",
@@ -203,9 +204,14 @@ def test_actual_native_prepare_freezes_800_specs_and_controller_entrypoints(nati
     for key in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENCODE_SERVER_PASSWORD"):
         environment.pop(key, None)
     result = subprocess.run([sys.executable, str(Path(__file__).with_name("final_owner_probe.py")),
-        str(path), str(tmp_path)], cwd=fixture["repository"]["path"], env=environment,
+        str(path), str(tmp_path), scenario], cwd=fixture["repository"]["path"], env=environment,
         capture_output=True, text=True, timeout=180)
     assert result.returncode == 0, result.stdout + result.stderr
+    if scenario == "cancelled":
+        assert json.loads(result.stdout) == {"native_starts": 0, "assigned": 800, "controller_admitted": True,
+            "controller_exit": 1, "execution_status": "cancelled"}
+        assert not list(tmp_path.rglob("started.json"))
+        return
     assert json.loads(result.stdout) == {"native_starts": 0, "assigned": 800, "checks": [
         "prepared-before-admission", "review-required", "frozen-entrypoints", "qualified-interpreter", "native-specifications",
         "template-review-bound", "actual-launcher-review-bound", "exact-root-review",

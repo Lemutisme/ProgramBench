@@ -20,6 +20,8 @@ from tests.final_native_probe import probe
 def main():
     fixture = read(sys.argv[1])
     root = Path(sys.argv[2])
+    scenario = sys.argv[3] if len(sys.argv) > 3 else "bypass"
+    assert scenario in {"bypass", "cancelled"}
     root.chmod(0o700)
     execution = root / "execution"
     execution.mkdir(mode=0o700)
@@ -98,6 +100,32 @@ def main():
         raise AssertionError("changed owner entrypoint accepted")
     entrypoint.write_bytes(original)
     entrypoint.chmod(0o400)
+    if scenario == "cancelled":
+        # Real live parent identity admits the materialized controller. The
+        # marker models cancellation's durable first step before ledger append;
+        # it is present before run() can admit even one native operation.
+        sys.path.insert(0, str(root))
+        import launch
+        assert Path(launch.__file__).resolve() == root / "launch.py"
+        record(root / "SUPERVISOR_PROCESS.json", {"identity": launch.identity(os.getpid()),
+            "status": "running", "scope": "synthetic-parent-only"})
+        record(execution / "CANCEL", {"reason": "synthetic cancellation before run admission"})
+        result = subprocess.run([sys.executable, str(root / "controller.py"), "--cohort", str(root)],
+            cwd=root, env=os.environ, capture_output=True, text=True, timeout=90)
+        admission = read(root / "CONTROLLER_ADMISSION.json")
+        summary = read(root / "PRIVATE_EXECUTION_SUMMARY.json")
+        record(root / "CONTROLLER_EXIT_PROBE.json", {"exit_code": result.returncode,
+            "execution_status": summary["status"], "controller_admitted": True,
+            "native_starts": len(list(root.rglob("started.json"))), "stdout": result.stdout, "stderr": result.stderr})
+        assert admission["scheduler"] == "scripts.growth_final_execution.run"
+        assert summary["status"] == "cancelled" and summary["counts"]["not-started"] == 800
+        assert (execution / "invocation.json").exists() and (execution / "CANCEL").exists()
+        assert (root / "OWNER_CANCELLED_LEDGER.json").exists() and not (root / "CONTROLLER_FAILURE.json").exists()
+        assert not list(root.rglob("started.json"))
+        assert result.returncode == 1, f"cancelled native controller exited {result.returncode} instead of 1"
+        print(json.dumps({"native_starts": 0, "assigned": 800, "controller_admitted": True,
+            "controller_exit": result.returncode, "execution_status": summary["status"]}))
+        return
     # Same real native inputs, but no admitted supervisor: fail before run().
     result = subprocess.run([sys.executable, str(root / "controller.py"), "--cohort", str(root)],
         cwd=root, env=os.environ, capture_output=True, text=True, timeout=90)
