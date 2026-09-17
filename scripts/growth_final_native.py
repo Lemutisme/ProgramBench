@@ -85,8 +85,8 @@ class FinalNativeInputs:
             raise GrowthError("final outer workers must equal twice active blocks")
         _keys(self.inputs["repeat_seeds"], {"1", "2"}, "repeat seeds")
         seeds = list(self.inputs["repeat_seeds"].values())
-        if any(not isinstance(seed, str) or not seed.strip() for seed in seeds) or seeds[0] == seeds[1]:
-            raise GrowthError("two distinct native repeat seeds are required")
+        if any(type(seed) is not int for seed in seeds) or seeds[0] == seeds[1]:
+            raise GrowthError("two distinct integer native repeat seeds are required")
         if study_disk_minimum(self.study) is None:
             raise GrowthError("native study requires the existing per-instance disk admission guard")
         self._provenance()

@@ -118,7 +118,8 @@ these fields:
 - `controller: {path, commit}`, plus `sources`: the deduplicated union of `source_inventory(controller)` and
   `source_inventory(study.runner)`. The helper derives all tracked Python and dependency-coordinate files.
 - `python: {path, resolved: {path, sha256}}`, binding both the invocation path and actual interpreter bytes.
-- `repeat_seeds: {"1": "...", "2": "..."}`, with distinct nonempty native seed strings.
+- `repeat_seeds: {"1": 1, "2": 2}`, with distinct integer native seeds, matching the CLI parser and campaign
+  manifest type. Numeric strings and booleans are rejected before operation admission.
 - `resources`, a frozen reference to the resource object described below.
 
 The actual `root/study.json`, `root/config.yaml` and `root/metadata.json` must already exist and match the

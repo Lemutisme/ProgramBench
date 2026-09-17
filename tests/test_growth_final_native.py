@@ -67,7 +67,7 @@ def native_fixture(tmp_path_factory, initial):
     "inner_workers", "outer_workers", "initial_revision", "recipe", "root_config", "metadata", "catalog",
     "task_resource", "blob", "image", "image_tag", "python", "runner", "source_inventory", "module_origin", "module_code",
     "backend", "callback", "backend_study", "policy", "runtime", "spec_runner", "seed", "test_map", "spec_study",
-    "slot_repeat", "contract_cap", "contract_model", "contract_deadline", "contract_reset", "cached_config",
+    "slot_repeat", "seed_type", "seed_boolean", "contract_cap", "contract_model", "contract_deadline", "contract_reset", "cached_config",
 ])
 def test_real_native_binding_rejects_before_operation_admission(native_fixture, tmp_path, scenario):
     path, fixture = native_fixture

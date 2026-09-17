@@ -77,7 +77,9 @@ def probe(fixture, root, scenario):
               "sources": sources, "python": {"path": sys.executable, "resolved": {
                   "path": str(Path(sys.executable).resolve()), "sha256": sha256(Path(sys.executable).read_bytes())}},
               "resources": artifact(root, "resources.json", resources),
-              "repeat_seeds": {"1": "repeat-1", "2": "repeat-2"}}
+              "repeat_seeds": {"1": 1, "2": 2}}
+    if scenario == "seed_type": native["repeat_seeds"]["1"] = "1"
+    if scenario == "seed_boolean": native["repeat_seeds"]["1"] = True
     if scenario == "python": native["python"]["resolved"]["sha256"] = "b" * 64
     registration = {"schema_version": 1, "attempt_id": "synthetic-unregistered", "revisions": revisions,
                     "catalog": catalog_ref, "analyzer": {"path": str(Path(repository["path"]) / "scripts/growth_final_analysis.py"),
@@ -139,6 +141,7 @@ def probe(fixture, root, scenario):
             "root_config": "frozen input changed", "metadata": "frozen input changed", "catalog": "catalog/metadata differ",
             "task_resource": "metadata resource inventory", "blob": "blob inventory", "image": "resource identity",
             "image_tag": "image name differs",
+            "seed_type": "integer native repeat seeds", "seed_boolean": "integer native repeat seeds",
             "python": "frozen input changed", "runner": "frozen commit", "source_inventory": "native sources omit",
             "module_origin": "outside its frozen", "module_code": "native method code",
             "backend": "were rebound", "callback": "constructor-bound qualifier", "backend_study": "were rebound",
