@@ -75,7 +75,8 @@ def prepare(root, *, registration, registry_ref, registry_receipt, expected_cata
     _reference(ripgrep, verify=True)
     execution = {"schema_version": 1, "registration": registration, "registry_receipt": registry_receipt,
                  "slots": [{"slot": slot, "output": f"slots/{slot['slot']:06d}",
-                            "specification": binding.specification(slot)} for slot in registered["schedule"]]}
+                            "specification": specification} for slot, specification in
+                           zip(registered["schedule"], binding.specifications(), strict=True)]}
     validate_execution(execution, registry_ref=registry_ref, expected_catalog_sha256=expected_catalog_sha256,
                        require_active=True)
     owner_source = reference(Path(__file__).resolve())
@@ -186,8 +187,8 @@ def check(root, *, require_active=True):
     binding = FinalNativeInputs(registered, expected_catalog_sha256=config["expected_catalog_sha256"])
     if binding.root != root / "execution" or binding.inputs["python"] != config["python"]:
         raise GrowthError("owner/native execution root or Python binding changed")
-    for entry in execution["slots"]:
-        if encode(entry["specification"]) != encode(binding.specification(entry["slot"])):
+    for entry, specification in zip(execution["slots"], binding.specifications(), strict=True):
+        if encode(entry["specification"]) != encode(specification):
             raise GrowthError("frozen final specification differs from its actual native binding")
     return {"passed": True, "frozen_manifest_sha256": reference(root / "FROZEN_MANIFEST.json")["sha256"],
             "execution_sha256": config["execution"]["sha256"], "assigned": 800,

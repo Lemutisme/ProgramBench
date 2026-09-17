@@ -44,6 +44,9 @@ receipt = prepare(
 Preparation constructs `FinalNativeInputs`, recursively checks the actual native
 resources and both revisions, verifies the active registry receipt, and derives
 all 800 specifications and fixed `slots/000001` through `slots/000800` outputs.
+Each bulk derivation revalidates both revisions once, avoiding 800 repeated
+hashes of the same runtime. Every native operation still uses strict individual
+qualification before admission and result validation.
 It freezes this inventory in `execution/execution.json` before any launch. It
 also freezes the actual `launch.py`, `control.py`, `controller.py`, `entrypoint.py`,
 owner configuration/resources and complete input manifest. The wrappers verify
