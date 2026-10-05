@@ -113,7 +113,12 @@ class FakeApi:
         assert _write_git_export(destination) == DEFAULT_SUBJECT_HASH
         return {"contractID": contract_id, "subjectHash": DEFAULT_SUBJECT_HASH, "directory": str(destination)}
 
-    def attest(self, contract_id: str, evidence_hash: str) -> dict[str, object]:
+    def attest(self, contract_id: str, evidence_hash: str, **coordinates: object) -> dict[str, object]:
+        assert coordinates == {
+            "revision": self.contract["revision"],
+            "spec_hash": self.contract["specHash"],
+            "subject_hash": self.contract["handoff"]["subjectHash"],
+        }
         self.attestations.append((contract_id, evidence_hash))
         self.contract = {**self.contract, "status": "discharged", "attestationID": "pca_attestation"}
         return {"frontier": 2, "hash": "attested"}
@@ -143,8 +148,8 @@ class CrashApi(FakeApi):
             raise InjectedCrash("after export")
         return response
 
-    def attest(self, contract_id: str, evidence_hash: str) -> dict[str, object]:
-        response = super().attest(contract_id, evidence_hash)
+    def attest(self, contract_id: str, evidence_hash: str, **coordinates: object) -> dict[str, object]:
+        response = super().attest(contract_id, evidence_hash, **coordinates)
         if self.stage == "attest" and not self.crashed:
             self.crashed = True
             raise InjectedCrash("after attest")
@@ -413,8 +418,8 @@ class CommitDropAttestApi(FakeApi):
         self.error = error
         self.dropped = False
 
-    def attest(self, contract_id: str, evidence_hash: str) -> dict[str, object]:
-        response = super().attest(contract_id, evidence_hash)
+    def attest(self, contract_id: str, evidence_hash: str, **coordinates: object) -> dict[str, object]:
+        response = super().attest(contract_id, evidence_hash, **coordinates)
         if not self.dropped:
             self.dropped = True
             raise self.error
@@ -422,7 +427,7 @@ class CommitDropAttestApi(FakeApi):
 
 
 class ConcurrentAttestApi(FakeApi):
-    def attest(self, contract_id: str, evidence_hash: str) -> dict[str, object]:
+    def attest(self, contract_id: str, evidence_hash: str, **coordinates: object) -> dict[str, object]:
         from scripts.campaign_procontract import ProContractHttpError
 
         self.attestations.append((contract_id, evidence_hash))
@@ -436,7 +441,7 @@ class AttestErrorApi(FakeApi):
         self.error = error
         self.attest_calls = 0
 
-    def attest(self, contract_id: str, evidence_hash: str) -> dict[str, object]:
+    def attest(self, contract_id: str, evidence_hash: str, **coordinates: object) -> dict[str, object]:
         self.attest_calls += 1
         raise self.error
 
@@ -456,14 +461,14 @@ class AttestReconcileErrorApi(FakeApi):
         self.attest_calls = 0
         self.reconcile_calls = 0
 
-    def attest(self, contract_id: str, evidence_hash: str) -> dict[str, object]:
+    def attest(self, contract_id: str, evidence_hash: str, **coordinates: object) -> dict[str, object]:
         self.attest_calls += 1
         if self.attest_calls == 1:
             self.reconciling = True
             from scripts.campaign_procontract import ProContractHttpError
 
             raise ProContractHttpError("attestation response lost", status_code=503, transient=True)
-        return super().attest(contract_id, evidence_hash)
+        return super().attest(contract_id, evidence_hash, **coordinates)
 
     def get_contract(self, contract_id: str) -> dict[str, object] | None:
         if self.reconciling:
@@ -484,8 +489,8 @@ class MalformedIssueResponseApi(FakeApi):
 
 
 class MalformedAttestResponseApi(FakeApi):
-    def attest(self, contract_id: str, evidence_hash: str) -> dict[str, object]:
-        super().attest(contract_id, evidence_hash)
+    def attest(self, contract_id: str, evidence_hash: str, **coordinates: object) -> dict[str, object]:
+        super().attest(contract_id, evidence_hash, **coordinates)
         return {"frontier": -1, "hash": ""}
 
 
@@ -495,8 +500,8 @@ class PostAttestGetErrorApi(FakeApi):
         self.error = error
         self.failures = 0
 
-    def attest(self, contract_id: str, evidence_hash: str) -> dict[str, object]:
-        response = super().attest(contract_id, evidence_hash)
+    def attest(self, contract_id: str, evidence_hash: str, **coordinates: object) -> dict[str, object]:
+        response = super().attest(contract_id, evidence_hash, **coordinates)
         self.failures = 1
         return response
 
@@ -512,7 +517,7 @@ class DelayedDischargeApi(FakeApi):
         super().__init__(contract, execution)
         self.pending = 0
 
-    def attest(self, contract_id: str, evidence_hash: str) -> dict[str, object]:
+    def attest(self, contract_id: str, evidence_hash: str, **coordinates: object) -> dict[str, object]:
         self.attestations.append((contract_id, evidence_hash))
         self.pending = 2
         return {"frontier": 2, "hash": "attested"}
@@ -530,7 +535,7 @@ class PostAttestChallengeApi(FakeApi):
         super().__init__(contract, execution)
         self.pending = False
 
-    def attest(self, contract_id: str, evidence_hash: str) -> dict[str, object]:
+    def attest(self, contract_id: str, evidence_hash: str, **coordinates: object) -> dict[str, object]:
         self.attestations.append((contract_id, evidence_hash))
         self.pending = True
         return {"frontier": 2, "hash": "attested"}
@@ -2257,6 +2262,11 @@ def test_happy_lifecycle_uses_native_scheduler_and_exact_delivery(
         "specHash": result.spec_hash,
         "subjectHash": result.subject_hash,
     }
+    assert json.loads(paths.root.joinpath("procontract-attestation-request.json").read_text()) == {
+        "version": 2,
+        **report["contract"],
+        "evidenceHash": result.report_hash,
+    }
     assert report["execution"] == {
         "sessionID": result.session_id,
         "promptID": result.prompt_id,
@@ -2753,6 +2763,77 @@ def test_uncommitted_attestation_errors_preserve_recoverable_trajectory(
     assert caught.value.phase == recovery_phase
     assert api.attest_calls == calls
     assert api.attestations == []
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [None, "legacy", "contractID", "revision", "revision_type", "version_type", "specHash", "subjectHash", "evidenceHash"],
+)
+def test_attestation_retry_requires_unchanged_frozen_evaluated_coordinates(tmp_path: Path, changed: str | None) -> None:
+    from scripts.campaign_procontract import build_issue_payload, run_procontract
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    store = _state(paths)
+    _, workspace = _workspace(tmp_path, paths)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock())
+
+    class CrashBeforeAttestApi(FakeApi):
+        calls = 0
+
+        def attest(self, contract_id: str, evidence_hash: str, **coordinates: object) -> dict[str, object]:
+            self.calls += 1
+            if self.calls == 1:
+                raise InjectedCrash("before native attestation mutation")
+            return super().attest(contract_id, evidence_hash, **coordinates)
+
+    api = CrashBeforeAttestApi(_contract(payload), _execution(payload))
+
+    def invoke():
+        with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+            workspace.lease._handle_active = True
+            return run_procontract(
+                job,
+                store,
+                workspace,
+                model="openai/gpt-5.6-luna",
+                variant="max",
+                limits=_limits(),
+                breaker=CircuitBreaker(),
+                api=api,
+                clock=clock,
+                sleeper=clock.sleep,
+                package=lambda subject, run_dir, iid: _package(run_dir, iid),
+                preflight=lambda archive, iid: SimpleNamespace(executable_hash="e" * 64, output="ok"),
+            )
+
+    with pytest.raises(InjectedCrash):
+        invoke()
+    request = paths.root / "procontract-attestation-request.json"
+    intended = json.loads(request.read_text())
+    report = json.loads(paths.root.joinpath("verifier-report.json").read_text())
+    assert intended == {
+        "version": 2,
+        **report["contract"],
+        "evidenceHash": _file_hash(paths.root / "verifier-report.json"),
+    }
+    if changed == "legacy":
+        request.write_text(json.dumps({
+            "version": 1, "contractID": intended["contractID"], "evidenceHash": intended["evidenceHash"],
+        }))
+    elif changed in {"revision_type", "version_type"}:
+        field = changed.removesuffix("_type")
+        request.write_text(json.dumps({**intended, field: float(intended[field])}))
+    elif changed is not None:
+        request.write_text(json.dumps({**intended, changed: 2 if changed == "revision" else "different"}))
+    retained = request.read_bytes()
+    result = invoke()
+
+    assert result.completion.value == ("discharged" if changed is None else "delivery_failed")
+    assert api.calls == (2 if changed is None else 1)
+    assert len(api.attestations) == (1 if changed is None else 0)
+    assert request.read_bytes() == retained
 
 
 def test_malformed_committed_attestation_response_is_not_falsely_attributed(tmp_path: Path) -> None:
@@ -6020,7 +6101,13 @@ def test_real_public_http_adapter_uses_only_contract_and_read_only_session_endpo
         assert api.status("ses_contract") == "idle"
         assert api.quiet(str(payload["scope"]))["outstanding"] == [payload["id"]]
         api.interrupt("ses_contract")
-        assert api.attest(str(payload["id"]), "report-hash") == {"frontier": 2, "hash": "attest"}
+        assert api.attest(
+            str(payload["id"]),
+            "report-hash",
+            revision=1,
+            spec_hash=str(contract["specHash"]),
+            subject_hash=DEFAULT_SUBJECT_HASH,
+        ) == {"frontier": 2, "hash": "attest"}
     finally:
         server.shutdown()
         thread.join()
@@ -6032,6 +6119,38 @@ def test_real_public_http_adapter_uses_only_contract_and_read_only_session_endpo
         for method, path, _ in requests
     )
     assert sum(path == f"/api/contract/{payload['id']}/attestation" for _, path, _ in requests) == 1
+    assert requests[-1] == (
+        "POST",
+        f"/api/contract/{payload['id']}/attestation",
+        {
+            "revision": 1,
+            "specHash": contract["specHash"],
+            "subjectHash": DEFAULT_SUBJECT_HASH,
+            "evidenceHash": "report-hash",
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    "invalid", [{"revision": 0}, {"revision": True}, {"spec_hash": ""}, {"subject_hash": ""}, {"evidence_hash": ""}],
+)
+def test_http_attestation_rejects_missing_coordinates_without_fetching_latest(invalid: dict[str, object]) -> None:
+    from scripts.campaign_procontract import HttpProContractApi, ProContractError
+
+    client = SequenceHttpClient([])
+    api = HttpProContractApi("http://127.0.0.1:4096", expected_port=4096, password="secret", http_client=client)
+    with pytest.raises(ProContractError, match="exact evaluated Contract coordinates"):
+        api.attest(
+            "pct_exact",
+            **{
+                "revision": 1,
+                "spec_hash": "frozen-terms",
+                "subject_hash": "evaluated-subject",
+                "evidence_hash": "report",
+                **invalid,
+            },
+        )
+    assert client.urls == []
 
 
 @pytest.mark.parametrize(
@@ -6358,6 +6477,57 @@ def test_done_result_revalidates_retained_export_git_identity(tmp_path: Path) ->
 
     with pytest.raises(ProContractConflictError, match="export"):
         invoke()
+
+
+@pytest.mark.parametrize("changed", ["legacy", "revision", "specHash", "subjectHash", "evidenceHash"])
+def test_done_result_rejects_unbound_or_changed_attestation_request(tmp_path: Path, changed: str) -> None:
+    from scripts.campaign_procontract import (
+        ProContractConflictError, _verify_done_delivery, build_issue_payload, run_procontract,
+    )
+
+    paths = JobPaths(tmp_path / "job")
+    paths.root.mkdir()
+    store = _state(paths)
+    _, workspace = _workspace(tmp_path, paths)
+    clock = FakeClock()
+    payload = build_issue_payload(workspace, now=clock())
+    api = FakeApi(_contract(payload), _execution(payload))
+
+    def invoke():
+        with JobLease(paths, resume=True, redo=False, retry_infra=False) as job, workspace.lease:
+            workspace.lease._handle_active = True
+            return run_procontract(
+                job,
+                store,
+                workspace,
+                model="openai/gpt-5.6-luna",
+                variant="max",
+                limits=_limits(),
+                breaker=CircuitBreaker(),
+                api=api,
+                clock=clock,
+                sleeper=clock.sleep,
+                package=lambda subject, run_dir, iid: _package(run_dir, iid),
+                preflight=lambda archive, iid: SimpleNamespace(executable_hash="e" * 64, output="ok"),
+            )
+
+    first = invoke()
+    assert first.completion.value == "discharged"
+    request = paths.root / "procontract-attestation-request.json"
+    intended = json.loads(request.read_text())
+    if changed == "legacy":
+        request.write_text(json.dumps({
+            "version": 1, "contractID": intended["contractID"], "evidenceHash": intended["evidenceHash"],
+        }))
+    else:
+        request.write_text(json.dumps({**intended, changed: 2 if changed == "revision" else "different"}))
+    retained = request.read_bytes()
+    with pytest.raises(ProContractConflictError, match="terminal artifacts"):
+        invoke()
+    with pytest.raises(ProContractConflictError, match="attestation request"):
+        _verify_done_delivery(paths.root, first, workspace)
+    assert len(api.issues) == len(api.exports) == len(api.attestations) == 1
+    assert request.read_bytes() == retained
 
 
 def test_interrupted_result_is_idempotently_adopted_without_api_calls(tmp_path: Path) -> None:

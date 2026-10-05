@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from scripts.campaign_install import InstallRecord
+from scripts.campaign_offline import HEADLESS_CONFIG
 from scripts.campaign_procontract import (
     HttpProContractApi,
     ProContractHttpError,
@@ -128,7 +129,7 @@ FAKE_OPENCODE = textwrap.dedent(
             if parsed.path != "/api/contract/" + CONTRACT_ID + "/attestation":
                 return self.send_error(404)
             body = json.loads(self.rfile.read(int(self.headers["content-length"])))
-            if body != {{"evidenceHash": "principal-evidence"}}:
+            if body != {{"revision": 1, "specHash": "fixture-spec", "subjectHash": "fixture-subject", "evidenceHash": "principal-evidence"}}:
                 return self.send_error(400)
             with LOCK:
                 state = load()
@@ -272,8 +273,10 @@ def test_real_delivery_restart_rebinds_procontract_api_and_preserves_attestation
                     events.append("get")
                     return contract
 
-                def attest(self, contract_id: str, evidence_hash: str):
-                    response = super().attest(contract_id, evidence_hash)
+                def attest(self, contract_id: str, evidence_hash: str, *, revision: int, spec_hash: str, subject_hash: str):
+                    response = super().attest(
+                        contract_id, evidence_hash, revision=revision, spec_hash=spec_hash, subject_hash=subject_hash
+                    )
                     events.append("attest")
                     return response
 
@@ -315,7 +318,9 @@ def test_real_delivery_restart_rebinds_procontract_api_and_preserves_attestation
                 "stateHash": "state",
                 "outstanding": [CONTRACT_ID],
             }
-            assert api.attest(CONTRACT_ID, "principal-evidence") == {"frontier": 1, "hash": "attestation"}
+            assert api.attest(
+                CONTRACT_ID, "principal-evidence", revision=1, spec_hash="fixture-spec", subject_hash="fixture-subject"
+            ) == {"frontier": 1, "hash": "attestation"}
             assert api.quiet(SCOPE)["quiet"] is True
 
             state = json.loads(restarted.state_dir.joinpath("data/procontract-fixture.json").read_text())
@@ -375,9 +380,9 @@ def test_real_delivery_restart_rebinds_procontract_api_and_preserves_attestation
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize("expected_completion", ["discharged", "pending_revision"])
+@pytest.mark.parametrize("attempt_revision", [False, True])
 def test_pinned_real_binary_completes_native_procontract_lifecycle(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, expected_completion: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, attempt_revision: bool
 ) -> None:
     from scripts.run_opencode import (
         CircuitBreaker,
@@ -457,6 +462,7 @@ def test_pinned_real_binary_completes_native_procontract_lifecycle(
                 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
                 responses = 0
+                attempt_revision = False
 
                 class Handler(BaseHTTPRequestHandler):
                     def do_POST(self):
@@ -466,14 +472,19 @@ def test_pinned_real_binary_completes_native_procontract_lifecycle(
                             output.write(body + b"\\n")
                         if self.path.endswith("/responses"):
                             responses += 1
-                            if responses == 1:
-                                args = json.dumps({"summary":"Candidate and replay are ready.","uncertainties":[]}, separators=(",", ":"))
+                            if responses == 1 or (attempt_revision and responses == 2):
+                                revise = attempt_revision and responses == 1
+                                tool = "contract_propose_revision" if revise else "contract_report_ready"
+                                arguments = {"goal":"Revised fixture goal","brief":"Change the frozen task.","reason":"Try changing scope."} if revise else {"summary":"Candidate and replay are ready.","uncertainties":[]}
+                                args = json.dumps(arguments, separators=(",", ":"))
+                                item_id = f"fc_{responses}"
+                                call_id = f"call_{responses}"
                                 events = [
-                                    {"type":"response.created","sequence_number":1,"response":{"id":"resp_programbench","created_at":1,"model":"gpt-5.6-luna","service_tier":None}},
-                                    {"type":"response.output_item.added","sequence_number":2,"output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"contract_report_ready","arguments":"","status":"in_progress"}},
-                                    {"type":"response.function_call_arguments.delta","sequence_number":3,"output_index":0,"item_id":"fc_1","delta":args},
-                                    {"type":"response.function_call_arguments.done","sequence_number":4,"output_index":0,"item_id":"fc_1","arguments":args},
-                                    {"type":"response.output_item.done","sequence_number":5,"output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"contract_report_ready","arguments":args,"status":"completed"}},
+                                    {"type":"response.created","sequence_number":1,"response":{"id":f"resp_programbench_{responses}","created_at":1,"model":"gpt-5.6-luna","service_tier":None}},
+                                    {"type":"response.output_item.added","sequence_number":2,"output_index":0,"item":{"type":"function_call","id":item_id,"call_id":call_id,"name":tool,"arguments":"","status":"in_progress"}},
+                                    {"type":"response.function_call_arguments.delta","sequence_number":3,"output_index":0,"item_id":item_id,"delta":args},
+                                    {"type":"response.function_call_arguments.done","sequence_number":4,"output_index":0,"item_id":item_id,"arguments":args},
+                                    {"type":"response.output_item.done","sequence_number":5,"output_index":0,"item":{"type":"function_call","id":item_id,"call_id":call_id,"name":tool,"arguments":args,"status":"completed"}},
                                     {"type":"response.completed","sequence_number":6,"response":{"incomplete_details":None,"service_tier":None,"usage":{"input_tokens":10,"input_tokens_details":{"cached_tokens":0},"output_tokens":3,"output_tokens_details":{"reasoning_tokens":0}}}},
                                 ]
                             else:
@@ -507,11 +518,8 @@ def test_pinned_real_binary_completes_native_procontract_lifecycle(
                 ThreadingHTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
             """
         )
-        if expected_completion == "pending_revision":
-            provider_source = provider_source.replace("contract_report_ready", "contract_propose_revision").replace(
-                '{"summary":"Candidate and replay are ready.","uncertainties":[]}',
-                '{"goal":"Revised fixture goal","brief":"Await principal revision decision.","reason":"Need revised scope."}',
-            )
+        if attempt_revision:
+            provider_source = provider_source.replace("attempt_revision = False", "attempt_revision = True")
         provider_script.write_text(provider_source)
         provider_name = f"programbench-provider-{uuid.uuid4().hex}"
         provider_container = _run_docker(
@@ -584,6 +592,7 @@ def test_pinned_real_binary_completes_native_procontract_lifecycle(
                         "lsp": False,
                         "model": "openai/gpt-5.6-luna",
                         "small_model": "openai/gpt-5.6-luna",
+                        "permission": HEADLESS_CONFIG["permission"],
                         "provider": {
                             "openai": {
                                 "name": "Deterministic OpenAI",
@@ -705,31 +714,30 @@ def test_pinned_real_binary_completes_native_procontract_lifecycle(
                 protocol=protocol,  # type: ignore[arg-type]
             )
 
-            assert result.completion.value == expected_completion
-            if expected_completion == "discharged":
-                assert result.quiet is True
-                assert result.report_hash is not None
-                assert result.attestation_id is not None
-            else:
-                assert result.pending_revision is not None
-                assert result.attestation_id is None
-                assert not paths.root.joinpath("procontract-attestation-request.json").exists()
-                native = json.loads(paths.root.joinpath("procontract-native-result.json").read_text())
-                assert native["contract"]["pendingRevision"] == result.pending_revision
-                assert native["execution"]["contractID"] == result.contract_id
-                progress = json.loads(paths.root.joinpath("procontract-progress.json").read_text())["current"]
-                assistant = next(message for message in progress["messages"]["data"] if message["type"] == "assistant")
-                assert assistant["finish"] == "tool-calls"
-                assert all(part["state"]["status"] in {"completed", "error"} for part in assistant["content"])
-                assert result.usage_incomplete is False
-                assert result.input_tokens == breaker.campaign_usage.input == 10
-                assert result.output_tokens == breaker.campaign_usage.output == 3
-                assert result.cost == breaker.campaign_usage.cost > 0
-                issued = json.loads(paths.root.joinpath("procontract-issue-response.json").read_text())["execution"]
-                assert (
-                    native["execution"]["dispatched"] is False
-                    or native["execution"]["promptID"] != issued["promptID"]
-                    or result.interrupt_attempted
+            assert result.completion.value == "discharged"
+            assert result.quiet is True
+            assert result.report_hash is not None
+            assert result.attestation_id is not None
+            issued = json.loads(paths.root.joinpath("procontract-issue-response.json").read_text())["data"]
+            discharged = json.loads(paths.root.joinpath("procontract-discharge.json").read_text())["contract"]
+            assert discharged["revision"] == issued["revision"] == 1
+            assert discharged["specHash"] == issued["specHash"]
+            assert discharged["spec"] == issued["spec"]
+            assert discharged["spec"]["budget"]["deadline"] == issued["spec"]["budget"]["deadline"]
+            assert not discharged.get("pendingRevision")
+            assert result.usage_incomplete is False
+            assert result.cost == breaker.campaign_usage.cost > 0
+            if attempt_revision:
+                verification = json.loads(paths.root.joinpath("procontract-verification.json").read_text())
+                denied = [
+                    part for message in verification["messages"]["data"] if message["type"] == "assistant"
+                    for part in message["content"]
+                    if part.get("type") == "tool" and part.get("name") == "contract_propose_revision"
+                ]
+                assert len(denied) == 1
+                assert denied[0]["state"]["status"] == "error"
+                assert denied[0]["state"]["error"]["message"] == (
+                    "Revision rejected by the principal; the original Contract remains authoritative"
                 )
             assert tmp_path.joinpath("provider-hits.jsonl").is_file()
             assert workspace.manifest.binary_sha256 == fixture_metadata["sha256"]

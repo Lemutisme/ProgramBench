@@ -615,7 +615,9 @@ class ProContractApi(Protocol):
 
     def export(self, workspace: DockerWorkspace, contract_id: str, destination: Path) -> Mapping[str, object]: ...
 
-    def attest(self, contract_id: str, evidence_hash: str) -> Mapping[str, object]: ...
+    def attest(
+        self, contract_id: str, evidence_hash: str, *, revision: int, spec_hash: str, subject_hash: str
+    ) -> Mapping[str, object]: ...
 
 
 class ProContractWorkspace(Protocol):
@@ -797,12 +799,23 @@ class HttpProContractApi:
             raise ProContractError("Contract export returned invalid JSON")
         return raw
 
-    def attest(self, contract_id: str, evidence_hash: str) -> Mapping[str, object]:
+    def attest(
+        self, contract_id: str, evidence_hash: str, *, revision: int, spec_hash: str, subject_hash: str
+    ) -> Mapping[str, object]:
+        if type(revision) is not int or revision <= 0 or any(
+            not isinstance(value, str) or not value for value in (spec_hash, subject_hash, evidence_hash)
+        ):
+            raise ProContractError("attestation requires exact evaluated Contract coordinates")
         return self._mapping(
             self._request(
                 "POST",
                 f"/api/contract/{_id(contract_id, 'pct_')}/attestation",
-                {"evidenceHash": evidence_hash},
+                {
+                    "revision": revision,
+                    "specHash": spec_hash,
+                    "subjectHash": subject_hash,
+                    "evidenceHash": evidence_hash,
+                },
             )
         )
 
@@ -2682,9 +2695,18 @@ def _deliver(
     report_hash = _validate_verifier_report(report_path, report)
     attestation_path = job.job.root / "procontract-attestation.json"
     attestation_request_path = job.job.root / "procontract-attestation-request.json"
-    intended = {"version": 1, "contractID": payload["id"], "evidenceHash": report_hash}
-    if attestation_request_path.exists() and _read_json(attestation_request_path) != intended:
-        raise ProContractDeliveryError("persisted attestation request conflicts with verifier report")
+    # Bind the evidence to the evaluated report, never to a freshly fetched handoff.
+    # Legacy requests lack these coordinates and must not be silently readmitted.
+    intended = {"version": 2, **report["contract"], "evidenceHash": report_hash}
+    if attestation_request_path.exists():
+        retained = _read_json(attestation_request_path)
+        if (
+            not isinstance(retained, Mapping)
+            or type(retained.get("version")) is not int
+            or type(retained.get("revision")) is not int
+            or retained != intended
+        ):
+            raise ProContractDeliveryError("persisted attestation request conflicts with verifier report")
     if not attestation_request_path.exists():
         _write_json(attestation_request_path, intended)
     _scan_all_credentials(job.job.root, workspace, export_dir)
@@ -2731,7 +2753,13 @@ def _deliver(
         if safety is not None:
             raise ProContractNativeOutcome(safety, current, current_execution)
         try:
-            response = api.attest(str(payload["id"]), report_hash)
+            response = api.attest(
+                str(intended["contractID"]),
+                str(intended["evidenceHash"]),
+                revision=int(intended["revision"]),
+                spec_hash=str(intended["specHash"]),
+                subject_hash=str(intended["subjectHash"]),
+            )
             _validate_receipt(response, "attestation")
             _write_json(
                 attestation_path,
@@ -5684,11 +5712,19 @@ def _verify_done_delivery(job_root: Path, result: ProContractResult, workspace: 
         ):
             raise ProContractConflictError("terminal subject inventory is invalid")
         attestation_request = _read_json(job_root / "procontract-attestation-request.json")
-        if attestation_request != {
-            "version": 1,
-            "contractID": result.contract_id,
-            "evidenceHash": result.report_hash,
-        }:
+        if (
+            not isinstance(attestation_request, Mapping)
+            or type(attestation_request.get("version")) is not int
+            or type(attestation_request.get("revision")) is not int
+            or attestation_request != {
+                "version": 2,
+                "contractID": result.contract_id,
+                "revision": result.revision,
+                "specHash": result.spec_hash,
+                "subjectHash": result.subject_hash,
+                "evidenceHash": result.report_hash,
+            }
+        ):
             raise ProContractConflictError("terminal attestation request conflicts with result")
         if not isinstance(discharge, Mapping) or set(discharge) != {"version", "contract", "execution"}:
             raise ProContractConflictError("terminal discharge observation is invalid")
