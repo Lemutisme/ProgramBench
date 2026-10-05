@@ -56,6 +56,7 @@ from scripts.campaign_workspace import (
     WorkspaceHealthError,
     WorkspaceRequest,
     ensure_workspace,
+    _workspace_campaign,
     reconcile_workspace_for_cleanup,
 )
 from scripts.run_opencode import CampaignConfig, ConfigError, Job, expand_jobs, load_config, select_instances
@@ -1571,11 +1572,6 @@ def _install_for(plan: CampaignPlan, arm: str) -> InstallRecord:
     except BaseException as error:
         raise CampaignError(f"frozen install record is unavailable for {arm}") from error
 
-
-def _workspace_campaign(root: Path) -> str:
-    # Docker names and Contract scopes are daemon/process global, not relative
-    # to the output's parent. Equal basenames must not collide across studies.
-    return "campaign-" + hashlib.sha256(os.fsencode(root.resolve())).hexdigest()[:32]
 
 
 def _campaign_name(root: Path) -> str:

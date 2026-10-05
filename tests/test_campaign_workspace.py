@@ -2079,3 +2079,30 @@ def test_real_docker_runs_two_exact_isolated_workspaces(tmp_path: Path, monkeypa
                     )
                 finally:
                     _run_docker(("docker", "rmi", "-f", tag), 60)
+
+
+def test_path_derived_campaign_identity_keeps_real_directory_layout(tmp_path):
+    docker = RecordingDocker()
+    value = request(tmp_path, docker)
+    output = value.job.root.parent.parent
+    identity = campaign_workspace._workspace_campaign(output)
+    with JobLease(value.job, resume=False, redo=False, retry_infra=False):
+        with WorkspaceLease(replace(value, campaign=identity)) as lease:
+            workspace = ensure_workspace_impl(replace(value, campaign=identity), lease)
+            assert workspace.manifest.campaign == identity
+            assert workspace.manifest.job_root == value.job.root
+            assert workspace.manifest.container_name == "programbench-" + campaign_workspace._job_id(
+                identity, value.instance_id, value.arm)[:32]
+            workspace.stop_for_freeze()
+            workspace = workspace.restart()
+            assert workspace.manifest.campaign == identity
+            workspace.stop_for_freeze()
+
+
+def test_path_derived_campaign_cannot_rebind_to_unrelated_output(tmp_path):
+    value = request(tmp_path, RecordingDocker())
+    foreign = campaign_workspace._workspace_campaign(tmp_path / "foreign/campaign")
+    with JobLease(value.job, resume=False, redo=False, retry_infra=False):
+        with WorkspaceLease(replace(value, campaign=foreign)) as lease:
+            with pytest.raises(WorkspaceError, match="fixed campaign/arm/instance"):
+                ensure_workspace_impl(replace(value, campaign=foreign), lease)

@@ -92,9 +92,16 @@ def workspace(tmp_path: Path, spec: study.SeedSpec, monkeypatch):
     state_root = root / "state"
     control = state_root / "provider-control"
     control.mkdir(parents=True)
-    with sqlite3.connect(control / "requests.db") as connection:
-        connection.execute("CREATE TABLE request(id INTEGER)")
-        connection.execute("CREATE TABLE execution_budget(identity TEXT)")
+    # Use the real gateway schema and its mandatory denied-readiness record,
+    # not a hand-written empty DB that hides startup activity.
+    import os
+    from scripts.campaign_provider_gateway import Gateway
+    gateway = Gateway(state_root / "provider-channel", control, "test-model", "max",
+                      upstream="http://127.0.0.1:1/v1", api_key="unused-test-key")
+    gateway.deny("caller_not_admitted_runtime", 403)
+    gateway.server_close()
+    gateway.db.close()
+    os.close(gateway.directory_fd)
     docker = FakeDocker()
     manifest = SimpleNamespace(path_identities=(PathIdentity.capture("candidate", candidate),),
         candidate=candidate, platform="linux/amd64", image_digest="sha256:" + "a" * 64,
@@ -189,7 +196,8 @@ def test_previous_gateway_admission_prevents_seeding(tmp_path, monkeypatch, tabl
     spec = seed(tmp_path)
     request, _, _, docker, _ = workspace(tmp_path, spec, monkeypatch)
     with sqlite3.connect(request.state_root / "provider-control/requests.db") as connection:
-        connection.execute(f"INSERT INTO {table} VALUES (?)", (1,))
+        connection.execute("INSERT INTO request(id) VALUES (2)" if table == "request" else
+                           "INSERT INTO execution_budget(identity) VALUES ('test')")
     with pytest.raises(study.StudyError, match="already admitted"):
         study.workspace_factory(spec)(request, object())
     assert docker.events == ["stop"]
@@ -406,3 +414,32 @@ def test_factory_stop_failure_has_local_bounded_cleanup_before_registration(tmp_
         study._stop_workspace(workspace)
     assert (tmp_path / "force-attempted").exists()
     assert (tmp_path / "released").exists() is recover
+
+
+@pytest.mark.parametrize("field,value", [
+    ("status", 200), ("status", None), ("outcome", "admitted"), ("outcome", None),
+    ("peer_pid", 123), ("body_sha256", "digest"), ("usage", "{}"), ("finished", 1),
+    ("metadata", "{}"), ("sent", 1), ("headers_at", 1), ("first_byte", 1),
+    ("last_byte", 1), ("terminal_at", 1), ("close_reason", "eof"),
+    ("error_name", "network-error"), ("error_code", 1),
+])
+def test_only_exact_preforward_readiness_denial_is_safe_before_seed(tmp_path, monkeypatch, field, value):
+    spec = seed(tmp_path)
+    request, _, _, docker, _ = workspace(tmp_path, spec, monkeypatch)
+    path = request.state_root / "provider-control/requests.db"
+    study._require_unused_gateway(path)
+    with sqlite3.connect(path) as connection:
+        connection.execute(f"UPDATE request SET {field} = ?", (value,))
+    with pytest.raises(study.StudyError, match="unknown attempt"):
+        study.workspace_factory(spec)(request, object())
+    assert docker.events == ["stop"]
+
+
+def test_initial_provider_body_even_without_request_row_blocks_seed(tmp_path, monkeypatch):
+    spec = seed(tmp_path)
+    request, _, _, _, _ = workspace(tmp_path, spec, monkeypatch)
+    path = request.state_root / "provider-control/requests.db"
+    with sqlite3.connect(path) as connection:
+        connection.execute("INSERT INTO initial_request(request_id,body) VALUES (99,?)", (b"{}",))
+    with pytest.raises(study.StudyError, match="already admitted"):
+        study._require_unused_gateway(path)

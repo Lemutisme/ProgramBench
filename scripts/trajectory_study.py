@@ -274,9 +274,20 @@ def _require_unused_gateway(path: Path) -> None:
     if not path.exists():
         raise StudyError("fresh isolated workspace lacks gateway accounting")
     with sqlite3.connect(path.as_uri() + "?mode=ro", uri=True) as connection:
-        for table in ("request", "execution_budget"):
+        for table in ("initial_request", "execution_budget"):
             if connection.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() is not None:
                 raise StudyError("workspace has already admitted provider work or a deadline")
+        # The required real network readiness probe deliberately attempts an
+        # unauthorized child request. Its pre-forward 403 is not model work.
+        # All other rows, including unknown/incomplete attempts, fail closed.
+        if connection.execute("""SELECT 1 FROM request WHERE
+                status IS NOT 403 OR outcome IS NOT 'caller_not_admitted_runtime'
+                OR peer_pid IS NOT NULL OR body_sha256 IS NOT NULL OR usage IS NOT NULL
+                OR finished IS NOT NULL OR metadata IS NOT NULL OR sent IS NOT NULL
+                OR headers_at IS NOT NULL OR first_byte IS NOT NULL OR last_byte IS NOT NULL
+                OR terminal_at IS NOT NULL OR close_reason IS NOT NULL
+                OR error_name IS NOT NULL OR error_code IS NOT NULL LIMIT 1""").fetchone() is not None:
+            raise StudyError("workspace has already admitted provider work or an unknown attempt")
 
 
 def _sha256(path: Path) -> str:

@@ -1298,8 +1298,10 @@ def _validate_request(request: WorkspaceRequest) -> WorkspaceRequest:
         raise ContainerConflictError("installed OpenCode binary hash does not match installation evidence")
     campaign_root = _canonical_root(request.campaign_root, "campaign output root")
     job_root = _canonical_root(request.job.root, "job root")
-    expected_job_root = campaign_root / request.campaign / request.arm / request.instance_id
-    if job_root != expected_job_root:
+    directory = job_root.parent.parent
+    if (directory.parent != campaign_root
+            or job_root != directory / request.arm / request.instance_id
+            or request.campaign not in {directory.name, _workspace_campaign(directory)}):
         raise WorkspaceError("job root must use the fixed campaign/arm/instance layout")
     job = JobPaths(
         job_root,
@@ -1396,6 +1398,12 @@ def _canonical_job_path(path: Path | None, root: Path, label: str) -> Path:
     if not _contains(root, value):
         raise WorkspaceError(f"{label} escapes the job root")
     return value
+
+
+def _workspace_campaign(root: Path) -> str:
+    # Docker names and Contract scopes are global; the directory label is not.
+    # Keep the existing layout, but bind new identities to its canonical path.
+    return "campaign-" + hashlib.sha256(os.fsencode(root.resolve())).hexdigest()[:32]
 
 
 def _job_id(campaign: str, instance_id: str, arm: str) -> str:
