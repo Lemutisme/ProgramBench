@@ -121,6 +121,8 @@ class CampaignPlan:
     dry_run: bool
     cleanup_only: bool = False
     selected_instances: tuple["CampaignInstance", ...] = ()
+    # Absent in historical manifests: preserve their original basename identity.
+    workspace_campaign: str | None = None
 
 
 @dataclass(frozen=True)
@@ -331,8 +333,10 @@ def plan_campaign(
     jobs = expand_campaign_jobs(selected_ids, images, seed=seed, arms=arm_names)
     root.mkdir(parents=True, exist_ok=True)
     installs = {arm.name: prepare_install_fn(arm, root / "installs") for arm in config.arms if arm.name in arm_names}
+    workspace_campaign = _workspace_campaign(root)
     manifest = {
         "version": 2,
+        "workspace_campaign": workspace_campaign,
         "config": canonical,
         "selected_ids": list(selected_ids),
         "selected_instances": [_campaign_instance_json(instance) for instance in selected_instances],
@@ -351,7 +355,8 @@ def plan_campaign(
     }
     _atomic_json(manifest_path, manifest)
     return CampaignPlan(
-        root, manifest_path, config, selected_ids, jobs, installs, dry_run, selected_instances=selected_instances
+        root, manifest_path, config, selected_ids, jobs, installs, dry_run, selected_instances=selected_instances,
+        workspace_campaign=workspace_campaign,
     )
 
 
@@ -681,7 +686,7 @@ def run_job(
         install = _install_for(plan, candidate.arm)
         request = WorkspaceRequest(
             job=paths,
-            campaign=_campaign_name(plan.output),
+            campaign=plan.workspace_campaign if plan.workspace_campaign is not None else _campaign_name(plan.output),
             campaign_root=plan.output.parent,
             instance_id=candidate.instance_id,
             arm=candidate.arm,
@@ -1131,6 +1136,9 @@ def _plan_from_manifest(
 ) -> CampaignPlan:
     if raw.get("version") != 2:
         raise CampaignError("campaign manifest has unsupported version")
+    workspace_campaign = raw.get("workspace_campaign")
+    if "workspace_campaign" in raw and workspace_campaign != _workspace_campaign(root):
+        raise CampaignError("campaign manifest workspace identity conflicts with its canonical output path")
     selected = raw.get("selected_ids")
     selected_instances = _manifest_selected_instances(raw.get("selected_instances"))
     jobs = raw.get("jobs")
@@ -1184,6 +1192,7 @@ def _plan_from_manifest(
         dry_run,
         cleanup_only,
         selected_instances,
+        workspace_campaign,
     )
 
 
@@ -1561,6 +1570,12 @@ def _install_for(plan: CampaignPlan, arm: str) -> InstallRecord:
         raise
     except BaseException as error:
         raise CampaignError(f"frozen install record is unavailable for {arm}") from error
+
+
+def _workspace_campaign(root: Path) -> str:
+    # Docker names and Contract scopes are daemon/process global, not relative
+    # to the output's parent. Equal basenames must not collide across studies.
+    return "campaign-" + hashlib.sha256(os.fsencode(root.resolve())).hexdigest()[:32]
 
 
 def _campaign_name(root: Path) -> str:

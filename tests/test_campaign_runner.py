@@ -3265,3 +3265,73 @@ def _invoke_public_main(run_opencode: object, monkeypatch: pytest.MonkeyPatch, a
     with pytest.raises(SystemExit) as exited:
         run_opencode.main()  # type: ignore[attr-defined]
     return int(exited.value.code)
+
+
+def test_new_campaign_identity_binds_canonical_path_and_preserves_legacy_resume(tmp_path, monkeypatch):
+    from scripts import campaign_runner
+    from scripts.campaign_workspace import _job_id
+    from scripts.run_opencode import load_config
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config_path = tmp_path / "campaign.yaml"
+    config_path.write_text(_config(repo))
+    config = load_config(config_path)
+    instance = {"instance_id": "owner__one.abc1234", "image_name": "owner-image",
+                "repository": "owner/repo", "commit": "a" * 40,
+                "difficulty": "easy", "language": "python"}
+    first = campaign_runner.plan_campaign(config, [instance], output=tmp_path / "neutral/campaign",
+        limit=1, dry_run=True, prepare_install_fn=lambda arm, _: {"arm": arm.name})
+    second = campaign_runner.plan_campaign(config, [instance], output=tmp_path / "frontier/campaign",
+        limit=1, dry_run=True, prepare_install_fn=lambda arm, _: {"arm": arm.name})
+    assert first.output.name == second.output.name == "campaign"
+    assert first.workspace_campaign != second.workspace_campaign
+    assert first.workspace_campaign == campaign_runner._workspace_campaign(first.output)
+    assert _job_id(first.workspace_campaign, instance["instance_id"], "procontract") != _job_id(
+        second.workspace_campaign, instance["instance_id"], "procontract")
+    alias = tmp_path / "alias"
+    alias.symlink_to(first.output, target_is_directory=True)
+    assert campaign_runner._workspace_campaign(alias) == first.workspace_campaign
+    resumed = campaign_runner.plan_campaign(config, [], output=alias, limit=1, dry_run=True, resume=True)
+    assert resumed.workspace_campaign == first.workspace_campaign
+
+    # A historical version-2 manifest has no new field. It must retain the
+    # already admitted scope/container rather than silently deriving a new one.
+    manifest = json.loads(second.manifest_path.read_text())
+    del manifest["workspace_campaign"]
+    second.manifest_path.write_text(json.dumps(manifest))
+    before = second.manifest_path.read_bytes()
+    legacy = campaign_runner.plan_campaign(config, [], output=second.output, limit=1, dry_run=True, resume=True)
+    assert legacy.workspace_campaign is None
+    assert second.manifest_path.read_bytes() == before
+
+    captured = []
+    def stop_before_workspace(request, lease):
+        captured.append(request.campaign)
+        raise RuntimeError("capture only; no Docker or model execution")
+    monkeypatch.setattr(campaign_runner, "_install_for", lambda *_: object())
+    for plan in (first, legacy):
+        campaign_runner.run_job(plan, plan.jobs[0], breaker=CircuitBreaker(), workspace_factory=stop_before_workspace)
+    assert captured == [first.workspace_campaign, "campaign"]
+
+
+@pytest.mark.parametrize("value", [None, "campaign", "campaign-" + "0" * 32, 7])
+def test_resume_rejects_replaced_new_workspace_identity(tmp_path, value):
+    from scripts import campaign_runner
+    from scripts.run_opencode import load_config
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config_path = tmp_path / "campaign.yaml"
+    config_path.write_text(_config(repo))
+    config = load_config(config_path)
+    instance = {"instance_id": "owner__one.abc1234", "image_name": "owner-image",
+                "repository": "owner/repo", "commit": "a" * 40,
+                "difficulty": "easy", "language": "python"}
+    plan = campaign_runner.plan_campaign(config, [instance], output=tmp_path / "campaign",
+        limit=1, dry_run=True, prepare_install_fn=lambda arm, _: {"arm": arm.name})
+    manifest = json.loads(plan.manifest_path.read_text())
+    manifest["workspace_campaign"] = value
+    plan.manifest_path.write_text(json.dumps(manifest))
+    with pytest.raises(campaign_runner.CampaignError, match="workspace identity"):
+        campaign_runner.plan_campaign(config, [], output=plan.output, limit=1, dry_run=True, resume=True)
